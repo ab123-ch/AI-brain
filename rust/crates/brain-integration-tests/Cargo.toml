@@ -1,0 +1,26 @@
+[package]
+name = "brain-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+brain-bus = { path = "../brain-bus" }
+brain-sensory = { path = "../brain-sensory" }
+brain-master = { path = "../brain-master" }
+brain-memory = { path = "../brain-memory" }
+brain-reasoning = { path = "../brain-reasoning" }
+brain-motor = { path = "../brain-motor" }
+brain-validation = { path = "../brain-validation" }
+brain-evaluation = { path = "../brain-evaluation" }
+brain-llm = { path = "../brain-llm" }
+tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tempfile = "3"
+serde_json = "1"
+
+[lints]
+workspace = true

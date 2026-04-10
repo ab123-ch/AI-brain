@@ -1,0 +1,340 @@
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::Json;
+use axum::Router;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+use crate::orchestrator::Orchestrator;
+
+// ─── 请求/响应类型 ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct QueryRequest {
+    query: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryResponse {
+    answer: String,
+    confidence: f64,
+    participating_brains: Vec<String>,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    status: String,
+    broadcast_subscribers: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BrainInfo {
+    name: String,
+    weight: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct WeightsResponse {
+    brains: Vec<BrainInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryStatsResponse {
+    l0_count: u32,
+    l1_count: u32,
+    l2_count: u32,
+    l3_count: u32,
+    total_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct EvaluateResponse {
+    overall_health: f64,
+    brain_count: usize,
+    slim_instructions: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// ─── 进化相关请求/响应 ─────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct BrainListResponse {
+    active: Vec<BrainEntryResponse>,
+    dormant: Vec<BrainEntryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrainEntryResponse {
+    name: String,
+    description: String,
+    state: String,
+    task_count: u32,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBrainRequest {
+    template_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateBrainResponse {
+    brain_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TemplatesResponse {
+    templates: Vec<TemplateEntryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct TemplateEntryResponse {
+    name: String,
+    description: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SuggestResponse {
+    suggestions: Vec<SuggestEntryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct SuggestEntryResponse {
+    name: String,
+    reason: String,
+    capabilities: Vec<String>,
+    confidence: f64,
+}
+
+// ─── 路由 ────────────────────────────────────────────────────────
+
+type SharedOrch = Arc<Mutex<Orchestrator>>;
+
+pub async fn serve(orch: Orchestrator, addr: &str) {
+    let shared = Arc::new(Mutex::new(orch));
+
+    let app = Router::new()
+        .route("/api/query", post(handle_query))
+        .route("/api/status", get(handle_status))
+        .route("/api/brains", get(handle_brains))
+        .route("/api/brains/list", get(handle_brain_list))
+        .route("/api/brains/templates", get(handle_templates))
+        .route("/api/brains/create", post(handle_create_brain))
+        .route("/api/brains/{id}/dormant", post(handle_dormant_brain))
+        .route("/api/brains/{id}/wake", post(handle_wake_brain))
+        .route("/api/brains/suggest", get(handle_suggest))
+        .route("/api/memory/stats", get(handle_memory_stats))
+        .route("/api/evaluate", post(handle_evaluate))
+        .with_state(shared);
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("绑定 {addr} 失败: {e}");
+            return;
+        }
+    };
+
+    tracing::info!("HTTP API 服务启动于 http://{addr}");
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("API 服务错误: {e}");
+    }
+}
+
+// ─── Handlers ────────────────────────────────────────────────────
+
+async fn handle_query(
+    State(orch): State<SharedOrch>,
+    Json(req): Json<QueryRequest>,
+) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    match orch.query(&req.query).await {
+        Ok(output) => Json(QueryResponse {
+            answer: output.answer,
+            confidence: output.confidence,
+            participating_brains: output
+                .participating_brains
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            duration_ms: output.usage.duration_ms,
+        })
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_status(State(orch): State<SharedOrch>) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    Json(StatusResponse {
+        status: "running".into(),
+        broadcast_subscribers: orch.broadcast_subscribers(),
+    })
+}
+
+async fn handle_brains(State(orch): State<SharedOrch>) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    let weights = orch.weights_list().await;
+    Json(WeightsResponse {
+        brains: weights
+            .into_iter()
+            .map(|(name, weight)| BrainInfo { name, weight })
+            .collect(),
+    })
+}
+
+async fn handle_memory_stats(State(orch): State<SharedOrch>) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    match orch.memory_stats_raw().await {
+        Ok(stats) => Json(MemoryStatsResponse {
+            l0_count: stats.l0_count,
+            l1_count: stats.l1_count,
+            l2_count: stats.l2_count,
+            l3_count: stats.l3_count,
+            total_size_bytes: stats.total_size_bytes,
+        })
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_evaluate(State(orch): State<SharedOrch>) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    let result = orch.evaluate_default_raw();
+    Json(EvaluateResponse {
+        overall_health: result.overall_health,
+        brain_count: result.brain_reports.len(),
+        slim_instructions: result.slim_instructions.len(),
+    })
+}
+
+// ─── 进化相关 Handlers ────────────────────────────────────────────
+
+async fn handle_brain_list(State(orch): State<SharedOrch>) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    let status = orch.brain_status().await;
+    Json(BrainListResponse {
+        active: status
+            .active
+            .into_iter()
+            .map(|e| BrainEntryResponse {
+                name: e.name,
+                description: e.description,
+                state: "active".into(),
+                task_count: e.task_count,
+                capabilities: e.capabilities,
+            })
+            .collect(),
+        dormant: status
+            .dormant
+            .into_iter()
+            .map(|e| BrainEntryResponse {
+                name: e.name,
+                description: e.description,
+                state: "dormant".into(),
+                task_count: e.task_count,
+                capabilities: e.capabilities,
+            })
+            .collect(),
+    })
+}
+
+async fn handle_templates(State(orch): State<SharedOrch>) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    let templates = orch.list_templates().await;
+    Json(TemplatesResponse {
+        templates: templates
+            .into_iter()
+            .map(|t| TemplateEntryResponse {
+                name: t.name,
+                description: t.description,
+                capabilities: t.capabilities,
+            })
+            .collect(),
+    })
+}
+
+async fn handle_create_brain(
+    State(orch): State<SharedOrch>,
+    Json(req): Json<CreateBrainRequest>,
+) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    match orch.create_brain(&req.template_name).await {
+        Ok(id) => Json(CreateBrainResponse {
+            brain_id: id.to_string(),
+        })
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: e }),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_dormant_brain(
+    State(orch): State<SharedOrch>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    let brain_id = brain_core::types::BrainId(id);
+    match orch.dormant_brain(&brain_id).await {
+        Ok(()) => Json(serde_json::json!({"status": "dormant"})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: e }),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_wake_brain(
+    State(orch): State<SharedOrch>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    let brain_id = brain_core::types::BrainId(id);
+    match orch.wake_brain(&brain_id).await {
+        Ok(weight) => {
+            Json(serde_json::json!({"status": "active", "weight": weight})).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: e }),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_suggest(State(orch): State<SharedOrch>) -> impl IntoResponse {
+    let orch = orch.lock().await;
+    let suggestions = orch.get_suggestions().await;
+    Json(SuggestResponse {
+        suggestions: suggestions
+            .into_iter()
+            .map(|s| SuggestEntryResponse {
+                name: s.suggested_name,
+                reason: s.reason,
+                capabilities: s.suggested_capabilities,
+                confidence: s.confidence,
+            })
+            .collect(),
+    })
+}

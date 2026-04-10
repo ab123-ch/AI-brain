@@ -1,0 +1,37 @@
+[package]
+name = "ai-brain-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ai-brain"
+path = "src/main.rs"
+
+[dependencies]
+brain-core = { path = "../brain-core" }
+brain-bus = { path = "../brain-bus" }
+brain-sensory = { path = "../brain-sensory" }
+brain-master = { path = "../brain-master" }
+brain-memory = { path = "../brain-memory" }
+brain-reasoning = { path = "../brain-reasoning" }
+brain-motor = { path = "../brain-motor" }
+brain-validation = { path = "../brain-validation" }
+brain-evaluation = { path = "../brain-evaluation" }
+brain-llm = { path = "../brain-llm" }
+brain-evolution = { path = "../brain-evolution" }
+
+tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-std", "io-util"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+thiserror = "2"
+
+[lints]
+workspace = true
