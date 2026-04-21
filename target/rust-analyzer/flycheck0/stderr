@@ -1,0 +1,507 @@
+   0.417287458s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: dependency on `brain_core` is newer than we are 1776499791.124042944s > 1776231282.269115767s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-master"
+   0.417467542s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: dependency on `brain_core` is newer than we are 1776499791.124042944s > 1776231282.342851559s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-memory"
+   0.417541417s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: dependency on `brain_core` is newer than we are 1776499791.124042944s > 1776231282.076957943s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-sensory"
+   0.421323417s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: fingerprint error for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: false }/TargetInner { name: "ai-brain", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/main.rs", Edition2021) }
+   0.421339125s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/ai-brain-cli-8e6b6a0669999be2/bin-ai-brain`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.456318500s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint: fingerprint error for brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_evolution", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution/src/lib.rs", Edition2021) }
+   0.456596125s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-evolution-411e31dfdfe26db1/lib-brain_evolution`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.457079542s  INFO prepare_target{force=false package_id=brain-llm v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm) target="brain_llm"}: cargo::core::compiler::fingerprint: fingerprint error for brain-llm v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_llm", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm/src/lib.rs", Edition2021) }
+   0.457086958s  INFO prepare_target{force=false package_id=brain-llm v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm) target="brain_llm"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-llm-7b4ba12a608a4c77/lib-brain_llm`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  10: cargo::ops::cargo_compile::compile_ws
+  11: cargo::ops::cargo_compile::compile_with_exec
+  12: cargo::ops::cargo_compile::compile
+  13: cargo::commands::check::exec
+  14: <cargo::cli::Exec>::exec
+  15: cargo::main
+  16: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  17: std::rt::lang_start::<()>::{closure#0}
+  18: std::rt::lang_start_internal
+  19: _main
+   0.476816583s  INFO prepare_target{force=false package_id=brain-master v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-master) target="brain_master"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-master v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-master)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_master", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-master/src/lib.rs", Edition2021) }
+   0.476833208s  INFO prepare_target{force=false package_id=brain-master v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-master) target="brain_master"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_core", dep_mtime: FileTime { seconds: 1776499791, nanos: 124042944 }, max_mtime: FileTime { seconds: 1776231282, nanos: 269115767 } })
+   0.477557292s  INFO prepare_target{force=false package_id=brain-memory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-memory) target="brain_memory"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-memory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-memory)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_memory", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-memory/src/lib.rs", Edition2021) }
+   0.477565167s  INFO prepare_target{force=false package_id=brain-memory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-memory) target="brain_memory"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_core", dep_mtime: FileTime { seconds: 1776499791, nanos: 124042944 }, max_mtime: FileTime { seconds: 1776231282, nanos: 342851559 } })
+   0.477827625s  INFO prepare_target{force=false package_id=brain-motor v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor) target="brain_motor"}: cargo::core::compiler::fingerprint: fingerprint error for brain-motor v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_motor", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor/src/lib.rs", Edition2021) }
+   0.477832625s  INFO prepare_target{force=false package_id=brain-motor v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor) target="brain_motor"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-motor-07fa71d7f8040e87/lib-brain_motor`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.478452000s  INFO prepare_target{force=false package_id=brain-reasoning v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning) target="brain_reasoning"}: cargo::core::compiler::fingerprint: fingerprint error for brain-reasoning v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_reasoning", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning/src/lib.rs", Edition2021) }
+   0.478481250s  INFO prepare_target{force=false package_id=brain-reasoning v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning) target="brain_reasoning"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-reasoning-99dbf9e418dd6ee5/lib-brain_reasoning`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.479126833s  INFO prepare_target{force=false package_id=brain-sensory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-sensory) target="brain_sensory"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-sensory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-sensory)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_sensory", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-sensory/src/lib.rs", Edition2021) }
+   0.479132125s  INFO prepare_target{force=false package_id=brain-sensory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-sensory) target="brain_sensory"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_core", dep_mtime: FileTime { seconds: 1776499791, nanos: 124042944 }, max_mtime: FileTime { seconds: 1776231282, nanos: 76957943 } })
+   0.484346208s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: fingerprint error for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: true }/TargetInner { name: "ai-brain", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/main.rs", Edition2021) }
+   0.484358875s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/ai-brain-cli-b478e586a47088a0/test-bin-ai-brain`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.497293250s  INFO prepare_target{force=false package_id=brain-eval v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval) target="brain_eval"}: cargo::core::compiler::fingerprint: fingerprint error for brain-eval v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_eval", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval/src/lib.rs", Edition2021) }
+   0.497315458s  INFO prepare_target{force=false package_id=brain-eval v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval) target="brain_eval"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-eval-125ae1e2ce57a925/lib-brain_eval`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.498160625s  INFO prepare_target{force=false package_id=brain-eval v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval) target="brain_eval"}: cargo::core::compiler::fingerprint: fingerprint error for brain-eval v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("brain_eval", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval/src/lib.rs", Edition2021) }
+   0.498174875s  INFO prepare_target{force=false package_id=brain-eval v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval) target="brain_eval"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-eval-19b9f9d5ed0437a4/test-lib-brain_eval`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.499402917s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint: fingerprint error for brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("brain_evolution", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution/src/lib.rs", Edition2021) }
+   0.499414500s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-evolution-f6daac333aefc3ee/test-lib-brain_evolution`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.499861625s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="brain_integration_tests"}: cargo::core::compiler::fingerprint: fingerprint error for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_integration_tests", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/src/lib.rs", Edition2021) }
+   0.499867375s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="brain_integration_tests"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-integration-tests-c8c12e3b4f988718/lib-brain_integration_tests`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.500278625s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="brain_integration_tests"}: cargo::core::compiler::fingerprint: fingerprint error for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("brain_integration_tests", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/src/lib.rs", Edition2021) }
+   0.500284083s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="brain_integration_tests"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-integration-tests-e1a0a9b5e23e0846/test-lib-brain_integration_tests`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.500687792s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e"}: cargo::core::compiler::fingerprint: fingerprint error for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: true }/TargetInner { kind: "test", name: "e2e", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/tests/e2e.rs", Edition2021) }
+   0.500693250s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-integration-tests-47fd9905fc3c0dad/test-integration-test-e2e`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.501115333s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e_real_llm"}: cargo::core::compiler::fingerprint: fingerprint error for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: true }/TargetInner { kind: "test", name: "e2e_real_llm", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/tests/e2e_real_llm.rs", Edition2021) }
+   0.501119958s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e_real_llm"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-integration-tests-bdfee11061d4f524/test-integration-test-e2e_real_llm`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.501518917s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="minimal_loop"}: cargo::core::compiler::fingerprint: fingerprint error for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: true }/TargetInner { kind: "test", name: "minimal_loop", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/tests/minimal_loop.rs", Edition2021) }
+   0.501523375s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="minimal_loop"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-integration-tests-894d84c34dab20df/test-integration-test-minimal_loop`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.501934458s  INFO prepare_target{force=false package_id=brain-llm v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm) target="brain_llm"}: cargo::core::compiler::fingerprint: fingerprint error for brain-llm v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("brain_llm", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm/src/lib.rs", Edition2021) }
+   0.501938958s  INFO prepare_target{force=false package_id=brain-llm v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm) target="brain_llm"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-llm-bd5a6c895b444fc8/test-lib-brain_llm`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.502393542s  INFO prepare_target{force=false package_id=brain-main v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main) target="brain_main"}: cargo::core::compiler::fingerprint: fingerprint error for brain-main v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_main", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main/src/lib.rs", Edition2021) }
+   0.502397542s  INFO prepare_target{force=false package_id=brain-main v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main) target="brain_main"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-main-e5158d676bbba69f/lib-brain_main`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.502667833s  INFO prepare_target{force=false package_id=brain-main v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main) target="brain_main"}: cargo::core::compiler::fingerprint: fingerprint error for brain-main v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("brain_main", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main/src/lib.rs", Edition2021) }
+   0.502671583s  INFO prepare_target{force=false package_id=brain-main v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main) target="brain_main"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-main-99a7c87e894ff3af/test-lib-brain_main`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.503879125s  INFO prepare_target{force=false package_id=brain-motor v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor) target="brain_motor"}: cargo::core::compiler::fingerprint: fingerprint error for brain-motor v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("brain_motor", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor/src/lib.rs", Edition2021) }
+   0.503886583s  INFO prepare_target{force=false package_id=brain-motor v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor) target="brain_motor"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-motor-8769cf345cbca6fb/test-lib-brain_motor`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.504258042s  INFO prepare_target{force=false package_id=brain-reasoning v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning) target="brain_reasoning"}: cargo::core::compiler::fingerprint: fingerprint error for brain-reasoning v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("brain_reasoning", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning/src/lib.rs", Edition2021) }
+   0.504262333s  INFO prepare_target{force=false package_id=brain-reasoning v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning) target="brain_reasoning"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-reasoning-96a89e4c5aaa10cc/test-lib-brain_reasoning`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+    Checking brain-memory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-memory)
+    Checking brain-master v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-master)
+    Checking brain-sensory v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-sensory)
+    Checking brain-llm v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-llm)
+    Checking brain-reasoning v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-reasoning)
+    Checking brain-motor v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-motor)
+    Checking brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution)
+    Checking brain-eval v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-eval)
+    Checking brain-main v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-main)
+error: could not compile `brain-main` (lib) due to 10 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `brain-main` (lib test) due to 15 previous errors
+error: could not compile `brain-motor` (lib) due to 2 previous errors
+error: could not compile `brain-motor` (lib test) due to 2 previous errors
+error: could not compile `brain-reasoning` (lib) due to 4 previous errors
+error: could not compile `brain-eval` (lib) due to 7 previous errors
+error: could not compile `brain-eval` (lib test) due to 11 previous errors
+error: could not compile `brain-reasoning` (lib test) due to 4 previous errors

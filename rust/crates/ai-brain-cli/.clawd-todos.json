@@ -1,0 +1,17 @@
+[
+  {
+    "content": "分析项目结构和模块关系",
+    "activeForm": "分析项目结构",
+    "status": "completed"
+  },
+  {
+    "content": "检查其他核心模块实现",
+    "activeForm": "检查核心模块",
+    "status": "completed"
+  },
+  {
+    "content": "等待用户进一步指令",
+    "activeForm": "等待用户指令",
+    "status": "pending"
+  }
+]
