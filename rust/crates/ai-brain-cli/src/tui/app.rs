@@ -36,15 +36,19 @@ pub struct App {
     spinner_frame: usize,
     should_quit: bool,
     is_busy: bool,
-    orch: Orchestrator,
+    orch: Arc<Orchestrator>,
     progress_rx: Option<tokio::sync::mpsc::Receiver<ProgressEvent>>,
-    query_handle: Option<tokio::task::JoinHandle<Result<brain_core::types::MainBrainOutput, String>>>,
+    query_handle:
+        Option<tokio::task::JoinHandle<Result<brain_core::types::MainBrainOutput, String>>>,
     /// Done 事件已收到，等待 query_handle 完成
     done_received: bool,
+    /// 待发送消息队列（busy 时 Enter 提交的消息排队等处理）
+    pending_queue: Vec<String>,
 }
 
 impl App {
     pub fn new(orch: Orchestrator) -> Self {
+        let orch = Arc::new(orch);
         let status_structured = orch.status_structured();
         let mut output = OutputArea::new();
         output.push_system("AI Brain v2 一主二从系统");
@@ -61,6 +65,7 @@ impl App {
             progress_rx: None,
             query_handle: None,
             done_received: false,
+            pending_queue: Vec::new(),
         }
     }
 
@@ -101,9 +106,7 @@ impl App {
                         self.handle_mouse(mouse);
                     }
                     Event::Paste(text) => {
-                        if !self.is_busy {
-                            self.input.insert_paste(&text);
-                        }
+                        self.input.insert_paste(&text);
                     }
                     _ => {}
                 }
@@ -147,7 +150,7 @@ impl App {
             }
         });
 
-        self.orch.shutdown().await;
+        self.orch.shutdown_with_analysis().await;
         shutdown_done.store(true, Ordering::Relaxed);
         guard.abort();
 
@@ -180,15 +183,29 @@ impl App {
         let mut ratatui_lines: Vec<Line> = Vec::new();
 
         for line in &self.output.lines {
+            // Verbose-only 行在非 verbose 模式下跳过
+            match line {
+                OutputLine::MemoryDetail { .. } | OutputLine::EvalDetail { .. } => {
+                    if !self.output.verbose {
+                        continue;
+                    }
+                }
+                _ => {}
+            }
             ratatui_lines.extend(self.format_output_line(line));
         }
 
-        // 流式缓冲区（正在接收的文本）
+        // 流式缓冲区（正在接收的文本）— 过滤思考标签
         if let Some(text) = self.output.streaming_text() {
-            ratatui_lines.extend(self.format_output_line(&OutputLine::AssistantReply {
-                text: text.to_string(),
-                expanded: false,
-            }));
+            let (clean, _thinking) = crate::tui::output::OutputArea::strip_thinking_tags(text);
+            if !clean.is_empty() {
+                ratatui_lines.extend(self.format_output_line(&OutputLine::AssistantReply {
+                    text: clean,
+                    expanded: true,
+                    thinking: None,
+                    thinking_visible: false,
+                }));
+            }
         }
 
         // Spinner 行（独立渲染，不在 lines 中）
@@ -199,10 +216,21 @@ impl App {
             )));
         }
 
-        // 滚动计算：手动滚动偏移 vs 自动滚底
-        let content_lines = ratatui_lines.len();
+        // 滚动计算：考虑文本换行后的实际行数
+        let area_width = area.width as usize;
+        let actual_lines: usize = ratatui_lines
+            .iter()
+            .map(|l| {
+                let line_width = l.width();
+                if line_width == 0 {
+                    1
+                } else {
+                    (line_width + area_width - 1) / area_width
+                }
+            })
+            .sum();
         let visible_lines = area.height as usize;
-        let max_scroll = content_lines.saturating_sub(visible_lines) as u16;
+        let max_scroll = actual_lines.saturating_sub(visible_lines) as u16;
         let scroll = if self.output.manual_scroll > 0 {
             // 手动模式：用户在往上翻，从底部往上偏移
             max_scroll.saturating_sub(self.output.manual_scroll)
@@ -224,50 +252,125 @@ impl App {
         match line {
             OutputLine::UserInput(text) => {
                 vec![Line::from(vec![
-                    Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "> ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(text.clone(), Style::default().fg(Color::White)),
                 ])]
             }
 
-            OutputLine::AssistantReply { text, expanded } => {
+            OutputLine::AssistantReply {
+                text,
+                expanded,
+                thinking,
+                thinking_visible,
+            } => {
+                let mut lines = Vec::new();
+
                 if *expanded {
-                    let mut lines = vec![Line::from(Span::styled(
+                    // 显示展开标记
+                    lines.push(Line::from(Span::styled(
                         "▾",
                         Style::default().fg(Color::DarkGray),
-                    ))];
+                    )));
+
+                    // 显示正常内容
                     for l in text.lines() {
                         lines.push(Line::from(Span::styled(
                             l.to_string(),
                             Style::default().fg(Color::White),
                         )));
                     }
-                    lines.push(Line::from(Span::styled(
-                        "▴ [Ctrl+E 收起]",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    lines
+
+                    // 显示思考内容（如果可见）
+                    if let Some(thinking_content) = thinking {
+                        if *thinking_visible {
+                            // 思考内容可见，显示分隔线和思考内容
+                            lines.push(Line::from(Span::styled(
+                                "  ────── 思考内容 ──────",
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM),
+                            )));
+                            for l in thinking_content.lines() {
+                                lines.push(Line::from(Span::styled(
+                                    format!("  {l}"),
+                                    Style::default()
+                                        .fg(Color::DarkGray)
+                                        .add_modifier(Modifier::DIM),
+                                )));
+                            }
+                            lines.push(Line::from(Span::styled(
+                                "▴ [Ctrl+E 隐藏思考]",
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        } else {
+                            // 思考内容隐藏，显示提示
+                            lines.push(Line::from(Span::styled(
+                                "▸ [Ctrl+E 查看思考]",
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                    }
                 } else {
+                    // 折叠状态（不再使用，但保留兼容）
                     let first_line = text.lines().next().unwrap_or("");
                     let display = if first_line.chars().count() > COLLAPSE_MAX_CHARS {
-                        let truncated: String = first_line.chars().take(COLLAPSE_MAX_CHARS).collect();
+                        let truncated: String =
+                            first_line.chars().take(COLLAPSE_MAX_CHARS).collect();
                         format!("{truncated}...")
                     } else if text.lines().count() > 1 {
                         format!("{first_line} ...")
                     } else {
                         first_line.to_string()
                     };
-                    vec![Line::from(vec![
+                    lines.push(Line::from(vec![
                         Span::styled("▸ ", Style::default().fg(Color::DarkGray)),
                         Span::styled(display, Style::default().fg(Color::White)),
                         Span::styled(
                             format!(" [{}行]", text.lines().count()),
                             Style::default().fg(Color::DarkGray),
                         ),
-                    ])]
+                    ]));
+                }
+
+                lines
+            }
+
+            OutputLine::ToolStart { name } => {
+                vec![Line::from(Span::styled(
+                    format!("  ⏳ {name}..."),
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            }
+
+            OutputLine::ToolDone {
+                name,
+                duration_ms,
+                is_error,
+            } => {
+                let dur = format_duration(*duration_ms);
+                if *is_error {
+                    vec![Line::from(Span::styled(
+                        format!("  ✘ {name} ({dur}) — 失败"),
+                        Style::default().fg(Color::Yellow),
+                    ))]
+                } else {
+                    vec![Line::from(Span::styled(
+                        format!("  ✔ {name} ({dur})"),
+                        Style::default().fg(Color::Green),
+                    ))]
                 }
             }
 
-            OutputLine::ToolSummary { count, total_ms, has_error } => {
+            OutputLine::ToolSummary {
+                count,
+                total_ms,
+                has_error,
+            } => {
                 let dur = format_duration(*total_ms);
                 let err = if *has_error { " (有错误)" } else { "" };
                 vec![Line::from(Span::styled(
@@ -283,7 +386,10 @@ impl App {
                 ))]
             }
 
-            OutputLine::EvalResult { passed, issue_count } => {
+            OutputLine::EvalResult {
+                passed,
+                issue_count,
+            } => {
                 if *passed {
                     vec![Line::from(Span::styled(
                         "  评估 ✔ 通过",
@@ -302,6 +408,54 @@ impl App {
                     text.clone(),
                     Style::default().fg(Color::DarkGray),
                 ))]
+            }
+
+            OutputLine::MemoryDetail { memories } => {
+                let mut lines = Vec::new();
+                lines.push(Line::from(Span::styled(
+                    "  │ ────── 记忆详情 ──────",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                )));
+                for (i, mem) in memories.iter().enumerate() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  │ {}. {}", i + 1, mem),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines
+            }
+
+            OutputLine::EvalDetail {
+                score,
+                reports,
+                instructions,
+            } => {
+                let mut lines = Vec::new();
+                lines.push(Line::from(Span::styled(
+                    format!("  │ ────── 评估详情 ({:.0}%) ──────", score * 100.0),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::DIM),
+                )));
+                for r in reports {
+                    lines.push(Line::from(Span::styled(
+                        format!("  │ {r}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                if !instructions.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  │ 瘦身指令:",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    for instr in instructions {
+                        lines.push(Line::from(Span::styled(
+                            format!("  │   {instr}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+                lines
             }
 
             OutputLine::Blank => {
@@ -328,25 +482,31 @@ impl App {
                 self.should_quit = true;
                 return true;
             }
-            // Ctrl+E — 展开/收起最近回复
+            // Ctrl+E — 切换 Verbose 模式（思考+记忆+评估详情）
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
-                self.output.toggle_last_reply_expand();
+                self.output.toggle_verbose();
+                return true;
+            }
+            // Shift+↑ / PageUp — 向上滚动
+            (KeyModifiers::SHIFT, KeyCode::Up) | (_, KeyCode::PageUp) => {
+                self.output.scroll_up(5);
+                return true;
+            }
+            // Shift+↓ / PageDown — 向下滚动
+            (KeyModifiers::SHIFT, KeyCode::Down) | (_, KeyCode::PageDown) => {
+                self.output.scroll_down(5);
                 return true;
             }
             _ => {}
         }
 
-        // 忙碌时不处理其他键
-        if self.is_busy {
-            return false;
-        }
-
+        // Enter 提交：busy 时排队，否则直接发送
         if key.code == KeyCode::Enter {
             self.submit_input();
             return true;
         }
 
-        // 其他键交给 textarea
+        // 其他键（打字、方向键等）始终交给 textarea，不受 busy 限制
         let input: Input = key.into();
         self.input.textarea.input(input);
         true
@@ -358,8 +518,7 @@ impl App {
             return;
         }
 
-        self.output.push_user_input(&text);
-
+        // 内置命令始终立即处理
         match self.handle_builtin_command_sync(&text) {
             CommandResult::Handled => return,
             CommandResult::Exit => {
@@ -369,7 +528,23 @@ impl App {
             CommandResult::Unknown => {}
         }
 
-        let (rx, handle) = self.orch.query_streaming(&text);
+        self.output.push_user_input(&text);
+
+        if self.is_busy {
+            // busy 时排队，等当前回复完成后再发
+            self.pending_queue.push(text);
+            self.output.push_system(&format!(
+                "  (已排队，等待当前回复完成... 队列: {})",
+                self.pending_queue.len()
+            ));
+        } else {
+            self.start_query(&text);
+        }
+    }
+
+    /// 发起一次查询
+    fn start_query(&mut self, text: &str) {
+        let (rx, handle) = Arc::clone(&self.orch).query_streaming(text);
         self.progress_rx = Some(rx);
         self.query_handle = Some(handle);
         self.is_busy = true;
@@ -437,6 +612,13 @@ impl App {
                 Err(_) => {}
             }
         }
+
+        // 检查队列，有待发消息就自动发
+        let next = self.pending_queue.first().cloned();
+        if let Some(text) = next {
+            self.pending_queue.remove(0);
+            self.start_query(&text);
+        }
     }
 
     fn cancel_query(&mut self) {
@@ -447,6 +629,7 @@ impl App {
         self.done_received = false;
         self.is_busy = false;
         self.status.busy = false;
+        self.pending_queue.clear();
         self.output.push_system("查询已取消");
     }
 
@@ -481,7 +664,8 @@ impl App {
                     "  :status         — 系统状态",
                     "  :memory         — 记忆统计",
                     "  :quit / Ctrl+C  — 退出并保存",
-                    "  Ctrl+E          — 展开/收起回复",
+                    "  Ctrl+E          — 显示/隐藏详情（思考+记忆+评估）",
+                    "  Shift+↑/↓       — 上下滚动输出",
                     "  ↑/↓             — 翻阅输入历史",
                 ] {
                     self.output.push_system(line);

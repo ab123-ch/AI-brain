@@ -49,7 +49,7 @@ pub fn build_evaluation_system_prompt() -> String {
   ]
 }"#
         .to_string()
-    }
+}
 
 /// 构建评估用户提示词
 ///
@@ -213,6 +213,7 @@ mod tests {
             user_correction: Some("应该用 ok_or".into()),
             occurred_at: Utc::now(),
             occurrence_count: 3,
+            superseded: false,
         };
         let prompt = build_evaluation_user_prompt(
             "写代码",
@@ -251,6 +252,7 @@ mod tests {
             source_pitfall_ids: vec!["p1".into()],
             priority: 5,
             created_at: Utc::now(),
+            superseded: false,
         };
         let prompt = build_evaluation_user_prompt(
             "写代码",

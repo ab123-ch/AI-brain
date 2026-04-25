@@ -70,6 +70,41 @@ pub const L2_TO_L3_PROMPT: &str = "\
 // v2 四步分析 Prompt
 // ---------------------------------------------------------------------------
 
+/// Step0: 记忆迭代分类（插入在 Step1 之前）
+pub const STEP0_MEMORY_ITERATION_PROMPT: &str = "\
+# 身份
+你是一个记忆迭代分类引擎。你分析新会话的事实总结，判断与已有记忆之间的关系类型。
+
+# 输入
+新会话事实总结：
+{new_fact_summary}
+
+已有记忆条目：
+{existing_entries_json}
+
+# 规则
+1. 对每条已有记忆，判断它与新事实之间的关系：
+   - OVERRIDE: 同一事实的不同结论（互斥，新结论取代旧结论）
+   - COMPLEMENT: 同一话题的不同方面（互补，两边都保留）
+   - REFINE: 新的是旧的细化/深化版本（旧标记 superseded）
+   - UNRELATED: 完全无关（跳过）
+2. 只分类关系，不判断事实对错
+3. 如果没有匹配的已有记忆，返回空数组
+
+# 输出格式（严格 JSON 数组）
+[
+  {\"id\": \"已有记忆的id\", \"relation\": \"OVERRIDE\"},
+  {\"id\": \"另一个id\", \"relation\": \"COMPLEMENT\"}
+]\
+";
+
+/// 构建 Step0 记忆迭代 prompt
+pub fn build_step0_prompt(new_fact_summary: &str, existing_entries_json: &str) -> String {
+    STEP0_MEMORY_ITERATION_PROMPT
+        .replace("{new_fact_summary}", new_fact_summary)
+        .replace("{existing_entries_json}", existing_entries_json)
+}
+
 /// 第一步：事实总结（做了什么）
 pub const STEP1_FACT_SUMMARY_PROMPT: &str = "\
 # 身份
@@ -263,6 +298,109 @@ pub fn build_step4_prompt(pitfalls_json: &str, existing_rules: &str) -> String {
     STEP4_EVOLUTION_PROMPT
         .replace("{pitfalls_json}", pitfalls_json)
         .replace("{existing_rules}", existing_rules)
+}
+
+/// 构建第五步：潜意识抽象 prompt
+pub fn build_step5_prompt(
+    fact_summary: &str,
+    pitfalls_text: &str,
+    evolution_text: &str,
+    existing_subconscious: &str,
+) -> String {
+    STEP5_SUBCONSCIOUS_PROMPT
+        .replace("{fact_summary}", fact_summary)
+        .replace("{pitfalls_text}", pitfalls_text)
+        .replace("{evolution_text}", evolution_text)
+        .replace("{existing_subconscious}", existing_subconscious)
+}
+
+/// 第五步：潜意识抽象（印象索引生成）
+pub const STEP5_SUBCONSCIOUS_PROMPT: &str = "\
+# 身份
+你是一个记忆抽象引擎。你将对话事实、踩坑记录、进化规则抽象为「潜意识印象」——不写具体细节，只写触发词和高度概括。
+
+# 输入
+事实总结：
+{fact_summary}
+
+本轮新增踩坑：
+{pitfalls_text}
+
+本轮新增进化规则：
+{evolution_text}
+
+已有潜意识印象（去重用）：
+{existing_subconscious}
+
+# 规则
+1. 从中提取「做过的事情」作为 topic
+2. trigger_keywords 是触发词：当用户提到这些词时，说明可能做过相关的事
+3. impression 是高度概括：用一句话说做过什么、大致踩过什么类型的坑、详情在哪
+4. reference_hint 指向哪类文件有详情（如 \"pitfall/\" \"evolution/\" \"sessions/\"）
+5. 每个 topic 独立一条，不要把不相关的事情合并
+6. importance 评估：踩坑多/有进化规则 → 更高
+7. trigger_keywords 每条最多 8 个
+8. 用中文输出
+
+# 输出格式（严格 JSON）
+{
+  \"entries\": [
+    {
+      \"topic\": \"记忆脑开发\",
+      \"trigger_keywords\": [\"记忆脑\", \"memory brain\", \"L2\", \"短期记忆\", \"四层架构\"],
+      \"impression\": \"做过记忆脑开发，熟悉L0-L3四层架构和关键词索引机制，踩过多轮坑详见pitfall\",
+      \"reference_hint\": \"pitfall/\",
+      \"importance\": 0.9
+    }
+  ]
+}\
+";
+
+// ---------------------------------------------------------------------------
+// Step6: L2 会话总结 Prompt
+// ---------------------------------------------------------------------------
+
+/// 第六步：生成 L2 会话总结
+pub const STEP6_SESSION_SUMMARY_PROMPT: &str = "\
+# 身份
+你是一个会话总结引擎。你将一次对话的事实总结、踩坑记录和决策提炼为精炼的会话总结。
+
+# 输入
+事实总结：
+{fact_summary}
+
+本轮踩坑记录：
+{pitfalls_text}
+
+已有潜意识印象（参考用）：
+{existing_subconscious}
+
+# 规则
+1. fact_summary：用 2-3 句话概括本次会话做了什么（200 字以内）
+2. tags：提取 3-8 个关键词标签（中文为主，英文术语保留）
+3. pitfalls：列出遇到的踩坑（每条 50 字以内，没有则空数组）
+4. decisions：列出达成的决策或关键结论（每条 50 字以内，没有则空数组）
+5. 用中文输出
+
+# 输出格式（严格 JSON）
+{
+  \"fact_summary\": \"讨论了记忆脑层级重构，决定 L2 改总结层、L1 改归档层\",
+  \"tags\": [\"记忆脑\", \"层级重构\", \"四步分析\"],
+  \"pitfalls\": [\"旧 L2 存原文导致关键词噪音大\"],
+  \"decisions\": [\"L2 由四步分析 Step6 生成\", \"L1 归档等守护线程实现\"]
+}\
+";
+
+/// 构建第六步：会话总结 prompt
+pub fn build_step6_prompt(
+    fact_summary: &str,
+    pitfalls_text: &str,
+    existing_subconscious: &str,
+) -> String {
+    STEP6_SESSION_SUMMARY_PROMPT
+        .replace("{fact_summary}", fact_summary)
+        .replace("{pitfalls_text}", pitfalls_text)
+        .replace("{existing_subconscious}", existing_subconscious)
 }
 
 // ---------------------------------------------------------------------------

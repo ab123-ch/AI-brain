@@ -1,6 +1,4 @@
-use brain_core::types::{
-    BrainHealthReport, ContextSnapshot, EvaluationResult, SlimInstruction,
-};
+use brain_core::types::{BrainHealthReport, ContextSnapshot, EvaluationResult, SlimInstruction};
 
 /// 上下文健康度阈值配置
 #[derive(Debug, Clone)]
@@ -80,11 +78,7 @@ impl ContextHealthChecker {
         let overall_health = if brain_reports.is_empty() {
             1.0
         } else {
-            brain_reports
-                .iter()
-                .map(|r| r.health_score)
-                .sum::<f64>()
-                / brain_reports.len() as f64
+            brain_reports.iter().map(|r| r.health_score).sum::<f64>() / brain_reports.len() as f64
         };
 
         EvaluationResult {

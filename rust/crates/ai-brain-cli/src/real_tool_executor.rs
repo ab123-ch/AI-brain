@@ -3,14 +3,20 @@
 //! This is the production implementation used by the orchestrator,
 //! as opposed to `StubToolExecutor` which is only for tests.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
-use std::collections::HashMap;
+use brain_memory::memory_brain::MemoryBrain;
 
-/// Production tool executor that delegates to `tools::execute_tool`.
+/// Production tool executor that delegates to `tools::execute_tool` for built-in tools
+/// and handles `search_memory` directly via MemoryBrain.
 pub struct RealToolExecutor {
     /// Tool descriptors (name → descriptor) for list_tools()
     tool_descriptors: HashMap<String, ToolDescriptor>,
+    /// MemoryBrain for search_memory tool
+    memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>,
 }
 
 impl RealToolExecutor {
@@ -30,7 +36,17 @@ impl RealToolExecutor {
                 )
             })
             .collect();
-        Self { tool_descriptors }
+        Self {
+            tool_descriptors,
+            memory_brain: None,
+        }
+    }
+
+    /// Create with an optional MemoryBrain for search_memory support.
+    pub fn with_memory(memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>) -> Self {
+        let mut exec = Self::new();
+        exec.memory_brain = memory_brain;
+        exec
     }
 }
 
@@ -49,10 +65,70 @@ impl ToolExecutor for RealToolExecutor {
         let input = tool_call.input.clone();
         let tool_name_owned = tool_call.tool_name.clone();
 
+        // special-case: search_memory 由 MemoryBrain 处理
+        if name == "search_memory" {
+            let memory_brain = self.memory_brain.clone();
+            return Box::pin(async move {
+                let start = std::time::Instant::now();
+                let mem: Arc<tokio::sync::Mutex<MemoryBrain>> = match memory_brain {
+                    Some(m) => m,
+                    None => {
+                        return ToolExecutionResult {
+                            tool_name: tool_name_owned,
+                            output: "search_memory: MemoryBrain not available".into(),
+                            is_error: true,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        };
+                    }
+                };
+                let query = input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let max_results = input
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5)
+                    .min(20) as usize;
+
+                let entries = {
+                    let guard = mem.lock().await;
+                    guard.search(&query, max_results)
+                };
+
+                let output = if entries.is_empty() {
+                    "未找到相关记忆".into()
+                } else {
+                    let lines: Vec<String> = entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| {
+                            let preview: String = e.content.chars().take(300).collect();
+                            format!(
+                                "{}. [{}] (层级={:?}, 重要度={:.2})\n   {}",
+                                i + 1,
+                                e.id,
+                                e.layer,
+                                e.importance,
+                                preview
+                            )
+                        })
+                        .collect();
+                    lines.join("\n\n")
+                };
+
+                ToolExecutionResult {
+                    tool_name: tool_name_owned,
+                    output,
+                    is_error: false,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                }
+            });
+        }
+
         Box::pin(async move {
             let start = std::time::Instant::now();
-            // tools::execute_tool 可能内部创建自己的 runtime（如 bash），
-            // 必须在阻塞线程中运行以避免 runtime 冲突
             let result = tokio::task::spawn_blocking(move || tools::execute_tool(&name, &input))
                 .await
                 .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));

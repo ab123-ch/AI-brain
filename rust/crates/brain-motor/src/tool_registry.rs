@@ -65,9 +65,7 @@ impl ToolRegistry {
 
     /// 工具是否需要校验脑审核
     pub fn requires_validation(&self, name: &str) -> bool {
-        self.tools
-            .get(name)
-            .is_some_and(|c| c.requires_validation)
+        self.tools.get(name).is_some_and(|c| c.requires_validation)
     }
 
     /// 列出所有注册工具
@@ -120,7 +118,11 @@ impl ToolRegistry {
         let medium_risk = [
             ("Edit", "编辑文件内容", vec!["文件", "编辑", "修改"]),
             ("Write", "创建/覆盖文件", vec!["文件", "创建", "写入"]),
-            ("NotebookEdit", "编辑 Jupyter notebook", vec!["notebook", "编辑"]),
+            (
+                "NotebookEdit",
+                "编辑 Jupyter notebook",
+                vec!["notebook", "编辑"],
+            ),
         ];
         for (name, desc, scenarios) in medium_risk {
             self.register(ToolCapability {
@@ -133,9 +135,7 @@ impl ToolRegistry {
         }
 
         // 高风险：系统操作
-        let high_risk = [
-            ("Bash", "执行 shell 命令", vec!["命令", "执行", "系统"]),
-        ];
+        let high_risk = [("Bash", "执行 shell 命令", vec!["命令", "执行", "系统"])];
         for (name, desc, scenarios) in high_risk {
             self.register(ToolCapability {
                 name: name.into(),

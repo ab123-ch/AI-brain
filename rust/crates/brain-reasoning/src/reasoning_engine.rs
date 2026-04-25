@@ -71,15 +71,20 @@ impl ReasoningEngine {
             ],
             max_tokens: Some(2048),
             temperature: Some(0.7),
-            stream: None,
+            tools: None,
+            tool_choice: None,
         };
 
         match provider.complete(request).await {
             Ok(response) => {
-                let content = response.content;
+                let content = response.text();
                 tracing::info!("LLM 原始响应:\n{}", content);
-                tracing::info!("Token 用量: prompt={}, completion={}, total={}",
-                    response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens);
+                tracing::info!(
+                    "Token 用量: prompt={}, completion={}, total={}",
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens
+                );
 
                 let (conclusion, reasoning_path) = self.parse_llm_response(&content);
                 tracing::info!("解析结论: {}", conclusion);
@@ -164,7 +169,10 @@ impl ReasoningEngine {
     // ─── 私有方法 ──────────────────────────────────────────────
 
     fn build_reasoning_prompt(&self, msg: &BroadcastMessage, negatives: &[String]) -> String {
-        let mut prompt = format!("请分析以下输入并给出推理结论：\n\n## 输入\n{}\n", msg.content);
+        let mut prompt = format!(
+            "请分析以下输入并给出推理结论：\n\n## 输入\n{}\n",
+            msg.content
+        );
 
         if !negatives.is_empty() {
             prompt.push_str("\n## 需要避免的错误路径\n");
@@ -175,7 +183,8 @@ impl ReasoningEngine {
             }
         }
 
-        prompt.push_str("\n## 输出格式\n先给出推理步骤（每步一行），最后以「结论：」开头给出结论。");
+        prompt
+            .push_str("\n## 输出格式\n先给出推理步骤（每步一行），最后以「结论：」开头给出结论。");
         prompt
     }
 
@@ -189,7 +198,11 @@ impl ReasoningEngine {
                 continue;
             }
             if trimmed.starts_with("结论：") || trimmed.starts_with("结论:") {
-                conclusion = trimmed.trim_start_matches("结论：").trim_start_matches("结论:").trim().into();
+                conclusion = trimmed
+                    .trim_start_matches("结论：")
+                    .trim_start_matches("结论:")
+                    .trim()
+                    .into();
             } else {
                 steps.push(trimmed.into());
             }
@@ -211,7 +224,10 @@ impl ReasoningEngine {
         negative_examples: &[String],
     ) -> Vec<String> {
         let mut path = Vec::new();
-        path.push(format!("分析输入: {}", msg.content.chars().take(100).collect::<String>()));
+        path.push(format!(
+            "分析输入: {}",
+            msg.content.chars().take(100).collect::<String>()
+        ));
         path.push("检索记忆脑中的相关历史".into());
 
         if !negative_examples.is_empty() {
@@ -224,11 +240,7 @@ impl ReasoningEngine {
     }
 
     fn synthesize_conclusion(&self, msg: &BroadcastMessage, reasoning_path: &[String]) -> String {
-        format!(
-            "基于 {} 步推理分析: {}",
-            reasoning_path.len(),
-            msg.content
-        )
+        format!("基于 {} 步推理分析: {}", reasoning_path.len(), msg.content)
     }
 
     fn extract_trigger_pattern(&self, msg: &BroadcastMessage) -> String {
@@ -308,9 +320,8 @@ mod tests {
     #[test]
     fn parse_llm_response_extracts_conclusion() {
         let engine = make_engine();
-        let (conclusion, steps) = engine.parse_llm_response(
-            "第一步：分析问题\n第二步：查找原因\n结论：问题已定位",
-        );
+        let (conclusion, steps) =
+            engine.parse_llm_response("第一步：分析问题\n第二步：查找原因\n结论：问题已定位");
         assert_eq!(conclusion, "问题已定位");
         assert_eq!(steps.len(), 2);
     }

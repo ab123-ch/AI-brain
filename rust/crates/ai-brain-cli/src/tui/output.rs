@@ -7,7 +7,15 @@
 
 use brain_core::types::ProgressEvent;
 
-use crate::terminal::brain_display_name;
+/// 脑名映射（内联避免跨模块引用）
+fn brain_display_name(brain: &str) -> &str {
+    match brain {
+        "main" => "主脑",
+        "memory" => "记忆脑",
+        "eval" => "评估脑",
+        _ => brain,
+    }
+}
 
 use super::session_logger::SessionLogger;
 
@@ -16,10 +24,44 @@ use super::session_logger::SessionLogger;
 #[derive(Debug, Clone)]
 pub enum OutputLine {
     UserInput(String),
-    AssistantReply { text: String, expanded: bool },
-    ToolSummary { count: usize, total_ms: u64, has_error: bool },
-    MemoryInjected { count: usize },
-    EvalResult { passed: bool, issue_count: usize },
+    AssistantReply {
+        text: String,
+        expanded: bool,
+        /// 思考内容（已被解析分离）
+        thinking: Option<String>,
+        /// 思考内容是否可见（默认隐藏）
+        thinking_visible: bool,
+    },
+    ToolStart {
+        name: String,
+    },
+    ToolDone {
+        name: String,
+        duration_ms: u64,
+        is_error: bool,
+    },
+    ToolSummary {
+        count: usize,
+        total_ms: u64,
+        has_error: bool,
+    },
+    MemoryInjected {
+        count: usize,
+    },
+    /// 记忆详情（verbose 模式可见）
+    MemoryDetail {
+        memories: Vec<String>,
+    },
+    EvalResult {
+        passed: bool,
+        issue_count: usize,
+    },
+    /// 评估详情（verbose 模式可见）
+    EvalDetail {
+        score: f64,
+        reports: Vec<String>,
+        instructions: Vec<String>,
+    },
     System(String),
     Blank,
 }
@@ -45,6 +87,8 @@ pub struct OutputArea {
     session_logger: SessionLogger,
     /// 手动滚动偏移（0 = 自动滚底）
     pub manual_scroll: u16,
+    /// Verbose 模式：显示记忆详情、评估详情、思考内容
+    pub verbose: bool,
 }
 
 impl OutputArea {
@@ -60,6 +104,7 @@ impl OutputArea {
             tool_has_error: false,
             session_logger: SessionLogger::new(),
             manual_scroll: 0,
+            verbose: false,
         }
     }
 
@@ -71,7 +116,6 @@ impl OutputArea {
             ProgressEvent::Connecting { brain, model } => {
                 let name = brain_display_name(brain);
                 self.flush_streaming();
-                // 只更新 spinner 标签，不往 lines 里添加
                 self.spinner_label = Some(format!("{name}-连接中... ({model})"));
             }
             ProgressEvent::Thinking { brain } => {
@@ -80,14 +124,34 @@ impl OutputArea {
                 self.spinner_label = Some(format!("{name}-推理中..."));
             }
             ProgressEvent::TextDelta { text } => {
-                self.streaming_buf.push_str(text);
-                self.streaming_flushed = false;
+                // 需求1: 流式展示时分离思考内容
+                // 只将非思考部分放入 streaming_buf，思考部分丢弃（不展示给用户）
+                let (clean, _thinking) = Self::strip_thinking_tags(text);
+                if !clean.is_empty() {
+                    self.streaming_buf.push_str(&clean);
+                    self.streaming_flushed = false;
+                }
             }
-            ProgressEvent::ToolStart { .. } => {
+            ProgressEvent::ToolStart { tool_name, .. } => {
                 self.flush_streaming();
                 self.tool_count += 1;
+                // 需求2: 显示每个工具调用的名称
+                self.lines.push(OutputLine::ToolStart {
+                    name: tool_name.clone(),
+                });
             }
-            ProgressEvent::ToolDone { duration_ms, is_error, .. } => {
+            ProgressEvent::ToolDone {
+                tool_name,
+                duration_ms,
+                is_error,
+                ..
+            } => {
+                // 需求2: 显示工具完成状态
+                self.lines.push(OutputLine::ToolDone {
+                    name: tool_name.clone(),
+                    duration_ms: *duration_ms,
+                    is_error: *is_error,
+                });
                 self.tool_total_ms += duration_ms;
                 if *is_error {
                     self.tool_has_error = true;
@@ -96,17 +160,50 @@ impl OutputArea {
             ProgressEvent::MemoryInjected { count, .. } => {
                 self.flush_streaming();
                 self.spinner_label = None;
-                self.lines.push(OutputLine::MemoryInjected { count: *count });
+                // 需求4: 记忆注入可见
+                self.lines
+                    .push(OutputLine::MemoryInjected { count: *count });
+            }
+            ProgressEvent::MemoryDetail { memories } => {
+                self.lines.push(OutputLine::MemoryDetail {
+                    memories: memories.clone(),
+                });
             }
             ProgressEvent::EvaluationStart => {
                 self.flush_streaming();
+                // 需求3: 评估脑可见
                 self.spinner_label = Some("评估脑-检查中...".into());
             }
             ProgressEvent::EvaluationResult { passed, issues } => {
                 self.spinner_label = None;
+                // 需求3: 评估结果可见
                 self.lines.push(OutputLine::EvalResult {
                     passed: *passed,
                     issue_count: issues.len(),
+                });
+            }
+            ProgressEvent::EvaluationDetail {
+                score,
+                reports,
+                instructions,
+            } => {
+                let report_lines: Vec<String> = reports
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "[{}] health={:.0}% usage={:.0}%",
+                            r.brain_id,
+                            r.health_score * 100.0,
+                            r.usage_percent * 100.0
+                        )
+                    })
+                    .collect();
+                let instr_lines: Vec<String> =
+                    instructions.iter().map(|i| format!("{i:?}")).collect();
+                self.lines.push(OutputLine::EvalDetail {
+                    score: *score,
+                    reports: report_lines,
+                    instructions: instr_lines,
                 });
             }
             ProgressEvent::Evaluating => {
@@ -144,22 +241,79 @@ impl OutputArea {
         if text.trim().is_empty() {
             return;
         }
+
+        // 解析并分离思考内容（<think>...</think> 标签）
+        let (clean_text, thinking) = Self::strip_thinking_tags(text);
+
         self.lines.push(OutputLine::AssistantReply {
-            text: text.to_string(),
-            expanded: false,
+            text: clean_text,
+            expanded: true, // 默认展开显示正常回复
+            thinking,
+            thinking_visible: false, // 默认隐藏思考内容
         });
+    }
+
+    /// 解析并分离思考内容
+    /// 返回 (去掉思考标签的文本, 思考内容或None)
+    pub fn strip_thinking_tags(text: &str) -> (String, Option<String>) {
+        let start_tag = "<think>";
+        let end_tag = "</think>";
+
+        if !text.contains(start_tag) || !text.contains(end_tag) {
+            return (text.to_string(), None);
+        }
+
+        let mut clean_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
+        let mut remaining = text;
+
+        while let Some(start_pos) = remaining.find(start_tag) {
+            // 添加思考标签之前的内容
+            if start_pos > 0 {
+                clean_parts.push(&remaining[..start_pos]);
+            }
+            remaining = &remaining[start_pos + start_tag.len()..];
+
+            if let Some(end_pos) = remaining.find(end_tag) {
+                // 提取思考内容
+                thinking_parts.push(&remaining[..end_pos]);
+                remaining = &remaining[end_pos + end_tag.len()..];
+            } else {
+                // 没有结束标签，把剩余的都当思考
+                thinking_parts.push(remaining);
+                remaining = "";
+            }
+        }
+
+        // 添加剩余内容
+        if !remaining.is_empty() {
+            clean_parts.push(remaining);
+        }
+
+        let clean_text = clean_parts.join("").trim().to_string();
+        let thinking = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("").trim().to_string())
+        };
+
+        (clean_text, thinking)
     }
 
     pub fn push_system(&mut self, text: &str) {
         self.lines.push(OutputLine::System(text.to_string()));
     }
 
-    /// 切换最近一条回复的展开/折叠
-    pub fn toggle_last_reply_expand(&mut self) {
-        for i in (0..self.lines.len()).rev() {
-            if let OutputLine::AssistantReply { expanded, .. } = &mut self.lines[i] {
-                *expanded = !*expanded;
-                return;
+    /// 切换 Verbose 模式（Ctrl+E）：显示记忆详情、评估详情、思考内容
+    pub fn toggle_verbose(&mut self) {
+        self.verbose = !self.verbose;
+        // 同步切换所有回复的 thinking_visible
+        for line in &mut self.lines {
+            if let OutputLine::AssistantReply {
+                thinking_visible, ..
+            } = line
+            {
+                *thinking_visible = self.verbose;
             }
         }
     }

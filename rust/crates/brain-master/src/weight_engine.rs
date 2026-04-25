@@ -155,7 +155,9 @@ impl WeightEngine {
         confidence: f64,
         threshold: f64,
     ) {
-        self.record_performance_with_task_type(brain_id, relevant, confidence, threshold, "default");
+        self.record_performance_with_task_type(
+            brain_id, relevant, confidence, threshold, "default",
+        );
     }
 
     /// 带任务类型的表现记录
@@ -237,11 +239,7 @@ impl WeightEngine {
     }
 
     /// 获取某个副脑在特定任务类型的表现统计
-    pub fn get_task_stats(
-        &self,
-        task_type: &str,
-        brain_id: &BrainId,
-    ) -> Option<&TaskTypeStats> {
+    pub fn get_task_stats(&self, task_type: &str, brain_id: &BrainId) -> Option<&TaskTypeStats> {
         self.task_stats.get(task_type).and_then(|m| m.get(brain_id))
     }
 
@@ -324,16 +322,30 @@ mod tests {
 
         let mut engine = WeightEngine::new(init);
         engine.record_performance_with_task_type(
-            &BrainId::reasoning(), true, 0.9, 0.7, "code_generation",
+            &BrainId::reasoning(),
+            true,
+            0.9,
+            0.7,
+            "code_generation",
         );
         engine.record_performance_with_task_type(
-            &BrainId::reasoning(), true, 0.8, 0.7, "code_generation",
+            &BrainId::reasoning(),
+            true,
+            0.8,
+            0.7,
+            "code_generation",
         );
         engine.record_performance_with_task_type(
-            &BrainId::reasoning(), false, 0.3, 0.7, "code_generation",
+            &BrainId::reasoning(),
+            false,
+            0.3,
+            0.7,
+            "code_generation",
         );
 
-        let stats = engine.get_task_stats("code_generation", &BrainId::reasoning()).unwrap();
+        let stats = engine
+            .get_task_stats("code_generation", &BrainId::reasoning())
+            .unwrap();
         assert_eq!(stats.total_tasks, 3);
         assert_eq!(stats.relevant_count, 2);
     }

@@ -146,13 +146,10 @@ impl MainBrain {
         }
 
         // 确保最终回答也写入历史
-        let has_final_answer = self
-            .history
-            .messages()
-            .iter()
-            .rev()
-            .take(3)
-            .any(|m| m.role == brain_core::types::MessageRole::Assistant && m.content == answer);
+        let has_final_answer =
+            self.history.messages().iter().rev().take(3).any(|m| {
+                m.role == brain_core::types::MessageRole::Assistant && m.content == answer
+            });
         if !has_final_answer {
             self.history.push_assistant(&answer);
         }

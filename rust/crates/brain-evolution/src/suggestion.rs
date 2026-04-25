@@ -209,11 +209,7 @@ mod tests {
     #[test]
     fn test_record_pattern_new() {
         let mut engine = SuggestionEngine::new();
-        engine.record_pattern(
-            vec!["代码审查".into()],
-            0.3,
-            vec![BrainId::reasoning()],
-        );
+        engine.record_pattern(vec!["代码审查".into()], 0.3, vec![BrainId::reasoning()]);
         assert_eq!(engine.patterns().len(), 1);
         assert_eq!(engine.patterns()[0].frequency, 1);
     }
@@ -221,16 +217,8 @@ mod tests {
     #[test]
     fn test_record_pattern_existing() {
         let mut engine = SuggestionEngine::new();
-        engine.record_pattern(
-            vec!["代码审查".into()],
-            0.3,
-            vec![BrainId::reasoning()],
-        );
-        engine.record_pattern(
-            vec!["代码审查".into()],
-            0.4,
-            vec![BrainId::reasoning()],
-        );
+        engine.record_pattern(vec!["代码审查".into()], 0.3, vec![BrainId::reasoning()]);
+        engine.record_pattern(vec!["代码审查".into()], 0.4, vec![BrainId::reasoning()]);
         assert_eq!(engine.patterns().len(), 1);
         assert_eq!(engine.patterns()[0].frequency, 2);
     }
@@ -241,11 +229,7 @@ mod tests {
 
         // 记录 3 次，置信度很低
         for _ in 0..3 {
-            engine.record_pattern(
-                vec!["安全审计".into()],
-                0.2,
-                vec![BrainId::reasoning()],
-            );
+            engine.record_pattern(vec!["安全审计".into()], 0.2, vec![BrainId::reasoning()]);
         }
 
         let suggestions = engine.check_suggestions();
@@ -258,11 +242,7 @@ mod tests {
 
         // 记录 3 次，但置信度高
         for _ in 0..3 {
-            engine.record_pattern(
-                vec!["正常任务".into()],
-                0.9,
-                vec![BrainId::reasoning()],
-            );
+            engine.record_pattern(vec!["正常任务".into()], 0.9, vec![BrainId::reasoning()]);
         }
 
         let suggestions = engine.check_suggestions();

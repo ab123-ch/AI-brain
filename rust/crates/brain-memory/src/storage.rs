@@ -12,6 +12,25 @@ pub struct Storage {
     base_dir: PathBuf,
 }
 
+/// 将 topic 名称转化为安全的目录名（去特殊字符，截断长度）
+fn sanitize_topic_name(topic: &str) -> String {
+    let sanitized: String = topic
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.len() > 100 {
+        sanitized[..100].to_string()
+    } else {
+        sanitized
+    }
+}
+
 impl Storage {
     /// 创建存储实例，自动创建目录结构
     pub fn new(base_dir: PathBuf) -> Result<Self> {
@@ -47,9 +66,29 @@ impl Storage {
         self.base_dir.join("memory").join("long-term").join("tasks")
     }
 
+    /// L2 会话总结: `memory/summaries/`
+    pub fn summaries_dir(&self) -> PathBuf {
+        self.base_dir.join("memory").join("summaries")
+    }
+
+    /// L1 归档根目录: `memory/archive/`
+    pub fn archive_dir(&self) -> PathBuf {
+        self.base_dir.join("memory").join("archive")
+    }
+
+    /// L1 归档分类目录: `memory/archive/{topic}/`
+    pub fn archive_topic_dir(&self, topic: &str) -> PathBuf {
+        self.archive_dir().join(sanitize_topic_name(topic))
+    }
+
     /// 关键词索引: `memory/index/tags.json`
     pub fn tags_index_path(&self) -> PathBuf {
         self.base_dir.join("memory").join("index").join("tags.json")
+    }
+
+    /// 获取存储根目录
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
     }
 
     // === 文件操作 ===
@@ -109,6 +148,52 @@ impl Storage {
             .collect();
         files.sort();
         Ok(files)
+    }
+
+    /// 原子写入 JSON 文件（先写临时文件再 rename）
+    pub fn write_json_atomic<T: serde::Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        let data = serde_json::to_string_pretty(value)?;
+        fs::write(&tmp_path, &data)?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// 递归列出目录及子目录下所有 .json 文件
+    pub fn list_json_files_recursive(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut files = Vec::new();
+        self.collect_json_files_recursive(dir, &mut files)?;
+        files.sort();
+        Ok(files)
+    }
+
+    fn collect_json_files_recursive(&self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                self.collect_json_files_recursive(&path, files)?;
+            } else if path.extension().is_some_and(|ext| ext == "json") {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// L2 索引根目录: `memory/index/`
+    pub fn index_dir(&self) -> PathBuf {
+        self.base_dir.join("memory").join("index")
+    }
+
+    /// L2 索引分类目录: `memory/index/{category}/`
+    pub fn index_category_dir(&self, category: &str) -> PathBuf {
+        self.base_dir.join("memory").join("index").join(category)
     }
 
     /// 列出目录下所有 .jsonl 文件

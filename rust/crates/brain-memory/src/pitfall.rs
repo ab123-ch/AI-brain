@@ -64,10 +64,26 @@ impl PitfallStore {
         Ok(all.into_iter().filter(|r| r.category == category).collect())
     }
 
-    /// 获取活跃踩坑记录（occurrence_count > 0）
+    /// 获取活跃踩坑记录（occurrence_count > 0 且未 superseded）
     pub fn load_active(&self) -> Result<Vec<PitfallRecord>> {
         let all = self.load_all()?;
-        Ok(all.into_iter().filter(|r| r.occurrence_count > 0).collect())
+        Ok(all
+            .into_iter()
+            .filter(|r| r.occurrence_count > 0 && !r.superseded)
+            .collect())
+    }
+
+    /// 标记为已取代
+    pub fn mark_superseded(&self, id: &str) -> Result<()> {
+        let all = self.load_all()?;
+        for mut record in all {
+            if record.id == id {
+                record.superseded = true;
+                self.store(&record)?;
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// 合并 LLM 分析产出的新踩坑记录
@@ -98,6 +114,7 @@ impl PitfallStore {
                     user_correction: new_pitfall.user_correction.clone(),
                     occurred_at: Utc::now(),
                     occurrence_count: 1,
+                    superseded: false,
                 };
                 let cloned = record.clone();
                 self.store(&record)?;
@@ -121,7 +138,7 @@ impl PitfallStore {
 }
 
 /// 新踩坑记录输入（LLM 分析产出）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NewPitfall {
     pub category: PitfallCategory,
     pub description: String,
@@ -147,6 +164,7 @@ mod tests {
             user_correction: None,
             occurred_at: Utc::now(),
             occurrence_count: 1,
+            superseded: false,
         }
     }
 

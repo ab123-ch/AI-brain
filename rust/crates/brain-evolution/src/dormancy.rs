@@ -73,8 +73,8 @@ impl DormancyManager {
     pub fn persist(&self, record: &DormantRecord) -> Result<()> {
         self.ensure_storage_dir()?;
         let path = self.brain_path(&record.template.brain_id());
-        let content =
-            serde_json::to_string_pretty(record).map_err(|e| EvolutionError::PersistenceFailed(e.to_string()))?;
+        let content = serde_json::to_string_pretty(record)
+            .map_err(|e| EvolutionError::PersistenceFailed(e.to_string()))?;
         std::fs::write(&path, content)?;
         tracing::info!(
             "副脑 {} 已持久化到 {}",
@@ -94,8 +94,7 @@ impl DormancyManager {
             )));
         }
         let content = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&content)
-            .map_err(|e| EvolutionError::LoadFailed(e.to_string()))
+        serde_json::from_str(&content).map_err(|e| EvolutionError::LoadFailed(e.to_string()))
     }
 
     /// 列出所有休眠副脑

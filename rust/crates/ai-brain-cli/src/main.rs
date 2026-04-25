@@ -1,10 +1,13 @@
 mod api_server;
 mod init;
 mod orchestrator;
+mod real_tool_executor;
 mod repl;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use orchestrator::{format_output, Orchestrator};
+use std::io::IsTerminal;
 
 /// AI Brain — 多副脑并行智能系统
 #[derive(Parser)]
@@ -17,9 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// 单次查询
-    Query {
-        query: String,
-    },
+    Query { query: String },
     /// 查看系统状态
     Status,
     /// 查看副脑权重
@@ -65,23 +66,27 @@ enum BrainAction {
 
 #[tokio::main]
 async fn main() {
-    // 控制台日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let cli = Cli::parse();
+    let is_tui = cli.command.is_none() && std::io::stdin().is_terminal();
 
-    // 初始化运行环境
+    // 日志初始化：TUI 模式只写文件，避免污染 alternate screen
     let (base_dir, is_first_run) = init::init_environment();
-    init::init_file_logging(&base_dir);
-    if is_first_run {
+    if is_tui {
+        init::init_tui_logging(&base_dir);
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+        init::init_file_logging(&base_dir);
+    }
+    if is_first_run && !is_tui {
         init::print_first_run_guide();
     }
     tracing::info!("AI Brain 启动，根目录: {:?}", base_dir);
 
-    let cli = Cli::parse();
     run_command(cli).await;
 }
 
@@ -89,7 +94,12 @@ async fn run_command(cli: Cli) {
     match &cli.command {
         None => {
             let orch = Orchestrator::new().await.expect("初始化失败");
-            repl::run(orch).await;
+            // 使用 TUI 模式（修复旧 REPL 的 UTF-8 崩溃）
+            if std::io::stdin().is_terminal() {
+                tui::run(orch).await;
+            } else {
+                repl::run(orch).await;
+            }
         }
         Some(Commands::Query { query }) => {
             let orch = Orchestrator::new().await.expect("初始化失败");

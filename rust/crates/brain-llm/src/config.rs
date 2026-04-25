@@ -70,8 +70,8 @@ pub struct BrainSection {
 impl LlmConfig {
     /// 从指定路径加载配置
     pub fn load(path: &Path) -> Result<Self> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| LlmError::Config(format!("读取配置失败: {e}")))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| LlmError::Config(format!("读取配置失败: {e}")))?;
         let config: Self =
             toml::from_str(&content).map_err(|e| LlmError::Config(format!("解析配置失败: {e}")))?;
         Ok(config)
@@ -102,9 +102,11 @@ impl LlmConfig {
 
     /// 解析 API Key（优先环境变量，其次直接配置）
     pub fn resolve_api_key(&self, provider_name: &str) -> Result<String> {
-        let provider = self.llm.providers.get(provider_name).ok_or_else(|| {
-            LlmError::ProviderNotFound(provider_name.to_string())
-        })?;
+        let provider = self
+            .llm
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| LlmError::ProviderNotFound(provider_name.to_string()))?;
 
         // 优先环境变量
         if !provider.api_key_env.is_empty() {
@@ -135,9 +137,11 @@ impl LlmConfig {
         let provider_name = &self.llm.default_provider;
         let api_key = self.resolve_api_key(provider_name)?;
 
-        let provider_config = self.llm.providers.get(provider_name).ok_or_else(|| {
-            LlmError::ProviderNotFound(provider_name.clone())
-        })?;
+        let provider_config = self
+            .llm
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| LlmError::ProviderNotFound(provider_name.clone()))?;
 
         let client = OpenAiCompatClient::new(
             provider_config.api_base.clone(),

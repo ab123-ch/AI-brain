@@ -9,4 +9,4 @@ pub use config::LlmConfig;
 pub use error::{LlmError, Result};
 pub use openai_compat::OpenAiCompatClient;
 pub use provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, MessageRole};
-pub use types::{ContentBlock, FinishReason, StreamEvent, ToolChoice, ToolDefinition, TokenUsage};
+pub use types::{ContentBlock, FinishReason, StreamEvent, TokenUsage, ToolChoice, ToolDefinition};

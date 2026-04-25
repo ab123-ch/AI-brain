@@ -18,10 +18,7 @@ impl PatternMatcher {
     /// 快速匹配，返回最佳匹配经验的推理路径
     ///
     /// 返回 (confidence, reasoning_path, experience_id)
-    pub fn match_pattern(
-        &self,
-        msg: &BroadcastMessage,
-    ) -> Option<(f64, Vec<String>, String)> {
+    pub fn match_pattern(&self, msg: &BroadcastMessage) -> Option<(f64, Vec<String>, String)> {
         let keywords = extract_keywords_from_message(msg);
         if keywords.is_empty() {
             return None;
@@ -47,11 +44,7 @@ impl PatternMatcher {
     }
 
     /// 获取反面案例（供慢思考参考）
-    pub fn get_negative_examples(
-        &self,
-        msg: &BroadcastMessage,
-        limit: usize,
-    ) -> Vec<String> {
+    pub fn get_negative_examples(&self, msg: &BroadcastMessage, limit: usize) -> Vec<String> {
         let keywords = extract_keywords_from_message(msg);
         self.experience
             .get_negative_examples(&keywords, limit)
@@ -81,7 +74,11 @@ fn extract_keywords_from_message(msg: &BroadcastMessage) -> Vec<String> {
     // 从 content 中提取（按标点分割）
     let content_words: Vec<String> = msg
         .content
-        .split(&[' ', ',', '，', '。', '、', '；', '！', '？', '\n', '\t', ':', '：'][..])
+        .split(
+            &[
+                ' ', ',', '，', '。', '、', '；', '！', '？', '\n', '\t', ':', '：',
+            ][..],
+        )
         .flat_map(extract_subwords)
         .filter(|s| s.len() >= 2)
         .take(12)
@@ -143,9 +140,9 @@ fn extract_subwords(segment: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experience::ExperienceEntry;
     use brain_core::types::BrainContext;
     use chrono::Utc;
-    use crate::experience::ExperienceEntry;
     use tempfile::TempDir;
 
     fn make_matcher() -> PatternMatcher {

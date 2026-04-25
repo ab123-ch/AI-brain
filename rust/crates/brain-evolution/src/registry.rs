@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dormancy::{DormancyManager, DormantRecord};
 use crate::error::{EvolutionError, Result};
-use crate::template::{BrainTemplate, builtin_templates};
+use crate::template::{builtin_templates, BrainTemplate};
 
 /// 活跃副脑条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,8 +388,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = BrainRegistry::with_storage_dir(dir.path().to_path_buf());
 
-        let t = BrainTemplate::new("status-test", "test status")
-            .with_capabilities(vec!["test"]);
+        let t = BrainTemplate::new("status-test", "test status").with_capabilities(vec!["test"]);
         registry.register_template(t).unwrap();
         registry.create_from_template("status-test").unwrap();
 

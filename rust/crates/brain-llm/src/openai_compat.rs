@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{LlmError, Result};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, MessageRole};
-use crate::types::{ContentBlock, FinishReason, ToolChoice, ToolDefinition, TokenUsage};
+use crate::types::{ContentBlock, FinishReason, TokenUsage, ToolChoice};
 
 // ---------------------------------------------------------------------------
 // OpenAI-compatible API Client
@@ -55,6 +55,7 @@ struct ApiChoice {
 
 #[derive(Debug, Deserialize)]
 struct ApiMessage {
+    #[allow(dead_code)]
     role: String,
     content: Option<serde_json::Value>,
     tool_calls: Option<Vec<ApiToolCall>>,
@@ -63,6 +64,7 @@ struct ApiMessage {
 #[derive(Debug, Deserialize)]
 struct ApiToolCall {
     id: String,
+    #[allow(dead_code)]
     r#type: String,
     function: ApiFunction,
 }
@@ -159,13 +161,15 @@ impl OpenAiCompatClient {
             msg.content
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
-                        Some(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tool_use_id,
-                            "content": content
-                        }))
-                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => Some(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content
+                    })),
                     _ => None,
                 })
                 .collect()
@@ -186,16 +190,19 @@ impl OpenAiCompatClient {
             .collect();
 
         let tools = request.tools.map(|tools| {
-            serde_json::json!(tools.iter().map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.input_schema
-                    }
+            serde_json::json!(tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema
+                        }
+                    })
                 })
-            }).collect::<Vec<_>>())
+                .collect::<Vec<_>>())
         });
 
         let tool_choice = request.tool_choice.map(|tc| match tc {
@@ -239,14 +246,17 @@ impl OpenAiCompatClient {
             body["temperature"] = serde_json::json!(temp);
         }
         if let Some(tools) = request.tools {
-            body["tools"] = serde_json::json!(tools.iter().map(|t| serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema
-                }
-            })).collect::<Vec<_>>());
+            body["tools"] = serde_json::json!(tools
+                .iter()
+                .map(|t| serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema
+                    }
+                }))
+                .collect::<Vec<_>>());
         }
         if let Some(tc) = request.tool_choice {
             body["tool_choice"] = match tc {
@@ -312,7 +322,9 @@ impl OpenAiCompatClient {
                 }
                 serde_json::Value::Array(parts) => {
                     for part in parts {
-                        if let Some(reasoning) = part.get("reasoning_content").and_then(|r| r.as_str()) {
+                        if let Some(reasoning) =
+                            part.get("reasoning_content").and_then(|r| r.as_str())
+                        {
                             if !reasoning.is_empty() {
                                 blocks.push(ContentBlock::thinking(reasoning));
                             }
@@ -330,7 +342,8 @@ impl OpenAiCompatClient {
 
         if let Some(tool_calls) = &msg.tool_calls {
             for tc in tool_calls {
-                let input = serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
+                let input =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
                 blocks.push(ContentBlock::ToolUse {
                     id: tc.id.clone(),
                     name: tc.function.name.clone(),
@@ -450,7 +463,9 @@ impl LlmProvider for OpenAiCompatClient {
         let url = self.chat_url();
         let api_key = self.api_key.clone();
 
-        Box::pin(async move { crate::stream::stream_openai(&self.client, &url, &api_key, &body).await })
+        Box::pin(
+            async move { crate::stream::stream_openai(&self.client, &url, &api_key, &body).await },
+        )
     }
 
     fn stream_incremental(
@@ -458,8 +473,9 @@ impl LlmProvider for OpenAiCompatClient {
         request: ChatRequest,
     ) -> Pin<
         Box<
-            dyn Future<Output = crate::Result<tokio::sync::mpsc::Receiver<crate::types::StreamEvent>>>
-                + Send
+            dyn Future<
+                    Output = crate::Result<tokio::sync::mpsc::Receiver<crate::types::StreamEvent>>,
+                > + Send
                 + '_,
         >,
     > {
@@ -511,7 +527,10 @@ mod tests {
             1024,
             0.5,
         );
-        assert_eq!(client.chat_url(), "https://api.example.com/v1/chat/completions");
+        assert_eq!(
+            client.chat_url(),
+            "https://api.example.com/v1/chat/completions"
+        );
     }
 
     #[test]

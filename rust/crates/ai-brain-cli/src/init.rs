@@ -93,13 +93,17 @@ pub fn print_first_run_guide() {
     eprintln!();
 }
 
-/// 初始化文件日志
+/// 初始化文件日志（普通模式：stdout + 文件）
 pub fn init_file_logging(base_dir: &Path) {
     let log_dir = base_dir.join("logs");
     let date = chrono::Local::now().format("%Y-%m-%d");
     let log_path = log_dir.join(format!("brain-{date}.log"));
 
-    let file = match fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!("无法打开日志文件 {:?}: {e}", log_path);
@@ -114,6 +118,38 @@ pub fn init_file_logging(base_dir: &Path) {
 
     // 在现有 subscriber 上叠加文件日志
     let _ = tracing_subscriber::registry().with(file_layer).try_init();
+}
+
+/// 初始化 TUI 模式日志（只写文件，不写终端）
+pub fn init_tui_logging(base_dir: &Path) {
+    let log_dir = base_dir.join("logs");
+    let _ = fs::create_dir_all(&log_dir);
+    let date = chrono::Local::now().format("%Y-%m-%d");
+    let log_path = log_dir.join(format!("brain-{date}.log"));
+
+    match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        Err(_) => {
+            // 连日志文件都打不开，全部丢弃
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+                .with_writer(std::io::sink)
+                .init();
+        }
+    }
 }
 
 /// AI Brain 根目录

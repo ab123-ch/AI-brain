@@ -1,6 +1,4 @@
-use brain_core::types::{
-    KnowledgeSource, MemoryLayer, SourceAnalysis, TruthfulnessResult,
-};
+use brain_core::types::{KnowledgeSource, MemoryLayer, SourceAnalysis, TruthfulnessResult};
 
 /// 来源可信度评分规则
 ///
@@ -87,10 +85,7 @@ impl TruthfulnessChecker {
             .collect();
 
         // 2. 计算支持声明的来源数量
-        let supporting_count = source_analysis
-            .iter()
-            .filter(|a| a.supports_claim)
-            .count();
+        let supporting_count = source_analysis.iter().filter(|a| a.supports_claim).count();
 
         // 3. 综合可信度
         #[allow(clippy::cast_precision_loss)]
@@ -235,20 +230,46 @@ mod tests {
     #[test]
     fn user_confirmation_highest_reliability() {
         let checker = TruthfulnessChecker::new();
-        let result = checker.check(
-            "用户确认",
-            &[KnowledgeSource::UserConfirmation],
-        );
+        let result = checker.check("用户确认", &[KnowledgeSource::UserConfirmation]);
         assert!((result.confidence - 0.95).abs() < 0.01);
     }
 
     #[test]
     fn source_reliability_mapping() {
-        assert!((TruthfulnessChecker::reliability_of(&KnowledgeSource::UserConfirmation) - 0.95).abs() < f64::EPSILON);
-        assert!((TruthfulnessChecker::reliability_of(&KnowledgeSource::WebSearch { url: String::new() }) - 0.80).abs() < f64::EPSILON);
-        assert!((TruthfulnessChecker::reliability_of(&KnowledgeSource::LlmReasoning { model: "test".into() }) - 0.60).abs() < f64::EPSILON);
-        assert!((TruthfulnessChecker::reliability_of(&KnowledgeSource::Memory { memory_id: String::new(), layer: MemoryLayer::TaskSummary }) - 0.90).abs() < f64::EPSILON);
-        assert!((TruthfulnessChecker::reliability_of(&KnowledgeSource::Memory { memory_id: String::new(), layer: MemoryLayer::Raw }) - 0.30).abs() < f64::EPSILON);
+        assert!(
+            (TruthfulnessChecker::reliability_of(&KnowledgeSource::UserConfirmation) - 0.95).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (TruthfulnessChecker::reliability_of(&KnowledgeSource::WebSearch {
+                url: String::new()
+            }) - 0.80)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (TruthfulnessChecker::reliability_of(&KnowledgeSource::LlmReasoning {
+                model: "test".into()
+            }) - 0.60)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (TruthfulnessChecker::reliability_of(&KnowledgeSource::Memory {
+                memory_id: String::new(),
+                layer: MemoryLayer::TaskSummary
+            }) - 0.90)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (TruthfulnessChecker::reliability_of(&KnowledgeSource::Memory {
+                memory_id: String::new(),
+                layer: MemoryLayer::Raw
+            }) - 0.30)
+                .abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]

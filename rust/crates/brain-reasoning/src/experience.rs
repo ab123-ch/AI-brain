@@ -195,13 +195,14 @@ impl ExperienceStore {
                 .any(|kw| pattern_lower.contains(&kw.to_lowercase()));
 
             // 方向2: 关键词包含 trigger_pattern 的成分
-            let kw_contains_pattern = Self::extract_keywords(&entry.trigger_pattern)
-                .iter()
-                .any(|trigger_kw| {
-                    keywords
-                        .iter()
-                        .any(|msg_kw| msg_kw.to_lowercase().contains(&trigger_kw.to_lowercase()))
-                });
+            let kw_contains_pattern =
+                Self::extract_keywords(&entry.trigger_pattern)
+                    .iter()
+                    .any(|trigger_kw| {
+                        keywords.iter().any(|msg_kw| {
+                            msg_kw.to_lowercase().contains(&trigger_kw.to_lowercase())
+                        })
+                    });
 
             if pattern_contains_kw || kw_contains_pattern {
                 return true;
@@ -212,7 +213,11 @@ impl ExperienceStore {
     }
 
     /// 获取反面案例（用于慢思考参考）
-    pub fn get_negative_examples(&self, keywords: &[String], limit: usize) -> Vec<&ExperienceEntry> {
+    pub fn get_negative_examples(
+        &self,
+        keywords: &[String],
+        limit: usize,
+    ) -> Vec<&ExperienceEntry> {
         let mut results: Vec<&ExperienceEntry> = self
             .entries
             .values()

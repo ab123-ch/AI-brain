@@ -3,9 +3,9 @@ use std::pin::Pin;
 
 use brain_core::agent::BrainAgent;
 use brain_core::types::{
-    BrainId, BrainKind, BrainResponse, BroadcastMessage,
-    CollaborationMessage, CollaborationKind, FastThinkResult, KnowledgeSource,
-    SafetyCheckResult, SlowThinkResult, ThinkContext, ToolCall, TruthfulnessResult,
+    BrainId, BrainKind, BrainResponse, BroadcastMessage, CollaborationKind, CollaborationMessage,
+    FastThinkResult, KnowledgeSource, SafetyCheckResult, SlowThinkResult, ThinkContext, ToolCall,
+    TruthfulnessResult,
 };
 
 use crate::error::Result;
@@ -163,10 +163,7 @@ impl BrainAgent for ValidationBrain {
         let result = self.fast_think(&msg);
         // 如果检测到危险，记录缓存
         if result.confidence > 0.8 {
-            tracing::warn!(
-                "校验脑检测到潜在风险: {:?}",
-                result.summary
-            );
+            tracing::warn!("校验脑检测到潜在风险: {:?}", result.summary);
         }
     }
 
@@ -174,7 +171,10 @@ impl BrainAgent for ValidationBrain {
         match msg.kind {
             CollaborationKind::Request => {
                 if msg.to.contains(&self.id) {
-                    tracing::debug!("校验脑收到安全审查请求: {}", msg.content.chars().take(100).collect::<String>());
+                    tracing::debug!(
+                        "校验脑收到安全审查请求: {}",
+                        msg.content.chars().take(100).collect::<String>()
+                    );
                 }
             }
             CollaborationKind::Response => {}
@@ -268,8 +268,13 @@ mod tests {
         let result = brain.check_truthfulness(
             "清明节4月4-6日放假",
             &[
-                KnowledgeSource::WebSearch { url: "https://example.com".into() },
-                KnowledgeSource::Memory { memory_id: "mem_001".into(), layer: MemoryLayer::ShortTerm },
+                KnowledgeSource::WebSearch {
+                    url: "https://example.com".into(),
+                },
+                KnowledgeSource::Memory {
+                    memory_id: "mem_001".into(),
+                    layer: MemoryLayer::ShortTerm,
+                },
             ],
         );
         assert!(result.confidence > 0.6);
@@ -289,10 +294,15 @@ mod tests {
     async fn slow_think_returns_result() {
         let brain = make_brain();
         let msg = make_broadcast("检查这段代码的安全性");
-        let result = brain.slow_think(&msg, &ThinkContext {
-            related_memories: Vec::new(),
-            task_history: Vec::new(),
-        }).await;
+        let result = brain
+            .slow_think(
+                &msg,
+                &ThinkContext {
+                    related_memories: Vec::new(),
+                    task_history: Vec::new(),
+                },
+            )
+            .await;
         assert!(!result.conclusion.is_empty());
         assert!(!result.reasoning_path.is_empty());
     }

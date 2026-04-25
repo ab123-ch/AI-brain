@@ -139,40 +139,26 @@ impl SafetyChecker {
             },
             SafetyRule {
                 description: "网络危险操作".into(),
-                patterns: vec![
-                    "curl | sh".into(),
-                    "wget | sh".into(),
-                    "nc -l".into(),
-                ],
+                patterns: vec!["curl | sh".into(), "wget | sh".into(), "nc -l".into()],
                 risk_level: RiskLevel::High,
                 requires_user_approval: true,
             },
             // === 中风险 ===
             SafetyRule {
                 description: "文件修改操作".into(),
-                patterns: vec![
-                    "edit".into(),
-                    "write".into(),
-                ],
+                patterns: vec!["edit".into(), "write".into()],
                 risk_level: RiskLevel::Medium,
                 requires_user_approval: false,
             },
             SafetyRule {
                 description: "Shell 命令执行".into(),
-                patterns: vec![
-                    "bash".into(),
-                    "sh -c".into(),
-                    "exec".into(),
-                ],
+                patterns: vec!["bash".into(), "sh -c".into(), "exec".into()],
                 risk_level: RiskLevel::Medium,
                 requires_user_approval: false,
             },
             SafetyRule {
                 description: "环境变量修改".into(),
-                patterns: vec![
-                    "export ".into(),
-                    "setenv".into(),
-                ],
+                patterns: vec!["export ".into(), "setenv".into()],
                 risk_level: RiskLevel::Medium,
                 requires_user_approval: false,
             },

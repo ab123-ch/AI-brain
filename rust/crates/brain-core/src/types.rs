@@ -406,9 +406,221 @@ pub enum BrainResponsePayload {
     MemoryRecall(Vec<MemoryEntry>),
     ToolResult(ToolExecutionResult),
     Evaluation(EvaluationResult),
-    NotRelevant { reason: String },
+    NotRelevant {
+        reason: String,
+    },
     /// 副脑已收到调度，正在处理中（ack 信号）
     Processing,
+}
+
+// ─── 对话消息（主脑历史管理） ─────────────────────────────────────────
+
+/// 消息角色（内部对话历史用，与 brain_llm::MessageRole 分离）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    Tool,
+    Evaluator,
+}
+
+/// 对话消息（主脑内部历史记录）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub role: MessageRole,
+    pub content: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl ConversationMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    pub fn evaluator(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Evaluator,
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+}
+
+// ─── 主脑输出 ──────────────────────────────────────────────────────
+
+/// 主脑输出（直接给用户的结果）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MainBrainOutput {
+    pub answer: String,
+    pub usage: TurnUsage,
+}
+
+// ─── 进度事件 ──────────────────────────────────────────────────────
+
+/// 进度事件（主脑→TUI/终端 的实时通知）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProgressEvent {
+    Connecting {
+        brain: String,
+        model: String,
+    },
+    Thinking {
+        brain: String,
+    },
+    TextDelta {
+        text: String,
+    },
+    ToolStart {
+        brain: String,
+        tool_name: String,
+        input: String,
+    },
+    ToolDone {
+        brain: String,
+        tool_name: String,
+        duration_ms: u64,
+        output_preview: String,
+        is_error: bool,
+    },
+    MemoryInjected {
+        count: usize,
+        preview: String,
+    },
+    /// 记忆详情（verbose 模式可见）
+    MemoryDetail {
+        memories: Vec<String>,
+    },
+    EvaluationStart,
+    EvaluationResult {
+        passed: bool,
+        issues: Vec<String>,
+    },
+    /// 评估详情（verbose 模式可见）
+    EvaluationDetail {
+        score: f64,
+        reports: Vec<BrainHealthReport>,
+        instructions: Vec<SlimInstruction>,
+    },
+    Evaluating,
+    LlmRetry {
+        attempt: u32,
+        max_attempts: u32,
+        error: String,
+    },
+    Done,
+}
+
+// ─── 用户画像 ──────────────────────────────────────────────────────
+
+/// 用户画像（四步分析第二步产出）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserProfile {
+    pub explicit_preferences: Vec<String>,
+    pub implicit_preferences: Vec<String>,
+    pub taboos: Vec<String>,
+    pub habits: Vec<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for UserProfile {
+    fn default() -> Self {
+        Self {
+            explicit_preferences: Vec::new(),
+            implicit_preferences: Vec::new(),
+            taboos: Vec::new(),
+            habits: Vec::new(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+}
+
+// ─── 踩坑记录 ──────────────────────────────────────────────────────
+
+/// 踩坑类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PitfallCategory {
+    ToolFailure,
+    WrongAnswer,
+    LazyBehavior,
+    FormatIssue,
+    Other,
+}
+
+/// 踩坑记录（四步分析第三步产出）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PitfallRecord {
+    pub id: String,
+    pub category: PitfallCategory,
+    pub description: String,
+    pub user_correction: Option<String>,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub occurrence_count: u32,
+    /// 被后续记忆迭代取代（不再召回，保留审计）
+    #[serde(default)]
+    pub superseded: bool,
+}
+
+// ─── 自进化规则 ────────────────────────────────────────────────────
+
+/// 自进化规则（四步分析第四步产出）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionRule {
+    pub id: String,
+    pub rule: String,
+    pub source_pitfall_ids: Vec<String>,
+    pub priority: u8,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// 被后续记忆迭代取代（不再召回，保留审计）
+    #[serde(default)]
+    pub superseded: bool,
+}
+
+// ─── 脑状态快照 ────────────────────────────────────────────────────
+
+/// 来源引用类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceRefKind {
+    Message,
+}
+
+/// 来源引用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRef {
+    pub kind: SourceRefKind,
+    pub reference: String,
+    pub storage_id: String,
+}
+
+/// 脑状态快照（记忆脑→主脑 上下文重建用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrainState {
+    pub fact_summary: String,
+    pub user_profile: UserProfile,
+    pub active_pitfalls: Vec<PitfallRecord>,
+    pub evolution_rules: Vec<EvolutionRule>,
+    pub index_entries: Vec<SourceRef>,
+    pub snapshot_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[cfg(test)]

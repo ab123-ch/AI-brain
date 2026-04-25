@@ -468,7 +468,10 @@ fn parse_llm_issues(json_str: &str) -> Vec<EvalIssue> {
 fn clean_json_string(s: &str) -> String {
     let mut result = s.to_string();
     // 移除尾随逗号（}, ] 前的逗号）
-    result = result.replace(",}", "}").replace(", ]", "]").replace(",]", "]");
+    result = result
+        .replace(",}", "}")
+        .replace(", ]", "]")
+        .replace(",]", "]");
     // 修复中文标点
     result = result.replace('\u{ff1a}', ":").replace('\u{ff0c}', ",");
     result = result.replace(['\u{201c}', '\u{201d}'], "\"");
@@ -826,6 +829,7 @@ mod tests {
             user_correction: None,
             occurred_at: chrono::Utc::now(),
             occurrence_count: 2,
+            superseded: false,
         };
 
         let issues = brain.quick_check(

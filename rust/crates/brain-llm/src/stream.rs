@@ -149,10 +149,7 @@ fn process_chunk(
             }
 
             // Reasoning/thinking content (some OpenAI-compatible APIs)
-            if let Some(reasoning) = delta
-                .get("reasoning_content")
-                .and_then(|c| c.as_str())
-            {
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                 if !reasoning.is_empty() {
                     events.push(StreamEvent::ThinkingDelta {
                         content: reasoning.into(),

@@ -38,20 +38,11 @@ pub struct MemoryInjection {
 #[serde(tag = "tier", rename_all = "snake_case")]
 pub enum InjectionContent {
     /// Full original content (weight >= 0.8).
-    Full {
-        content: String,
-        ref_id: String,
-    },
+    Full { content: String, ref_id: String },
     /// Compressed summary (weight 0.5..0.8).
-    Summary {
-        summary: String,
-        ref_id: String,
-    },
+    Summary { summary: String, ref_id: String },
     /// One-line mention (weight 0.3..0.5).
-    Mention {
-        hint: String,
-        ref_id: String,
-    },
+    Mention { hint: String, ref_id: String },
 }
 
 // ---------------------------------------------------------------------------

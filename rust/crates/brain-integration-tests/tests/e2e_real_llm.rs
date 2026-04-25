@@ -62,8 +62,7 @@ fn real_llm_client(brain_name: &str) -> Option<Box<dyn LlmProvider>> {
 #[tokio::test]
 #[ignore = "需要真实 LLM API Key"]
 async fn real_llm_connectivity() {
-    let client =
-        real_llm_client("sensory").expect("无法创建 LLM 客户端，请配置 ZHIPU_API_KEY");
+    let client = real_llm_client("sensory").expect("无法创建 LLM 客户端，请配置 ZHIPU_API_KEY");
 
     let request = ChatRequest {
         model: None,
@@ -79,10 +78,7 @@ async fn real_llm_connectivity() {
 
     let usage = &response.usage;
     println!("[连通性测试] 回复: {}", response.content);
-    println!(
-        "[连通性测试] 模型: {}, 耗时: {:?}",
-        response.model, elapsed
-    );
+    println!("[连通性测试] 模型: {}, 耗时: {:?}", response.model, elapsed);
     println!(
         "[连通性测试] Token 用量: prompt={}, completion={}, total={}",
         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
@@ -102,9 +98,8 @@ async fn real_llm_reasoning_brain() {
     use chrono::Utc;
     use tempfile::TempDir;
 
-    let llm: Arc<dyn LlmProvider> = Arc::from(
-        real_llm_client("reasoning").expect("无法创建推理脑 LLM 客户端"),
-    );
+    let llm: Arc<dyn LlmProvider> =
+        Arc::from(real_llm_client("reasoning").expect("无法创建推理脑 LLM 客户端"));
 
     let tmp = TempDir::new().unwrap();
     let mut reasoning = ReasoningBrain::new(ReasoningConfig {
@@ -160,9 +155,8 @@ async fn real_llm_motor_brain() {
     use brain_motor::motor_brain::{MotorBrain, MotorConfig};
     use chrono::Utc;
 
-    let llm: Arc<dyn LlmProvider> = Arc::from(
-        real_llm_client("motor").expect("无法创建执行脑 LLM 客户端"),
-    );
+    let llm: Arc<dyn LlmProvider> =
+        Arc::from(real_llm_client("motor").expect("无法创建执行脑 LLM 客户端"));
 
     let mut motor = MotorBrain::new(MotorConfig::default()).unwrap();
     motor.set_llm(llm);
@@ -198,10 +192,7 @@ async fn real_llm_motor_brain() {
         result.confidence, elapsed
     );
 
-    assert!(
-        !result.conclusion.is_empty(),
-        "工具选择结论不应为空"
-    );
+    assert!(!result.conclusion.is_empty(), "工具选择结论不应为空");
 }
 
 /// 测试 4: 感知脑 LLM 解析

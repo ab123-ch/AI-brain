@@ -2,10 +2,10 @@
 //!
 //! 显示模型名、上下文使用率、当前轮次等信息。
 
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
 use crate::orchestrator::SystemStatus;
 
@@ -45,7 +45,11 @@ impl StatusBar {
             Color::Green
         };
 
-        let eval_str = if self.eval_enabled { "评估:开" } else { "评估:关" };
+        let eval_str = if self.eval_enabled {
+            "评估:开"
+        } else {
+            "评估:关"
+        };
         let busy_indicator = if self.busy { " *" } else { "" };
 
         let text = format!(

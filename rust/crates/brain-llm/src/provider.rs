@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ContentBlock, FinishReason, ToolChoice, ToolDefinition, TokenUsage};
+use crate::types::{ContentBlock, FinishReason, TokenUsage, ToolChoice, ToolDefinition};
 
 /// 消息角色
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,7 +148,11 @@ pub trait LlmProvider: Send + Sync {
         _request: ChatRequest,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Vec<crate::types::StreamEvent>>> + Send + '_>>
     {
-        Box::pin(async { Err(crate::error::LlmError::RequestFailed("Streaming not supported".into())) })
+        Box::pin(async {
+            Err(crate::error::LlmError::RequestFailed(
+                "Streaming not supported".into(),
+            ))
+        })
     }
 
     /// Incremental streaming: returns a channel of SSE events
@@ -163,6 +167,10 @@ pub trait LlmProvider: Send + Sync {
                 + '_,
         >,
     > {
-        Box::pin(async { Err(crate::error::LlmError::RequestFailed("Streaming not supported".into())) })
+        Box::pin(async {
+            Err(crate::error::LlmError::RequestFailed(
+                "Streaming not supported".into(),
+            ))
+        })
     }
 }

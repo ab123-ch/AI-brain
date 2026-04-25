@@ -833,6 +833,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "search_memory",
+            description: "Search past session memory for relevant content. Use when you need to recall details from previous conversations — specific tasks, decisions, code changes, or user preferences. Returns matching raw conversation excerpts and session summaries, sorted by relevance.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search keywords or phrase describing what to find" },
+                    "max_results": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
     ]
 }
 

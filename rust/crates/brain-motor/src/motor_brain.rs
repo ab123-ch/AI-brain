@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use brain_core::agent::BrainAgent;
 use brain_core::types::{
-    BrainId, BrainKind, BrainResponse, BroadcastMessage, CollaborationMessage, CollaborationKind,
+    BrainId, BrainKind, BrainResponse, BroadcastMessage, CollaborationKind, CollaborationMessage,
     FastThinkResult, SlowThinkResult, ThinkContext, ToolCall, ToolDescriptor, ToolExecutionResult,
 };
 use brain_llm::{ChatMessage, ChatRequest, LlmProvider};
@@ -87,12 +87,14 @@ impl MotorBrain {
         let start = Instant::now();
 
         // 1. 检查工具是否已注册
-        let capability = self.registry.get(&tool_call.tool_name).ok_or_else(|| {
-            MotorError::ToolNotRegistered(tool_call.tool_name.clone())
-        })?;
+        let capability = self
+            .registry
+            .get(&tool_call.tool_name)
+            .ok_or_else(|| MotorError::ToolNotRegistered(tool_call.tool_name.clone()))?;
 
         // 2. 安全检查：中高风险必须经过校验
-        if self.config.require_validation && capability.requires_validation && !tool_call.validated {
+        if self.config.require_validation && capability.requires_validation && !tool_call.validated
+        {
             return Err(MotorError::ValidationFailed(format!(
                 "工具 \"{}\" 需要校验脑审核，但 tool_call.validated=false",
                 tool_call.tool_name
@@ -217,17 +219,19 @@ impl MotorBrain {
             model: None,
             messages: vec![
                 ChatMessage::system(MOTOR_SYSTEM_PROMPT),
-                ChatMessage::user(format!(
-                    "## 任务\n{task}\n\n## 可用工具\n{tools_desc}"
-                )),
+                ChatMessage::user(format!("## 任务\n{task}\n\n## 可用工具\n{tools_desc}")),
             ],
             max_tokens: Some(1024),
             temperature: Some(0.3),
-            stream: None,
+            tools: None,
+            tool_choice: None,
         };
 
-        let response = provider.complete(request).await.map_err(|e| e.to_string())?;
-        let content = response.content;
+        let response = provider
+            .complete(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let content = response.text();
 
         // 解析：第一行是结论，后续是推理路径
         let mut lines = content.lines().peekable();
@@ -337,10 +341,7 @@ impl BrainAgent for MotorBrain {
     fn on_broadcast(&mut self, msg: BroadcastMessage) {
         let result = self.fast_think(&msg);
         if result.relevant && !result.suggested_tools.is_empty() {
-            tracing::debug!(
-                "执行脑识别工具需求: {:?}",
-                result.suggested_tools
-            );
+            tracing::debug!("执行脑识别工具需求: {:?}", result.suggested_tools);
             // 记录待处理的工具需求
         }
     }
@@ -349,7 +350,10 @@ impl BrainAgent for MotorBrain {
         match msg.kind {
             CollaborationKind::Dispatch => {
                 if msg.to.contains(&self.id) {
-                    tracing::debug!("执行脑收到主脑调度: {}", msg.content.chars().take(100).collect::<String>());
+                    tracing::debug!(
+                        "执行脑收到主脑调度: {}",
+                        msg.content.chars().take(100).collect::<String>()
+                    );
                 }
             }
             CollaborationKind::Request | CollaborationKind::Response => {}
@@ -496,7 +500,8 @@ mod tests {
         let mut brain = MotorBrain::new(MotorConfig {
             require_validation: false,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         let call = ToolCall {
             tool_name: "Edit".into(),
             input: serde_json::Value::String("修改".into()),
@@ -512,10 +517,15 @@ mod tests {
     async fn slow_think_with_tool_hints() {
         let brain = make_brain();
         let msg = make_broadcast("帮我搜索代码并编辑文件");
-        let result = brain.slow_think(&msg, &ThinkContext {
-            related_memories: Vec::new(),
-            task_history: Vec::new(),
-        }).await;
+        let result = brain
+            .slow_think(
+                &msg,
+                &ThinkContext {
+                    related_memories: Vec::new(),
+                    task_history: Vec::new(),
+                },
+            )
+            .await;
         assert!(!result.reasoning_path.is_empty());
     }
 
@@ -546,8 +556,17 @@ mod tests {
     #[test]
     fn tool_risk_level_query() {
         let brain = make_brain();
-        assert_eq!(brain.tool_risk_level("Read"), crate::tool_registry::ToolRiskLevel::Low);
-        assert_eq!(brain.tool_risk_level("Edit"), crate::tool_registry::ToolRiskLevel::Medium);
-        assert_eq!(brain.tool_risk_level("Bash"), crate::tool_registry::ToolRiskLevel::High);
+        assert_eq!(
+            brain.tool_risk_level("Read"),
+            crate::tool_registry::ToolRiskLevel::Low
+        );
+        assert_eq!(
+            brain.tool_risk_level("Edit"),
+            crate::tool_registry::ToolRiskLevel::Medium
+        );
+        assert_eq!(
+            brain.tool_risk_level("Bash"),
+            crate::tool_registry::ToolRiskLevel::High
+        );
     }
 }

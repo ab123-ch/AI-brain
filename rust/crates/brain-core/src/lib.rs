@@ -2,6 +2,8 @@ pub mod agent;
 pub mod config;
 pub mod error;
 pub mod evaluation;
+pub mod guard_check;
 pub mod memory_types;
 pub mod plan;
+pub mod tool_executor;
 pub mod types;

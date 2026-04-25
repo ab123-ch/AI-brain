@@ -12,7 +12,15 @@ use std::sync::Mutex;
 
 use brain_core::types::ProgressEvent;
 
-use crate::terminal::brain_display_name;
+/// 脑名映射（内联避免跨模块引用）
+fn brain_display_name(brain: &str) -> &str {
+    match brain {
+        "main" => "主脑",
+        "memory" => "记忆脑",
+        "eval" => "评估脑",
+        _ => brain,
+    }
+}
 
 /// 会话日志记录器
 pub struct SessionLogger {
@@ -114,7 +122,11 @@ impl SessionLogger {
         let ts = Self::timestamp();
         // 截断到 500 字符，避免日志文件过大
         let preview: String = text.chars().take(500).collect();
-        let ellipsis = if text.chars().count() > 500 { "..." } else { "" };
+        let ellipsis = if text.chars().count() > 500 {
+            "..."
+        } else {
+            ""
+        };
         self.log_raw(&format!(
             "[{ts}] ASSISTANT | {duration_ms}ms\n{preview}{ellipsis}\n\n"
         ));

@@ -98,19 +98,22 @@ impl BrainTemplate {
 
 /// 内置模板：代码审查副脑
 pub fn builtin_code_review_template() -> BrainTemplate {
-    BrainTemplate::new("code-review", "代码审查专用副脑，检测安全漏洞、代码风格和最佳实践")
-        .with_prompt("你是一个代码审查专家。分析代码中的安全问题、性能瓶颈和改进机会。")
-        .with_rule(FastThinkRule {
-            keywords: vec![
-                "代码审查".into(),
-                "code review".into(),
-                "安全漏洞".into(),
-                "代码质量".into(),
-            ],
-            confidence: 0.85,
-            summary_template: "检测到代码审查请求，准备分析代码质量".into(),
-        })
-        .with_capabilities(vec!["code_review", "security", "best_practices"])
+    BrainTemplate::new(
+        "code-review",
+        "代码审查专用副脑，检测安全漏洞、代码风格和最佳实践",
+    )
+    .with_prompt("你是一个代码审查专家。分析代码中的安全问题、性能瓶颈和改进机会。")
+    .with_rule(FastThinkRule {
+        keywords: vec![
+            "代码审查".into(),
+            "code review".into(),
+            "安全漏洞".into(),
+            "代码质量".into(),
+        ],
+        confidence: 0.85,
+        summary_template: "检测到代码审查请求，准备分析代码质量".into(),
+    })
+    .with_capabilities(vec!["code_review", "security", "best_practices"])
 }
 
 /// 内置模板：文档生成副脑

@@ -1,7 +1,5 @@
 use brain_core::agent::StatelessBrain;
-use brain_core::types::{
-    BrainId, BrainKind, ContextSnapshot, EvaluationResult,
-};
+use brain_core::types::{BrainId, BrainKind, ContextSnapshot, EvaluationResult};
 
 use crate::context_health::{ContextHealthChecker, HealthThresholds};
 use crate::error::Result;
@@ -52,10 +50,7 @@ pub struct EvaluationBrain {
 
 impl EvaluationBrain {
     pub fn new(config: EvaluationConfig) -> Result<Self> {
-        let checker = ContextHealthChecker::new(
-            config.thresholds.clone(),
-            config.max_messages,
-        );
+        let checker = ContextHealthChecker::new(config.thresholds.clone(), config.max_messages);
         Ok(Self {
             id: BrainId::evaluation(),
             config,
@@ -118,10 +113,7 @@ impl StatelessBrain for EvaluationBrain {
     ///
     /// 调用后建议立即 drop 此实例（无状态自毁语义）
     fn evaluate(&self, snapshots: Vec<ContextSnapshot>) -> EvaluationResult {
-        tracing::info!(
-            "评估脑启动: 接收 {} 个副脑快照",
-            snapshots.len()
-        );
+        tracing::info!("评估脑启动: 接收 {} 个副脑快照", snapshots.len());
 
         let result = self.checker.evaluate(&snapshots);
 
@@ -152,7 +144,11 @@ mod tests {
         EvaluationBrain::with_defaults().unwrap()
     }
 
-    fn make_brain_with_config(max_messages: usize, idle_secs: u64, usage_pct: f64) -> EvaluationBrain {
+    fn make_brain_with_config(
+        max_messages: usize,
+        idle_secs: u64,
+        usage_pct: f64,
+    ) -> EvaluationBrain {
         let config = EvaluationConfig {
             max_messages,
             idle_trigger_secs: idle_secs,

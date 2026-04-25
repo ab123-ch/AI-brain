@@ -50,7 +50,7 @@ impl BrainStateGenerator {
     pub fn generate(&self, fact_summary: &str) -> Result<BrainState> {
         let user_profile = self.profile_store.load()?;
         let active_pitfalls = self.pitfall_store.load_active()?;
-        let evolution_rules = self.evolution_store.load_sorted_by_priority()?;
+        let evolution_rules = self.evolution_store.load_active()?;
 
         // 从 L2 索引构建 SourceRef 映射
         let index_entries = self.build_source_refs()?;

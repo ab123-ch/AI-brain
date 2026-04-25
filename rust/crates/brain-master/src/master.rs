@@ -6,8 +6,7 @@ use brain_bus::{BrainBus, BroadcastReceiver, ResultReceiver};
 use brain_core::config::BrainConfig;
 use brain_core::types::{
     BrainId, BrainResponse, BrainResponsePayload, BroadcastMessage, CollaborationKind,
-    CollaborationMessage, MasterOutput, MessagePriority, TaskContext,
-    TaskPhase, TurnUsage, Weight,
+    CollaborationMessage, MasterOutput, MessagePriority, TaskContext, TaskPhase, TurnUsage, Weight,
 };
 use chrono::Utc;
 
@@ -104,7 +103,8 @@ impl MasterBrain {
             if let Some(task) = &mut self.current_task {
                 task.phase = TaskPhase::WaitingSlowThink;
             }
-            self.collect_slow_thinks(result_rx, slow_targets.len()).await
+            self.collect_slow_thinks(result_rx, slow_targets.len())
+                .await
         };
 
         // 4. 合并快+慢结果
@@ -177,16 +177,10 @@ impl MasterBrain {
     ///
     /// Phase 1: 向记忆脑发送 Dispatch → 记忆脑召回相关记忆 → 通过通道3返回结果
     /// Phase 2: 向其他慢思考目标（推理脑等）发送 Dispatch
-    async fn dispatch_slow_think(
-        &self,
-        targets: &[BrainId],
-        broadcast: &BroadcastMessage,
-    ) {
+    async fn dispatch_slow_think(&self, targets: &[BrainId], broadcast: &BroadcastMessage) {
         let memory_id = BrainId::memory();
-        let memory_targets: Vec<&BrainId> =
-            targets.iter().filter(|id| **id == memory_id).collect();
-        let other_targets: Vec<&BrainId> =
-            targets.iter().filter(|id| **id != memory_id).collect();
+        let memory_targets: Vec<&BrainId> = targets.iter().filter(|id| **id == memory_id).collect();
+        let other_targets: Vec<&BrainId> = targets.iter().filter(|id| **id != memory_id).collect();
 
         // Phase 1: 记忆脑优先调度
         for target in &memory_targets {
@@ -247,7 +241,8 @@ impl MasterBrain {
             if remaining.is_zero() {
                 tracing::warn!(
                     "慢思考超时: 已收 {}/{} 个结果",
-                    completed_count, expected_count
+                    completed_count,
+                    expected_count
                 );
                 break;
             }
@@ -259,7 +254,8 @@ impl MasterBrain {
                     } else {
                         tracing::info!(
                             "收到 {} 的慢思考结果 (confidence={:.2})",
-                            resp.from, resp.confidence
+                            resp.from,
+                            resp.confidence
                         );
                         if let Some(task) = &mut self.current_task {
                             task.brain_responses.insert(resp.from.clone(), resp.clone());
@@ -270,10 +266,7 @@ impl MasterBrain {
 
                     // 收齐了，立刻返回
                     if completed_count >= expected_count {
-                        tracing::info!(
-                            "慢思考全部收齐: {} 个结果，无需等待超时",
-                            completed_count
-                        );
+                        tracing::info!("慢思考全部收齐: {} 个结果，无需等待超时", completed_count);
                         break;
                     }
                 }
@@ -283,7 +276,8 @@ impl MasterBrain {
 
         tracing::info!(
             "慢思考收集完成: {}/{} 个结果",
-            completed_count, expected_count
+            completed_count,
+            expected_count
         );
         responses
     }

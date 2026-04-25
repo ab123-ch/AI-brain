@@ -236,6 +236,7 @@ mod tests {
             user_correction: None,
             occurred_at: Utc::now(),
             occurrence_count: 1,
+            superseded: false,
         }
     }
 

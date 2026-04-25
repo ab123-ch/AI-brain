@@ -108,6 +108,7 @@ impl EvolutionStore {
                     source_pitfall_ids: new_rule.source_pitfall_ids.clone(),
                     priority: new_rule.priority,
                     created_at: Utc::now(),
+                    superseded: false,
                 };
                 let cloned = rule.clone();
                 self.store(&rule)?;
@@ -127,6 +128,27 @@ impl EvolutionStore {
     /// 统计总规则数
     pub fn count(&self) -> Result<u32> {
         Ok(self.load_all()?.len() as u32)
+    }
+
+    /// 标记为已取代
+    pub fn mark_superseded(&self, id: &str) -> Result<()> {
+        let all = self.load_all()?;
+        for mut rule in all {
+            if rule.id == id {
+                rule.superseded = true;
+                self.store(&rule)?;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// 加载未取代的规则（按优先级排序）
+    pub fn load_active(&self) -> Result<Vec<EvolutionRule>> {
+        let mut rules = self.load_all()?;
+        rules.retain(|r| !r.superseded);
+        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        Ok(rules)
     }
 }
 
@@ -156,6 +178,7 @@ mod tests {
             source_pitfall_ids: vec!["pit-1".into()],
             priority,
             created_at: Utc::now(),
+            superseded: false,
         }
     }
 

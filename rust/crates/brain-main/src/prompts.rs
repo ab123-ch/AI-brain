@@ -77,8 +77,8 @@ pub fn build_environment_info() -> String {
         "windows" => "Windows",
         other => other,
     };
-    let cwd = std::env::current_dir()
-        .map_or_else(|_| "unknown".into(), |p| p.display().to_string());
+    let cwd =
+        std::env::current_dir().map_or_else(|_| "unknown".into(), |p| p.display().to_string());
     let now = chrono::Utc::now();
     let date_str = now.format("%Y年%m月%d日").to_string();
     let weekday = match now.weekday().num_days_from_monday() {

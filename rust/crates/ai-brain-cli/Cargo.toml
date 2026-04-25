@@ -22,9 +22,14 @@ brain-evaluation = { path = "../brain-evaluation" }
 brain-llm = { path = "../brain-llm" }
 brain-evolution = { path = "../brain-evolution" }
 
-tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-std", "io-util"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-std", "io-util", "signal"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.29"
+tui-textarea = "0.7"
+brain-main = { path = "../brain-main" }
+tools = { path = "../tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

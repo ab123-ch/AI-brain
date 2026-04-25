@@ -4,8 +4,7 @@ use brain_bus::BrainBus;
 use brain_core::config::BrainConfig;
 use brain_core::types::{
     BrainContext, BrainId, BrainResponse, BrainResponsePayload, BroadcastMessage,
-    CollaborationKind, FastThinkResult, MemoryEntry, MemoryLayer,
-    SlowThinkResult, Weight,
+    CollaborationKind, FastThinkResult, MemoryEntry, MemoryLayer, SlowThinkResult, Weight,
 };
 use brain_master::MasterBrain;
 use chrono::Utc;
@@ -118,7 +117,10 @@ async fn run_master_once(
         bus.submit_result(resp).await.unwrap();
     }
 
-    master.run_once(&mut broadcast_rx, &mut result_rx).await.unwrap()
+    master
+        .run_once(&mut broadcast_rx, &mut result_rx)
+        .await
+        .unwrap()
 }
 
 // ─── active tests ───────────────────────────────────────────────
@@ -166,7 +168,11 @@ async fn test_e2e_broadcast_reaches_all_brains() {
     let _rx2 = bus.subscribe_broadcast();
     let _rx3 = bus.subscribe_broadcast();
 
-    assert_eq!(bus.broadcast_receiver_count(), 4, "all brains should receive broadcast");
+    assert_eq!(
+        bus.broadcast_receiver_count(),
+        4,
+        "all brains should receive broadcast"
+    );
 }
 
 // ─── previously ignored tests (now enabled) ──────────────────────
@@ -210,11 +216,8 @@ async fn test_e2e_slow_think_low_confidence() {
         let bus = reas_bus;
         let mut rx = reasoning_collab_rx;
         if let Some(_msg) = rx.recv().await {
-            let response = make_slow_response(
-                BrainId::reasoning(),
-                "经过深度推理分析的新结论",
-                0.75,
-            );
+            let response =
+                make_slow_response(BrainId::reasoning(), "经过深度推理分析的新结论", 0.75);
             bus.submit_result(response).await.unwrap();
         }
     });
@@ -229,7 +232,10 @@ async fn test_e2e_slow_think_low_confidence() {
     assert!(!output.answer.is_empty());
     assert!(output.participating_brains.contains(&BrainId::reasoning()));
     // 慢思考结果应该比快思考置信度更高
-    assert!(output.confidence >= 0.4, "confidence should improve after slow think");
+    assert!(
+        output.confidence >= 0.4,
+        "confidence should improve after slow think"
+    );
 }
 
 /// 多轮查询后权重进化
@@ -262,7 +268,10 @@ async fn test_e2e_weight_evolution_after_multiple_queries() {
             bus.submit_result(resp).await.unwrap();
         }
 
-        master.run_once(&mut broadcast_rx, &mut result_rx).await.unwrap();
+        master
+            .run_once(&mut broadcast_rx, &mut result_rx)
+            .await
+            .unwrap();
     }
 
     // 验证权重已进化
@@ -337,9 +346,8 @@ async fn test_e2e_full_pipeline() {
         let mut rx = memory_collab_rx;
         if let Some(msg) = rx.recv().await {
             if msg.kind == CollaborationKind::Dispatch {
-                let response = make_memory_recall_response(vec![
-                    ("mem-pipeline-1", "管线相关记忆1"),
-                ]);
+                let response =
+                    make_memory_recall_response(vec![("mem-pipeline-1", "管线相关记忆1")]);
                 bus.submit_result(response).await.unwrap();
             }
         }
@@ -351,11 +359,7 @@ async fn test_e2e_full_pipeline() {
         let bus = reas_bus;
         let mut rx = reasoning_collab_rx;
         if let Some(_msg) = rx.recv().await {
-            let response = make_slow_response(
-                BrainId::reasoning(),
-                "管线完整慢思考结论",
-                0.85,
-            );
+            let response = make_slow_response(BrainId::reasoning(), "管线完整慢思考结论", 0.85);
             bus.submit_result(response).await.unwrap();
         }
     });
@@ -383,7 +387,10 @@ async fn test_e2e_full_pipeline() {
         "motor should not participate"
     );
     assert!(output.confidence > 0.0);
-    assert!(output.usage.duration_ms > 0, "should have measurable duration");
+    assert!(
+        output.usage.duration_ms > 0,
+        "should have measurable duration"
+    );
 }
 
 /// 校验脑安全检查集成
@@ -399,9 +406,7 @@ async fn test_e2e_validation_safety_check() {
     let mut result_rx = bus.take_result_receiver().await.unwrap();
 
     // 推理脑给出正常响应
-    let fast_reasoning = make_fast_response(
-        BrainId::reasoning(), true, 0.8, "正常推理结果",
-    );
+    let fast_reasoning = make_fast_response(BrainId::reasoning(), true, 0.8, "正常推理结果");
     // 校验脑给出安全检查结果（安全）
     let validation_response = BrainResponse {
         from: BrainId::validation(),

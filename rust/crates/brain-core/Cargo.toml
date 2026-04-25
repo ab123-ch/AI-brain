@@ -11,5 +11,8 @@ serde_json.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
 [lints]
 workspace = true

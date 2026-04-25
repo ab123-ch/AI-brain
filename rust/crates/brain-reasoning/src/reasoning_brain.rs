@@ -2,9 +2,8 @@ use std::path::PathBuf;
 
 use brain_core::agent::BrainAgent;
 use brain_core::types::{
-    BrainId, BrainKind, BrainResponse, BroadcastMessage,
-    CollaborationMessage, CollaborationKind, FastThinkResult, SlowThinkResult,
-    ThinkContext,
+    BrainId, BrainKind, BrainResponse, BroadcastMessage, CollaborationKind, CollaborationMessage,
+    FastThinkResult, SlowThinkResult, ThinkContext,
 };
 
 use crate::error::Result;
@@ -55,7 +54,8 @@ pub struct ReasoningBrain {
 
 impl ReasoningBrain {
     pub fn new(config: ReasoningConfig) -> Result<Self> {
-        let experience = ExperienceStore::new(config.experience_path.clone(), config.min_success_rate);
+        let experience =
+            ExperienceStore::new(config.experience_path.clone(), config.min_success_rate);
         let matcher = PatternMatcher::new(experience);
         let engine = ReasoningEngine::new(matcher);
 
@@ -77,18 +77,13 @@ impl ReasoningBrain {
     pub fn experience_stats(&self) -> (usize, usize) {
         let store = self.engine.pattern_matcher().experience();
         let total = store.len();
-        let negative = store
-            .get_negative_examples(&[], 10000)
-            .len();
+        let negative = store.get_negative_examples(&[], 10000).len();
         (total, negative)
     }
 
     /// 持久化经验库
     pub fn persist(&self) -> Result<()> {
-        self.engine
-            .pattern_matcher()
-            .experience()
-            .persist()
+        self.engine.pattern_matcher().experience().persist()
     }
 }
 
@@ -119,7 +114,10 @@ impl BrainAgent for ReasoningBrain {
             return FastThinkResult {
                 relevant: true,
                 confidence,
-                summary: Some(format!("部分匹配经验，需要深入分析: {}", reasoning_path.join("→"))),
+                summary: Some(format!(
+                    "部分匹配经验，需要深入分析: {}",
+                    reasoning_path.join("→")
+                )),
                 suggested_tools: Vec::new(),
                 matched_experience: Some(exp_id),
             };
@@ -219,7 +217,10 @@ impl BrainAgent for ReasoningBrain {
                 created_at: chrono::Utc::now(),
                 last_used: chrono::Utc::now(),
             };
-            self.engine.pattern_matcher_mut().experience_mut().store(entry);
+            self.engine
+                .pattern_matcher_mut()
+                .experience_mut()
+                .store(entry);
             self.pending_experience_ids.push(id);
             tracing::info!("推理脑新经验已保存: {}", exp.trigger_pattern);
         }
@@ -296,10 +297,13 @@ mod tests {
         let brain = make_brain();
         let msg = make_broadcast("分析系统性能瓶颈");
         let result = brain
-            .slow_think(&msg, &ThinkContext {
-                related_memories: Vec::new(),
-                task_history: Vec::new(),
-            })
+            .slow_think(
+                &msg,
+                &ThinkContext {
+                    related_memories: Vec::new(),
+                    task_history: Vec::new(),
+                },
+            )
             .await;
         assert!(!result.reasoning_path.is_empty());
         assert!(result.new_experience.is_some());
@@ -308,7 +312,9 @@ mod tests {
     #[test]
     fn on_broadcast_records_usage() {
         let mut brain = make_brain();
-        brain.engine.save_new_experience("测试", vec!["步骤1".into()], vec![]);
+        brain
+            .engine
+            .save_new_experience("测试", vec!["步骤1".into()], vec![]);
 
         let msg = make_broadcast("测试任务");
         brain.on_broadcast(msg);
@@ -318,7 +324,9 @@ mod tests {
     #[test]
     fn experience_stats() {
         let mut brain = make_brain();
-        brain.engine.save_new_experience("测试", vec!["步骤".into()], vec![]);
+        brain
+            .engine
+            .save_new_experience("测试", vec!["步骤".into()], vec![]);
         let (total, _negative) = brain.experience_stats();
         assert_eq!(total, 1);
     }
