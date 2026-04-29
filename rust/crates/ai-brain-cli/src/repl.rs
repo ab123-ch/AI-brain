@@ -71,7 +71,6 @@ pub async fn run(orch: Orchestrator) {
                 continue;
             }
             ":quit" | ":exit" | "exit" | "quit" => {
-                println!("再见！");
                 break;
             }
             _ => {}
@@ -93,7 +92,9 @@ pub async fn run(orch: Orchestrator) {
         println!();
     }
 
-    orch.shutdown();
+    println!("正在保存记忆（触发四步分析）...");
+    orch.shutdown_with_analysis().await;
+    println!("记忆已保存。再见！");
 }
 
 fn print_help() {

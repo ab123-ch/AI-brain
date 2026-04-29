@@ -58,6 +58,8 @@ struct ApiMessage {
     #[allow(dead_code)]
     role: String,
     content: Option<serde_json::Value>,
+    /// DeepSeek v4 思考模式返回的顶层字段，必须原样传回
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<ApiToolCall>>,
 }
 
@@ -124,6 +126,7 @@ impl OpenAiCompatClient {
         if has_tool_use {
             let mut text_parts = Vec::new();
             let mut tool_calls = Vec::new();
+            let mut reasoning_content: Option<String> = None;
 
             for block in &msg.content {
                 match block {
@@ -133,7 +136,10 @@ impl OpenAiCompatClient {
                             "text": text
                         }));
                     }
-                    ContentBlock::Thinking { .. } => {} // 不发送给 API
+                    ContentBlock::Thinking { content } => {
+                        // DeepSeek v4: reasoning_content 作为顶层字段
+                        reasoning_content = Some(content.clone());
+                    }
                     ContentBlock::ToolUse { id, name, input } => {
                         tool_calls.push(serde_json::json!({
                             "id": id,
@@ -156,6 +162,9 @@ impl OpenAiCompatClient {
             if !tool_calls.is_empty() {
                 obj.insert("tool_calls".into(), serde_json::json!(tool_calls));
             }
+            if let Some(rc) = reasoning_content {
+                obj.insert("reasoning_content".into(), serde_json::json!(rc));
+            }
             vec![serde_json::Value::Object(obj)]
         } else if has_tool_result {
             msg.content
@@ -173,6 +182,22 @@ impl OpenAiCompatClient {
                     _ => None,
                 })
                 .collect()
+        } else if msg.role == MessageRole::Assistant && msg.content.iter().any(ContentBlock::is_thinking) {
+            // assistant 消息含 thinking — reasoning_content 作为顶层字段
+            let text = msg.text_content();
+            let thinking = msg.content.iter().find_map(|b| match b {
+                ContentBlock::Thinking { content } => Some(content.clone()),
+                _ => None,
+            });
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".into(), serde_json::json!("assistant"));
+            if !text.is_empty() {
+                obj.insert("content".into(), serde_json::json!(text));
+            }
+            if let Some(rc) = thinking {
+                obj.insert("reasoning_content".into(), serde_json::json!(rc));
+            }
+            vec![serde_json::Value::Object(obj)]
         } else {
             let text: String = msg.text_content();
             vec![serde_json::json!({
@@ -306,6 +331,13 @@ impl OpenAiCompatClient {
     /// Parse an API message into content blocks.
     fn parse_api_message(msg: &ApiMessage) -> Vec<ContentBlock> {
         let mut blocks = Vec::new();
+
+        // DeepSeek v4: 顶层 reasoning_content 字段
+        if let Some(reasoning) = &msg.reasoning_content {
+            if !reasoning.is_empty() {
+                blocks.push(ContentBlock::thinking(reasoning));
+            }
+        }
 
         if let Some(content) = &msg.content {
             match content {

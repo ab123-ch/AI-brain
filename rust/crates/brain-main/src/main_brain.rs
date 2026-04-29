@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use brain_core::config::BrainConfig;
 use brain_core::tool_executor::ToolExecutor;
-use brain_core::types::{MainBrainOutput, ProgressEvent, TurnUsage};
+use brain_core::types::{MainBrainOutput, ProgressEvent, TurnRecord, TurnRole, TurnUsage};
 use brain_llm::{ChatMessage, LlmProvider, ToolDefinition};
 
 use crate::conversation::ConversationHistory;
@@ -107,6 +107,7 @@ impl MainBrain {
             &mut messages,
             &self.tools,
             progress_tx,
+            None,
             self.llm_max_tokens,
             self.llm_temperature,
         )
@@ -163,6 +164,17 @@ impl MainBrain {
                 llm_calls: loop_result.llm_calls,
                 duration_ms: elapsed.as_millis() as u64,
             },
+            turns: {
+                // 在工具调用轨迹前面加上用户输入
+                let mut full_turns = vec![TurnRecord {
+                    role: TurnRole::User,
+                    content: input.to_string(),
+                    tool_call: None,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                }];
+                full_turns.extend(loop_result.turns);
+                full_turns
+            },
         })
     }
 
@@ -206,6 +218,7 @@ impl MainBrain {
                 &mut messages,
                 &tools,
                 Some(&tx),
+                None,
                 max_tokens,
                 temperature,
             )

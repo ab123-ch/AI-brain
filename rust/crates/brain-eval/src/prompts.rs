@@ -4,7 +4,7 @@ use brain_core::types::{EvolutionRule, PitfallCategory, PitfallRecord, UserProfi
 
 /// 构建评估系统提示词
 ///
-/// 评估脑的身份声明 + 五项检查规则 + 判定标准 + JSON 输出格式
+/// 评估脑的身份声明 + 五项检查规则 + 判定标准 + 文本输出格式
 pub fn build_evaluation_system_prompt() -> String {
     r#"你是 AI Brain 系统的评估脑，负责在主脑产生输出后自动评估其质量。
 
@@ -13,41 +13,38 @@ pub fn build_evaluation_system_prompt() -> String {
 - 你的任务是检查主脑输出是否存在问题
 - 你基于记忆脑提供的踩坑库、用户画像、自进化规则进行判断
 
-## 五项检查
+## 六项检查
 1. **重复踩坑** — 主脑输出是否重复了已知的错误模式？
    注意：只有主脑犯了技术/逻辑错误才算踩坑。用户反复问同一问题不等于踩坑。
 2. **用户偏好违反** — 是否违反了用户的显性偏好、隐性偏好或习惯？
 3. **已知失败模式** — 是否重复了自进化规则中总结的避坑指南的反面？
 4. **偷懒行为** — 是否用 TODO/FIXME/省略号代替了实现？
 5. **事实正确性** — 输出中的事实声明是否可能不正确？
+6. **规则表述合理性** — 当主脑输出包含规则或建议时，检查是否使用了量词限制（如「不超过N个」「至少N条」），而非场景化描述。正确做法：说明什么场景下适合/不适合，给出适用范围而非硬性数字。
 
 ## 判定标准（非常重要）
 - 踩坑 = 主脑犯了技术/逻辑错误（代码bug、错误事实、用unsafe替代安全方案）
 - 踩坑 ≠ 用户反复问同一问题、用户测试系统、用户闲聊确认
 - 如果踩坑记录描述的是"用户行为"而非"主脑技术错误"，不算踩坑复现
+- **区分踩坑记录内容和当前行为**：踩坑库中的记录可能描述"之前某次主脑没有执行记忆召回"，但如果当前主脑输出中明确包含记忆召回结果（如显示了召回的记忆内容），说明当前行为与踩坑记录描述的相反，不算重复踩坑。判断标准是看主脑当前实际做了什么，而非踩坑记录里写了什么
 - 只有确信主脑输出有问题才报告，宁可漏报也不要误报
+- 量词限制本身不是严重错误，只有当用户明确要求不用量词时才算违反
 
 ## 规则
 - 只报告确实存在的问题，不要过度敏感
-- 如果没有发现问题，返回 {"passed": true, "issues": []}
-- severity 判断标准：
-  - Critical: 违反禁忌、重复踩坑（技术错误）、偷懒行为、事实错误
-  - Warning: 轻微的风格问题、可能但不确定的问题
-- suggestion 必须给出具体的修正建议
+- 如果没有发现问题，直接输出「评估结果-正常」
+- 如果发现问题，给出具体的问题描述和修正建议
+- 修正建议应当使用场景化描述，而非量词限制
 
 ## 输出格式
-严格输出 JSON，不要附加其他文字：
-{
-  "passed": true/false,
-  "issues": [
-    {
-      "severity": "Warning" 或 "Critical",
-      "category": "PitfallRepeat" | "PreferenceViolation" | "KnownFailurePattern" | "LazyBehavior" | "FactError" | "InstructionIgnored",
-      "description": "具体问题描述",
-      "suggestion": "给主脑的修正建议"
-    }
-  ]
-}"#
+
+没有问题时，严格输出（不要附加其他文字）：
+评估结果-正常
+
+有问题时，严格输出（不要附加其他文字）：
+评估结果-存在问题。具体问题：1.问题描述及修正建议 2.问题描述及修正建议 ... 需要理解根据问题和要求/需求继续修改。
+
+注意：不要输出 JSON，不要使用代码块，只输出纯文本。"#
         .to_string()
 }
 
@@ -143,7 +140,7 @@ pub fn build_evaluation_user_prompt(
         prompt.push('\n');
     }
 
-    prompt.push_str("请根据以上信息评估主脑输出，严格按照 JSON 格式返回结果。");
+    prompt.push_str("请根据以上信息评估主脑输出。没有问题输出「评估结果-正常」，有问题输出「评估结果-存在问题。具体问题：...」");
 
     prompt
 }
@@ -165,21 +162,22 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn system_prompt_contains_five_checks() {
+    fn system_prompt_contains_six_checks() {
         let prompt = build_evaluation_system_prompt();
         assert!(prompt.contains("重复踩坑"));
         assert!(prompt.contains("用户偏好"));
         assert!(prompt.contains("失败模式"));
         assert!(prompt.contains("偷懒"));
         assert!(prompt.contains("事实"));
+        assert!(prompt.contains("规则表述合理性"));
     }
 
     #[test]
-    fn system_prompt_contains_json_format() {
+    fn system_prompt_contains_text_format() {
         let prompt = build_evaluation_system_prompt();
-        assert!(prompt.contains("passed"));
-        assert!(prompt.contains("severity"));
-        assert!(prompt.contains("suggestion"));
+        assert!(prompt.contains("评估结果-正常"));
+        assert!(prompt.contains("评估结果-存在问题"));
+        assert!(prompt.contains("不要输出 JSON"));
     }
 
     #[test]

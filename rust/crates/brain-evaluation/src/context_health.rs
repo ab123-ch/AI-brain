@@ -65,12 +65,13 @@ impl ContextHealthChecker {
         }
 
         let mut brain_reports = Vec::with_capacity(snapshots.len());
-        let mut slim_instructions = Vec::new();
+        let slim_instructions: Vec<SlimInstruction> = Vec::new(); // 瘦身指令已禁用
 
         for snapshot in snapshots {
             let report = self.evaluate_single(snapshot);
-            let instructions = self.generate_slim_instructions(snapshot, &report);
-            slim_instructions.extend(instructions);
+            // 瘦身指令生成已禁用 — 保留健康度评估，不再生成 Compress/Delete/Preserve 指令
+            // let instructions = self.generate_slim_instructions(snapshot, &report);
+            // slim_instructions.extend(instructions);
             brain_reports.push(report);
         }
 
@@ -132,6 +133,7 @@ impl ContextHealthChecker {
     }
 
     /// 根据评估报告生成瘦身指令
+    #[allow(dead_code)]
     fn generate_slim_instructions(
         &self,
         snapshot: &ContextSnapshot,
@@ -227,10 +229,8 @@ mod tests {
         let snapshot = make_snapshot("reasoning", 50, 0.9);
         let result = checker.evaluate(&[snapshot]);
         assert!(result.overall_health > 0.5);
-        assert!(result
-            .slim_instructions
-            .iter()
-            .any(|i| matches!(i, SlimInstruction::Preserve { .. })));
+        // 瘦身指令已禁用，应为空
+        assert!(result.slim_instructions.is_empty());
     }
 
     #[test]
@@ -242,16 +242,7 @@ mod tests {
         let report = &result.brain_reports[0];
         assert!(report.usage_percent > 0.9);
         assert!(report.health_score < 0.5);
-
-        let has_compress = result
-            .slim_instructions
-            .iter()
-            .any(|i| matches!(i, SlimInstruction::Compress { .. }));
-        let has_delete = result
-            .slim_instructions
-            .iter()
-            .any(|i| matches!(i, SlimInstruction::Delete { .. }));
-        assert!(has_compress || has_delete);
+        // 瘦身指令已禁用，只验证健康度评估结果
     }
 
     #[test]

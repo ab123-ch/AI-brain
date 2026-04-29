@@ -54,7 +54,7 @@ pub enum OutputLine {
     },
     EvalResult {
         passed: bool,
-        issue_count: usize,
+        feedback: String,
     },
     /// 评估详情（verbose 模式可见）
     EvalDetail {
@@ -174,12 +174,12 @@ impl OutputArea {
                 // 需求3: 评估脑可见
                 self.spinner_label = Some("评估脑-检查中...".into());
             }
-            ProgressEvent::EvaluationResult { passed, issues } => {
+            ProgressEvent::EvaluationResult { passed, feedback } => {
                 self.spinner_label = None;
                 // 需求3: 评估结果可见
                 self.lines.push(OutputLine::EvalResult {
                     passed: *passed,
-                    issue_count: issues.len(),
+                    feedback: feedback.clone(),
                 });
             }
             ProgressEvent::EvaluationDetail {

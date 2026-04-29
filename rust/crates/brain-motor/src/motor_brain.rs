@@ -241,30 +241,6 @@ impl MotorBrain {
         Ok((conclusion, reasoning_path))
     }
 
-    /// 规则引擎降级
-    fn rule_based_slow_think(_content: &str, tool_hints: &[String]) -> SlowThinkResult {
-        if tool_hints.is_empty() {
-            return SlowThinkResult {
-                conclusion: "无需工具调用".into(),
-                reasoning_path: Vec::new(),
-                confidence: 0.5,
-                sources: Vec::new(),
-                new_experience: None,
-            };
-        }
-
-        SlowThinkResult {
-            conclusion: format!("规划工具调用: {}", tool_hints.join(" → ")),
-            reasoning_path: vec![
-                "分析工具需求".into(),
-                "选择合适工具".into(),
-                "规划执行顺序".into(),
-            ],
-            confidence: 0.75,
-            sources: Vec::new(),
-            new_experience: None,
-        }
-    }
 }
 
 impl BrainAgent for MotorBrain {
@@ -302,38 +278,52 @@ impl BrainAgent for MotorBrain {
 
     /// 慢思考 — 执行具体的工具调用
     ///
-    /// LLM 可用时：调用 LLM 根据任务内容选择最佳工具组合
-    /// LLM 不可用时：降级为规则匹配（extract_tool_hints）
+    /// 需要接入 LLM 才能执行智能工具选择。
+    /// LLM 不可用或调用失败时返回低置信度结果（非降级）。
     fn slow_think(
         &self,
         msg: &BroadcastMessage,
         _context: &ThinkContext,
     ) -> Pin<Box<dyn Future<Output = SlowThinkResult> + Send + '_>> {
         let content = msg.content.clone();
-        let tool_hints = self.extract_tool_hints(&content);
         let llm = self.llm.clone();
         let tools_desc = self.list_tool_descriptions();
 
         Box::pin(async move {
-            match llm {
-                Some(provider) => {
-                    match Self::select_tools_with_llm(&provider, &content, &tools_desc).await {
-                        Ok((conclusion, path)) => SlowThinkResult {
-                            conclusion,
-                            reasoning_path: path,
-                            confidence: 0.85,
-                            sources: vec![brain_core::types::KnowledgeSource::LlmReasoning {
-                                model: provider.model().into(),
-                            }],
-                            new_experience: None,
-                        },
-                        Err(e) => {
-                            tracing::warn!("执行脑 LLM 调用失败，降级规则: {e}");
-                            Self::rule_based_slow_think(&content, &tool_hints)
-                        }
+            let provider = match llm {
+                Some(p) => p,
+                None => {
+                    tracing::error!("执行脑慢思考失败: 未接入 LLM Provider");
+                    return SlowThinkResult {
+                        conclusion: "执行脑未接入 LLM，无法进行慢思考".into(),
+                        reasoning_path: Vec::new(),
+                        confidence: 0.0,
+                        sources: Vec::new(),
+                        new_experience: None,
+                    };
+                }
+            };
+
+            match Self::select_tools_with_llm(&provider, &content, &tools_desc).await {
+                Ok((conclusion, path)) => SlowThinkResult {
+                    conclusion,
+                    reasoning_path: path,
+                    confidence: 0.85,
+                    sources: vec![brain_core::types::KnowledgeSource::LlmReasoning {
+                        model: provider.model().into(),
+                    }],
+                    new_experience: None,
+                },
+                Err(e) => {
+                    tracing::error!("执行脑 LLM 调用失败: {e}");
+                    SlowThinkResult {
+                        conclusion: format!("执行脑 LLM 调用失败: {e}"),
+                        reasoning_path: Vec::new(),
+                        confidence: 0.0,
+                        sources: Vec::new(),
+                        new_experience: None,
                     }
                 }
-                None => Self::rule_based_slow_think(&content, &tool_hints),
             }
         })
     }
@@ -514,7 +504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_think_with_tool_hints() {
+    async fn slow_think_without_llm_returns_low_confidence() {
         let brain = make_brain();
         let msg = make_broadcast("帮我搜索代码并编辑文件");
         let result = brain
@@ -526,7 +516,8 @@ mod tests {
                 },
             )
             .await;
-        assert!(!result.reasoning_path.is_empty());
+        // 无 LLM 时返回低置信度结果
+        assert!((result.confidence - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]

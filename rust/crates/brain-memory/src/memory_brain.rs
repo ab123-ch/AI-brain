@@ -60,6 +60,23 @@ impl Default for MemoryBrainConfig {
 /// 每多少轮查询触发一次四步分析
 const ANALYSIS_INTERVAL: u32 = 5;
 
+/// L2 会话总结的简要信息（供 list_recent_memories 工具返回）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecentSummary {
+    /// 文件路径（LLM 可用 read_file 深入查看）
+    pub file_path: String,
+    /// 会话 ID
+    pub session_id: String,
+    /// 会话开始时间 (RFC3339)
+    pub session_start: String,
+    /// 会话结束时间 (RFC3339)
+    pub session_end: String,
+    /// 标签/关键词
+    pub tags: Vec<String>,
+    /// 事实摘要预览（前 100 字）
+    pub summary_preview: String,
+}
+
 pub struct MemoryBrain {
     id: BrainId,
     config: MemoryBrainConfig,
@@ -120,26 +137,43 @@ impl MemoryBrain {
         self.llm.is_some()
     }
 
-    /// 存储广播消息到 L3 + 提取到 L2
-    pub fn store_broadcast(&mut self, msg: &BroadcastMessage) -> Result<()> {
-        // L3: 原始存储
-        let entry = RawEntry {
-            id: format!("raw-{}", Utc::now().timestamp_millis()),
-            content: msg.content.clone(),
-            raw_input: msg.raw_input.clone(),
-            context: msg.context.clone(),
-            timestamp: msg.timestamp,
-        };
-        self.raw.append(&self.config.session_id, &entry)?;
+    /// 存储完整对话轨迹到 L3 + 提取关键字到 L2
+    ///
+    /// 每条 TurnRecord 直接追加到 L3 jsonl，全量存储（用户、助手、工具调用、工具结果）。
+    /// 同时从用户输入和最终回答中提取关键字存入 L2 短期记忆。
+    pub fn store_turns(&mut self, turns: &[brain_core::types::TurnRecord]) -> Result<()> {
+        // L3: 逐条追加 TurnRecord 到同一个 session jsonl
+        for turn in turns {
+            self.raw.append_turn(&self.config.session_id, turn)?;
+        }
 
-        // L2: 提取关键词存入短期记忆
-        let tags = extract_keywords(&msg.content, self.config.max_keywords);
+        // L2: 从用户输入和最终回答提取关键字存入短期记忆
+        // 收集用户输入和最终回答的文本用于关键字提取
+        let mut texts = Vec::new();
+        for turn in turns {
+            match turn.role {
+                brain_core::types::TurnRole::User => {
+                    texts.push(turn.content.clone());
+                }
+                brain_core::types::TurnRole::Assistant => {
+                    texts.push(turn.content.chars().take(300).collect());
+                }
+                brain_core::types::TurnRole::ToolCall => {
+                    if let Some(ref tc) = turn.tool_call {
+                        texts.push(format!("{}: {}", tc.tool_name, tc.output.chars().take(100).collect::<String>()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let combined = texts.join(" ");
+        let tags = extract_keywords(&combined, self.config.max_keywords);
         let memory_entry = MemoryEntry {
             id: format!("stm-{}", Utc::now().timestamp_millis()),
-            content: msg.content.clone(),
+            content: combined.chars().take(500).collect(),
             tags,
             layer: MemoryLayer::ShortTerm,
-            importance: 0.6, // 初始 importance
+            importance: 0.6,
             source: KnowledgeSource::Memory {
                 memory_id: format!("raw-{}", Utc::now().timestamp_millis()),
                 layer: MemoryLayer::Raw,
@@ -151,7 +185,46 @@ impl MemoryBrain {
             consolidated: false,
         };
         self.short_term.store(memory_entry);
-        // 每次 store 后立即持久化，防止重启丢失
+        if let Err(e) = self.short_term.persist() {
+            tracing::warn!("L2 短期记忆持久化失败: {e}");
+        }
+
+        tracing::info!("L3 完整轨迹追加 {} 条", turns.len());
+        Ok(())
+    }
+
+    /// 存储广播消息（BrainAgent trait 的 on_broadcast 内部调用）
+    ///
+    /// 将广播消息存入 L3 + 提取关键字到 L2。
+    /// orchestrator 应优先使用 store_turns() 存完整轨迹。
+    pub fn store_broadcast(&mut self, msg: &BroadcastMessage) -> Result<()> {
+        let entry = RawEntry {
+            id: format!("raw-{}", Utc::now().timestamp_millis()),
+            content: msg.content.clone(),
+            raw_input: msg.raw_input.clone(),
+            context: msg.context.clone(),
+            timestamp: msg.timestamp,
+        };
+        self.raw.append(&self.config.session_id, &entry)?;
+
+        let tags = extract_keywords(&msg.content, self.config.max_keywords);
+        let memory_entry = MemoryEntry {
+            id: format!("stm-{}", Utc::now().timestamp_millis()),
+            content: msg.content.clone(),
+            tags,
+            layer: MemoryLayer::ShortTerm,
+            importance: 0.6,
+            source: KnowledgeSource::Memory {
+                memory_id: format!("raw-{}", Utc::now().timestamp_millis()),
+                layer: MemoryLayer::Raw,
+            },
+            confidence: 0.7,
+            reference_count: 0,
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            consolidated: false,
+        };
+        self.short_term.store(memory_entry);
         if let Err(e) = self.short_term.persist() {
             tracing::warn!("L2 短期记忆持久化失败: {e}");
         }
@@ -546,6 +619,50 @@ impl MemoryBrain {
         results
     }
 
+    /// 按时间列出最近的 L2 会话总结（供 list_recent_memories 工具调用）
+    ///
+    /// 只返回元数据 + 摘要，不返回全部内容。
+    /// 返回格式：路径 + 时间范围 + tags + fact_summary 摘要
+    pub fn list_recent_summaries(&self, limit: usize) -> Vec<RecentSummary> {
+        let summary_store =
+            SessionSummaryStore::new(Storage::new_lazy(self.config.base_dir.clone()));
+        let summaries = match summary_store.find_recallable() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("列出 L2 会话总结失败: {e}");
+                return Vec::new();
+            }
+        };
+
+        summaries
+            .into_iter()
+            .take(limit)
+            .map(|s| {
+                let summary_preview: String = s.fact_summary.chars().take(100).collect();
+                let file_path = self
+                    .storage_base()
+                    .join("memory")
+                    .join("summaries")
+                    .join(format!("{}.json", s.session_id))
+                    .display()
+                    .to_string();
+                RecentSummary {
+                    file_path,
+                    session_id: s.session_id,
+                    session_start: s.session_start.to_rfc3339(),
+                    session_end: s.session_end.to_rfc3339(),
+                    tags: s.tags,
+                    summary_preview,
+                }
+            })
+            .collect()
+    }
+
+    /// 获取存储根目录
+    fn storage_base(&self) -> std::path::PathBuf {
+        self.config.base_dir.clone()
+    }
+
     /// LLM 语义召回（async，由 orchestrator 调用）
     ///
     /// 把候选记忆给 LLM，让它选出与 query 最相关的 max 条
@@ -554,14 +671,14 @@ impl MemoryBrain {
         query: &str,
         candidates: &[MemoryEntry],
         max: usize,
-    ) -> Vec<MemoryEntry> {
+    ) -> Result<Vec<MemoryEntry>> {
         let llm = match &self.llm {
             Some(l) => l,
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
         if candidates.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // 构建候选列表（截断每个候选到 200 字避免 token 爆炸）
@@ -625,11 +742,13 @@ impl MemoryBrain {
                         }
                     }
                 }
-                results
+                Ok(results)
             }
             Err(e) => {
-                tracing::warn!("LLM 语义召回失败，回退关键词: {e}");
-                Vec::new()
+                tracing::error!("LLM 语义召回失败: {e}");
+                Err(crate::error::MemoryError::ConsolidationFailed(format!(
+                    "LLM 语义召回失败: {e}"
+                )))
             }
         }
     }
@@ -682,18 +801,33 @@ impl MemoryBrain {
         &self.config.session_id
     }
 
-    /// 加载潜意识层的全部摘要文本（供启动时注入主脑）
+    /// 加载潜意识摘要用于注入上下文
+    ///
+    /// 过滤策略：
+    /// 1. 跳过 superseded 条目
+    /// 2. 跳过 importance < 0.5 的低质量条目
+    /// 3. 最多注入 6 条（load_all 已按 importance 降序，take 即 top）
     pub fn load_subconscious_summary(&self) -> Option<String> {
         let sc_store = SubconsciousStore::new(Storage::new_lazy(self.config.base_dir.clone()));
         let entries = sc_store.load_all().ok()?;
-        if entries.is_empty() {
+        let filtered: Vec<_> = entries
+            .into_iter()
+            .filter(|e| !e.superseded && e.importance >= 0.5)
+            .take(6)
+            .collect();
+        if filtered.is_empty() {
             return None;
         }
-        let text = entries
+        let text = filtered
             .iter()
             .map(|e| {
                 let kws = e.trigger_keywords.join("、");
-                format!("• {} (触发词: {}) — {}", e.topic, kws, e.impression)
+                let pitfall = if e.pitfall_hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | 坑: {}", e.pitfall_hint)
+                };
+                format!("• {} (触发: {}) — {}{pitfall} → {}", e.topic, kws, e.impression, e.reference_hint)
             })
             .collect::<Vec<_>>()
             .join("\n");

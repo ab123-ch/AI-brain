@@ -835,14 +835,27 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search_memory",
-            description: "Search past session memory for relevant content. Use when you need to recall details from previous conversations — specific tasks, decisions, code changes, or user preferences. Returns matching raw conversation excerpts and session summaries, sorted by relevance.",
+            description: "按关键字搜索历史记忆。适合按内容/主题查找，如「DeepSeek 调研」「架构设计」「踩坑」。返回匹配的记忆条目（L1归档、L2会话摘要、潜意识印象）。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search keywords or phrase describing what to find" },
+                    "query": { "type": "string", "description": "搜索关键词，多个词用空格分隔" },
                     "max_results": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "list_recent_memories",
+            description: "按时间列出最近的会话记忆（L2 会话总结）。适合用户说「刚刚」「昨天」「最近」「上次」等时间相关表述时使用。返回每条记忆的文件路径、时间范围、标签和摘要预览。如需查看完整内容，再用 read_file 工具读取对应路径。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5, "description": "返回最近几条会话总结" }
+                },
+                "required": [],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,

@@ -42,10 +42,9 @@ impl SensoryBrain {
     ///   2. 构建环境上下文 (date, cwd, git_branch)
     ///   3. 调用 LLM 生成自然语言描述
     ///   4. 投递到广播通道
-    ///   5. 降级: LLM 失败 → 直接投递原始输入 + 标记 "未解析"
     pub async fn process_input(&self, raw_input: &str) -> Result<String, SensoryError> {
         let context = gather_context();
-        let content = self.parse_with_llm(raw_input, &context).await;
+        let content = self.parse_with_llm(raw_input, &context).await?;
 
         let msg = BroadcastMessage {
             content: content.clone(),
@@ -58,24 +57,24 @@ impl SensoryBrain {
         Ok(content)
     }
 
-    /// LLM 解析，降级策略
-    async fn parse_with_llm(&self, raw_input: &str, context: &BrainContext) -> String {
+    /// LLM 解析
+    async fn parse_with_llm(
+        &self,
+        raw_input: &str,
+        context: &BrainContext,
+    ) -> Result<String, SensoryError> {
         let prompt = format!(
             "当前环境: 日期={}, 目录={}, 平台={}\n用户输入: {}",
             context.current_date, context.cwd, context.platform, raw_input
         );
 
-        match self
-            .llm
+        self.llm
             .complete(&self.model, &self.system_prompt, &prompt, 512)
             .await
-        {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                tracing::warn!("LLM 解析失败，降级为原始输入: {e}");
-                format!("[未解析] {raw_input}")
-            }
-        }
+            .map_err(|e| {
+                tracing::error!("LLM 解析失败: {e}");
+                SensoryError::LlmFailed(e.to_string())
+            })
     }
 
     pub fn id(&self) -> &BrainId {
@@ -120,21 +119,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_llm_failure_degrades_gracefully() {
+    async fn test_llm_failure_returns_error() {
         let bus = make_bus();
-        let mut broadcast_rx = bus.subscribe_broadcast();
 
         let sensory = SensoryBrain::new(
             "haiku",
             bus.clone(),
             Box::new(crate::llm::FailingLlmProvider),
         );
-        drop(bus);
 
-        let result = sensory.process_input("测试降级").await.unwrap();
-        assert!(result.contains("[未解析]"));
-
-        let msg = broadcast_rx.recv().await.unwrap();
-        assert_eq!(msg.content, "[未解析] 测试降级");
+        let result = sensory.process_input("测试失败").await;
+        assert!(result.is_err());
     }
 }

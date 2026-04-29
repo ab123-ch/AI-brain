@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_think_generates_result() {
+    async fn slow_think_without_llm_returns_low_confidence() {
         let brain = make_brain();
         let msg = make_broadcast("分析系统性能瓶颈");
         let result = brain
@@ -305,8 +305,9 @@ mod tests {
                 },
             )
             .await;
-        assert!(!result.reasoning_path.is_empty());
-        assert!(result.new_experience.is_some());
+        // 无 LLM 时，reason() 返回 Err，slow_think 捕获后返回低置信度结果
+        assert!((result.confidence - 0.1).abs() < f64::EPSILON);
+        assert!(result.reasoning_path.is_empty());
     }
 
     #[test]

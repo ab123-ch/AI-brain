@@ -194,8 +194,8 @@ mod tests {
         let result = brain.evaluate(snapshots);
         // 整体健康应较低
         assert!(result.overall_health < 0.5);
-        // 应生成瘦身指令
-        assert!(!result.slim_instructions.is_empty());
+        // 瘦身指令已禁用
+        assert!(result.slim_instructions.is_empty());
     }
 
     #[test]
@@ -239,20 +239,8 @@ mod tests {
         ];
         let result = brain.evaluate(snapshots);
 
-        // memory 应有瘦身指令
-        let memory_instructions: Vec<_> = result
-            .slim_instructions
-            .iter()
-            .filter(|i| match i {
-                brain_core::types::SlimInstruction::Delete { message_ids, .. } => {
-                    message_ids.iter().any(|id| id.starts_with("memory"))
-                }
-                brain_core::types::SlimInstruction::Compress { message_ids, .. } => {
-                    message_ids.iter().any(|id| id.starts_with("memory"))
-                }
-                brain_core::types::SlimInstruction::Preserve { .. } => false,
-            })
-            .collect();
-        assert!(!memory_instructions.is_empty());
+        // 瘦身指令已禁用，只验证健康度报告
+        assert_eq!(result.brain_reports.len(), 2);
+        assert!(result.slim_instructions.is_empty());
     }
 }

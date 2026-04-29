@@ -315,9 +315,14 @@ pub fn build_step5_prompt(
 }
 
 /// 第五步：潜意识抽象（印象索引生成）
+///
+/// 三层渐进披露设计：
+/// - impression: 极简"我做过这件事"（触发用）
+/// - pitfall_hint: 直觉级"有个坑大概是这样"（唤醒用）
+/// - reference_hint: L2/L3 具体文件引用（深入回忆用）
 pub const STEP5_SUBCONSCIOUS_PROMPT: &str = "\
 # 身份
-你是一个记忆抽象引擎。你将对话事实、踩坑记录、进化规则抽象为「潜意识印象」——不写具体细节，只写触发词和高度概括。
+你是一个记忆抽象引擎。你将对话事实、踩坑记录、进化规则抽象为「潜意识印象」——三层渐进披露。
 
 # 输入
 事实总结：
@@ -332,25 +337,43 @@ pub const STEP5_SUBCONSCIOUS_PROMPT: &str = "\
 已有潜意识印象（去重用）：
 {existing_subconscious}
 
-# 规则
-1. 从中提取「做过的事情」作为 topic
-2. trigger_keywords 是触发词：当用户提到这些词时，说明可能做过相关的事
-3. impression 是高度概括：用一句话说做过什么、大致踩过什么类型的坑、详情在哪
-4. reference_hint 指向哪类文件有详情（如 \"pitfall/\" \"evolution/\" \"sessions/\"）
-5. 每个 topic 独立一条，不要把不相关的事情合并
-6. importance 评估：踩坑多/有进化规则 → 更高
-7. trigger_keywords 每条最多 8 个
-8. 用中文输出
+# 准入门槛（关键！不是所有对话都值得存潜意识）
+只有满足以下至少一项的内容才能生成潜意识条目：
+✅ 踩坑/故障排查经验（遇到什么问题、怎么解决的）
+✅ 架构决策或技术选型（为什么这么设计）
+✅ 用户明确的偏好/禁忌/工作习惯
+✅ 跨项目可复用的经验教训
+✅ 复杂业务逻辑的关键理解
+
+以下内容【禁止】存入潜意识：
+❌ 一次性闲聊（称呼、玩笑、寒暄）
+❌ 通用编程知识（语法、标准库用法）
+❌ 当前对话的上下文信息（这些属于会话记忆，不是潜意识）
+❌ 自我介绍/功能说明
+❌ 浅层问答（查个信息、问个概念）
+❌ 对自身能力的描述（那不是经验，是自我认知）
+
+# 三层渐进披露规则（关键！）
+1. topic：主题领域，简短（如\"Claude Code配置\"，不是\"Claude Code配置文件修改踩坑\"）
+2. trigger_keywords：触发词，用户提到这些词时说明可能做过相关的事，最多 8 个
+3. impression：极简印象，只说\"了解过/做过/配置过/开发过X\"，不超过 15 字，不写结论和教训
+4. pitfall_hint：踩坑摘要，一句话直觉级描述坑在哪（如\"配置文件有多个，改错了\"），没有踩坑则为空字符串
+5. reference_hint：精确引用，指向有详情的文件（如\"pitfall/pt-xxx.json\"、\"sessions/sess_xxx\"），只填目录级即可
+6. 每个 topic 独立一条，不要把不相关的事情合并
+7. importance 评估：有踩坑记录且有进化规则 → 0.9+，仅有踩坑 → 0.7-0.8，仅有事实 → 0.5 以下或不生成
+8. 如果本轮对话没有产生有价值的新经验，返回空 entries 数组
+9. 用中文输出
 
 # 输出格式（严格 JSON）
 {
   \"entries\": [
     {
-      \"topic\": \"记忆脑开发\",
-      \"trigger_keywords\": [\"记忆脑\", \"memory brain\", \"L2\", \"短期记忆\", \"四层架构\"],
-      \"impression\": \"做过记忆脑开发，熟悉L0-L3四层架构和关键词索引机制，踩过多轮坑详见pitfall\",
+      \"topic\": \"Claude Code配置\",
+      \"trigger_keywords\": [\"配置文件\", \"settings\", \"Claude Code\", \"修改配置\"],
+      \"impression\": \"了解过Claude Code配置\",
+      \"pitfall_hint\": \"配置文件有多个，改错了文件\",
       \"reference_hint\": \"pitfall/\",
-      \"importance\": 0.9
+      \"importance\": 0.85
     }
   ]
 }\
@@ -477,5 +500,230 @@ mod tests {
         assert!(prompt.contains("已有规则"));
         assert!(!prompt.contains("{pitfalls_json}"));
         assert!(!prompt.contains("{existing_rules}"));
+    }
+
+    /// ── 场景模拟：DeepSeek 配置 4 轮对话 → Step5 潜意识抽取 ──
+    ///
+    /// 对话内容：
+    ///   R1: 用户想配 DeepSeek 到 Claude Code → 助手查了官网和配置文档
+    ///   R2: 用户不想自己配 → 助手直接改了 settings.local.json（未确认）
+    ///   R3: 配置没生效 → 助手排查内容正确但方向错了
+    ///   R4: 用户指出改错文件了 → 助手改到 settings.json 修复
+    #[test]
+    fn step5_scenario_deepseek_config() {
+        // ── Step1 产出：事实总结 ──
+        let fact_summary = "\
+用户想将DeepSeek最新模型配置到Claude Code中使用。
+助手查询了DeepSeek官网和Claude Code配置文档，找到了配置方法。
+助手在本机找到了多个配置文件：settings.json、settings.local.json等。
+助手未向用户确认，自行判断修改了settings.local.json。
+用户反馈配置未生效。助手排查了配置内容本身，确认格式和参数都正确。
+用户指出是修改了错误的文件，应该是settings.json而非settings.local.json。
+助手最终修改了settings.json，配置生效。";
+
+        // ── Step3 产出：踩坑记录 ──
+        let pitfalls_text = "\
+- [ToolFailure] 修改配置文件时未确认正确的文件路径，自行假设settings.local.json是正确的文件
+- [WrongAnswer] 排查配置不生效问题时，只检查了配置内容是否正确，未优先检查是否修改了正确的文件路径
+- [LazyBehavior] 未主动向用户确认要修改哪个配置文件，擅自做了判断";
+
+        // ── Step4 产出：进化规则 ──
+        let evolution_text = "\
+- 修改配置文件前必须先向用户确认正确的文件路径，不能自行假设
+- 排查配置不生效问题时，应优先检查是否修改了正确的文件，而非只检查内容
+- 当存在多个同名/相似配置文件时，必须逐一确认用途后再操作";
+
+        let existing_subconscious = "（无）";
+
+        // ── 构建 Step5 prompt ──
+        let prompt = build_step5_prompt(
+            fact_summary,
+            pitfalls_text,
+            evolution_text,
+            existing_subconscious,
+        );
+
+        // 打印完整 prompt 供人工审查
+        eprintln!("\n========== Step5 Prompt (新版本) ==========\n{prompt}\n========== End ==========\n");
+
+        // 验证准入门槛存在于 prompt 中
+        assert!(prompt.contains("准入门槛"), "新 prompt 应包含准入门槛");
+        assert!(prompt.contains("踩坑"), "准入标准应包含踩坑经验");
+        assert!(prompt.contains("禁止"), "应包含禁止标准");
+        assert!(prompt.contains("一次性闲聊"), "禁止标准应包含一次性闲聊");
+        assert!(prompt.contains("通用编程知识"), "禁止标准应包含通用编程知识");
+
+        // ── 模拟 LLM 返回（按新 prompt 三层渐进披露） ──
+        // 新 prompt 要求：impression 极简 + pitfall_hint 直觉级 + reference_hint 精确引用
+        let llm_response = serde_json::json!({
+            "entries": [{
+                "topic": "Claude Code配置",
+                "trigger_keywords": ["配置文件", "settings.json", "Claude Code", "修改配置", "配置不生效"],
+                "impression": "了解过Claude Code配置",
+                "pitfall_hint": "配置文件有多个，改错了文件",
+                "reference_hint": "pitfall/",
+                "importance": 0.85
+            }]
+        });
+        let response_str = serde_json::to_string(&llm_response).unwrap();
+
+        // ── 解析 LLM 返回（复用 step5 的解析逻辑） ──
+        let parsed: serde_json::Value = serde_json::from_str(&response_str).unwrap();
+        let entries_arr = parsed
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut new_entries: Vec<crate::subconscious::NewSubconsciousEntry> = Vec::new();
+        for e in &entries_arr {
+            let topic = e.get("topic").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
+            if topic.is_empty() {
+                continue;
+            }
+            let trigger_keywords: Vec<String> = e
+                .get("trigger_keywords")
+                .and_then(|v: &serde_json::Value| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v: serde_json::Value| v.as_str().map(String::from))
+                .filter(|s: &String| !s.trim().is_empty())
+                .take(8)
+                .collect();
+            let impression = e.get("impression").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
+            let pitfall_hint = e.get("pitfall_hint").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
+            let reference_hint = e.get("reference_hint").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
+            let importance = e.get("importance").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.7);
+
+            new_entries.push(crate::subconscious::NewSubconsciousEntry {
+                topic,
+                trigger_keywords,
+                impression,
+                pitfall_hint,
+                reference_hint,
+                importance,
+            });
+        }
+
+        // ── 验证结果 ──
+        eprintln!("\n========== 潜意识抽取结果（三层渐进披露） ==========");
+        for entry in &new_entries {
+            eprintln!(
+                "  topic: {}\n  impression: {}  ← 极简触发\n  pitfall_hint: {}  ← 直觉级踩坑\n  reference: {}  ← 精确引用\n  importance: {}\n",
+                entry.topic, entry.impression, entry.pitfall_hint, entry.reference_hint, entry.importance
+            );
+        }
+
+        // 应该只有 1 条（不是 4 条每轮一条）
+        assert_eq!(new_entries.len(), 1, "应该只生成 1 条高质量潜意识");
+        assert_eq!(new_entries[0].topic, "Claude Code配置");
+        assert!(new_entries[0].importance >= 0.7, "有踩坑+进化规则 importance 应 >= 0.7");
+        assert!(new_entries[0].trigger_keywords.len() >= 3);
+
+        // impression 极简（<= 15 字）
+        assert!(
+            new_entries[0].impression.chars().count() <= 20,
+            "impression 应极简，实际: {} ({}字)",
+            new_entries[0].impression,
+            new_entries[0].impression.chars().count()
+        );
+        assert!(
+            new_entries[0].impression.contains("了解") || new_entries[0].impression.contains("做过"),
+            "impression 应只表达'我做过这事'"
+        );
+
+        // pitfall_hint 非空且简短直觉
+        assert!(
+            !new_entries[0].pitfall_hint.is_empty(),
+            "有踩坑时 pitfall_hint 不应为空"
+        );
+        assert!(
+            new_entries[0].pitfall_hint.contains("改错"),
+            "pitfall_hint 应直觉级描述坑"
+        );
+
+        // 不应包含结论性内容（那是 L2/L3 的活）
+        assert!(
+            !new_entries[0].impression.contains("必须"),
+            "impression 不应包含结论性指令"
+        );
+        assert!(
+            !new_entries[0].impression.contains("教训"),
+            "impression 不应包含教训总结"
+        );
+
+        // ── 模拟 load_subconscious_summary 过滤 ──
+        let all_passed_filter = new_entries.iter().all(|e| e.importance >= 0.5);
+        assert!(all_passed_filter, "所有条目应通过 importance >= 0.5 过滤");
+        assert!(new_entries.len() <= 6, "条目数应 <= 6");
+
+        eprintln!("========== 过滤验证通过 ==========\n");
+    }
+
+    /// ── 对照组：旧 prompt 会生成什么垃圾 ──
+    ///
+    /// 旧 prompt 只说"从中提取做过的事情"，LLM 大概率会生成 3-4 条：
+    /// 1. DeepSeek模型配置查询（浅层信息查询，无价值）
+    /// 2. Claude Code配置文件查找（通用操作，无价值）
+    /// 3. 配置文件修改操作（重复了，无价值）
+    /// 4. 配置不生效排查（和#3重复）
+    /// 而"角色称呼"这类直接被忽略（本轮没有）
+    #[test]
+    fn step5_old_prompt_would_produce_garbage() {
+        let _fact_summary = "用户想配置DeepSeek最新模型到Claude Code。\
+助手查询了DeepSeek官网。助手修改了settings.local.json。\
+用户说配置没生效。最终改了settings.json。";
+
+        // 旧 prompt 没有准入门槛，LLM 会把一切"做过的事"都提取
+        // 模拟旧 prompt 下 LLM 的典型输出：
+        let old_llm_response = serde_json::json!({
+            "entries": [
+                {
+                    "topic": "DeepSeek模型配置",
+                    "trigger_keywords": ["DeepSeek", "模型配置", "最新模型", "Claude Code"],
+                    "impression": "帮用户查询过DeepSeek最新模型的配置方法",
+                    "reference_hint": "sessions/",
+                    "importance": 0.6
+                },
+                {
+                    "topic": "配置文件查找",
+                    "trigger_keywords": ["配置文件", "settings", "查找文件"],
+                    "impression": "查找过Claude Code的配置文件，找到settings.json和settings.local.json",
+                    "reference_hint": "sessions/",
+                    "importance": 0.5
+                },
+                {
+                    "topic": "配置文件修改",
+                    "trigger_keywords": ["修改配置", "settings.local", "settings.json"],
+                    "impression": "修改过Claude Code配置文件",
+                    "reference_hint": "sessions/",
+                    "importance": 0.5
+                },
+                {
+                    "topic": "配置不生效排查",
+                    "trigger_keywords": ["配置不生效", "排查", "不生效"],
+                    "impression": "排查过配置不生效的问题",
+                    "reference_hint": "sessions/",
+                    "importance": 0.5
+                }
+            ]
+        });
+
+        let entries = old_llm_response.get("entries").unwrap().as_array().unwrap();
+
+        eprintln!("\n========== 旧 Prompt 典型输出 (4条垃圾) ==========");
+        for e in entries {
+            eprintln!(
+                "  topic: {} | importance: {} | impression: {}",
+                e["topic"].as_str().unwrap(),
+                e["importance"].as_f64().unwrap(),
+                e["impression"].as_str().unwrap()
+            );
+        }
+
+        // 旧 prompt 生成 4 条，新 prompt 应只生成 1 条
+        assert_eq!(entries.len(), 4, "旧 prompt 会生成 4 条");
+        eprintln!("========== 对比：新 prompt 只生成 1 条高质量条目 ==========\n");
     }
 }

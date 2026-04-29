@@ -40,6 +40,8 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:3141")]
         addr: String,
     },
+    /// v2 路径集成测试（3 轮对话，验证 eval_gate + 评估脑）
+    V2Test,
 }
 
 #[derive(Subcommand)]
@@ -127,6 +129,78 @@ async fn run_command(cli: Cli) {
         Some(Commands::Brain { action }) => {
             let orch = Orchestrator::new().await.expect("初始化失败");
             handle_brain_command(orch, action).await;
+        }
+        Some(Commands::V2Test) => {
+            use std::sync::Arc;
+            use std::time::Duration;
+            use brain_core::types::ProgressEvent;
+
+            println!("=== v2 路径集成测试 ===");
+            let orch: Arc<Orchestrator> = Arc::new(
+                Orchestrator::new().await.expect("初始化失败"),
+            );
+
+            let queries = vec![
+                "你好，简单介绍一下你自己",
+                "帮我写一个 Rust 函数计算阶乘，只要函数签名和实现",
+                "今天天气怎么样",
+            ];
+
+            for (i, query) in queries.iter().enumerate() {
+                println!("\n=== 第 {} 轮 ===", i + 1);
+                println!("输入: {query}");
+
+                let (rx, handle) = Arc::clone(&orch).query_streaming(query);
+                let mut rx = rx;
+
+                // 在后台收集进度事件
+                let collect = tokio::spawn(async move {
+                    let mut events: Vec<String> = Vec::new();
+                    loop {
+                        match tokio::time::timeout(Duration::from_secs(120), rx.recv()).await {
+                            Ok(Some(event)) => {
+                                let desc = match &event {
+                                    ProgressEvent::Connecting { brain, model } =>
+                                        format!("连接 {} ({})", brain, model),
+                                    ProgressEvent::ToolStart { brain, tool_name, .. } =>
+                                        format!("{} 工具: {}", brain, tool_name),
+                                    ProgressEvent::ToolDone { brain, tool_name, duration_ms, is_error, .. } =>
+                                        format!("{} 完成: {} ({}ms{})", brain, tool_name, duration_ms,
+                                            if *is_error { " ERR" } else { "" }),
+                                    ProgressEvent::Evaluating => "评估脑评估中".into(),
+                                    ProgressEvent::EvaluationResult { passed, feedback } =>
+                                        format!("评估结果: passed={}, {}", passed, feedback),
+                                    ProgressEvent::Done => "完成".into(),
+                                    _ => format!("{:?}", event),
+                                };
+                                events.push(desc);
+                                if matches!(event, ProgressEvent::Done) { break; }
+                            }
+                            Ok(None) => break,
+                            Err(_) => { events.push("超时".into()); break; }
+                        }
+                    }
+                    events
+                });
+
+                match handle.await {
+                    Ok(Ok(output)) => {
+                        let p: String = output.answer.chars().take(200).collect();
+                        println!("回答: {p}");
+                    }
+                    Ok(Err(e)) => println!("错误: {e}"),
+                    Err(e) => println!("Join错误: {e}"),
+                }
+
+                if let Ok(events) = collect.await {
+                    println!("进度事件:");
+                    for ev in &events { println!("  - {ev}"); }
+                }
+            }
+
+            println!("\n=== 测试完成，关闭 ===");
+            orch.shutdown_with_analysis().await;
+            println!("记忆已保存");
         }
     }
 }

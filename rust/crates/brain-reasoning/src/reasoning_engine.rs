@@ -42,11 +42,13 @@ impl ReasoningEngine {
 
     /// 执行慢思考推理
     ///
-    /// 优先走 LLM，降级时走规则引擎。
+    /// 需要 LLM 才能执行推理，LLM 不可用时返回错误。
     pub async fn reason(&self, msg: &BroadcastMessage) -> Result<SlowThinkResult> {
         match &self.llm {
             Some(provider) => self.reason_with_llm(provider, msg).await,
-            None => Ok(self.reason_with_rules(msg)),
+            None => Err(crate::error::ReasoningError::Experience(
+                "推理脑未接入 LLM Provider，无法进行推理".into(),
+            )),
         }
     }
 
@@ -106,30 +108,11 @@ impl ReasoningEngine {
                 })
             }
             Err(e) => {
-                tracing::warn!("LLM 推理失败，降级到规则引擎: {e}");
-                Ok(self.reason_with_rules(msg))
+                tracing::error!("LLM 推理失败: {e}");
+                Err(crate::error::ReasoningError::Experience(format!(
+                    "LLM 推理失败: {e}"
+                )))
             }
-        }
-    }
-
-    /// 规则引擎降级（原有逻辑）
-    fn reason_with_rules(&self, msg: &BroadcastMessage) -> SlowThinkResult {
-        let negative_examples = self.pattern_matcher.get_negative_examples(msg, 3);
-        let reasoning_path = self.generate_rule_path(msg, &negative_examples);
-        let conclusion = self.synthesize_conclusion(msg, &reasoning_path);
-
-        SlowThinkResult {
-            conclusion,
-            reasoning_path,
-            confidence: 0.6,
-            sources: vec![brain_core::types::KnowledgeSource::LlmReasoning {
-                model: "rule-engine".into(),
-            }],
-            new_experience: Some(brain_core::types::NewExperience {
-                trigger_pattern: self.extract_trigger_pattern(msg),
-                reasoning_path: vec!["规则推理".into()],
-                tools_used: vec![],
-            }),
         }
     }
 
@@ -218,31 +201,6 @@ impl ReasoningEngine {
         (conclusion, steps)
     }
 
-    fn generate_rule_path(
-        &self,
-        msg: &BroadcastMessage,
-        negative_examples: &[String],
-    ) -> Vec<String> {
-        let mut path = Vec::new();
-        path.push(format!(
-            "分析输入: {}",
-            msg.content.chars().take(100).collect::<String>()
-        ));
-        path.push("检索记忆脑中的相关历史".into());
-
-        if !negative_examples.is_empty() {
-            path.push(format!("参考反面案例: {}", negative_examples.join("; ")));
-        }
-
-        path.push("基于历史经验和当前需求制定推理方案".into());
-        path.push("验证推理路径的合理性".into());
-        path
-    }
-
-    fn synthesize_conclusion(&self, msg: &BroadcastMessage, reasoning_path: &[String]) -> String {
-        format!("基于 {} 步推理分析: {}", reasoning_path.len(), msg.content)
-    }
-
     fn extract_trigger_pattern(&self, msg: &BroadcastMessage) -> String {
         msg.content
             .split(&[' ', ',', '，', '。', '、', '；', '？', '！'][..])
@@ -300,15 +258,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reason_with_rules_fallback() {
+    async fn reason_without_llm_returns_error() {
         let engine = make_engine();
         let msg = make_broadcast("帮我分析代码中的性能问题");
-        let result = engine.reason(&msg).await.unwrap();
-        assert!(!result.reasoning_path.is_empty());
-        assert!(result.confidence > 0.0);
-        assert!(result.new_experience.is_some());
-        // 规则引擎置信度 0.6
-        assert!((result.confidence - 0.6).abs() < f64::EPSILON);
+        let result = engine.reason(&msg).await;
+        assert!(result.is_err());
     }
 
     #[test]

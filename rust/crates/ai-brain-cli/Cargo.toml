@@ -19,8 +19,10 @@ brain-reasoning = { path = "../brain-reasoning" }
 brain-motor = { path = "../brain-motor" }
 brain-validation = { path = "../brain-validation" }
 brain-evaluation = { path = "../brain-evaluation" }
+brain-eval = { path = "../brain-eval" }
 brain-llm = { path = "../brain-llm" }
 brain-evolution = { path = "../brain-evolution" }
+brain-hooks = { path = "../brain-hooks" }
 
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-std", "io-util", "signal"] }
 clap = { version = "4", features = ["derive"] }

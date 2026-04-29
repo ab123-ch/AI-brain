@@ -40,6 +40,15 @@ impl RawLayer {
         self.storage.append_jsonl(&path, &entry)
     }
 
+    /// 追加一条 TurnRecord 到 L3 jsonl
+    pub fn append_turn(&self, session_id: &str, turn: &brain_core::types::TurnRecord) -> Result<()> {
+        let path = self
+            .storage
+            .sessions_dir()
+            .join(format!("{session_id}.jsonl"));
+        self.storage.append_jsonl(&path, &turn)
+    }
+
     /// 读取一个会话的所有原始记忆
     pub fn read_session(&self, session_id: &str) -> Result<Vec<RawEntry>> {
         let path = self

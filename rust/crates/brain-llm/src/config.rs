@@ -13,6 +13,9 @@ pub struct LlmConfig {
     pub llm: LlmSection,
     #[serde(default)]
     pub brain: BrainSection,
+    /// Hook 系统配置（原始 toml::Value，由 ai-brain-cli 层解析为 brain-hooks::HooksConfig）
+    #[serde(default)]
+    pub hooks: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +185,7 @@ impl LlmConfig {
                 defaults: LlmDefaults::default(),
             },
             brain: BrainSection::default(),
+            hooks: None,
         }
     }
 }

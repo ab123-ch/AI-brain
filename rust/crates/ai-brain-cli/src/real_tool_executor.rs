@@ -127,6 +127,65 @@ impl ToolExecutor for RealToolExecutor {
             });
         }
 
+        // special-case: list_recent_memories 由 MemoryBrain 处理
+        if name == "list_recent_memories" {
+            let memory_brain = self.memory_brain.clone();
+            return Box::pin(async move {
+                let start = std::time::Instant::now();
+                let mem: Arc<tokio::sync::Mutex<MemoryBrain>> = match memory_brain {
+                    Some(m) => m,
+                    None => {
+                        return ToolExecutionResult {
+                            tool_name: tool_name_owned,
+                            output: "list_recent_memories: MemoryBrain not available".into(),
+                            is_error: true,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        };
+                    }
+                };
+                let limit = input
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5)
+                    .min(20) as usize;
+
+                let summaries = {
+                    let guard = mem.lock().await;
+                    guard.list_recent_summaries(limit)
+                };
+
+                let output = if summaries.is_empty() {
+                    "暂无历史会话记忆".into()
+                } else {
+                    let lines: Vec<String> = summaries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            let tags = s.tags.join(", ");
+                            format!(
+                                "{}. [{}] {} ~ {}\n   标签: {}\n   摘要: {}\n   路径: {}",
+                                i + 1,
+                                s.session_id,
+                                s.session_start,
+                                s.session_end,
+                                tags,
+                                s.summary_preview,
+                                s.file_path,
+                            )
+                        })
+                        .collect();
+                    lines.join("\n\n")
+                };
+
+                ToolExecutionResult {
+                    tool_name: tool_name_owned,
+                    output,
+                    is_error: false,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                }
+            });
+        }
+
         Box::pin(async move {
             let start = std::time::Instant::now();
             let result = tokio::task::spawn_blocking(move || tools::execute_tool(&name, &input))

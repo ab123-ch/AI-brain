@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -16,13 +16,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
-use tui_textarea::Input;
-
 use brain_core::types::ProgressEvent;
 
 use crate::orchestrator::Orchestrator;
 
-use super::input::InputArea;
+use super::input::{InputArea, InputResult};
 use super::output::{OutputArea, OutputLine};
 use super::status::StatusBar;
 
@@ -44,6 +42,8 @@ pub struct App {
     done_received: bool,
     /// 待发送消息队列（busy 时 Enter 提交的消息排队等处理）
     pending_queue: Vec<String>,
+    /// 上一次键盘事件时间
+    last_event_time: Instant,
 }
 
 impl App {
@@ -52,7 +52,7 @@ impl App {
         let status_structured = orch.status_structured();
         let mut output = OutputArea::new();
         output.push_system("AI Brain v2 一主二从系统");
-        output.push_system("输入查询 | :help 命令 | Ctrl+E 展开/收起回复");
+        output.push_system("输入查询 | :help 命令 | Enter 提交 | Shift+Enter 换行");
 
         Self {
             output,
@@ -66,6 +66,7 @@ impl App {
             query_handle: None,
             done_received: false,
             pending_queue: Vec::new(),
+            last_event_time: Instant::now(),
         }
     }
 
@@ -162,15 +163,20 @@ impl App {
 
     // ─── 渲染 ──────────────────────────────────────────────────────
 
-    fn render(&self, f: &mut ratatui::Frame) {
+    fn render(&mut self, f: &mut ratatui::Frame) {
         let size = f.area();
+
+        // 更新折行宽度（终端 resize 时自动适配）
+        self.input.set_wrap_width(size.width);
+
+        let input_h = self.input.desired_height();
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(10),
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(input_h),
             ])
             .split(size);
 
@@ -388,7 +394,7 @@ impl App {
 
             OutputLine::EvalResult {
                 passed,
-                issue_count,
+                feedback,
             } => {
                 if *passed {
                     vec![Line::from(Span::styled(
@@ -396,10 +402,18 @@ impl App {
                         Style::default().fg(Color::Green),
                     ))]
                 } else {
-                    vec![Line::from(Span::styled(
-                        format!("  评估 ✘ {issue_count} 个问题"),
+                    // 显示评估脑反馈文本
+                    let mut lines = vec![Line::from(Span::styled(
+                        "  评估 ✘ 发现问题",
                         Style::default().fg(Color::Yellow),
-                    ))]
+                    ))];
+                    for line in feedback.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", line),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    }
+                    lines
                 }
             }
 
@@ -467,6 +481,10 @@ impl App {
     // ─── 事件处理 ──────────────────────────────────────────────────
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        let now = Instant::now();
+        self.last_event_time = now;
+
+        // ── App 层独占按键 ──
         match (key.modifiers, key.code) {
             // Ctrl+C / Esc — 取消查询或退出
             (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
@@ -482,17 +500,17 @@ impl App {
                 self.should_quit = true;
                 return true;
             }
-            // Ctrl+E — 切换 Verbose 模式（思考+记忆+评估详情）
+            // Ctrl+E — 切换 Verbose 模式
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
                 self.output.toggle_verbose();
                 return true;
             }
-            // Shift+↑ / PageUp — 向上滚动
+            // Shift+↑ / PageUp — 向上滚动输出
             (KeyModifiers::SHIFT, KeyCode::Up) | (_, KeyCode::PageUp) => {
                 self.output.scroll_up(5);
                 return true;
             }
-            // Shift+↓ / PageDown — 向下滚动
+            // Shift+↓ / PageDown — 向下滚动输出
             (KeyModifiers::SHIFT, KeyCode::Down) | (_, KeyCode::PageDown) => {
                 self.output.scroll_down(5);
                 return true;
@@ -500,15 +518,14 @@ impl App {
             _ => {}
         }
 
-        // Enter 提交：busy 时排队，否则直接发送
-        if key.code == KeyCode::Enter {
-            self.submit_input();
-            return true;
+        // ── 委托给 InputArea ──
+        match self.input.apply_key(key) {
+            InputResult::Submit => self.submit_input(),
+            InputResult::Consumed => {}
+            InputResult::Ignored => {
+                // 未识别的按键：静默忽略（不写入 textarea，避免与 original 不同步）
+            }
         }
-
-        // 其他键（打字、方向键等）始终交给 textarea，不受 busy 限制
-        let input: Input = key.into();
-        self.input.textarea.input(input);
         true
     }
 
@@ -664,9 +681,12 @@ impl App {
                     "  :status         — 系统状态",
                     "  :memory         — 记忆统计",
                     "  :quit / Ctrl+C  — 退出并保存",
+                    "  Enter           — 提交消息",
+                    "  Shift+Enter     — 插入换行",
                     "  Ctrl+E          — 显示/隐藏详情（思考+记忆+评估）",
                     "  Shift+↑/↓       — 上下滚动输出",
                     "  ↑/↓             — 翻阅输入历史",
+                    "  Ctrl+P          — 展开/折叠长粘贴",
                 ] {
                     self.output.push_system(line);
                 }

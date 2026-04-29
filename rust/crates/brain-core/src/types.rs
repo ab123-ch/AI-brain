@@ -469,11 +469,52 @@ impl ConversationMessage {
 
 // ─── 主脑输出 ──────────────────────────────────────────────────────
 
+/// 工具调用记录（L3 存储用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    /// 工具名
+    pub tool_name: String,
+    /// 工具输入（JSON）
+    pub input: serde_json::Value,
+    /// 工具输出
+    pub output: String,
+    /// 执行耗时 ms
+    pub duration_ms: u64,
+    /// 是否出错
+    pub is_error: bool,
+}
+
+/// 一轮对话的完整轨迹（L3 存储用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnRecord {
+    /// 角色
+    pub role: TurnRole,
+    /// 文本内容
+    pub content: String,
+    /// 工具调用（仅 role=ToolCall 时有值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<ToolCallRecord>,
+    /// 时间戳
+    pub timestamp: String,
+}
+
+/// 轨迹角色
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TurnRole {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
 /// 主脑输出（直接给用户的结果）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainBrainOutput {
     pub answer: String,
     pub usage: TurnUsage,
+    /// 完整对话轨迹（用户→助手→工具调用→工具结果→...→最终回答）
+    #[serde(default)]
+    pub turns: Vec<TurnRecord>,
 }
 
 // ─── 进度事件 ──────────────────────────────────────────────────────
@@ -514,7 +555,7 @@ pub enum ProgressEvent {
     EvaluationStart,
     EvaluationResult {
         passed: bool,
-        issues: Vec<String>,
+        feedback: String,
     },
     /// 评估详情（verbose 模式可见）
     EvaluationDetail {

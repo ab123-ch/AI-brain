@@ -2,14 +2,27 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// 按字符数安全截断 UTF-8 字符串（不会在多字节字符中间切割）
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let boundary = s.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(s.len());
+    &s[..boundary]
+}
+
 use brain_bus::BrainBus;
 use brain_core::agent::{BrainAgent, StatelessBrain};
 use brain_core::config::BrainConfig;
 use brain_core::types::{
     BrainId, BrainResponse, BrainResponsePayload, BroadcastMessage, ContextSnapshot,
-    EvaluationResult, MainBrainOutput, MasterOutput, MemoryStats, ProgressEvent, TurnUsage,
+    EvaluationResult, MainBrainOutput, MasterOutput, MemoryStats, ProgressEvent,
 };
+use brain_eval::EvalBrain;
 use brain_evaluation::EvaluationBrain;
+use brain_hooks::config::HooksConfig;
+use brain_hooks::runner::HookRunner;
+use brain_hooks::types::{HookEvent, HookInput};
 use brain_evolution::{
     BrainRegistry, BrainRegistryStatus, BrainTemplate, CreationSuggestion, SuggestionEngine,
 };
@@ -63,21 +76,6 @@ impl SensoryLlmProvider for LlmAdapter {
     }
 }
 
-/// 无 LLM 配置时的回声模式
-struct EchoLlm;
-
-impl SensoryLlmProvider for EchoLlm {
-    fn complete(
-        &self,
-        _model: &str,
-        _system: &str,
-        user_input: &str,
-        _max: u32,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
-        let result = format!("[回声] {user_input}");
-        Box::pin(async move { Ok(result) })
-    }
-}
 
 /// 为四步分析提供 LLM 能力的适配器
 struct AnalyzerLlm {
@@ -138,6 +136,10 @@ pub struct Orchestrator {
     master_state: Arc<Mutex<MasterState>>,
     memory_brain: Arc<Mutex<MemoryBrain>>,
     evaluation_brain: EvaluationBrain,
+    /// v2 评估脑（LLM 深度评估），None 表示 LLM 不可用
+    eval_brain: Option<EvalBrain>,
+    /// Hook 执行引擎（eval_gate 决策等）
+    hook_runner: HookRunner,
     registry: Arc<Mutex<BrainRegistry>>,
     suggestion_engine: Arc<Mutex<SuggestionEngine>>,
     #[allow(dead_code)]
@@ -189,6 +191,30 @@ impl Orchestrator {
                 tracing::info!("记忆脑已注入 LLM（语义召回）");
             }
         }
+
+        // 4.1 创建 v2 评估脑（LLM 深度评估）
+        let eval_brain = if let Ok(config) = LlmConfig::load_default() {
+            if let Ok(client) = config.create_brain_client("eval") {
+                Some(EvalBrain::new(Arc::from(client)))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if eval_brain.is_some() {
+            tracing::info!("v2 评估脑已创建（LLM 深度评估）");
+        }
+
+        // 4.2 初始化 Hook 系统（eval_gate 纯规则判断）
+        let hooks_config: HooksConfig = LlmConfig::load_default()
+            .ok()
+            .and_then(|c| c.hooks)
+            .as_ref()
+            .map(HooksConfig::from_toml_value)
+            .unwrap_or_default();
+
+        let hook_runner = HookRunner::new(hooks_config);
 
         // 5. 主脑
         let config = BrainConfig::default();
@@ -344,7 +370,7 @@ impl Orchestrator {
                 drop(mem_guard);
                 if let Ok(mut v2_guard) = v2_brain.try_lock() {
                     if let Some(ref mut brain) = *v2_guard {
-                        brain.push_memory_context(&format!(
+                        brain.inject_memory_context(&format!(
                             "[潜意识印象 — 你曾经做过这些事，匹配到时再深入回忆]\n{summary}"
                         ));
                         tracing::info!("潜意识印象已注入主脑");
@@ -359,6 +385,8 @@ impl Orchestrator {
             master_state,
             memory_brain: memory,
             evaluation_brain: evaluation,
+            eval_brain,
+            hook_runner,
             registry,
             suggestion_engine,
             tasks,
@@ -473,69 +501,180 @@ impl Orchestrator {
                 if let Some(ref mut brain) = *guard {
                     tracing::info!("使用 v2 MainBrain (带工具) 处理查询");
 
-                    // 主脑自己通过 search_memory 工具按需查询记忆，不再主动注入
-
-                    // 主脑处理
-                    let result = brain
+                    // --- 1. 主脑首次处理 ---
+                    let mut result = brain
                         .process_input(&input_owned, Some(&tx))
                         .await
                         .map_err(|e| format!("{e}"));
 
-                    // 将本轮对话存入记忆脑（L3 原始 + L2 短期）
+                    // 将本轮对话完整轨迹存入记忆脑（L3 原始 + L2 短期）
                     if let Ok(ref output) = result {
-                        let mem_content = format!(
-                            "用户: {}\n助手: {}",
-                            input_owned,
-                            output.answer.chars().take(500).collect::<String>()
-                        );
-                        let mem_msg = BroadcastMessage {
-                            content: mem_content,
-                            raw_input: input_owned.clone(),
-                            context: brain_core::types::BrainContext {
-                                current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
-                                cwd: std::env::current_dir()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_default(),
-                                git_branch: None,
-                                platform: std::env::consts::OS.to_string(),
-                            },
-                            timestamp: chrono::Utc::now(),
-                        };
                         let mut mem = this.memory_brain.lock().await;
-                        if let Err(e) = mem.store_broadcast(&mem_msg) {
+                        if let Err(e) = mem.store_turns(&output.turns) {
                             tracing::warn!("v2 对话存入记忆脑失败: {e}");
                         }
                     }
 
-                    // 评估脑
-                    if result.is_ok() {
-                        let snapshots = vec![ContextSnapshot {
-                            brain_id: BrainId::master(),
-                            message_count: 1,
-                            health_score: 0.9, // v2 模式暂用固定值
-                        }];
-                        if this.evaluation_brain.should_evaluate(&snapshots, 0, true) {
-                            let _ = tx.send(ProgressEvent::EvaluationStart).await;
-                            let eval_result = this.evaluation_brain.evaluate(snapshots);
-                            let passed = eval_result.overall_health >= 0.7;
-                            let _ = tx
-                                .send(ProgressEvent::EvaluationResult {
-                                    passed,
-                                    issues: eval_result
-                                        .slim_instructions
-                                        .iter()
-                                        .map(|i| format!("{i:?}"))
-                                        .collect(),
-                                })
-                                .await;
-                            let _ = tx
-                                .send(ProgressEvent::EvaluationDetail {
-                                    score: eval_result.overall_health,
-                                    reports: eval_result.brain_reports,
-                                    instructions: eval_result.slim_instructions,
-                                })
-                                .await;
+                    // --- 2. Hook 系统决策是否触发评估 ---
+                    let ai_answer = result
+                        .as_ref()
+                        .ok()
+                        .map(|o| o.answer.clone())
+                        .unwrap_or_default();
+                    let hook_input = HookInput {
+                        event: HookEvent::PostQuery,
+                        session_id: String::new(),
+                        cwd: std::env::current_dir().unwrap_or_default(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        is_error: false,
+                        user_input: Some(input_owned.clone()),
+                        ai_output: Some(ai_answer),
+                    };
+                    let hook_outputs = this.hook_runner.run(&hook_input).await;
+                    let should_eval = hook_outputs.iter().any(|o| o.trigger_eval);
+
+                    // --- 3. 评估反馈循环 ---
+                    if should_eval && result.is_ok() {
+                        tracing::info!("eval_gate 判定：需要评估");
+                        if let Some(ref eb) = this.eval_brain {
+                            let mem_base_dir = {
+                                let mem_guard = this.memory_brain.lock().await;
+                                mem_guard.base_dir().to_path_buf()
+                            };
+                            let storage =
+                                brain_memory::storage::Storage::new_lazy(mem_base_dir);
+
+                            // 从记忆脑读取踩坑库、用户画像、进化规则
+                            let pitfalls =
+                                brain_memory::pitfall::PitfallStore::new(storage.clone())
+                                    .load_active()
+                                    .unwrap_or_default();
+                            let profile =
+                                brain_memory::user_profile::UserProfileStore::new(
+                                    storage.clone(),
+                                )
+                                .load()
+                                .unwrap_or_default();
+                            let rules =
+                                brain_memory::evolution::EvolutionStore::new(storage)
+                                    .load_active()
+                                    .unwrap_or_default();
+
+                            tracing::info!(
+                                "v2 评估脑开始评估 (踩坑={} 画像偏好={} 进化规则={})",
+                                pitfalls.len(),
+                                profile.explicit_preferences.len()
+                                    + profile.implicit_preferences.len(),
+                                rules.len(),
+                            );
+
+                            let max_eval_retries = 2u32;
+                            for attempt in 0..=max_eval_retries {
+                                let answer =
+                                    result.as_ref().unwrap().answer.clone();
+                                let _ = tx.send(ProgressEvent::Evaluating).await;
+
+                                match eb
+                                    .evaluate(
+                                        &input_owned,
+                                        &answer,
+                                        &pitfalls,
+                                        &profile,
+                                        &rules,
+                                    )
+                                    .await
+                                {
+                                    Ok(eval_result) => {
+                                        tracing::info!(
+                                            "v2 评估脑完成(第{}次): passed={}, feedback={}",
+                                            attempt + 1,
+                                            eval_result.passed,
+                                            truncate_chars(&eval_result.feedback, 100)
+                                        );
+                                        let _ = tx
+                                            .send(ProgressEvent::EvaluationResult {
+                                                passed: eval_result.passed,
+                                                feedback: eval_result.feedback.clone(),
+                                            })
+                                            .await;
+
+                                        if eval_result.passed {
+                                            tracing::info!(
+                                                "v2 评估通过 (第{}次)",
+                                                attempt + 1
+                                            );
+                                            break;
+                                        }
+
+                                        if attempt >= max_eval_retries {
+                                            tracing::warn!(
+                                                "v2 评估达到最大重试次数({}), 使用当前输出",
+                                                max_eval_retries + 1
+                                            );
+                                            break;
+                                        }
+
+                                        tracing::warn!(
+                                            "v2 评估发现问题(第{}次): {}",
+                                            attempt + 1,
+                                            truncate_chars(&eval_result.feedback, 200)
+                                        );
+
+                                        // 将评估反馈注入主脑对话历史（Evaluator 角色）
+                                        brain
+                                            .push_evaluator_to_history(
+                                                &eval_result.feedback,
+                                            );
+
+                                        // 主脑根据反馈重新生成
+                                        let revision_prompt =
+                                            "请根据以上评估反馈修正你的回答，直接输出修正后的完整内容。";
+                                        match brain
+                                            .process_input(
+                                                revision_prompt,
+                                                Some(&tx),
+                                            )
+                                            .await
+                                        {
+                                            Ok(retry_output) => {
+                                                tracing::info!(
+                                                    "评估重试第{}次完成, 新回答长度={}",
+                                                    attempt + 1,
+                                                    retry_output.answer.len()
+                                                );
+                                                // 存入记忆脑
+                                                {
+                                                    let mut mem =
+                                                        this.memory_brain.lock().await;
+                                                    if let Err(e) =
+                                                        mem.store_turns(&retry_output.turns)
+                                                    {
+                                                        tracing::warn!(
+                                                            "评估重试对话存入记忆脑失败: {e}"
+                                                        );
+                                                    }
+                                                }
+                                                result = Ok(retry_output);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "评估重试处理失败: {e}"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("v2 评估脑评估失败: {e}");
+                                        break;
+                                    }
+                                }
+                            }
                         }
+                    } else if !should_eval {
+                        tracing::info!("eval_gate 判定：跳过评估");
                     }
 
                     result
@@ -550,51 +689,11 @@ impl Orchestrator {
                     this.maybe_trigger_analysis();
                     Ok(output)
                 }
-                Err(_) => {
-                    // 回退 v1 路径
-                    tracing::info!("回退 v1 MasterBrain 处理查询");
-                    let _ = tx
-                        .send(ProgressEvent::Connecting {
-                            brain: "main".into(),
-                            model: this.model_name.clone(),
-                        })
-                        .await;
-                    let _ = tx
-                        .send(ProgressEvent::Thinking {
-                            brain: "main".into(),
-                        })
-                        .await;
-
-                    match this.query(&input_owned).await {
-                        Ok(master_output) => {
-                            let answer = master_output.answer.clone();
-                            let duration_ms = master_output.usage.duration_ms;
-
-                            // 记忆 + 评估事件
-                            Self::send_detail_events(&this, &input_owned, &master_output, &tx)
-                                .await;
-
-                            let _ = tx
-                                .send(ProgressEvent::TextDelta {
-                                    text: answer.clone(),
-                                })
-                                .await;
-                            let _ = tx.send(ProgressEvent::Done).await;
-
-                            Ok(MainBrainOutput {
-                                answer,
-                                usage: TurnUsage {
-                                    total_tokens: master_output.usage.total_tokens,
-                                    llm_calls: master_output.usage.llm_calls,
-                                    duration_ms,
-                                },
-                            })
-                        }
-                        Err(e) => {
-                            let _ = tx.send(ProgressEvent::Done).await;
-                            Err(e)
-                        }
-                    }
+                Err(e) => {
+                    // 不再回退 v1，直接返回错误
+                    tracing::error!("v2 MainBrain 处理失败，不回退 v1: {e}");
+                    let _ = tx.send(ProgressEvent::Done).await;
+                    Err(e)
                 }
             }
         });
@@ -602,48 +701,6 @@ impl Orchestrator {
         (rx, handle)
     }
 
-    /// 发送记忆 + 评估详情事件（v1 回退路径用）
-    async fn send_detail_events(
-        this: &Arc<Self>,
-        _input: &str,
-        master_output: &MasterOutput,
-        tx: &tokio::sync::mpsc::Sender<ProgressEvent>,
-    ) {
-        // v1 回退路径不主动注入记忆 —— 主脑自己通过 search_memory 工具按需查询
-
-        // 评估详情
-        let snapshots: Vec<ContextSnapshot> = master_output
-            .participating_brains
-            .iter()
-            .map(|id| ContextSnapshot {
-                brain_id: id.clone(),
-                message_count: 1,
-                health_score: master_output.confidence,
-            })
-            .collect();
-        if this.evaluation_brain.should_evaluate(&snapshots, 0, true) {
-            let _ = tx.send(ProgressEvent::EvaluationStart).await;
-            let eval_result = this.evaluation_brain.evaluate(snapshots);
-            let passed = eval_result.overall_health >= 0.7;
-            let _ = tx
-                .send(ProgressEvent::EvaluationResult {
-                    passed,
-                    issues: eval_result
-                        .slim_instructions
-                        .iter()
-                        .map(|i| format!("{i:?}"))
-                        .collect(),
-                })
-                .await;
-            let _ = tx
-                .send(ProgressEvent::EvaluationDetail {
-                    score: eval_result.overall_health,
-                    reports: eval_result.brain_reports,
-                    instructions: eval_result.slim_instructions,
-                })
-                .await;
-        }
-    }
 
     /// 系统状态（文本）
     pub fn status(&self) -> String {
@@ -1028,7 +1085,7 @@ impl Orchestrator {
 
         let llm = self.create_analyzer_llm();
         if let Some(llm) = llm {
-            tracing::info!("关闭时强制执行四步分析...");
+            tracing::info!("正在执行四步分析（关闭时强制触发）...");
             let analyzer = FourStepAnalyzer::new(Box::new(llm), base_dir, session_id);
             let report = analyzer
                 .run(&format!("[{}]", conversations.join(",")))
@@ -1041,6 +1098,8 @@ impl Orchestrator {
                 report.rules_created,
                 report.subconscious_entries,
             );
+        } else {
+            tracing::warn!("无法创建记忆脑 LLM 客户端，跳过关闭时的四步分析");
         }
     }
 
@@ -1266,50 +1325,26 @@ pub fn format_output(output: &MasterOutput) -> String {
 
 // ─── 辅助函数 ────────────────────────────────────────────────────
 
-/// 创建感知脑 LLM（配置存在时用真实 LLM，否则回声模式）
+/// 创建感知脑 LLM（配置必须存在，否则 panic）
 fn create_sensory_llm() -> Box<dyn SensoryLlmProvider> {
-    match LlmConfig::load_default() {
-        Ok(config) => match config.create_brain_client("sensory") {
-            Ok(client) => {
-                tracing::info!(
-                    "LLM 已加载，感知脑模型: {}",
-                    config.model_for_brain("sensory")
-                );
-                Box::new(LlmAdapter { inner: client })
-            }
-            Err(e) => {
-                tracing::warn!("LLM 客户端创建失败 ({e})，使用回声模式");
-                Box::new(EchoLlm)
-            }
-        },
-        Err(e) => {
-            tracing::info!("未找到 LLM 配置 ({e})，使用回声模式");
-            Box::new(EchoLlm)
-        }
-    }
+    let config = LlmConfig::load_default().expect("LLM 配置必须存在，请检查 ~/.ai-brain/config.toml");
+    let client = config.create_brain_client("sensory")
+        .expect("LLM 客户端创建失败，请检查 config.toml 中的 sensory 配置");
+    tracing::info!("LLM 已加载，感知脑模型: {}", config.model_for_brain("sensory"));
+    Box::new(LlmAdapter { inner: client })
 }
 
 /// 创建 v2 MainBrain（带 tool_loop + 工具注册）
 ///
-/// LLM 可用时创建并注册所有 MVP 工具，不可用时返回 None（回退 v1）
+/// LLM 必须可用，否则 panic
 fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<MemoryBrain>>>,
 ) -> Arc<Mutex<Option<MainBrain>>> {
-    let config = match LlmConfig::load_default() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::info!("v2 MainBrain: 无 LLM 配置 ({e})，跳过");
-            return Arc::new(Mutex::new(None));
-        }
-    };
+    let config = LlmConfig::load_default()
+        .expect("v2 MainBrain: LLM 配置必须存在，请检查 ~/.ai-brain/config.toml");
 
-    let client: Box<dyn brain_llm::LlmProvider> = match config.create_brain_client("sensory") {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("v2 MainBrain: LLM 客户端创建失败 ({e})，跳过");
-            return Arc::new(Mutex::new(None));
-        }
-    };
+    let client: Box<dyn brain_llm::LlmProvider> = config.create_brain_client("sensory")
+        .expect("v2 MainBrain: LLM 客户端创建失败，请检查 config.toml 中的 sensory 配置");
     let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
 
     let tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
