@@ -283,13 +283,8 @@ impl App {
                         Style::default().fg(Color::DarkGray),
                     )));
 
-                    // 显示正常内容
-                    for l in text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            l.to_string(),
-                            Style::default().fg(Color::White),
-                        )));
-                    }
+                    // Markdown 渲染主内容
+                    lines.extend(render_markdown_lines(text));
 
                     // 显示思考内容（如果可见）
                     if let Some(thinking_content) = thinking {
@@ -659,6 +654,7 @@ impl App {
     }
 
     /// 处理鼠标事件（滚轮滚动）
+    /// 处理鼠标事件（滚轮滚动）
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -687,6 +683,8 @@ impl App {
                     "  Shift+↑/↓       — 上下滚动输出",
                     "  ↑/↓             — 翻阅输入历史",
                     "  Ctrl+P          — 展开/折叠长粘贴",
+                    "  鼠标滚轮        — 上下滚动输出",
+                    "  Shift+鼠标选择  — 复制输出内容",
                 ] {
                     self.output.push_system(line);
                 }
@@ -715,5 +713,258 @@ fn format_duration(duration_ms: u64) -> String {
         let secs = duration_ms / 1000;
         let frac = duration_ms % 1000 / 100;
         format!("{secs}.{frac}s")
+    }
+}
+
+// ─── Markdown 渲染 ──────────────────────────────────────────────────
+
+/// 将 markdown 文本渲染为带样式的终端行
+fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        // ── 代码块边界 ──
+        if line.trim_start().starts_with("```") {
+            if in_code_block {
+                in_code_block = false;
+                lines.push(Line::from(Span::styled(
+                    String::from("  └──"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                in_code_block = true;
+                let lang = line.trim_start().trim_start_matches('`').trim();
+                let label = if lang.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {lang}")
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  ┌──{label}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            continue;
+        }
+
+        if in_code_block {
+            lines.push(Line::from(Span::styled(
+                format!("  │ {line}"),
+                Style::default().fg(Color::Green),
+            )));
+            continue;
+        }
+
+        // ── 标题 ──
+        if let Some(rest) = line.strip_prefix("### ") {
+            lines.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("## ") {
+            lines.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# ") {
+            lines.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+
+        // ── 引用 ──
+        if let Some(rest) = line.strip_prefix("> ") {
+            lines.push(Line::from(Span::styled(
+                format!("  │ {rest}"),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            )));
+            continue;
+        }
+
+        // ── 无序列表 ──
+        if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            let mut spans = vec![Span::styled(
+                String::from("  • "),
+                Style::default().fg(Color::Cyan),
+            )];
+            spans.extend(parse_inline_markdown(rest));
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // ── 有序列表 ──
+        if let Some(dot_pos) = line.find(". ") {
+            let prefix = &line[..dot_pos];
+            if prefix.chars().all(|c| c.is_ascii_digit()) && !prefix.is_empty() {
+                let rest = &line[dot_pos + 2..];
+                let mut spans = vec![Span::styled(
+                    format!("  {prefix}. "),
+                    Style::default().fg(Color::Cyan),
+                )];
+                spans.extend(parse_inline_markdown(rest));
+                lines.push(Line::from(spans));
+                continue;
+            }
+        }
+
+        // ── 分割线 ──
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            lines.push(Line::from(Span::styled(
+                String::from("  ──────────────"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        // ── 普通行：解析行内 markdown ──
+        lines.push(Line::from(parse_inline_markdown(line)));
+    }
+
+    lines
+}
+
+/// 解析行内 Markdown：**bold**、*italic*、`code`、[link](url)
+fn parse_inline_markdown(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut buf = String::new();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            // ── **bold** ──
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next(); // 消费第二个 *
+                flush_buf(&mut spans, &mut buf);
+                let bold = collect_until_marker(&mut chars, &['*', '*']);
+                if let Some(content) = bold {
+                    spans.push(Span::styled(
+                        content,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            // ── *italic* ──
+            '*' => {
+                flush_buf(&mut spans, &mut buf);
+                let italic = collect_until_char(&mut chars, '*');
+                if let Some(content) = italic {
+                    spans.push(Span::styled(
+                        content,
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                }
+            }
+            // ── `code` ──
+            '`' => {
+                flush_buf(&mut spans, &mut buf);
+                let code = collect_until_char(&mut chars, '`');
+                if let Some(content) = code {
+                    spans.push(Span::styled(
+                        content,
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
+            // ── [link](url) ──
+            '[' => {
+                flush_buf(&mut spans, &mut buf);
+                let (link_text, matched) = collect_link(&mut chars);
+                if matched {
+                    spans.push(Span::styled(
+                        link_text,
+                        Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ));
+                } else {
+                    spans.push(Span::raw(format!("[{link_text}")));
+                }
+            }
+            _ => buf.push(ch),
+        }
+    }
+
+    flush_buf(&mut spans, &mut buf);
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
+}
+
+/// 将缓冲区内容刷入 spans
+fn flush_buf(spans: &mut Vec<Span<'static>>, buf: &mut String) {
+    if !buf.is_empty() {
+        spans.push(Span::raw(std::mem::take(buf)));
+    }
+}
+
+/// 收集字符直到遇到连续标记（如 **）
+fn collect_until_marker(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, markers: &[char]) -> Option<String> {
+    let mut result = String::new();
+    loop {
+        match chars.next() {
+            Some(ch) => {
+                if ch == markers[0] && chars.peek() == Some(&markers[1]) {
+                    chars.next(); // 消费第二个标记
+                    return Some(result);
+                }
+                result.push(ch);
+            }
+            None => {
+                // 未闭合，原样返回（带标记前缀）
+                result = format!("{}{}", markers.iter().collect::<String>(), result);
+                return Some(result);
+            }
+        }
+    }
+}
+
+/// 收集字符直到遇到指定字符
+fn collect_until_char(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, end: char) -> Option<String> {
+    let mut result = String::new();
+    loop {
+        match chars.next() {
+            Some(ch) if ch == end => return Some(result),
+            Some(ch) => result.push(ch),
+            None => {
+                // 未闭合，原样返回（带起始标记）
+                result = format!("{end}{result}");
+                return Some(result);
+            }
+        }
+    }
+}
+
+/// 收集链接文本和 URL：[text](url)
+fn collect_link(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String, bool) {
+    let mut text = String::new();
+    // 收集 [text]
+    loop {
+        match chars.next() {
+            Some(']') => break,
+            Some(ch) => text.push(ch),
+            None => return (text, false),
+        }
+    }
+    // 检查是否紧跟 (
+    if chars.peek() != Some(&'(') {
+        return (text, false);
+    }
+    chars.next(); // 消费 (
+    // 跳过 URL（不存储）
+    loop {
+        match chars.next() {
+            Some(')') => return (text, true),
+            None => return (text, false),
+            _ => {}
+        }
     }
 }

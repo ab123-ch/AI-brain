@@ -773,17 +773,31 @@ impl MemoryBrain {
     pub fn read_recent_conversations(&self, max_entries: usize) -> Vec<String> {
         let mut entries = Vec::new();
 
-        // 读取当前 session
-        if let Ok(raw_entries) = self.raw.read_session(&self.config.session_id) {
-            for entry in raw_entries.iter().rev().take(max_entries) {
-                entries.push(
-                    serde_json::json!({
-                        "role": "user",
-                        "content": entry.content,
-                        "timestamp": entry.timestamp.to_rfc3339()
-                    })
-                    .to_string(),
-                );
+        // 读取当前 session 的 TurnRecord（v2 路径写入的是 TurnRecord 不是 RawEntry）
+        let path = self
+            .config
+            .base_dir
+            .join("sessions")
+            .join(format!("{}.jsonl", self.config.session_id));
+
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                let turns: Vec<brain_core::types::TurnRecord> = data
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+
+                for turn in turns.iter().rev().take(max_entries) {
+                    entries.push(
+                        serde_json::json!({
+                            "role": format!("{:?}", turn.role).to_lowercase(),
+                            "content": turn.content,
+                            "timestamp": turn.timestamp
+                        })
+                        .to_string(),
+                    );
+                }
             }
         }
 
