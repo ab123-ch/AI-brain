@@ -27,6 +27,9 @@ impl BrainId {
     pub fn evaluation() -> Self {
         Self("evaluation".into())
     }
+    pub fn evolver() -> Self {
+        Self("evolver".into())
+    }
 }
 
 impl std::fmt::Display for BrainId {
@@ -45,6 +48,7 @@ pub enum BrainKind {
     Motor,
     Validation,
     Evaluation,
+    Evolver,
 }
 
 /// 权重 [0.1, 1.0]
