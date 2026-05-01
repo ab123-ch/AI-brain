@@ -676,6 +676,11 @@ impl App {
                     "  :help           — 显示帮助",
                     "  :status         — 系统状态",
                     "  :memory         — 记忆统计",
+                    "  :evo <目标>     — 启动进化任务",
+                    "  :evo-status     — 查看进化状态",
+                    "  :evo-approve    — 确认合并进化结果",
+                    "  :evo-reject     — 拒绝并回滚进化",
+                    "  :evo-diff       — 查看进化变更",
                     "  :quit / Ctrl+C  — 退出并保存",
                     "  Enter           — 提交消息",
                     "  Shift+Enter     — 插入换行",
@@ -692,6 +697,28 @@ impl App {
             }
             ":status" | "status" => {
                 self.output.push_system(&self.orch.status());
+                CommandResult::Handled
+            }
+            cmd if cmd == ":evo" || cmd.starts_with(":evo ")
+                || matches!(cmd, ":evo-status" | ":evo-approve" | ":evo-reject" | ":evo-diff") =>
+            {
+                // 进化命令需要异步调用，TUI 同步方法中暂为占位提示
+                let msg = match input {
+                    c if c == ":evo" || c.starts_with(":evo ") => {
+                        let goal = c.strip_prefix(":evo").unwrap_or("").trim();
+                        if goal.is_empty() {
+                            "用法: :evo <目标描述>".to_string()
+                        } else {
+                            format!("进化任务已排队: {goal}（TUI 模式异步执行待完善）")
+                        }
+                    }
+                    ":evo-status" => "进化状态查询（TUI 模式异步执行待完善）".to_string(),
+                    ":evo-approve" => "确认合并（TUI 模式异步执行待完善）".to_string(),
+                    ":evo-reject" => "拒绝回滚（TUI 模式异步执行待完善）".to_string(),
+                    ":evo-diff" => "进化变更查询（TUI 模式异步执行待完善）".to_string(),
+                    _ => unreachable!(),
+                };
+                self.output.push_system(&msg);
                 CommandResult::Handled
             }
             ":quit" | ":exit" | "exit" | "quit" => CommandResult::Exit,

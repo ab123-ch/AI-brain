@@ -70,6 +70,43 @@ pub async fn run(orch: Orchestrator) {
                 println!();
                 continue;
             }
+            cmd if cmd == ":evo" || cmd.starts_with(":evo ") => {
+                let goal = input.strip_prefix(":evo").unwrap_or("").trim();
+                if goal.is_empty() {
+                    println!("用法: :evo <目标描述>");
+                } else {
+                    match orch.start_evolution(goal.to_string()).await {
+                        Ok(status) => println!("进化已启动: {status}"),
+                        Err(e) => eprintln!("启动失败: {e}"),
+                    }
+                }
+                continue;
+            }
+            ":evo-status" => {
+                println!("{}", orch.evolution_status().await);
+                continue;
+            }
+            ":evo-approve" => {
+                match orch.approve_evolution().await {
+                    Ok(()) => println!("进化结果已确认合并。"),
+                    Err(e) => eprintln!("确认失败: {e}"),
+                }
+                continue;
+            }
+            ":evo-reject" => {
+                match orch.reject_evolution().await {
+                    Ok(()) => println!("进化已拒绝并回滚。"),
+                    Err(e) => eprintln!("回滚失败: {e}"),
+                }
+                continue;
+            }
+            ":evo-diff" => {
+                match orch.evolution_diff().await {
+                    Ok(diff) => println!("{diff}"),
+                    Err(e) => eprintln!("获取 diff 失败: {e}"),
+                }
+                continue;
+            }
             ":quit" | ":exit" | "exit" | "quit" => {
                 break;
             }
@@ -107,6 +144,11 @@ fn print_help() {
     println!("  :brains    — 副脑列表（活跃+休眠）");
     println!("  :templates — 可用副脑模板");
     println!("  :suggest   — 创建建议");
+    println!("  :evo <目标> — 启动进化任务");
+    println!("  :evo-status — 查看进化状态");
+    println!("  :evo-approve — 确认合并进化结果");
+    println!("  :evo-reject  — 拒绝并回滚进化");
+    println!("  :evo-diff    — 查看进化变更");
     println!("  :quit      — 退出");
     println!("  其他输入   — 发送查询");
     println!();
