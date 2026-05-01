@@ -44,10 +44,17 @@ pub struct ThresholdConfig {
     pub consolidation_importance: f64,
     /// 召回最低 importance，默认 0.2
     pub memory_recall_min_importance: f64,
-    /// 上下文使用率警告阈值，默认 0.70
+    /// 上下文使用率警告阈值，默认 0.60（触发 pending 替换）
     pub context_warning_threshold: f64,
-    /// 上下文使用率危险阈值，默认 0.85
+    /// 上下文使用率危险阈值，默认 0.80（触发强制截断）
     pub context_danger_threshold: f64,
+    /// 上下文窗口 token 上限，默认 1M（1_048_576）
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u64,
+}
+
+fn default_max_context_tokens() -> u64 {
+    1_048_576
 }
 
 impl Default for ThresholdConfig {
@@ -56,8 +63,9 @@ impl Default for ThresholdConfig {
             fast_think_confidence: 0.7,
             consolidation_importance: 0.7,
             memory_recall_min_importance: 0.2,
-            context_warning_threshold: 0.70,
-            context_danger_threshold: 0.85,
+            context_warning_threshold: 0.60,
+            context_danger_threshold: 0.80,
+            max_context_tokens: default_max_context_tokens(),
         }
     }
 }

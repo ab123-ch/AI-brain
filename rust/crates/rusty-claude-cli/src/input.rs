@@ -13,6 +13,8 @@ use rustyline::{
     Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
 };
 
+use crate::menu::{MenuEntry, show_menu};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Submit(String),
@@ -138,6 +140,18 @@ impl LineEditor {
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
+        self.read_line_with_menu(|_| Vec::new())
+    }
+
+    /// Read a line of input, opening the interactive slash menu if the user
+    /// enters just `/` or `/ ` (with trailing space).
+    ///
+    /// The `menu_entries` callback is called when the menu should be shown;
+    /// it returns the complete list of [`MenuEntry`] items to display.
+    pub fn read_line_with_menu<F>(&mut self, menu_entries: F) -> io::Result<ReadOutcome>
+    where
+        F: FnOnce() -> Vec<MenuEntry>,
+    {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
         }
@@ -147,7 +161,31 @@ impl LineEditor {
         }
 
         match self.editor.readline(&self.prompt) {
-            Ok(line) => Ok(ReadOutcome::Submit(line)),
+            Ok(line) => {
+                let trimmed = line.trim();
+                // If the user entered just `/` or `/ `, open the interactive menu.
+                if matches!(trimmed, "/" | "/ ") {
+                    let entries = menu_entries();
+                    let mut stdout = io::stdout();
+                    // Write a newline so the menu doesn't overlap the prompt.
+                    let _ = writeln!(stdout);
+                    match show_menu(&mut stdout, entries) {
+                        Ok(Some(selected)) => {
+                            // We could push to history, but the menu entry
+                            // will be executed immediately.
+                            Ok(ReadOutcome::Submit(selected))
+                        }
+                        Ok(None) => {
+                            // User cancelled – treat like an empty submit
+                            // so the REPL loop simply continues.
+                            Ok(ReadOutcome::Cancel)
+                        }
+                        Err(e) => Err(io::Error::other(e)),
+                    }
+                } else {
+                    Ok(ReadOutcome::Submit(line))
+                }
+            }
             Err(ReadlineError::Interrupted) => {
                 let has_input = !self.current_line().is_empty();
                 self.finish_interrupted_read()?;

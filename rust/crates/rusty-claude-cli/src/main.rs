@@ -8,6 +8,7 @@
 )]
 mod init;
 mod input;
+mod menu;
 mod render;
 
 use std::collections::BTreeSet;
@@ -30,12 +31,14 @@ use api::{
 };
 
 use commands::{
-    handle_agents_slash_command, handle_mcp_slash_command, handle_plugins_slash_command,
-    handle_skills_slash_command, render_slash_command_help, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SlashCommand,
+    discover_definition_roots, discover_skill_roots, handle_agents_slash_command,
+    handle_mcp_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
+    load_agents_from_roots, load_skills_from_roots, render_slash_command_help,
+    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
+use menu::{MenuCategory, MenuEntry};
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
@@ -1520,7 +1523,7 @@ fn run_repl(
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
+        match editor.read_line_with_menu(|| build_slash_menu_entries())? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
                 if trimmed.is_empty() {

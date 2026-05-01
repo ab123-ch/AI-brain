@@ -1404,6 +1404,8 @@ mod tests {
                 total_tokens: 100,
                 llm_calls: 1,
                 duration_ms: 150,
+                prompt_tokens: 0,
+                completion_tokens: 0,
             },
         };
         let formatted = format_output(&output);

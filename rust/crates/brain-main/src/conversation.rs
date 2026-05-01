@@ -1,5 +1,8 @@
 use brain_core::types::{BrainState, ConversationMessage, MessageRole};
 use brain_llm::{ChatMessage, MessageRole as LlmRole};
+use std::collections::HashMap;
+
+use crate::compact::CompactionResult;
 
 /// 对话历史管理
 ///
@@ -9,6 +12,8 @@ pub struct ConversationHistory {
     messages: Vec<ConversationMessage>,
     /// 上下文窗口 token 上限
     max_context_tokens: usize,
+    /// 真实 prompt_tokens（从 LLM usage 累加），0 表示未设置
+    tracked_prompt_tokens: u64,
 }
 
 impl ConversationHistory {
@@ -16,6 +21,7 @@ impl ConversationHistory {
         Self {
             messages: Vec::new(),
             max_context_tokens,
+            tracked_prompt_tokens: 0,
         }
     }
 
@@ -74,11 +80,28 @@ impl ConversationHistory {
     }
 
     /// 上下文使用率 (0.0 ~ 1.0)
+    ///
+    /// 优先用真实 prompt_tokens（从 LLM usage 累加），回退到估算值。
     pub fn context_usage(&self) -> f64 {
-        let tokens = self.estimate_tokens();
+        let tokens = if self.tracked_prompt_tokens > 0 {
+            self.tracked_prompt_tokens as usize
+        } else {
+            self.estimate_tokens()
+        };
         #[allow(clippy::cast_precision_loss)]
         let ratio = tokens as f64 / self.max_context_tokens as f64;
         ratio
+    }
+
+    /// 设置真实 prompt_tokens（从 LLM usage 累加）
+    pub fn set_tracked_tokens(&mut self, tokens: u64) {
+        self.tracked_prompt_tokens = tokens;
+    }
+
+    /// 获取 tracked_prompt_tokens
+    #[allow(dead_code)]
+    pub fn tracked_prompt_tokens(&self) -> u64 {
+        self.tracked_prompt_tokens
     }
 
     /// 判断是否超过危险阈值（需要重建）
@@ -102,6 +125,17 @@ impl ConversationHistory {
         let truncated = self.messages.len() - keep_recent;
         self.messages = self.messages.split_off(truncated);
         truncated
+    }
+
+    /// 应用已压缩的 pending 内容（替换 Tool 消息）
+    pub fn apply_pending_compaction(
+        &mut self,
+        pending: &HashMap<usize, String>,
+    ) -> CompactionResult {
+        let result = crate::compact::apply_pending(&mut self.messages, pending);
+        // 压缩后重新估算 tracked tokens
+        self.tracked_prompt_tokens = self.estimate_tokens() as u64;
+        result
     }
 
     /// 上下文重建 — 清空后注入记忆脑快照 + 最近 N 轮

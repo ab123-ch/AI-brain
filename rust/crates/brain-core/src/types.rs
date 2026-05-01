@@ -341,6 +341,12 @@ pub struct TurnUsage {
     pub total_tokens: u64,
     pub llm_calls: u32,
     pub duration_ms: u64,
+    /// 累计 prompt tokens（LLM 返回的真实值）
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    /// 累计 completion tokens
+    #[serde(default)]
+    pub completion_tokens: u64,
 }
 
 /// 任务上下文

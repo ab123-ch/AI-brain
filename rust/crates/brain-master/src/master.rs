@@ -382,6 +382,8 @@ impl MasterBrain {
                 total_tokens: 0,
                 llm_calls: 0,
                 duration_ms: (Utc::now() - start).num_milliseconds().max(0) as u64,
+                prompt_tokens: 0,
+                completion_tokens: 0,
             },
         }
     }

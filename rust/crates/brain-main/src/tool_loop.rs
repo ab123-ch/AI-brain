@@ -22,6 +22,8 @@ pub(crate) struct ToolLoopResult {
     pub(crate) llm_calls: u32,
     /// 完整对话轨迹（每轮 assistant 回复 + 工具调用 + 工具结果）
     pub(crate) turns: Vec<TurnRecord>,
+    /// 累计 prompt_tokens（从 LLM 返回的 usage 中累加）
+    pub(crate) total_prompt_tokens: u64,
 }
 
 /// 运行 tool_loop — LLM ↔ 工具 循环直到 LLM 不再调用工具（默认参数的便捷入口）
@@ -50,6 +52,7 @@ pub async fn run_tool_loop_with_config(
 ) -> Result<ToolLoopResult> {
     let mut llm_calls = 0u32;
     let mut turns: Vec<TurnRecord> = Vec::new();
+    let mut total_prompt_tokens = 0u64;
 
     loop {
         llm_calls += 1;
@@ -123,6 +126,9 @@ pub async fn run_tool_loop_with_config(
             }
         };
 
+        // 累计 prompt_tokens
+        total_prompt_tokens += response.usage.prompt_tokens;
+
         // === 日志：LLM 响应 ===
         let resp_text = response.text();
         let tool_calls = response.tool_calls();
@@ -160,6 +166,7 @@ pub async fn run_tool_loop_with_config(
                 response,
                 llm_calls,
                 turns,
+                total_prompt_tokens,
             });
         }
 

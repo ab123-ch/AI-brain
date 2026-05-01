@@ -1,10 +1,13 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use brain_core::config::BrainConfig;
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{MainBrainOutput, ProgressEvent, TurnRecord, TurnRole, TurnUsage};
 use brain_llm::{ChatMessage, LlmProvider, ToolDefinition};
+use tokio::sync::Mutex;
 
+use crate::compact::{self, CompactionConfig};
 use crate::conversation::ConversationHistory;
 use crate::error::Result;
 use crate::prompts;
@@ -28,6 +31,16 @@ pub struct MainBrain {
     llm_temperature: f64,
     /// 记忆脑启动时注入的上下文（追加到 system prompt 尾部）
     memory_context: Option<String>,
+    /// 会话级 prompt_tokens 累计
+    session_prompt_tokens: u64,
+    /// 后台压缩结果（消息索引 → 压缩后内容）
+    pending_compressions: Arc<Mutex<HashMap<usize, String>>>,
+    /// 已压缩的消息索引集合
+    compressed_indices: Arc<Mutex<HashSet<usize>>>,
+    /// 是否已触发过压缩
+    compaction_triggered: bool,
+    /// 压缩配置
+    compaction_config: CompactionConfig,
 }
 
 impl MainBrain {
@@ -37,18 +50,24 @@ impl MainBrain {
         tool_executor: Arc<dyn ToolExecutor>,
         config: BrainConfig,
     ) -> Self {
-        let max_tokens = 200_000; // 上下文窗口
+        // 从 ThresholdConfig 取 max_context_tokens，默认 1M
+        let max_context_tokens = config.brain.thresholds.max_context_tokens as usize;
         let llm_max_tokens = 8192;
         let llm_temperature = 0.7;
         Self {
             llm,
             tool_executor,
-            history: ConversationHistory::new(max_tokens),
+            history: ConversationHistory::new(max_context_tokens),
             tools: Vec::new(),
             config,
             llm_max_tokens,
             llm_temperature,
             memory_context: None,
+            session_prompt_tokens: 0,
+            pending_compressions: Arc::new(Mutex::new(HashMap::new())),
+            compressed_indices: Arc::new(Mutex::new(HashSet::new())),
+            compaction_triggered: false,
+            compaction_config: CompactionConfig::default(),
         }
     }
 
@@ -63,10 +82,12 @@ impl MainBrain {
     /// 事务式写入：失败不污染历史。
     ///
     /// 流程：
-    /// 1. 检查上下文使用率
-    /// 2. 构建 messages（system_prompt + 历史 + 用户输入）
-    /// 3. 跑 tool_loop
-    /// 4. 成功后一次性写入完整一轮到历史
+    /// 1. 应用后台预压缩结果（零阻塞）
+    /// 2. 检查上下文使用率 — 超危险阈值截断
+    /// 3. 构建 messages（system_prompt + 历史 + 用户输入）
+    /// 4. 跑 tool_loop
+    /// 5. 成功后一次性写入完整一轮到历史
+    /// 6. 更新 session token 追踪 + 触发后台预压缩
     pub async fn process_input(
         &mut self,
         input: &str,
@@ -74,8 +95,26 @@ impl MainBrain {
     ) -> Result<MainBrainOutput> {
         let start = std::time::Instant::now();
 
-        // 1. 检查上下文使用率 — 超阈值自动截断（R-P0-1）
+        // ── 0. 应用后台预压缩结果（零阻塞内存操作）──
+        let pending = {
+            let mut p = self.pending_compressions.lock().await;
+            std::mem::take(&mut *p)
+        };
+        if !pending.is_empty() {
+            let mut indices = self.compressed_indices.lock().await;
+            indices.extend(pending.keys().copied());
+            let result = self.history.apply_pending_compaction(&pending);
+            tracing::info!(
+                "应用后台压缩: {} 条消息, 节省 {} 字符",
+                result.compacted_groups,
+                result.chars_saved
+            );
+        }
+
+        // ── 1. 检查上下文使用率 ──
         let thresholds = &self.config.brain.thresholds;
+
+        // 超过危险阈值：强制截断
         if self
             .history
             .is_context_full(thresholds.context_danger_threshold)
@@ -87,7 +126,7 @@ impl MainBrain {
             );
         }
 
-        // 2. 构建 messages — 临时追加用户输入，但不写入历史
+        // ── 2. 构建 messages ──
         let mut messages = self.build_messages_with_user(input);
 
         // 发送 Connecting 事件
@@ -100,7 +139,7 @@ impl MainBrain {
                 .await;
         }
 
-        // 3. 跑 tool_loop — 失败直接返回 Err，历史保持不变
+        // ── 3. 跑 tool_loop ──
         let loop_result = tool_loop::run_tool_loop_with_config(
             self.llm.as_ref(),
             self.tool_executor.as_ref(),
@@ -115,14 +154,14 @@ impl MainBrain {
 
         let answer = loop_result.response.text();
         let total_tokens = loop_result.response.usage.total_tokens;
+        let prompt_tokens = loop_result.total_prompt_tokens;
+        let completion_tokens = loop_result.response.usage.completion_tokens;
 
-        // 4. 成功后一次性写入完整一轮到历史
-        // 先写用户消息
+        // ── 4. 成功后一次性写入完整一轮到历史 ──
         self.history.push_user(input);
 
-        // 写入 tool_loop 中新增的消息（跳过 system + 旧历史 + user）
-        let old_history_len = self.history.len() - 1; // 减去刚 push 的 user
-        let skip_count = 1 + old_history_len + 1; // system(1) + old_history + user(1)
+        let old_history_len = self.history.len() - 1;
+        let skip_count = 1 + old_history_len + 1;
 
         for msg in messages.iter().skip(skip_count) {
             if msg.role == brain_llm::MessageRole::System {
@@ -155,6 +194,49 @@ impl MainBrain {
             self.history.push_assistant(&answer);
         }
 
+        // ── 5. 更新 session token 追踪 ──
+        self.session_prompt_tokens += prompt_tokens;
+        self.history.set_tracked_tokens(self.session_prompt_tokens);
+
+        // ── 6. 后台预压缩：滑动窗口 ──
+        let turn_tool_chars = compact::last_turn_tool_chars(self.history.messages());
+        if turn_tool_chars > self.compaction_config.tool_result_compress_threshold {
+            self.compaction_triggered = true;
+        }
+
+        if self.compaction_triggered {
+            let indices_guard = self.compressed_indices.lock().await;
+            if let Some((start_idx, end_idx)) =
+                compact::find_slide_out_turn(self.history.messages(), &indices_guard, &self.compaction_config)
+            {
+                drop(indices_guard);
+
+                let pending = self.pending_compressions.clone();
+                let compressed_idx = self.compressed_indices.clone();
+                let messages_snapshot: Vec<_> =
+                    self.history.messages()[start_idx..end_idx].to_vec();
+                let llm = self.llm.clone();
+
+                tokio::spawn(async move {
+                    let compressed =
+                        compact::compress_single_turn(&messages_snapshot, 0, messages_snapshot.len(), llm.as_ref())
+                            .await;
+                    if !compressed.is_empty() {
+                        // key 加上 start_idx 偏移
+                        let offset_map: HashMap<usize, String> = compressed
+                            .into_iter()
+                            .map(|(k, v)| (k + start_idx, v))
+                            .collect();
+                        let keys: Vec<usize> = offset_map.keys().copied().collect();
+                        let mut p = pending.lock().await;
+                        p.extend(offset_map);
+                        let mut idx = compressed_idx.lock().await;
+                        idx.extend(keys);
+                    }
+                });
+            }
+        }
+
         let elapsed = start.elapsed();
 
         Ok(MainBrainOutput {
@@ -163,9 +245,10 @@ impl MainBrain {
                 total_tokens,
                 llm_calls: loop_result.llm_calls,
                 duration_ms: elapsed.as_millis() as u64,
+                prompt_tokens,
+                completion_tokens,
             },
             turns: {
-                // 在工具调用轨迹前面加上用户输入
                 let mut full_turns = vec![TurnRecord {
                     role: TurnRole::User,
                     content: input.to_string(),
