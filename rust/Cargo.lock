@@ -289,6 +289,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain-evolver"
+version = "0.1.0"
+dependencies = [
+ "brain-core",
+ "brain-llm",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "brain-hooks"
 version = "0.1.0"
 dependencies = [
