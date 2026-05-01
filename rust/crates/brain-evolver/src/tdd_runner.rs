@@ -46,6 +46,7 @@ pub struct LintResult {
 /// TDD 流程控制器
 pub struct TddRunner {
     sandbox: Sandbox,
+    #[allow(dead_code)] // 后续 LLM 驱动测试生成使用
     llm: Arc<dyn LlmProvider>,
     max_iterations: u32,
     phase: TddPhase,

@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 pub struct EvolverBrain {
     id: BrainId,
     engine: Arc<Mutex<EvolutionEngine>>,
+    #[allow(dead_code)] // 后续 LLM 驱动进化循环使用
     llm: Arc<dyn LlmProvider>,
 }
 

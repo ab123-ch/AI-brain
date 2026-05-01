@@ -51,6 +51,7 @@ pub struct EvolutionResult {
 
 /// 进化引擎
 pub struct EvolutionEngine {
+    #[allow(dead_code)] // 后续 LLM 驱动进化循环使用
     llm: Arc<dyn LlmProvider>,
     repo_path: std::path::PathBuf,
     status: EvolutionStatus,

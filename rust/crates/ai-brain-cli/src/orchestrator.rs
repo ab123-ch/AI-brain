@@ -26,6 +26,7 @@ use brain_hooks::types::{HookEvent, HookInput};
 use brain_evolution::{
     BrainRegistry, BrainRegistryStatus, BrainTemplate, CreationSuggestion, SuggestionEngine,
 };
+use brain_evolver::{EvolverBrain, EvolutionGoal};
 use brain_llm::{ChatMessage, ChatRequest, LlmConfig};
 use brain_main::main_brain::MainBrain;
 use brain_master::MasterBrain;
@@ -142,6 +143,7 @@ pub struct Orchestrator {
     hook_runner: HookRunner,
     registry: Arc<Mutex<BrainRegistry>>,
     suggestion_engine: Arc<Mutex<SuggestionEngine>>,
+    evolver: Arc<Mutex<EvolverBrain>>,
     #[allow(dead_code)]
     tasks: Vec<tokio::task::JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -291,6 +293,27 @@ impl Orchestrator {
         let registry = Arc::new(Mutex::new(BrainRegistry::new()));
         let suggestion_engine = Arc::new(Mutex::new(SuggestionEngine::new()));
 
+        // 11.1 进化脑（EvolverBrain）
+        let evolver = if let Ok(config) = LlmConfig::load_default() {
+            if let Ok(client) = config.create_brain_client("evolver") {
+                let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
+                Some(EvolverBrain::new(llm, std::path::Path::new(".")))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if evolver.is_some() {
+            tracing::info!("进化脑已创建（EvolverBrain）");
+        }
+        let evolver = Arc::new(Mutex::new(evolver.unwrap_or_else(|| {
+            // fallback: 用 sensory LLM 创建（不 panic）
+            let config = LlmConfig::load_default().expect("LLM 配置必须存在");
+            let client = config.create_brain_client("sensory").expect("LLM 客户端创建失败");
+            EvolverBrain::new(Arc::from(client), std::path::Path::new("."))
+        })));
+
         tracing::info!("AI Brain 初始化完成，{} 个副脑任务已启动", tasks.len());
 
         let model_name = LlmConfig::load_default()
@@ -389,6 +412,7 @@ impl Orchestrator {
             hook_runner,
             registry,
             suggestion_engine,
+            evolver,
             tasks,
             shutdown_tx,
             query_count: std::sync::atomic::AtomicU32::new(0),
@@ -1007,6 +1031,52 @@ impl Orchestrator {
             let _ = writeln!(out, "      能力: {:?}", s.suggested_capabilities);
         }
         out
+    }
+
+    // ─── 进化脑方法 ──────────────────────────────────────────────────
+
+    /// 启动进化任务
+    pub async fn start_evolution(&self, goal: String) -> Result<String, String> {
+        let engine = self.evolver.lock().await.engine();
+        let mut engine = engine.lock().await;
+
+        let evo_goal = EvolutionGoal {
+            description: goal.clone(),
+            target_files: vec![],
+            expected_outcome: String::new(),
+            test_scenarios: vec![],
+        };
+
+        engine.start(evo_goal).await.map_err(|e| e.to_string())?;
+        Ok(engine.status().to_string())
+    }
+
+    /// 查看进化状态
+    pub async fn evolution_status(&self) -> String {
+        let engine = self.evolver.lock().await.engine();
+        let engine = engine.lock().await;
+        format!("{}", engine.status())
+    }
+
+    /// 确认合并进化结果
+    pub async fn approve_evolution(&self) -> Result<(), String> {
+        let engine = self.evolver.lock().await.engine();
+        let mut engine = engine.lock().await;
+        engine.approve().await.map_err(|e| e.to_string())
+    }
+
+    /// 拒绝并回滚进化
+    pub async fn reject_evolution(&self) -> Result<(), String> {
+        let engine = self.evolver.lock().await.engine();
+        let mut engine = engine.lock().await;
+        engine.reject().await.map_err(|e| e.to_string())
+    }
+
+    /// 查看进化 diff
+    pub async fn evolution_diff(&self) -> Result<String, String> {
+        let engine = self.evolver.lock().await.engine();
+        let engine = engine.lock().await;
+        engine.current_diff().await.map_err(|e| e.to_string())
     }
 
     /// 优雅关闭（含强制四步分析）
