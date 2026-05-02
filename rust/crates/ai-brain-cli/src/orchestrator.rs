@@ -7,7 +7,11 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
         return s;
     }
-    let boundary = s.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(s.len());
+    let boundary = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
     &s[..boundary]
 }
 
@@ -20,13 +24,13 @@ use brain_core::types::{
 };
 use brain_eval::EvalBrain;
 use brain_evaluation::EvaluationBrain;
-use brain_hooks::config::HooksConfig;
-use brain_hooks::runner::HookRunner;
-use brain_hooks::types::{HookEvent, HookInput};
 use brain_evolution::{
     BrainRegistry, BrainRegistryStatus, BrainTemplate, CreationSuggestion, SuggestionEngine,
 };
-use brain_evolver::{EvolverBrain, EvolutionGoal};
+use brain_evolver::{EvolutionGoal, EvolverBrain};
+use brain_hooks::config::HooksConfig;
+use brain_hooks::runner::HookRunner;
+use brain_hooks::types::{HookEvent, HookInput};
 use brain_llm::{ChatMessage, ChatRequest, LlmConfig};
 use brain_main::main_brain::MainBrain;
 use brain_master::MasterBrain;
@@ -76,7 +80,6 @@ impl SensoryLlmProvider for LlmAdapter {
         })
     }
 }
-
 
 /// 为四步分析提供 LLM 能力的适配器
 struct AnalyzerLlm {
@@ -310,7 +313,9 @@ impl Orchestrator {
         let evolver = Arc::new(Mutex::new(evolver.unwrap_or_else(|| {
             // fallback: 用 sensory LLM 创建（不 panic）
             let config = LlmConfig::load_default().expect("LLM 配置必须存在");
-            let client = config.create_brain_client("sensory").expect("LLM 客户端创建失败");
+            let client = config
+                .create_brain_client("sensory")
+                .expect("LLM 客户端创建失败");
             EvolverBrain::new(Arc::from(client), std::path::Path::new("."))
         })));
 
@@ -567,8 +572,7 @@ impl Orchestrator {
                                 let mem_guard = this.memory_brain.lock().await;
                                 mem_guard.base_dir().to_path_buf()
                             };
-                            let storage =
-                                brain_memory::storage::Storage::new_lazy(mem_base_dir);
+                            let storage = brain_memory::storage::Storage::new_lazy(mem_base_dir);
 
                             // 从记忆脑读取踩坑库、用户画像、进化规则
                             let pitfalls =
@@ -576,15 +580,12 @@ impl Orchestrator {
                                     .load_active()
                                     .unwrap_or_default();
                             let profile =
-                                brain_memory::user_profile::UserProfileStore::new(
-                                    storage.clone(),
-                                )
-                                .load()
-                                .unwrap_or_default();
-                            let rules =
-                                brain_memory::evolution::EvolutionStore::new(storage)
-                                    .load_active()
+                                brain_memory::user_profile::UserProfileStore::new(storage.clone())
+                                    .load()
                                     .unwrap_or_default();
+                            let rules = brain_memory::evolution::EvolutionStore::new(storage)
+                                .load_active()
+                                .unwrap_or_default();
 
                             tracing::info!(
                                 "v2 评估脑开始评估 (踩坑={} 画像偏好={} 进化规则={})",
@@ -596,18 +597,11 @@ impl Orchestrator {
 
                             let max_eval_retries = 2u32;
                             for attempt in 0..=max_eval_retries {
-                                let answer =
-                                    result.as_ref().unwrap().answer.clone();
+                                let answer = result.as_ref().unwrap().answer.clone();
                                 let _ = tx.send(ProgressEvent::Evaluating).await;
 
                                 match eb
-                                    .evaluate(
-                                        &input_owned,
-                                        &answer,
-                                        &pitfalls,
-                                        &profile,
-                                        &rules,
-                                    )
+                                    .evaluate(&input_owned, &answer, &pitfalls, &profile, &rules)
                                     .await
                                 {
                                     Ok(eval_result) => {
@@ -625,10 +619,7 @@ impl Orchestrator {
                                             .await;
 
                                         if eval_result.passed {
-                                            tracing::info!(
-                                                "v2 评估通过 (第{}次)",
-                                                attempt + 1
-                                            );
+                                            tracing::info!("v2 评估通过 (第{}次)", attempt + 1);
                                             break;
                                         }
 
@@ -647,20 +638,12 @@ impl Orchestrator {
                                         );
 
                                         // 将评估反馈注入主脑对话历史（Evaluator 角色）
-                                        brain
-                                            .push_evaluator_to_history(
-                                                &eval_result.feedback,
-                                            );
+                                        brain.push_evaluator_to_history(&eval_result.feedback);
 
                                         // 主脑根据反馈重新生成
                                         let revision_prompt =
                                             "请根据以上评估反馈修正你的回答，直接输出修正后的完整内容。";
-                                        match brain
-                                            .process_input(
-                                                revision_prompt,
-                                                Some(&tx),
-                                            )
-                                            .await
+                                        match brain.process_input(revision_prompt, Some(&tx)).await
                                         {
                                             Ok(retry_output) => {
                                                 tracing::info!(
@@ -670,8 +653,7 @@ impl Orchestrator {
                                                 );
                                                 // 存入记忆脑
                                                 {
-                                                    let mut mem =
-                                                        this.memory_brain.lock().await;
+                                                    let mut mem = this.memory_brain.lock().await;
                                                     if let Err(e) =
                                                         mem.store_turns(&retry_output.turns)
                                                     {
@@ -683,9 +665,7 @@ impl Orchestrator {
                                                 result = Ok(retry_output);
                                             }
                                             Err(e) => {
-                                                tracing::warn!(
-                                                    "评估重试处理失败: {e}"
-                                                );
+                                                tracing::warn!("评估重试处理失败: {e}");
                                                 break;
                                             }
                                         }
@@ -724,7 +704,6 @@ impl Orchestrator {
 
         (rx, handle)
     }
-
 
     /// 系统状态（文本）
     pub fn status(&self) -> String {
@@ -1397,10 +1376,15 @@ pub fn format_output(output: &MasterOutput) -> String {
 
 /// 创建感知脑 LLM（配置必须存在，否则 panic）
 fn create_sensory_llm() -> Box<dyn SensoryLlmProvider> {
-    let config = LlmConfig::load_default().expect("LLM 配置必须存在，请检查 ~/.ai-brain/config.toml");
-    let client = config.create_brain_client("sensory")
+    let config =
+        LlmConfig::load_default().expect("LLM 配置必须存在，请检查 ~/.ai-brain/config.toml");
+    let client = config
+        .create_brain_client("sensory")
         .expect("LLM 客户端创建失败，请检查 config.toml 中的 sensory 配置");
-    tracing::info!("LLM 已加载，感知脑模型: {}", config.model_for_brain("sensory"));
+    tracing::info!(
+        "LLM 已加载，感知脑模型: {}",
+        config.model_for_brain("sensory")
+    );
     Box::new(LlmAdapter { inner: client })
 }
 
@@ -1413,7 +1397,8 @@ fn create_v2_main_brain(
     let config = LlmConfig::load_default()
         .expect("v2 MainBrain: LLM 配置必须存在，请检查 ~/.ai-brain/config.toml");
 
-    let client: Box<dyn brain_llm::LlmProvider> = config.create_brain_client("sensory")
+    let client: Box<dyn brain_llm::LlmProvider> = config
+        .create_brain_client("sensory")
         .expect("v2 MainBrain: LLM 客户端创建失败，请检查 config.toml 中的 sensory 配置");
     let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
 

@@ -18,8 +18,9 @@ impl LlmProvider for MockLlmProvider {
     fn complete(
         &self,
         _request: ChatRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>,
+    > {
         Box::pin(async {
             Ok(ChatResponse {
                 content: vec![brain_llm::ContentBlock::text("mock response")],

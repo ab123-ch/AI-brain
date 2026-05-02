@@ -14,7 +14,11 @@ fn setup_git_repo(dir: &std::path::Path) {
             .unwrap();
     }
     // Create a file and commit
-    std::fs::write(dir.join("lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }").unwrap();
+    std::fs::write(
+        dir.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+    )
+    .unwrap();
     std::process::Command::new("git")
         .args(["add", "-A"])
         .current_dir(dir)

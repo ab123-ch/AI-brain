@@ -50,9 +50,7 @@ impl BrainAgent for EvolverBrain {
             "refactor",
             "自我改进",
         ];
-        let relevant = keywords
-            .iter()
-            .any(|k| content.to_lowercase().contains(k));
+        let relevant = keywords.iter().any(|k| content.to_lowercase().contains(k));
 
         FastThinkResult {
             relevant,

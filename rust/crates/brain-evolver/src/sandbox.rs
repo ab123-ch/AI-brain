@@ -98,7 +98,9 @@ impl Sandbox {
         if full_path.exists() {
             guard.validate_path(&full_path)?;
         }
-        tokio::fs::read_to_string(&full_path).await.map_err(Into::into)
+        tokio::fs::read_to_string(&full_path)
+            .await
+            .map_err(Into::into)
     }
 
     /// 写入文件到沙箱
@@ -107,7 +109,9 @@ impl Sandbox {
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&full_path, content).await.map_err(Into::into)
+        tokio::fs::write(&full_path, content)
+            .await
+            .map_err(Into::into)
     }
 
     /// 获取 diff

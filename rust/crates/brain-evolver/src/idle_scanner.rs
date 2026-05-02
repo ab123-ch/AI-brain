@@ -75,7 +75,9 @@ impl IdleScanner {
         let json = serde_json::to_string_pretty(suggestions)
             .map_err(|e| EvolverError::Sandbox(format!("序列化失败: {e}")))?;
         let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-        let path = self.suggestion_store.join(format!("suggestions-{timestamp}.json"));
+        let path = self
+            .suggestion_store
+            .join(format!("suggestions-{timestamp}.json"));
         tokio::fs::write(&path, json).await?;
         Ok(())
     }

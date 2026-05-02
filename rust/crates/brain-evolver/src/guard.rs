@@ -15,12 +15,13 @@ impl Guard {
 
     /// 验证路径在沙箱内
     pub fn validate_path(&self, path: &Path) -> Result<()> {
-        let canonical = path.canonicalize().map_err(|e| {
-            EvolverError::GuardViolation(format!("路径无法解析: {e}"))
-        })?;
-        let root = self.sandbox_root.canonicalize().map_err(|e| {
-            EvolverError::GuardViolation(format!("沙箱根无法解析: {e}"))
-        })?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| EvolverError::GuardViolation(format!("路径无法解析: {e}")))?;
+        let root = self
+            .sandbox_root
+            .canonicalize()
+            .map_err(|e| EvolverError::GuardViolation(format!("沙箱根无法解析: {e}")))?;
         if canonical.starts_with(&root) {
             Ok(())
         } else {
