@@ -1,10 +1,12 @@
 mod app;
+mod completion;
 mod input;
 mod output;
 mod session_logger;
 mod status;
 
 pub use app::App;
+pub use completion::{CompletionCategory, CompletionItem, CompletionPopup, EvolutionCompleter, InputContext};
 
 use crate::orchestrator::Orchestrator;
 

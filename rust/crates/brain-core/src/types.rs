@@ -647,6 +647,24 @@ pub struct EvolutionRule {
     pub superseded: bool,
 }
 
+// ─── 用户评估要求 ──────────────────────────────────────────────────
+
+/// 用户评估要求（动态积累，从用户反馈中提炼）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalRequirement {
+    /// 唯一标识
+    pub id: String,
+    /// 要求内容
+    pub content: String,
+    /// 来源（"用户反馈" / "记忆脑分析" / "系统默认"）
+    pub source: String,
+    /// 创建时间
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// 是否已废弃
+    #[serde(default)]
+    pub superseded: bool,
+}
+
 // ─── 脑状态快照 ────────────────────────────────────────────────────
 
 /// 来源引用类型

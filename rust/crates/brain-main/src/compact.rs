@@ -119,8 +119,7 @@ pub fn find_slide_out_turn(
     let eligible_end = blocks.len() - preserve_count;
     for block in blocks.iter().take(eligible_end) {
         // 检查该 block 中是否有消息已被压缩
-        let any_compressed = (block.start..block.end)
-            .any(|i| compressed_indices.contains(&i));
+        let any_compressed = (block.start..block.end).any(|i| compressed_indices.contains(&i));
         if !any_compressed && !block.tool_indices.is_empty() {
             return Some((block.start, block.end));
         }
@@ -310,9 +309,7 @@ pub fn apply_pending(
 /// 计算消息列表中最近一轮（从最后一个 User 到末尾）的 Tool 消息总字符数
 pub fn last_turn_tool_chars(messages: &[ConversationMessage]) -> usize {
     // 从后往前找到最后一个 User 消息的位置
-    let last_user_idx = messages
-        .iter()
-        .rposition(|m| m.role == MessageRole::User);
+    let last_user_idx = messages.iter().rposition(|m| m.role == MessageRole::User);
 
     let start = match last_user_idx {
         Some(idx) => idx,
@@ -366,10 +363,7 @@ mod tests {
             ..Default::default()
         };
         let compressed = HashSet::new();
-        assert_eq!(
-            find_slide_out_turn(&messages, &compressed, &config),
-            None
-        );
+        assert_eq!(find_slide_out_turn(&messages, &compressed, &config), None);
     }
 
     #[test]

@@ -1,42 +1,65 @@
 use std::fmt::Write;
 
-use brain_core::types::{EvolutionRule, PitfallCategory, PitfallRecord, UserProfile};
+use brain_core::types::{EvalRequirement, EvolutionRule, PitfallCategory, PitfallRecord, UserProfile};
 
 /// 构建评估系统提示词
 ///
-/// 评估脑的身份声明 + 五项检查规则 + 判定标准 + 文本输出格式
-pub fn build_evaluation_system_prompt() -> String {
-    r#"你是 AI Brain 系统的评估脑，负责在主脑产生输出后自动评估其质量。
+/// 三段式结构：角色定义 + 评估维度 + 用户评估要求
+pub fn build_evaluation_system_prompt(eval_requirements: &[EvalRequirement]) -> String {
+    let mut prompt = String::new();
 
-## 身份
-- 你是常驻后台的监听者，每次主脑输出后自动触发
-- 你的任务是检查主脑输出是否存在问题
+    // ── 第一段：角色定义 ──
+    prompt.push_str(r#"# 角色定义
+
+你是 AI Brain 系统的质量审核员，负责在主脑产生输出后评估其质量和安全性。
+
+## 核心能力
+- **任务完成度审查**：判断主脑是否真正完成了用户要求的任务
+- **安全风险识别**：检测代码中的危险操作和安全隐患
+- **代码质量审查**：识别未完成实现、偷懒占位、潜在缺陷
+- **事实正确性校验**：验证技术细节、API 用法是否准确
+- **偏好合规检查**：确认输出遵守用户的偏好和禁忌
+
+## 工作方式
 - 你基于记忆脑提供的踩坑库、用户画像、自进化规则进行判断
+- 每次主脑输出后自动触发评估
+- 只报告确实存在的问题，宁可漏报不误报
 
-## 六项检查
-1. **重复踩坑** — 主脑输出是否重复了已知的错误模式？
-   注意：只有主脑犯了技术/逻辑错误才算踩坑。用户反复问同一问题不等于踩坑。
-2. **用户偏好违反** — 是否违反了用户的显性偏好、隐性偏好或习惯？
-3. **已知失败模式** — 是否重复了自进化规则中总结的避坑指南的反面？
-4. **偷懒行为** — 是否用 TODO/FIXME/省略号代替了实现？
-5. **事实正确性** — 输出中的事实声明是否可能不正确？
-6. **规则表述合理性** — 当主脑输出包含规则或建议时，检查是否使用了量词限制（如「不超过N个」「至少N条」），而非场景化描述。正确做法：说明什么场景下适合/不适合，给出适用范围而非硬性数字。
+"#);
 
-## 判定标准（非常重要）
-- 踩坑 = 主脑犯了技术/逻辑错误（代码bug、错误事实、用unsafe替代安全方案）
-- 踩坑 ≠ 用户反复问同一问题、用户测试系统、用户闲聊确认
-- 如果踩坑记录描述的是"用户行为"而非"主脑技术错误"，不算踩坑复现
-- **区分踩坑记录内容和当前行为**：踩坑库中的记录可能描述"之前某次主脑没有执行记忆召回"，但如果当前主脑输出中明确包含记忆召回结果（如显示了召回的记忆内容），说明当前行为与踩坑记录描述的相反，不算重复踩坑。判断标准是看主脑当前实际做了什么，而非踩坑记录里写了什么
-- 只有确信主脑输出有问题才报告，宁可漏报也不要误报
-- 量词限制本身不是严重错误，只有当用户明确要求不用量词时才算违反
+    // ── 第二段：评估维度（固定不变） ──
+    prompt.push_str(r#"# 评估维度
 
-## 规则
-- 只报告确实存在的问题，不要过度敏感
-- 如果没有发现问题，直接输出「评估结果-正常」
-- 如果发现问题，给出具体的问题描述和修正建议
-- 修正建议应当使用场景化描述，而非量词限制
+对每次主脑输出，按以下维度逐一检查：
 
-## 输出格式
+1. **任务完成度** — 主脑是否完成了用户要求的所有内容？有无遗漏关键步骤或要求？
+2. **高危操作检测** — 输出中是否包含危险操作？如：文件删除(rm -rf)、force push、覆盖写入、unsafe 代码、未备份的破坏性修改等。
+3. **代码完整性** — 是否存在 TODO、FIXME、省略号(...)、未实现的占位符？代码是否可以直接运行？
+4. **事实正确性** — 技术细节、API 用法、库版本、语法规则等是否正确？
+5. **用户偏好遵守** — 是否违反用户的显性偏好、隐性偏好或禁忌事项？
+6. **已知错误复现** — 是否重复了踩坑库中记录的错误模式？（注意：只有主脑犯了技术/逻辑错误才算踩坑复现，用户反复问/测试/闲聊不算）
+
+## 判定原则
+- **踩坑 = 主脑的技术/逻辑错误**（代码 bug、错误事实、用 unsafe 替代安全方案）
+- **踩坑 ≠ 用户行为**（反复问、测试、闲聊确认）
+- **高危操作必须报告**，无论最终是否实际执行
+- 区分踩坑记录内容和当前实际行为：看主脑当前做了什么，而非记录里写了什么
+- 只有确信有问题才报告
+
+"#);
+
+    // ── 第三段：用户评估要求（动态积累） ──
+    if !eval_requirements.is_empty() {
+        prompt.push_str("# 用户评估要求\n\n");
+        prompt.push_str("以下是用户对评估的具体要求和纠正，请严格遵循：\n\n");
+        for (i, req) in eval_requirements.iter().enumerate() {
+            let _ = writeln!(prompt, "{}. {}", i + 1, req.content);
+        }
+        prompt.push_str("\n**用户评估要求优先级高于固定评估维度。**\n\n");
+    }
+
+    // ── 输出格式 ──
+    prompt.push_str(r#"# 输出格式
 
 没有问题时，严格输出（不要附加其他文字）：
 评估结果-正常
@@ -44,8 +67,9 @@ pub fn build_evaluation_system_prompt() -> String {
 有问题时，严格输出（不要附加其他文字）：
 评估结果-存在问题。具体问题：1.问题描述及修正建议 2.问题描述及修正建议 ... 需要理解根据问题和要求/需求继续修改。
 
-注意：不要输出 JSON，不要使用代码块，只输出纯文本。"#
-        .to_string()
+注意：不要输出 JSON，不要使用代码块，只输出纯文本。"#);
+
+    prompt
 }
 
 /// 构建评估用户提示词
@@ -162,30 +186,69 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn system_prompt_contains_six_checks() {
-        let prompt = build_evaluation_system_prompt();
-        assert!(prompt.contains("重复踩坑"));
-        assert!(prompt.contains("用户偏好"));
-        assert!(prompt.contains("失败模式"));
-        assert!(prompt.contains("偷懒"));
-        assert!(prompt.contains("事实"));
-        assert!(prompt.contains("规则表述合理性"));
+    fn system_prompt_has_role_definition() {
+        let prompt = build_evaluation_system_prompt(&[]);
+        assert!(prompt.contains("角色定义"));
+        assert!(prompt.contains("质量审核员"));
+        assert!(prompt.contains("核心能力"));
     }
 
     #[test]
-    fn system_prompt_contains_text_format() {
-        let prompt = build_evaluation_system_prompt();
+    fn system_prompt_has_fixed_dimensions() {
+        let prompt = build_evaluation_system_prompt(&[]);
+        assert!(prompt.contains("评估维度"));
+        assert!(prompt.contains("任务完成度"));
+        assert!(prompt.contains("高危操作"));
+        assert!(prompt.contains("代码完整性"));
+        assert!(prompt.contains("事实正确性"));
+        assert!(prompt.contains("用户偏好遵守"));
+        assert!(prompt.contains("已知错误复现"));
+    }
+
+    #[test]
+    fn system_prompt_has_output_format() {
+        let prompt = build_evaluation_system_prompt(&[]);
         assert!(prompt.contains("评估结果-正常"));
         assert!(prompt.contains("评估结果-存在问题"));
         assert!(prompt.contains("不要输出 JSON"));
     }
 
     #[test]
-    fn system_prompt_contains_anti_false_positive_rules() {
-        let prompt = build_evaluation_system_prompt();
-        assert!(prompt.contains("判定标准"));
-        assert!(prompt.contains("用户反复问同一问题不等于踩坑"));
-        assert!(prompt.contains("宁可漏报也不要误报"));
+    fn system_prompt_has_judgment_principles() {
+        let prompt = build_evaluation_system_prompt(&[]);
+        assert!(prompt.contains("判定原则"));
+        assert!(prompt.contains("宁可漏报不误报"));
+    }
+
+    #[test]
+    fn system_prompt_with_eval_requirements() {
+        let reqs = vec![
+            EvalRequirement {
+                id: "evreq-1".into(),
+                content: "不要将简单问答判定为问题".into(),
+                source: "用户反馈".into(),
+                created_at: Utc::now(),
+                superseded: false,
+            },
+            EvalRequirement {
+                id: "evreq-2".into(),
+                content: "重点关注代码安全性".into(),
+                source: "记忆脑分析".into(),
+                created_at: Utc::now(),
+                superseded: false,
+            },
+        ];
+        let prompt = build_evaluation_system_prompt(&reqs);
+        assert!(prompt.contains("用户评估要求"));
+        assert!(prompt.contains("不要将简单问答判定为问题"));
+        assert!(prompt.contains("重点关注代码安全性"));
+        assert!(prompt.contains("优先级高于固定评估维度"));
+    }
+
+    #[test]
+    fn system_prompt_without_eval_requirements() {
+        let prompt = build_evaluation_system_prompt(&[]);
+        assert!(!prompt.contains("用户评估要求"));
     }
 
     #[test]

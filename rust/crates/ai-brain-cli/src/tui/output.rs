@@ -340,10 +340,20 @@ impl OutputArea {
     }
 
     fn flush_streaming(&mut self) {
-        // 清空 streaming_buf 但不推入 lines
-        // 最终回答由 finish_query 中的 push_assistant_reply 推入
         if self.streaming_flushed {
             return;
+        }
+        // 将流式文本推入 lines 作为 AssistantReply，而非静默丢弃
+        if !self.streaming_buf.trim().is_empty() {
+            let (clean_text, thinking) = Self::strip_thinking_tags(&self.streaming_buf);
+            if !clean_text.trim().is_empty() {
+                self.lines.push(OutputLine::AssistantReply {
+                    text: clean_text,
+                    expanded: true,
+                    thinking,
+                    thinking_visible: self.verbose,
+                });
+            }
         }
         self.streaming_buf.clear();
         self.streaming_flushed = true;

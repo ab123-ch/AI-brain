@@ -105,25 +105,31 @@ pub fn build_step0_prompt(new_fact_summary: &str, existing_entries_json: &str) -
         .replace("{existing_entries_json}", existing_entries_json)
 }
 
-/// 第一步：事实总结（做了什么）
+/// 第一步：事实总结（增量模式）
+///
+/// 首轮：从对话中提取事实摘要
+/// 后续轮：在已有摘要基础上，根据新对话内容更新/补充
 pub const STEP1_FACT_SUMMARY_PROMPT: &str = "\
 # 身份
-你是一个对话分析引擎。你分析最近几轮的对话记录，总结出事实性摘要。
+你是一个对话分析引擎。你的任务是维护一份持续累积的事实摘要。
 
 # 输入
-以下是对话记录（JSON 数组）：
+{previous_summary_section}
+以下是最新的对话记录（JSON 数组）：
 {conversation_json}
 
 # 规则
-1. 只总结客观事实：用户做了什么、讨论了什么、决定了什么
-2. 保留所有技术细节：文件路径、命令、配置值、错误信息
-3. 按时间顺序组织，形成连贯的叙事
-4. 不要遗漏关键步骤
-5. 用中文输出
-6. 摘要长度控制在 300 字以内
+1. **增量更新**：在已有摘要的基础上，根据新对话内容进行更新和补充
+2. 只总结客观事实：用户做了什么、讨论了什么、决定了什么
+3. 保留所有技术细节：文件路径、命令、配置值、错误信息
+4. 按时间顺序组织，形成连贯的叙事
+5. 已有摘要中未涉及的内容保持不变，不要删除
+6. 新对话中有新的进展、决定、发现时，追加到摘要中
+7. 用中文输出
+8. 摘要长度控制在 500 字以内（累积增长，但需要精炼）
 
 # 输出格式
-直接输出事实总结文本（纯文本，不要 JSON 包裹）。\
+直接输出完整的事实摘要（纯文本，不要 JSON 包裹）。输出是更新后的完整摘要，不是增量部分。\
 ";
 
 /// 第二步：用户画像分析
@@ -258,9 +264,15 @@ pub fn build_l2_to_l3_prompt(category: &str, index_entries_json: &str) -> String
 // v2 四步分析 Prompt Builder
 // ---------------------------------------------------------------------------
 
-/// 构建第一步：事实总结 prompt
-pub fn build_step1_prompt(conversation_json: &str) -> String {
-    STEP1_FACT_SUMMARY_PROMPT.replace("{conversation_json}", conversation_json)
+/// 构建第一步：事实总结 prompt（增量模式）
+pub fn build_step1_prompt(conversation_json: &str, previous_summary: Option<&str>) -> String {
+    let previous_section = match previous_summary {
+        Some(summary) => format!("## 已有的事实摘要（需要在此基础上更新）\n{summary}\n"),
+        None => "（这是首次总结，没有已有摘要）\n".to_string(),
+    };
+    STEP1_FACT_SUMMARY_PROMPT
+        .replace("{previous_summary_section}", &previous_section)
+        .replace("{conversation_json}", conversation_json)
 }
 
 /// 构建第二步：用户画像分析 prompt
@@ -426,6 +438,89 @@ pub fn build_step6_prompt(
         .replace("{existing_subconscious}", existing_subconscious)
 }
 
+/// 构建第七步：用户评估要求提取 prompt
+pub fn build_step7_prompt(
+    fact_summary: &str,
+    conversation_json: &str,
+    existing_requirements: &str,
+) -> String {
+    STEP7_EVAL_REQUIREMENTS_PROMPT
+        .replace("{fact_summary}", fact_summary)
+        .replace("{conversation_json}", conversation_json)
+        .replace("{existing_requirements}", existing_requirements)
+}
+
+/// 第七步：用户评估要求提取
+///
+/// 从对话中识别用户对评估脑输出质量的反馈、纠正和偏好，
+/// 转化为结构化的评估要求，持续优化评估脑的行为。
+pub const STEP7_EVAL_REQUIREMENTS_PROMPT: &str = "\
+# 身份
+你是一个评估要求提取引擎。你的任务是从对话中识别用户对评估脑（质量审核员）行为的反馈和要求。
+
+# 输入
+事实总结：
+{fact_summary}
+
+对话记录：
+{conversation_json}
+
+已有评估要求（去重用）：
+{existing_requirements}
+
+# 提取目标
+从对话中提取以下类型的用户评估要求：
+
+1. **评估纠正** — 用户对评估脑的判定提出异议
+   - 例：「评估脑把简单问答判为问题了」「这个不该报错」
+   - 转化为：「简单问答和闲聊内容不应判定为问题」
+
+2. **评估维度补充** — 用户希望评估脑关注新维度
+   - 例：「希望你也检查代码的安全性」「注意有没有内存泄漏」
+   - 转化为：「检查代码中是否存在安全隐患（内存泄漏、SQL 注入等）」
+
+3. **评估方式调整** — 用户对评估的严格程度、表达方式有要求
+   - 例：「评估太严格了」「不要那么敏感」
+   - 转化为：「降低评估敏感度，只报告确定的高危问题」
+
+4. **任务质量要求** — 用户对主脑任务完成的标准
+   - 例：「回答必须包含代码示例」「代码必须能直接编译运行」
+   - 转化为：「主脑输出的代码必须完整可运行，不能有占位符」
+
+# 规则
+- 只提取**明确**的用户反馈，不要推测
+- 每条要求应该是**具体可执行**的指导规则
+- 如果对话中没有与评估相关的反馈，返回空数组
+- 不要重复已有评估要求中的内容
+- content 字段用简洁的陈述句，描述评估脑应该怎么做
+
+# 输出格式（严格 JSON）
+```json
+{
+  \"requirements\": [
+    {
+      \"content\": \"具体的评估要求描述\",
+      \"source\": \"用户反馈|记忆脑分析\"
+    }
+  ]
+}
+```
+
+# 示例
+对话中有：「你评估太敏感了，简单的打招呼不要判成问题」
+输出：
+```json
+{
+  \"requirements\": [
+    {
+      \"content\": \"简单打招呼、确认回复不应判定为问题，跳过此类内容的评估\",
+      \"source\": \"用户反馈\"
+    }
+  ]
+}
+```\
+";
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -462,9 +557,22 @@ mod tests {
 
     #[test]
     fn step1_prompt_substitutes() {
-        let prompt = build_step1_prompt("[{\"role\":\"user\"}]");
+        let prompt = build_step1_prompt("[{\"role\":\"user\"}]", None);
         assert!(prompt.contains("[{\"role\":\"user\"}]"));
+        assert!(prompt.contains("首次总结"));
         assert!(!prompt.contains("{conversation_json}"));
+    }
+
+    #[test]
+    fn step1_prompt_with_previous_summary() {
+        let prompt = build_step1_prompt(
+            "[{\"role\":\"user\"}]",
+            Some("之前讨论了 Rust 架构"),
+        );
+        assert!(prompt.contains("[{\"role\":\"user\"}]"));
+        assert!(prompt.contains("之前讨论了 Rust 架构"));
+        assert!(prompt.contains("已有的事实摘要"));
+        assert!(!prompt.contains("首次总结"));
     }
 
     #[test]
@@ -544,14 +652,19 @@ mod tests {
         );
 
         // 打印完整 prompt 供人工审查
-        eprintln!("\n========== Step5 Prompt (新版本) ==========\n{prompt}\n========== End ==========\n");
+        eprintln!(
+            "\n========== Step5 Prompt (新版本) ==========\n{prompt}\n========== End ==========\n"
+        );
 
         // 验证准入门槛存在于 prompt 中
         assert!(prompt.contains("准入门槛"), "新 prompt 应包含准入门槛");
         assert!(prompt.contains("踩坑"), "准入标准应包含踩坑经验");
         assert!(prompt.contains("禁止"), "应包含禁止标准");
         assert!(prompt.contains("一次性闲聊"), "禁止标准应包含一次性闲聊");
-        assert!(prompt.contains("通用编程知识"), "禁止标准应包含通用编程知识");
+        assert!(
+            prompt.contains("通用编程知识"),
+            "禁止标准应包含通用编程知识"
+        );
 
         // ── 模拟 LLM 返回（按新 prompt 三层渐进披露） ──
         // 新 prompt 要求：impression 极简 + pitfall_hint 直觉级 + reference_hint 精确引用
@@ -577,7 +690,11 @@ mod tests {
 
         let mut new_entries: Vec<crate::subconscious::NewSubconsciousEntry> = Vec::new();
         for e in &entries_arr {
-            let topic = e.get("topic").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
+            let topic = e
+                .get("topic")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if topic.is_empty() {
                 continue;
             }
@@ -591,10 +708,25 @@ mod tests {
                 .filter(|s: &String| !s.trim().is_empty())
                 .take(8)
                 .collect();
-            let impression = e.get("impression").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
-            let pitfall_hint = e.get("pitfall_hint").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
-            let reference_hint = e.get("reference_hint").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string();
-            let importance = e.get("importance").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.7);
+            let impression = e
+                .get("impression")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let pitfall_hint = e
+                .get("pitfall_hint")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reference_hint = e
+                .get("reference_hint")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let importance = e
+                .get("importance")
+                .and_then(|v: &serde_json::Value| v.as_f64())
+                .unwrap_or(0.7);
 
             new_entries.push(crate::subconscious::NewSubconsciousEntry {
                 topic,
@@ -618,7 +750,10 @@ mod tests {
         // 应该只有 1 条（不是 4 条每轮一条）
         assert_eq!(new_entries.len(), 1, "应该只生成 1 条高质量潜意识");
         assert_eq!(new_entries[0].topic, "Claude Code配置");
-        assert!(new_entries[0].importance >= 0.7, "有踩坑+进化规则 importance 应 >= 0.7");
+        assert!(
+            new_entries[0].importance >= 0.7,
+            "有踩坑+进化规则 importance 应 >= 0.7"
+        );
         assert!(new_entries[0].trigger_keywords.len() >= 3);
 
         // impression 极简（<= 15 字）
@@ -629,7 +764,8 @@ mod tests {
             new_entries[0].impression.chars().count()
         );
         assert!(
-            new_entries[0].impression.contains("了解") || new_entries[0].impression.contains("做过"),
+            new_entries[0].impression.contains("了解")
+                || new_entries[0].impression.contains("做过"),
             "impression 应只表达'我做过这事'"
         );
 

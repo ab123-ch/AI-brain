@@ -131,14 +131,12 @@ async fn run_command(cli: Cli) {
             handle_brain_command(orch, action).await;
         }
         Some(Commands::V2Test) => {
+            use brain_core::types::ProgressEvent;
             use std::sync::Arc;
             use std::time::Duration;
-            use brain_core::types::ProgressEvent;
 
             println!("=== v2 路径集成测试 ===");
-            let orch: Arc<Orchestrator> = Arc::new(
-                Orchestrator::new().await.expect("初始化失败"),
-            );
+            let orch: Arc<Orchestrator> = Arc::new(Orchestrator::new().await.expect("初始化失败"));
 
             let queries = vec![
                 "你好，简单介绍一下你自己",
@@ -160,24 +158,42 @@ async fn run_command(cli: Cli) {
                         match tokio::time::timeout(Duration::from_secs(120), rx.recv()).await {
                             Ok(Some(event)) => {
                                 let desc = match &event {
-                                    ProgressEvent::Connecting { brain, model } =>
-                                        format!("连接 {} ({})", brain, model),
-                                    ProgressEvent::ToolStart { brain, tool_name, .. } =>
-                                        format!("{} 工具: {}", brain, tool_name),
-                                    ProgressEvent::ToolDone { brain, tool_name, duration_ms, is_error, .. } =>
-                                        format!("{} 完成: {} ({}ms{})", brain, tool_name, duration_ms,
-                                            if *is_error { " ERR" } else { "" }),
+                                    ProgressEvent::Connecting { brain, model } => {
+                                        format!("连接 {} ({})", brain, model)
+                                    }
+                                    ProgressEvent::ToolStart {
+                                        brain, tool_name, ..
+                                    } => format!("{} 工具: {}", brain, tool_name),
+                                    ProgressEvent::ToolDone {
+                                        brain,
+                                        tool_name,
+                                        duration_ms,
+                                        is_error,
+                                        ..
+                                    } => format!(
+                                        "{} 完成: {} ({}ms{})",
+                                        brain,
+                                        tool_name,
+                                        duration_ms,
+                                        if *is_error { " ERR" } else { "" }
+                                    ),
                                     ProgressEvent::Evaluating => "评估脑评估中".into(),
-                                    ProgressEvent::EvaluationResult { passed, feedback } =>
-                                        format!("评估结果: passed={}, {}", passed, feedback),
+                                    ProgressEvent::EvaluationResult { passed, feedback } => {
+                                        format!("评估结果: passed={}, {}", passed, feedback)
+                                    }
                                     ProgressEvent::Done => "完成".into(),
                                     _ => format!("{:?}", event),
                                 };
                                 events.push(desc);
-                                if matches!(event, ProgressEvent::Done) { break; }
+                                if matches!(event, ProgressEvent::Done) {
+                                    break;
+                                }
                             }
                             Ok(None) => break,
-                            Err(_) => { events.push("超时".into()); break; }
+                            Err(_) => {
+                                events.push("超时".into());
+                                break;
+                            }
                         }
                     }
                     events
@@ -194,7 +210,9 @@ async fn run_command(cli: Cli) {
 
                 if let Ok(events) = collect.await {
                     println!("进度事件:");
-                    for ev in &events { println!("  - {ev}"); }
+                    for ev in &events {
+                        println!("  - {ev}");
+                    }
                 }
             }
 

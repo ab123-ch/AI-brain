@@ -182,7 +182,9 @@ impl OpenAiCompatClient {
                     _ => None,
                 })
                 .collect()
-        } else if msg.role == MessageRole::Assistant && msg.content.iter().any(ContentBlock::is_thinking) {
+        } else if msg.role == MessageRole::Assistant
+            && msg.content.iter().any(ContentBlock::is_thinking)
+        {
             // assistant 消息含 thinking — reasoning_content 作为顶层字段
             let text = msg.text_content();
             let thinking = msg.content.iter().find_map(|b| match b {

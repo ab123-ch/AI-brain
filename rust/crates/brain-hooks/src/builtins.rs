@@ -27,8 +27,8 @@ fn is_trivial_input(user_input: &str) -> bool {
     if input_len <= 6 {
         let lower = input_trimmed.to_lowercase();
         let trivial_patterns = [
-            "你好", "hi", "hello", "hey", "嗨", "哈喽", "ok", "好的",
-            "谢谢", "thanks", "嗯", "哦", "不是",
+            "你好", "hi", "hello", "hey", "嗨", "哈喽", "ok", "好的", "谢谢", "thanks", "嗯", "哦",
+            "不是",
         ];
         if trivial_patterns.iter().any(|p| lower.contains(p)) {
             return true;

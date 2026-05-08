@@ -41,7 +41,11 @@ impl RawLayer {
     }
 
     /// 追加一条 TurnRecord 到 L3 jsonl
-    pub fn append_turn(&self, session_id: &str, turn: &brain_core::types::TurnRecord) -> Result<()> {
+    pub fn append_turn(
+        &self,
+        session_id: &str,
+        turn: &brain_core::types::TurnRecord,
+    ) -> Result<()> {
         let path = self
             .storage
             .sessions_dir()

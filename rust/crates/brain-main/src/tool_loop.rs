@@ -2,7 +2,9 @@ use std::time::Instant;
 
 use brain_core::guard_check::{guard_check, GuardResult};
 use brain_core::tool_executor::ToolExecutor;
-use brain_core::types::{ProgressEvent, ToolCall, ToolCallRecord, ToolExecutionResult, TurnRecord, TurnRole};
+use brain_core::types::{
+    ProgressEvent, ToolCall, ToolCallRecord, ToolExecutionResult, TurnRecord, TurnRole,
+};
 use brain_hooks::runner::HookRunner;
 use brain_hooks::types::{HookDecision, HookEvent, HookInput};
 use brain_llm::{
@@ -10,9 +12,6 @@ use brain_llm::{
 };
 
 use crate::error::{MainBrainError, Result};
-
-/// tool_loop 最大循环次数（防止无限工具调用）
-const MAX_TOOL_LOOP_ITERATIONS: u32 = 20;
 
 /// tool_loop 返回结果
 pub(crate) struct ToolLoopResult {
@@ -36,7 +35,17 @@ pub async fn run_tool_loop(
     progress_tx: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
     hook_runner: Option<&HookRunner>,
 ) -> Result<ToolLoopResult> {
-    run_tool_loop_with_config(llm, tool_executor, messages, tools, progress_tx, hook_runner, 4096, 0.7).await
+    run_tool_loop_with_config(
+        llm,
+        tool_executor,
+        messages,
+        tools,
+        progress_tx,
+        hook_runner,
+        4096,
+        0.7,
+    )
+    .await
 }
 
 /// 带配置参数的 tool_loop
@@ -56,9 +65,8 @@ pub async fn run_tool_loop_with_config(
 
     loop {
         llm_calls += 1;
-        if llm_calls > MAX_TOOL_LOOP_ITERATIONS {
-            return Err(MainBrainError::MaxRetriesExceeded(MAX_TOOL_LOOP_ITERATIONS));
-        }
+        // 不设硬限制，由上下文窗口和 LLM 自身决定何时停止
+        // （Claude Code 同样无硬限制）
 
         let request = build_request(messages, tools, max_tokens, temperature);
 
@@ -96,9 +104,7 @@ pub async fn run_tool_loop_with_config(
                 match block {
                     brain_llm::ContentBlock::ToolUse { name, input, .. } => {
                         let input_str = serde_json::to_string(input).unwrap_or_default();
-                        tracing::info!(
-                            "  msg[{i}].block[{bi}] [tool_use] {name}: {input_str}"
-                        );
+                        tracing::info!("  msg[{i}].block[{bi}] [tool_use] {name}: {input_str}");
                     }
                     brain_llm::ContentBlock::ToolResult {
                         content, is_error, ..
@@ -119,9 +125,7 @@ pub async fn run_tool_loop_with_config(
             Ok(resp) => resp,
             Err(e) => {
                 let err_msg = format!("{e}");
-                tracing::error!(
-                    "=== LLM 调用失败 [第{llm_calls}次] === 错误: {err_msg}"
-                );
+                tracing::error!("=== LLM 调用失败 [第{llm_calls}次] === 错误: {err_msg}");
                 return Err(MainBrainError::LlmError(err_msg));
             }
         };
@@ -132,10 +136,37 @@ pub async fn run_tool_loop_with_config(
         // === 日志：LLM 响应 ===
         let resp_text = response.text();
         let tool_calls = response.tool_calls();
+
+        // 将 LLM 的文本推理通过 TextDelta 发送到 TUI（让用户看到思考过程）
+        // 遍历所有 content blocks，Text 和 Thinking 都发送
+        for block in &response.content {
+            match block {
+                ContentBlock::Text { text } if !text.is_empty() => {
+                    send_progress(
+                        progress_tx,
+                        ProgressEvent::TextDelta { text: text.clone() },
+                    )
+                    .await;
+                }
+                ContentBlock::Thinking { content } if !content.is_empty() => {
+                    // DeepSeek 的 reasoning_content → 作为思考内容发送
+                    send_progress(
+                        progress_tx,
+                        ProgressEvent::TextDelta { text: format!("🧠 {content}") },
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
         tracing::info!(
             "=== LLM 响应 [第{llm_calls}次] === text({}字){}{}",
             resp_text.chars().count(),
-            if resp_text.is_empty() { String::new() } else { format!(": {resp_text}") },
+            if resp_text.is_empty() {
+                String::new()
+            } else {
+                format!(": {resp_text}")
+            },
             if tool_calls.is_empty() {
                 String::new()
             } else {
@@ -145,9 +176,7 @@ pub async fn run_tool_loop_with_config(
         for (i, block) in response.content.iter().enumerate() {
             if let brain_llm::ContentBlock::ToolUse { name, input, .. } = block {
                 let input_str = serde_json::to_string(input).unwrap_or_default();
-                tracing::info!(
-                    "  resp.block[{i}] [tool_use] {name}: {input_str}"
-                );
+                tracing::info!("  resp.block[{i}] [tool_use] {name}: {input_str}");
             }
         }
 
@@ -182,7 +211,15 @@ pub async fn run_tool_loop_with_config(
         }
 
         messages.push(ChatMessage::assistant_blocks(response.content.clone()));
-        execute_tool_calls(tool_executor, &response, messages, progress_tx, hook_runner, &mut turns).await;
+        execute_tool_calls(
+            tool_executor,
+            &response,
+            messages,
+            progress_tx,
+            hook_runner,
+            &mut turns,
+        )
+        .await;
     }
 }
 
@@ -270,7 +307,10 @@ async fn execute_tool_calls(
                     ai_output: None,
                 };
                 let hook_outputs = runner.run(&hook_input).await;
-                if hook_outputs.iter().any(|o| o.decision == HookDecision::Deny) {
+                if hook_outputs
+                    .iter()
+                    .any(|o| o.decision == HookDecision::Deny)
+                {
                     let reason = hook_outputs
                         .iter()
                         .find_map(|o| o.reason.clone())
@@ -342,7 +382,11 @@ async fn execute_tool_calls(
             )
             .await;
 
-            messages.push(ChatMessage::tool_result(id, result.output.clone(), result.is_error));
+            messages.push(ChatMessage::tool_result(
+                id,
+                result.output.clone(),
+                result.is_error,
+            ));
 
             // 记录工具调用轨迹
             turns.push(TurnRecord {
@@ -366,7 +410,11 @@ async fn execute_tool_calls(
                     cwd: std::env::current_dir().unwrap_or_default(),
                     tool_name: Some(name.clone()),
                     tool_input: Some(serde_json::to_string(input).unwrap_or_default()),
-                    tool_output: Some(turns.last().map_or(String::new(), |t| t.tool_call.as_ref().map_or(String::new(), |tc| tc.output.chars().take(200).collect()))),
+                    tool_output: Some(turns.last().map_or(String::new(), |t| {
+                        t.tool_call
+                            .as_ref()
+                            .map_or(String::new(), |tc| tc.output.chars().take(200).collect())
+                    })),
                     is_error: result.is_error,
                     user_input: None,
                     ai_output: None,

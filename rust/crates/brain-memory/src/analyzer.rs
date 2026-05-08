@@ -40,6 +40,8 @@ pub struct AnalysisReport {
     pub summary_generated: bool,
     /// Step0 记忆迭代处理条目数
     pub step0_iterations: usize,
+    /// Step7 用户评估要求提取条目数
+    pub eval_requirements_added: usize,
 }
 
 /// 四步分析编排器
@@ -63,8 +65,14 @@ impl FourStepAnalyzer {
     pub async fn run(&self, conversation_json: &str) -> AnalysisReport {
         let mut report = AnalysisReport::default();
 
-        // Step 1: 事实总结
-        let fact_summary = match self.step1_fact_summary(conversation_json).await {
+        // 加载上一轮的事实摘要（增量总结的基础）
+        let previous_summary = self.load_fact_summary();
+
+        // Step 1: 事实总结（增量：已有摘要 + 新对话 → 更新后摘要）
+        let fact_summary = match self
+            .step1_fact_summary(conversation_json, previous_summary.as_deref())
+            .await
+        {
             Ok(s) => {
                 tracing::info!("四步分析 Step1 完成: 事实总结 {} 字", s.chars().count());
                 self.save_fact_summary(&s);
@@ -168,6 +176,17 @@ impl FourStepAnalyzer {
                 tracing::info!("四步分析 Step6 跳过（已有总结）");
             }
             Err(e) => tracing::warn!("四步分析 Step6 失败: {e}"),
+        }
+
+        // Step 7: 用户评估要求提取
+        match self.step7_eval_requirements(&fact_summary, conversation_json).await {
+            Ok(added) => {
+                if added > 0 {
+                    tracing::info!("四步分析 Step7 完成: 提取 {} 条用户评估要求", added);
+                }
+                report.eval_requirements_added = added;
+            }
+            Err(e) => tracing::warn!("四步分析 Step7 失败: {e}"),
         }
 
         // 生成 BrainState 快照
@@ -305,13 +324,25 @@ impl FourStepAnalyzer {
         Ok(processed)
     }
 
-    // ─── Step 1: 事实总结 ──────────────────────────────────────
+    // ─── Step 1: 事实总结（增量） ──────────────────────────────────────
+
+    /// 加载上一轮的事实摘要
+    fn load_fact_summary(&self) -> Option<String> {
+        let path = self.base_dir.join("fact_summary.json");
+        if !path.exists() {
+            return None;
+        }
+        let data = std::fs::read_to_string(&path).ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+        parsed.get("summary").and_then(|v| v.as_str()).map(String::from)
+    }
 
     async fn step1_fact_summary(
         &self,
         conversation_json: &str,
+        previous_summary: Option<&str>,
     ) -> std::result::Result<String, String> {
-        let prompt = prompts::build_step1_prompt(conversation_json);
+        let prompt = prompts::build_step1_prompt(conversation_json, previous_summary);
         let response = self.llm.complete(&prompt).await?;
         let summary = response.trim().to_string();
         if summary.is_empty() {
@@ -604,6 +635,69 @@ impl FourStepAnalyzer {
             .map_err(|e| e.to_string())?;
 
         Ok(new_entries)
+    }
+
+    // ─── Step 7: 用户评估要求提取 ──────────────────────────────────────
+
+    /// 从对话中提取用户对评估脑的要求、纠正和偏好
+    async fn step7_eval_requirements(
+        &self,
+        fact_summary: &str,
+        conversation_json: &str,
+    ) -> std::result::Result<usize, String> {
+        let storage = Storage::new_lazy(self.base_dir.clone());
+        let req_store = crate::eval_requirement::EvalRequirementStore::new(storage);
+
+        let existing = req_store.load_active().map_err(|e| e.to_string())?;
+        let existing_text = if existing.is_empty() {
+            "（无）".into()
+        } else {
+            existing
+                .iter()
+                .map(|r| format!("- {}", r.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let prompt =
+            prompts::build_step7_prompt(fact_summary, conversation_json, &existing_text);
+        let response = self.llm.complete(&prompt).await?;
+
+        let parsed: serde_json::Value = serde_json::from_str(&extract_json(&response))
+            .map_err(|e| format!("Step7 JSON 解析失败: {e}"))?;
+
+        let requirements_arr = parsed
+            .get("requirements")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut added = 0;
+        for req in &requirements_arr {
+            let content = req
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            if content.is_empty() {
+                continue;
+            }
+
+            let source = req
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("记忆脑分析")
+                .to_string();
+
+            match req_store.add(&content, &source) {
+                Ok(_) => added += 1,
+                Err(e) => tracing::warn!("Step7 保存评估要求失败: {e}"),
+            }
+        }
+
+        Ok(added)
     }
 
     // ─── Step 6: L2 会话总结 ──────────────────────────────────────

@@ -376,7 +376,10 @@ mod tests {
             entry.last_accessed.timestamp() > 0,
             "last_accessed should be set"
         );
-        assert!(entry.pitfall_hint.is_empty(), "pitfall_hint should default to empty");
+        assert!(
+            entry.pitfall_hint.is_empty(),
+            "pitfall_hint should default to empty"
+        );
     }
 
     #[test]

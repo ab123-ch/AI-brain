@@ -14,14 +14,10 @@ use brain_core::types::ProgressEvent;
 #[tokio::main]
 async fn main() {
     // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     println!("=== 初始化 Orchestrator (v2 路径) ===");
-    let orch = Arc::new(
-        Orchestrator::new().await.expect("Orchestrator 初始化失败"),
-    );
+    let orch = Arc::new(Orchestrator::new().await.expect("Orchestrator 初始化失败"));
     println!("初始化完成\n");
 
     // 3 轮对话
@@ -53,11 +49,25 @@ async fn main() {
                                 let truncated: String = text.chars().take(50).collect();
                                 format!("文本: {truncated}...")
                             }
-                            ProgressEvent::ToolStart { brain, tool_name, .. } => {
+                            ProgressEvent::ToolStart {
+                                brain, tool_name, ..
+                            } => {
                                 format!("{} 工具: {}", brain, tool_name)
                             }
-                            ProgressEvent::ToolDone { brain, tool_name, duration_ms, is_error, .. } => {
-                                format!("{} 工具完成: {} ({}ms{})", brain, tool_name, duration_ms, if *is_error { " ERROR" } else { "" })
+                            ProgressEvent::ToolDone {
+                                brain,
+                                tool_name,
+                                duration_ms,
+                                is_error,
+                                ..
+                            } => {
+                                format!(
+                                    "{} 工具完成: {} ({}ms{})",
+                                    brain,
+                                    tool_name,
+                                    duration_ms,
+                                    if *is_error { " ERROR" } else { "" }
+                                )
                             }
                             ProgressEvent::Evaluating => "评估脑评估中...".to_string(),
                             ProgressEvent::EvaluationResult { passed, feedback } => {
@@ -86,7 +96,10 @@ async fn main() {
             Ok(Ok(output)) => {
                 let answer_preview = &output.answer[..output.answer.len().min(200)];
                 println!("回答: {answer_preview}");
-                println!("Token: {} 次LLM调用: {}", output.usage.total_tokens, output.usage.llm_calls);
+                println!(
+                    "Token: {} 次LLM调用: {}",
+                    output.usage.total_tokens, output.usage.llm_calls
+                );
             }
             Ok(Err(e)) => println!("错误: {e}"),
             Err(e) => println!("Join错误: {e}"),

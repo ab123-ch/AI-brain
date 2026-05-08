@@ -62,9 +62,7 @@ pub struct EvalGateConfig {
 
 impl Default for EvalGateConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-        }
+        Self { enabled: true }
     }
 }
 

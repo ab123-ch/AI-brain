@@ -27,18 +27,20 @@ impl HookRunner {
     pub fn new(mut config: HooksConfig) -> Self {
         // 自动注册 eval_gate builtin handler 到 post_query 列表
         if config.eval_gate.enabled {
-            let already_registered = config.post_query.iter().any(|h| {
-                matches!(h, HookHandlerConfig::Builtin { name } if name == "eval_gate")
-            });
+            let already_registered = config
+                .post_query
+                .iter()
+                .any(|h| matches!(h, HookHandlerConfig::Builtin { name } if name == "eval_gate"));
             if !already_registered {
-                config.post_query.insert(0, HookHandlerConfig::Builtin {
-                    name: "eval_gate".to_string(),
-                });
+                config.post_query.insert(
+                    0,
+                    HookHandlerConfig::Builtin {
+                        name: "eval_gate".to_string(),
+                    },
+                );
             }
         }
-        Self {
-            config,
-        }
+        Self { config }
     }
 
     /// 获取配置引用
@@ -104,19 +106,20 @@ impl HookRunner {
                 command,
                 matcher,
                 timeout,
-            } => self.execute_command(command, matcher.as_deref(), *timeout, input).await,
-            HookHandlerConfig::Builtin { name } => {
-                match name.as_str() {
-                    "eval_gate" => {
-                        let user_input = input.user_input.clone().unwrap_or_default();
-                        Some(builtins::run_eval_gate(&user_input))
-                    }
-                    _ => {
-                        warn!(builtin = %name, "Unknown builtin handler");
-                        None
-                    }
-                }
+            } => {
+                self.execute_command(command, matcher.as_deref(), *timeout, input)
+                    .await
             }
+            HookHandlerConfig::Builtin { name } => match name.as_str() {
+                "eval_gate" => {
+                    let user_input = input.user_input.clone().unwrap_or_default();
+                    Some(builtins::run_eval_gate(&user_input))
+                }
+                _ => {
+                    warn!(builtin = %name, "Unknown builtin handler");
+                    None
+                }
+            },
         }
     }
 
@@ -147,7 +150,15 @@ impl HookRunner {
         let duration = Duration::from_secs(timeout_secs);
 
         tokio::task::spawn_blocking(move || {
-            run_shell_command(&command, &event_str, &session_id, &cwd, &tool_name, &payload_str, duration)
+            run_shell_command(
+                &command,
+                &event_str,
+                &session_id,
+                &cwd,
+                &tool_name,
+                &payload_str,
+                duration,
+            )
         })
         .await
         .ok()? // JoinError → None
@@ -200,7 +211,10 @@ fn run_shell_command(
         .env("HOOK_EVENT", event_str)
         .env("HOOK_SESSION_ID", session_id)
         .env("HOOK_TOOL_NAME", tool_name.as_deref().unwrap_or(""))
-        .env("HOOK_TOOL_INPUT", tool_name.as_ref().map(|_| "1").unwrap_or(""))
+        .env(
+            "HOOK_TOOL_INPUT",
+            tool_name.as_ref().map(|_| "1").unwrap_or(""),
+        )
         .spawn()
     {
         Ok(c) => c,
@@ -233,15 +247,13 @@ fn run_shell_command(
 
     // 等待子进程完成：从 Mutex<Option<Child>> 中 take 出来，再 wait_with_output
     let output = match child_arc.lock() {
-        Ok(mut guard) => {
-            match guard.take() {
-                Some(c) => c.wait_with_output(),
-                None => {
-                    warn!("Child process already taken");
-                    return None;
-                }
+        Ok(mut guard) => match guard.take() {
+            Some(c) => c.wait_with_output(),
+            None => {
+                warn!("Child process already taken");
+                return None;
             }
-        }
+        },
         Err(e) => {
             warn!(error = %e, "Failed to lock child process");
             return None;
@@ -310,10 +322,7 @@ fn parse_hook_output(stdout: &str, default_decision: HookDecision) -> HookOutput
                 _ => default_decision,
             };
 
-            let reason = val
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let reason = val.get("reason").and_then(|v| v.as_str()).map(String::from);
 
             let system_message = val
                 .get("systemMessage")

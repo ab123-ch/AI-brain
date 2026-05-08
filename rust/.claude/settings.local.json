@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__memory-system__persona_switch",
+      "mcp__memory-system__experience_list",
+      "mcp__memory-system__memory_recall",
+      "mcp__memory-system__experience_get",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)"
+    ]
+  }
+}

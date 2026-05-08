@@ -160,7 +160,11 @@ impl MemoryBrain {
                 }
                 brain_core::types::TurnRole::ToolCall => {
                     if let Some(ref tc) = turn.tool_call {
-                        texts.push(format!("{}: {}", tc.tool_name, tc.output.chars().take(100).collect::<String>()));
+                        texts.push(format!(
+                            "{}: {}",
+                            tc.tool_name,
+                            tc.output.chars().take(100).collect::<String>()
+                        ));
                     }
                 }
                 _ => {}
@@ -841,7 +845,10 @@ impl MemoryBrain {
                 } else {
                     format!(" | 坑: {}", e.pitfall_hint)
                 };
-                format!("• {} (触发: {}) — {}{pitfall} → {}", e.topic, kws, e.impression, e.reference_hint)
+                format!(
+                    "• {} (触发: {}) — {}{pitfall} → {}",
+                    e.topic, kws, e.impression, e.reference_hint
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");

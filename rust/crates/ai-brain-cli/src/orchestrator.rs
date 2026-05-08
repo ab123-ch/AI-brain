@@ -407,6 +407,51 @@ impl Orchestrator {
             }
         }
 
+        // 12.6 检查并注入上次会话的待分析对话
+        let pending_base_dir = {
+            let mem = match memory.try_lock() {
+                Ok(m) => m,
+                Err(_) => return Err("记忆脑锁被占用".to_string()),
+            };
+            mem.base_dir().to_path_buf()
+        };
+        if let Some(pending) = brain_memory::pending_analysis::PendingAnalysis::load(&pending_base_dir) {
+            let injection_text = pending.format_for_injection();
+            let convs_for_analysis = pending.conversations.clone();
+            let sess_id = pending.session_id.clone();
+            let base_for_analysis = pending_base_dir.clone();
+
+            // 1) 注入主脑上下文（LLM 立即可用）
+            if let Ok(mut v2_guard) = v2_brain.try_lock() {
+                if let Some(ref mut brain) = *v2_guard {
+                    brain.push_memory_context(&injection_text);
+                    tracing::info!(
+                        "已注入上次会话记忆 ({}条对话)",
+                        convs_for_analysis.len()
+                    );
+                }
+            }
+
+            // 2) 后台跑四步分析（更新持久化记忆，fire-and-forget）
+            let llm = Self::create_analyzer_llm_from_config();
+            drop(tokio::spawn(async move {
+                if let Some(llm) = llm {
+                    let analyzer = FourStepAnalyzer::new(Box::new(llm), base_for_analysis, sess_id);
+                    let report = analyzer
+                        .run(&format!("[{}]", convs_for_analysis.join(",")))
+                        .await;
+                    tracing::info!(
+                        "后台四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识={}",
+                        report.fact_summary.chars().count(),
+                        report.profile_entries_added,
+                        report.pitfalls_found,
+                        report.rules_created,
+                        report.subconscious_entries,
+                    );
+                }
+            }));
+        }
+
         Ok(Self {
             bus,
             sensory,
@@ -506,6 +551,19 @@ impl Orchestrator {
         }
     }
 
+    /// 获取补全数据（模板名 + 模式关键词），供 TUI 补全使用
+    pub fn completion_data(&self) -> (Vec<String>, Vec<String>) {
+        let template_names = match self.registry.try_lock() {
+            Ok(guard) => guard.list_templates().iter().map(|t| t.name.clone()).collect(),
+            Err(_) => Vec::new(),
+        };
+        let pattern_keywords = match self.suggestion_engine.try_lock() {
+            Ok(guard) => guard.patterns().iter().flat_map(|p| p.keywords.clone()).collect(),
+            Err(_) => Vec::new(),
+        };
+        (template_names, pattern_keywords)
+    }
+
     /// 流式查询（TUI 用）
     ///
     /// 优先走 v2 MainBrain（带 tool_loop + 工具），不可用时回退 v1。
@@ -583,16 +641,20 @@ impl Orchestrator {
                                 brain_memory::user_profile::UserProfileStore::new(storage.clone())
                                     .load()
                                     .unwrap_or_default();
-                            let rules = brain_memory::evolution::EvolutionStore::new(storage)
+                            let rules = brain_memory::evolution::EvolutionStore::new(storage.clone())
+                                .load_active()
+                                .unwrap_or_default();
+                            let eval_requirements = brain_memory::eval_requirement::EvalRequirementStore::new(storage)
                                 .load_active()
                                 .unwrap_or_default();
 
                             tracing::info!(
-                                "v2 评估脑开始评估 (踩坑={} 画像偏好={} 进化规则={})",
+                                "v2 评估脑开始评估 (踩坑={} 画像偏好={} 进化规则={} 用户评估要求={})",
                                 pitfalls.len(),
                                 profile.explicit_preferences.len()
                                     + profile.implicit_preferences.len(),
                                 rules.len(),
+                                eval_requirements.len(),
                             );
 
                             let max_eval_retries = 2u32;
@@ -601,7 +663,7 @@ impl Orchestrator {
                                 let _ = tx.send(ProgressEvent::Evaluating).await;
 
                                 match eb
-                                    .evaluate(&input_owned, &answer, &pitfalls, &profile, &rules)
+                                    .evaluate(&input_owned, &answer, &pitfalls, &profile, &rules, &eval_requirements)
                                     .await
                                 {
                                     Ok(eval_result) => {
@@ -1064,9 +1126,9 @@ impl Orchestrator {
         tracing::info!("AI Brain 正在关闭...");
     }
 
-    /// 关闭时强制执行一次四步分析
+    /// 关闭时快速保存对话数据（替代 run_analysis_force，毫秒级）
     pub async fn shutdown_with_analysis(&self) {
-        self.run_analysis_force().await;
+        self.save_pending_analysis();
         self.shutdown();
     }
 
@@ -1114,7 +1176,36 @@ impl Orchestrator {
         }
     }
 
-    /// 强制执行一次四步分析（关闭时用）
+    /// 保存未分析的对话到磁盘（毫秒级，替代关闭时的 run_analysis_force）
+    fn save_pending_analysis(&self) {
+        let (conversations, base_dir, session_id) = {
+            let mem = match self.memory_brain.try_lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let convs = mem.read_recent_conversations(50);
+            let dir = mem.base_dir().to_path_buf();
+            let sid = mem.session_id().to_string();
+            (convs, dir, sid)
+        };
+
+        if conversations.is_empty() {
+            tracing::info!("无对话记录，跳过保存");
+            return;
+        }
+
+        match brain_memory::pending_analysis::PendingAnalysis::save(
+            &base_dir,
+            conversations,
+            session_id,
+        ) {
+            Ok(()) => tracing::info!("已保存待分析对话到磁盘"),
+            Err(e) => tracing::warn!("保存待分析对话失败: {e}"),
+        }
+    }
+
+    /// 强制执行一次四步分析（保留供手动调用）
+    #[allow(dead_code)]
     async fn run_analysis_force(&self) {
         let (conversations, base_dir, session_id) = {
             let mem = match self.memory_brain.try_lock() {
@@ -1150,6 +1241,14 @@ impl Orchestrator {
         } else {
             tracing::warn!("无法创建记忆脑 LLM 客户端，跳过关闭时的四步分析");
         }
+    }
+
+    /// 创建四步分析用的 LLM 客户端（静态版本，供 new() 中使用）
+    fn create_analyzer_llm_from_config() -> Option<AnalyzerLlm> {
+        let config = LlmConfig::load_default().ok()?;
+        let client: Box<dyn brain_llm::LlmProvider> = config.create_brain_client("memory").ok()?;
+        let model = config.model_for_brain("memory").to_string();
+        Some(AnalyzerLlm::new(Arc::from(client), model))
     }
 
     /// 创建四步分析用的 LLM 客户端

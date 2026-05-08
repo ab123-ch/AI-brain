@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use brain_core::types::{EvolutionRule, PitfallRecord, ProgressEvent, UserProfile};
+use brain_core::types::{EvalRequirement, EvolutionRule, PitfallRecord, ProgressEvent, UserProfile};
 use brain_llm::{ChatMessage, ChatRequest, LlmProvider};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +127,7 @@ impl EvalBrain {
         pitfalls: &[PitfallRecord],
         user_profile: &UserProfile,
         rules: &[EvolutionRule],
+        eval_requirements: &[EvalRequirement],
     ) -> Result<EvalResult> {
         if user_input.trim().is_empty() || ai_output.trim().is_empty() {
             return Err(EvalError::InvalidInput(
@@ -140,7 +141,9 @@ impl EvalBrain {
         }
 
         // LLM 评估
-        let feedback = self.llm_evaluate(user_input, ai_output, pitfalls, user_profile, rules).await?;
+        let feedback = self
+            .llm_evaluate(user_input, ai_output, pitfalls, user_profile, rules, eval_requirements)
+            .await?;
 
         // 判断是否通过：包含"存在问题"则不通过
         let passed = !feedback.contains("存在问题");
@@ -194,8 +197,9 @@ impl EvalBrain {
         pitfalls: &[PitfallRecord],
         user_profile: &UserProfile,
         rules: &[EvolutionRule],
+        eval_requirements: &[EvalRequirement],
     ) -> Result<String> {
-        let system_prompt = prompts::build_evaluation_system_prompt();
+        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements);
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
@@ -307,6 +311,7 @@ mod tests {
                 &[],
                 &UserProfile::default(),
                 &[],
+                &[],
             )
             .await
             .unwrap();
@@ -326,6 +331,7 @@ mod tests {
                 &[],
                 &UserProfile::default(),
                 &[],
+                &[],
             )
             .await
             .unwrap();
@@ -338,7 +344,7 @@ mod tests {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
         let result = brain
-            .evaluate("", "some output", &[], &UserProfile::default(), &[])
+            .evaluate("", "some output", &[], &UserProfile::default(), &[], &[])
             .await;
         assert!(result.is_err());
     }
@@ -348,7 +354,7 @@ mod tests {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
         let result = brain
-            .evaluate("some input", "", &[], &UserProfile::default(), &[])
+            .evaluate("some input", "", &[], &UserProfile::default(), &[], &[])
             .await;
         assert!(result.is_err());
     }
@@ -363,6 +369,7 @@ mod tests {
                 "fn add(a: i32, b: i32) -> i32 { a + b }",
                 &[],
                 &UserProfile::default(),
+                &[],
                 &[],
             )
             .await

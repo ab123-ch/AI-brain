@@ -72,9 +72,7 @@ pub enum HookHandlerConfig {
     },
     /// 内置 handler
     #[serde(rename = "builtin")]
-    Builtin {
-        name: String,
-    },
+    Builtin { name: String },
 }
 
 fn default_timeout() -> u64 {

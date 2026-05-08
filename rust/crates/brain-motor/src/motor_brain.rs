@@ -240,7 +240,6 @@ impl MotorBrain {
 
         Ok((conclusion, reasoning_path))
     }
-
 }
 
 impl BrainAgent for MotorBrain {

@@ -1,4 +1,4 @@
-pub mod types;
+pub mod builtins;
 pub mod config;
 pub mod runner;
-pub mod builtins;
+pub mod types;

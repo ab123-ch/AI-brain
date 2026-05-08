@@ -140,7 +140,7 @@ impl MainBrain {
         }
 
         // ── 3. 跑 tool_loop ──
-        let loop_result = tool_loop::run_tool_loop_with_config(
+        let loop_result = match tool_loop::run_tool_loop_with_config(
             self.llm.as_ref(),
             self.tool_executor.as_ref(),
             &mut messages,
@@ -150,7 +150,42 @@ impl MainBrain {
             self.llm_max_tokens,
             self.llm_temperature,
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // 失败时仍写入历史，确保后续轮次上下文连续
+                self.history.push_user(input);
+                // 将 tool_loop 中已执行的部分（assistant 中间回复 + tool 结果）写入
+                let old_len = self.history.len() - 1;
+                let skip = 1 + old_len + 1;
+                for msg in messages.iter().skip(skip) {
+                    if msg.role == brain_llm::MessageRole::System {
+                        continue;
+                    }
+                    match msg.role {
+                        brain_llm::MessageRole::Assistant => {
+                            let text = msg.text_content();
+                            if !text.is_empty() {
+                                self.history.push_assistant(&text);
+                            }
+                        }
+                        brain_llm::MessageRole::User => {
+                            for block in &msg.content {
+                                if let brain_llm::ContentBlock::ToolResult { content, .. } = block
+                                {
+                                    self.history.push_tool_result(content);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // 写入错误信息作为 assistant 消息
+                self.history.push_assistant(&format!("[系统错误] {e}"));
+                return Err(e);
+            }
+        };
 
         let answer = loop_result.response.text();
         let total_tokens = loop_result.response.usage.total_tokens;
@@ -206,9 +241,11 @@ impl MainBrain {
 
         if self.compaction_triggered {
             let indices_guard = self.compressed_indices.lock().await;
-            if let Some((start_idx, end_idx)) =
-                compact::find_slide_out_turn(self.history.messages(), &indices_guard, &self.compaction_config)
-            {
+            if let Some((start_idx, end_idx)) = compact::find_slide_out_turn(
+                self.history.messages(),
+                &indices_guard,
+                &self.compaction_config,
+            ) {
                 drop(indices_guard);
 
                 let pending = self.pending_compressions.clone();
@@ -218,9 +255,13 @@ impl MainBrain {
                 let llm = self.llm.clone();
 
                 tokio::spawn(async move {
-                    let compressed =
-                        compact::compress_single_turn(&messages_snapshot, 0, messages_snapshot.len(), llm.as_ref())
-                            .await;
+                    let compressed = compact::compress_single_turn(
+                        &messages_snapshot,
+                        0,
+                        messages_snapshot.len(),
+                        llm.as_ref(),
+                    )
+                    .await;
                     if !compressed.is_empty() {
                         // key 加上 start_idx 偏移
                         let offset_map: HashMap<usize, String> = compressed
@@ -410,8 +451,12 @@ impl MainBrain {
         // 注入运行环境信息（OS、工作目录、日期）
         let env_info = prompts::build_environment_info();
         // 将记忆上下文追加到 system prompt
+        // Prompt cache 排序：越稳定的越靠前
+        // 1. 系统核心规则（永不变化）
+        // 2. 环境信息（每天变化）
+        // 3. 记忆上下文/潜意识（每次会话变化）
         let full_prompt = match &self.memory_context {
-            Some(ctx) => format!("{system_prompt}\n\n{ctx}\n{env_info}"),
+            Some(ctx) => format!("{system_prompt}\n{env_info}\n\n{ctx}"),
             None => format!("{system_prompt}\n{env_info}"),
         };
         let mut messages = vec![ChatMessage::system(full_prompt)];

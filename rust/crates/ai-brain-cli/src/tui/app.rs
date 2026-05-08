@@ -10,19 +10,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use brain_core::types::ProgressEvent;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
-use brain_core::types::ProgressEvent;
 
 use crate::orchestrator::Orchestrator;
 
 use super::input::{InputArea, InputResult};
 use super::output::{OutputArea, OutputLine};
 use super::status::StatusBar;
+use super::completion::EvolutionCompleter;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⼾", "⼿", "⾀", "⾁", "⾂", "⾃"];
 const COLLAPSE_MAX_CHARS: usize = 80;
@@ -52,12 +53,18 @@ impl App {
         let status_structured = orch.status_structured();
         let mut output = OutputArea::new();
         output.push_system("AI Brain v2 一主二从系统");
-        output.push_system("输入查询 | :help 命令 | Enter 提交 | Shift+Enter 换行");
+        output.push_system("输入查询 | :help 命令 | Enter 提交 | Tab 补全 | ↑↓ 历史 | Shift+Enter 换行");
+
+        // 从 orchestrator 获取 brain-evolution 数据
+        let completer = {
+            let (template_names, pattern_keywords) = orch.completion_data();
+            EvolutionCompleter::new(template_names, pattern_keywords)
+        };
 
         Self {
             output,
             status: StatusBar::from_system_status(&status_structured),
-            input: InputArea::new(),
+            input: InputArea::new(completer),
             spinner_frame: 0,
             should_quit: false,
             is_busy: false,
@@ -130,32 +137,12 @@ impl App {
 
         ctrl_c_task.abort();
 
-        self.output.push_system("正在保存记忆（触发四步分析）...");
+        self.output.push_system("正在保存会话数据...");
         terminal.draw(|f| self.render(f))?;
 
-        let shutdown_done = Arc::new(AtomicBool::new(false));
-        let done_flag = shutdown_done.clone();
-        let guard = tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_err() {
-                return;
-            }
-            if done_flag.load(Ordering::Relaxed) {
-                return;
-            }
-            eprintln!("\n正在保存记忆，请稍候...（再按一次强制退出）");
-            if tokio::signal::ctrl_c().await.is_err() {
-                return;
-            }
-            if !done_flag.load(Ordering::Relaxed) {
-                std::process::exit(1);
-            }
-        });
-
         self.orch.shutdown_with_analysis().await;
-        shutdown_done.store(true, Ordering::Relaxed);
-        guard.abort();
 
-        self.output.push_system("记忆已保存。再见！");
+        self.output.push_system("会话数据已保存。再见！");
         terminal.draw(|f| self.render(f))?;
 
         Ok(())
@@ -286,17 +273,20 @@ impl App {
                     // Markdown 渲染主内容
                     lines.extend(render_markdown_lines(text));
 
-                    // 显示思考内容（如果可见）
+                    // 显示思考内容
                     if let Some(thinking_content) = thinking {
+                        let all_lines: Vec<&str> = thinking_content.lines().collect();
+                        let line_count = all_lines.len();
+
                         if *thinking_visible {
-                            // 思考内容可见，显示分隔线和思考内容
+                            // 展开状态：显示分隔线 + 全部思考内容
                             lines.push(Line::from(Span::styled(
                                 "  ────── 思考内容 ──────",
                                 Style::default()
                                     .fg(Color::DarkGray)
                                     .add_modifier(Modifier::DIM),
                             )));
-                            for l in thinking_content.lines() {
+                            for l in &all_lines {
                                 lines.push(Line::from(Span::styled(
                                     format!("  {l}"),
                                     Style::default()
@@ -305,15 +295,31 @@ impl App {
                                 )));
                             }
                             lines.push(Line::from(Span::styled(
-                                "▴ [Ctrl+E 隐藏思考]",
+                                format!("▴ [{line_count}行 — Ctrl+E 折叠思考]"),
                                 Style::default().fg(Color::DarkGray),
                             )));
                         } else {
-                            // 思考内容隐藏，显示提示
+                            // 折叠状态：只显示首行 + 折叠提示
                             lines.push(Line::from(Span::styled(
-                                "▸ [Ctrl+E 查看思考]",
-                                Style::default().fg(Color::DarkGray),
+                                "  ────── 思考内容 ──────",
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM),
                             )));
+                            if let Some(first) = all_lines.first() {
+                                lines.push(Line::from(Span::styled(
+                                    format!("  {first}"),
+                                    Style::default()
+                                        .fg(Color::DarkGray)
+                                        .add_modifier(Modifier::DIM),
+                                )));
+                            }
+                            if line_count > 1 {
+                                lines.push(Line::from(Span::styled(
+                                    format!("▸ [还有{}行 — Ctrl+E 展开全部]", line_count - 1),
+                                    Style::default().fg(Color::DarkGray),
+                                )));
+                            }
                         }
                     }
                 } else {
@@ -387,10 +393,7 @@ impl App {
                 ))]
             }
 
-            OutputLine::EvalResult {
-                passed,
-                feedback,
-            } => {
+            OutputLine::EvalResult { passed, feedback } => {
                 if *passed {
                     vec![Line::from(Span::styled(
                         "  评估 ✔ 通过",
@@ -687,7 +690,12 @@ impl App {
                     "  Ctrl+E          — 显示/隐藏详情（思考+记忆+评估）",
                     "  Shift+↑/↓       — 上下滚动输出",
                     "  ↑/↓             — 翻阅输入历史",
+                    "  Ctrl+W/Backspace— 删除前一词",
+                    "  Ctrl+Delete     — 删除后一词",
+                    "  Ctrl+U/K        — 删到行首/行尾",
+                    "  Ctrl+←/→        — 词间跳转",
                     "  Ctrl+P          — 展开/折叠长粘贴",
+                    "  Ctrl+A/E        — 跳到行首/行尾",
                     "  鼠标滚轮        — 上下滚动输出",
                     "  Shift+鼠标选择  — 复制输出内容",
                 ] {
@@ -699,8 +707,12 @@ impl App {
                 self.output.push_system(&self.orch.status());
                 CommandResult::Handled
             }
-            cmd if cmd == ":evo" || cmd.starts_with(":evo ")
-                || matches!(cmd, ":evo-status" | ":evo-approve" | ":evo-reject" | ":evo-diff") =>
+            cmd if cmd == ":evo"
+                || cmd.starts_with(":evo ")
+                || matches!(
+                    cmd,
+                    ":evo-status" | ":evo-approve" | ":evo-reject" | ":evo-diff"
+                ) =>
             {
                 // 进化命令需要异步调用，TUI 同步方法中暂为占位提示
                 let msg = match input {
@@ -787,21 +799,27 @@ fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
         if let Some(rest) = line.strip_prefix("### ") {
             lines.push(Line::from(Span::styled(
                 rest.to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
             continue;
         }
         if let Some(rest) = line.strip_prefix("## ") {
             lines.push(Line::from(Span::styled(
                 rest.to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
             continue;
         }
         if let Some(rest) = line.strip_prefix("# ") {
             lines.push(Line::from(Span::styled(
                 rest.to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
             continue;
         }
@@ -810,7 +828,9 @@ fn render_markdown_lines(text: &str) -> Vec<Line<'static>> {
         if let Some(rest) = line.strip_prefix("> ") {
             lines.push(Line::from(Span::styled(
                 format!("  │ {rest}"),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
             )));
             continue;
         }
@@ -894,10 +914,7 @@ fn parse_inline_markdown(text: &str) -> Vec<Span<'static>> {
                 flush_buf(&mut spans, &mut buf);
                 let code = collect_until_char(&mut chars, '`');
                 if let Some(content) = code {
-                    spans.push(Span::styled(
-                        content,
-                        Style::default().fg(Color::Yellow),
-                    ));
+                    spans.push(Span::styled(content, Style::default().fg(Color::Yellow)));
                 }
             }
             // ── [link](url) ──
@@ -934,7 +951,10 @@ fn flush_buf(spans: &mut Vec<Span<'static>>, buf: &mut String) {
 }
 
 /// 收集字符直到遇到连续标记（如 **）
-fn collect_until_marker(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, markers: &[char]) -> Option<String> {
+fn collect_until_marker(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    markers: &[char],
+) -> Option<String> {
     let mut result = String::new();
     loop {
         match chars.next() {
@@ -955,7 +975,10 @@ fn collect_until_marker(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, ma
 }
 
 /// 收集字符直到遇到指定字符
-fn collect_until_char(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, end: char) -> Option<String> {
+fn collect_until_char(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    end: char,
+) -> Option<String> {
     let mut result = String::new();
     loop {
         match chars.next() {
@@ -986,7 +1009,7 @@ fn collect_link(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String
         return (text, false);
     }
     chars.next(); // 消费 (
-    // 跳过 URL（不存储）
+                  // 跳过 URL（不存储）
     loop {
         match chars.next() {
             Some(')') => return (text, true),
