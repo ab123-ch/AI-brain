@@ -7,7 +7,17 @@
       "mcp__memory-system__experience_get",
       "Bash(cargo check:*)",
       "Bash(cargo test:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(find /Users/chenh/RustObject/claw-code-parity -path \"*/.sandbox-home\" -prune -o -type f -name \"*.json\" -path \"*/memory/*\" -print -o -type f -name \"*.json\" -path \"*/subconscious/*\" -print -o -type f -name \"*.json\" -path \"*/summary*\" -print -o -type f -name \"*.json\" -path \"*/session*\" -print -o -type f -name \"*.json\" -path \"*/pitfall*\" -print -o -type f -name \"*.json\" -path \"*/evolution*\" -print 2>/dev/null | head -50)",
+      "Read(//Users/chenh/**)",
+      "Bash(ls -la ~/.ai-brain/memory/subconscious/ 2>/dev/null && echo \"---\" && ls ~/.ai-brain/memory/subconscious/*.json 2>/dev/null | head -20)",
+      "Bash(python3 -m json.tool)",
+      "Read(//Users/chenh/RustObject/claw-code-parity/rust/**)",
+      "Bash(done)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Bash(cat ~/.ai-brain/memory/summaries/sess-1777038007.json | python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('tags:', d.get\\('tags',[]\\)\\); print\\('summary:', d.get\\('fact_summary',''\\)[:200]\\)\" 2>/dev/null; for f in ~/.ai-brain/memory/summaries/sess-*.json; do python3 -c \"import json,sys; d=json.load\\(open\\('$f'\\)\\); print\\(d.get\\('fact_summary',''\\)[:120]\\)\" 2>/dev/null; done)",
+      "Bash(cargo fmt:*)"
     ]
   }
 }

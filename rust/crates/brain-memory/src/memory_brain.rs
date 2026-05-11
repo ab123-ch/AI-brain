@@ -15,8 +15,6 @@ use crate::archive::ArchiveStore;
 use crate::consolidation::ConsolidationEngine;
 use crate::error::Result;
 use crate::event_index::EventIndexLayer;
-use crate::importance::ImportanceManager;
-use crate::memory_iteration::MemoryStoreType;
 use crate::raw_layer::{RawEntry, RawLayer};
 use crate::recall::RecallEngine;
 use crate::short_term::{ShortTermConfig, ShortTermLayer};
@@ -309,23 +307,7 @@ impl MemoryBrain {
             }
         }
 
-        // 召回后强化：对选中的 subconscious 条目增加 importance
-        if !results.is_empty() {
-            let sc_ids: Vec<String> = results
-                .iter()
-                .filter(|r| r.id.starts_with("sc-"))
-                .map(|r| r.id.clone())
-                .collect();
-            if !sc_ids.is_empty() {
-                if let Err(e) = ImportanceManager::reinforce(
-                    &Storage::new_lazy(self.config.base_dir.clone()),
-                    &sc_ids,
-                    MemoryStoreType::Subconscious,
-                ) {
-                    tracing::warn!("召回强化失败: {e}");
-                }
-            }
-        }
+        // 叙事模型不再有 importance 强化逻辑
 
         results
     }
@@ -334,27 +316,25 @@ impl MemoryBrain {
     fn gather_all_candidates(&self) -> Vec<MemoryEntry> {
         let mut candidates = Vec::new();
 
-        // 0. 潜意识层（最外层索引，渐进式披露入口）— 只加载可召回的
+        // 0. 潜意识层（流动叙事，单条目）
         let sc_store = SubconsciousStore::new(Storage::new_lazy(self.config.base_dir.clone()));
-        if let Ok(entries) = sc_store.load_recallable() {
-            for sc in entries.iter().take(10) {
-                candidates.push(MemoryEntry {
-                    id: sc.id.clone(),
-                    content: format!("[印象] {} — {}", sc.topic, sc.impression),
-                    tags: sc.trigger_keywords.clone(),
+        if let Ok(Some(narrative)) = sc_store.load() {
+            candidates.push(MemoryEntry {
+                id: "subconscious-narrative".to_string(),
+                content: narrative.narrative.clone(),
+                tags: narrative.trigger_keywords.clone(),
+                layer: MemoryLayer::TaskSummary,
+                importance: 0.9,
+                source: KnowledgeSource::Memory {
+                    memory_id: "subconscious-narrative".to_string(),
                     layer: MemoryLayer::TaskSummary,
-                    importance: sc.importance,
-                    source: KnowledgeSource::Memory {
-                        memory_id: sc.id.clone(),
-                        layer: MemoryLayer::TaskSummary,
-                    },
-                    confidence: 0.9,
-                    reference_count: 0,
-                    created_at: sc.created_at,
-                    last_accessed: Utc::now(),
-                    consolidated: true,
-                });
-            }
+                },
+                confidence: 0.9,
+                reference_count: 0,
+                created_at: narrative.created_at,
+                last_accessed: Utc::now(),
+                consolidated: true,
+            });
         }
 
         // 1. L1 归档主题匹配（按重要度取 top 5）
@@ -554,24 +534,21 @@ impl MemoryBrain {
 
         // 0. 潜意识层关键词匹配
         let sc_store = SubconsciousStore::new(Storage::new_lazy(self.config.base_dir.clone()));
-        if let Ok(matched) = sc_store.match_keywords(&keywords, max_results) {
-            for sc in &matched {
-                if results.len() >= max_results {
-                    break;
-                }
+        if let Ok(true) = sc_store.match_keywords(&keywords) {
+            if let Ok(Some(narrative)) = sc_store.load() {
                 results.push(MemoryEntry {
-                    id: sc.id.clone(),
-                    content: format!("[印象] {} — {}", sc.topic, sc.impression),
-                    tags: sc.trigger_keywords.clone(),
+                    id: "subconscious-narrative".to_string(),
+                    content: narrative.narrative.clone(),
+                    tags: narrative.trigger_keywords.clone(),
                     layer: MemoryLayer::TaskSummary,
-                    importance: sc.importance,
+                    importance: 0.9,
                     source: KnowledgeSource::Memory {
-                        memory_id: sc.id.clone(),
+                        memory_id: "subconscious-narrative".to_string(),
                         layer: MemoryLayer::TaskSummary,
                     },
                     confidence: 0.9,
                     reference_count: 0,
-                    created_at: sc.created_at,
+                    created_at: narrative.created_at,
                     last_accessed: Utc::now(),
                     consolidated: true,
                 });
@@ -730,21 +707,7 @@ impl MemoryBrain {
                         candidates.len(),
                         results.len()
                     );
-                    // LLM 召回后强化
-                    let sc_ids: Vec<String> = results
-                        .iter()
-                        .filter(|r| r.id.starts_with("sc-"))
-                        .map(|r| r.id.clone())
-                        .collect();
-                    if !sc_ids.is_empty() {
-                        if let Err(e) = ImportanceManager::reinforce(
-                            &Storage::new_lazy(self.config.base_dir.clone()),
-                            &sc_ids,
-                            MemoryStoreType::Subconscious,
-                        ) {
-                            tracing::warn!("LLM召回强化失败: {e}");
-                        }
-                    }
+                    // 叙事模型不再有 importance 强化逻辑
                 }
                 Ok(results)
             }
@@ -823,36 +786,16 @@ impl MemoryBrain {
     ///
     /// 过滤策略：
     /// 1. 跳过 superseded 条目
-    /// 2. 跳过 importance < 0.5 的低质量条目
-    /// 3. 最多注入 6 条（load_all 已按 importance 降序，take 即 top）
+    /// 加载潜意识叙事摘要（注入主脑 system prompt 用）
+    ///
+    /// 直接返回流动叙事文本
     pub fn load_subconscious_summary(&self) -> Option<String> {
         let sc_store = SubconsciousStore::new(Storage::new_lazy(self.config.base_dir.clone()));
-        let entries = sc_store.load_all().ok()?;
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .filter(|e| !e.superseded && e.importance >= 0.5)
-            .take(6)
-            .collect();
-        if filtered.is_empty() {
+        let narrative = sc_store.load().ok()??;
+        if narrative.narrative.is_empty() {
             return None;
         }
-        let text = filtered
-            .iter()
-            .map(|e| {
-                let kws = e.trigger_keywords.join("、");
-                let pitfall = if e.pitfall_hint.is_empty() {
-                    String::new()
-                } else {
-                    format!(" | 坑: {}", e.pitfall_hint)
-                };
-                format!(
-                    "• {} (触发: {}) — {}{pitfall} → {}",
-                    e.topic, kws, e.impression, e.reference_hint
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        Some(text)
+        Some(narrative.narrative)
     }
 
     /// 处理协作消息（召回请求）

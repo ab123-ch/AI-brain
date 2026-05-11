@@ -149,10 +149,10 @@ pub async fn run_tool_loop_with_config(
                     .await;
                 }
                 ContentBlock::Thinking { content } if !content.is_empty() => {
-                    // DeepSeek 的 reasoning_content → 作为思考内容发送
+                    // 用 <thinklh> 标签包裹，TUI 的 strip_thinking_tags 会检测并分离
                     send_progress(
                         progress_tx,
-                        ProgressEvent::TextDelta { text: format!("🧠 {content}") },
+                        ProgressEvent::TextDelta { text: format!("<thinklh>{content}</thinklh>") },
                     )
                     .await;
                 }

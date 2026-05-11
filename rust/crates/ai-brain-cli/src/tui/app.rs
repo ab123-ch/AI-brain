@@ -201,6 +201,14 @@ impl App {
             }
         }
 
+        // 流式思考内容：只显示最新一行，持续滚动
+        if let Some(latest) = self.output.streaming_thinking_latest_line() {
+            ratatui_lines.push(Line::from(Span::styled(
+                format!("  💭 {latest}"),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            )));
+        }
+
         // Spinner 行（独立渲染，不在 lines 中）
         if let Some(spinner) = self.output.spinner_text() {
             ratatui_lines.push(Line::from(Span::styled(
@@ -299,16 +307,16 @@ impl App {
                                 Style::default().fg(Color::DarkGray),
                             )));
                         } else {
-                            // 折叠状态：只显示首行 + 折叠提示
+                            // 折叠状态：只显示最新一行（最后一行非空）
                             lines.push(Line::from(Span::styled(
                                 "  ────── 思考内容 ──────",
                                 Style::default()
                                     .fg(Color::DarkGray)
                                     .add_modifier(Modifier::DIM),
                             )));
-                            if let Some(first) = all_lines.first() {
+                            if let Some(last) = all_lines.iter().rev().find(|l| !l.trim().is_empty()) {
                                 lines.push(Line::from(Span::styled(
-                                    format!("  {first}"),
+                                    format!("  💭 {last}"),
                                     Style::default()
                                         .fg(Color::DarkGray)
                                         .add_modifier(Modifier::DIM),
@@ -316,7 +324,7 @@ impl App {
                             }
                             if line_count > 1 {
                                 lines.push(Line::from(Span::styled(
-                                    format!("▸ [还有{}行 — Ctrl+E 展开全部]", line_count - 1),
+                                    format!("▸ [共{}行 — Ctrl+E 展开全部]", line_count),
                                     Style::default().fg(Color::DarkGray),
                                 )));
                             }

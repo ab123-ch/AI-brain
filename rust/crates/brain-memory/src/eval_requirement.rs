@@ -118,9 +118,7 @@ mod tests {
     #[test]
     fn add_and_load() {
         let (_tmp, store) = make_store();
-        let req = store
-            .add("不要将简单问答判定为问题", "用户反馈")
-            .unwrap();
+        let req = store.add("不要将简单问答判定为问题", "用户反馈").unwrap();
 
         assert!(req.id.starts_with("evreq-"));
         assert_eq!(req.content, "不要将简单问答判定为问题");

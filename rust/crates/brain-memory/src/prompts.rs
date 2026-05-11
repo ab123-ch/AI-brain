@@ -312,32 +312,30 @@ pub fn build_step4_prompt(pitfalls_json: &str, existing_rules: &str) -> String {
         .replace("{existing_rules}", existing_rules)
 }
 
-/// 构建第五步：潜意识抽象 prompt
+/// 构建第五步：潜意识叙事更新 prompt
 pub fn build_step5_prompt(
     fact_summary: &str,
     pitfalls_text: &str,
     evolution_text: &str,
-    existing_subconscious: &str,
+    existing_narrative: &str,
 ) -> String {
     STEP5_SUBCONSCIOUS_PROMPT
         .replace("{fact_summary}", fact_summary)
         .replace("{pitfalls_text}", pitfalls_text)
         .replace("{evolution_text}", evolution_text)
-        .replace("{existing_subconscious}", existing_subconscious)
+        .replace("{existing_narrative}", existing_narrative)
 }
 
-/// 第五步：潜意识抽象（印象索引生成）
+/// 第五步：潜意识叙事更新
 ///
-/// 三层渐进披露设计：
-/// - impression: 极简"我做过这件事"（触发用）
-/// - pitfall_hint: 直觉级"有个坑大概是这样"（唤醒用）
-/// - reference_hint: L2/L3 具体文件引用（深入回忆用）
+/// 从结构化条目改为流动叙事，LLM 负责 合并/覆盖/追加 决策。
 pub const STEP5_SUBCONSCIOUS_PROMPT: &str = "\
 # 身份
-你是一个记忆抽象引擎。你将对话事实、踩坑记录、进化规则抽象为「潜意识印象」——三层渐进披露。
+你是一个记忆叙事编辑器。你负责维护一段关于用户的流动叙事文本——\"用户做过什么、踩过什么坑、比较过什么\"。
+你的目标是：用最少的文字覆盖最多的经验触发面。
 
 # 输入
-事实总结：
+本轮事实总结：
 {fact_summary}
 
 本轮新增踩坑：
@@ -346,48 +344,42 @@ pub const STEP5_SUBCONSCIOUS_PROMPT: &str = "\
 本轮新增进化规则：
 {evolution_text}
 
-已有潜意识印象（去重用）：
-{existing_subconscious}
+已有叙事文本：
+{existing_narrative}
 
-# 准入门槛（关键！不是所有对话都值得存潜意识）
-只有满足以下至少一项的内容才能生成潜意识条目：
-✅ 踩坑/故障排查经验（遇到什么问题、怎么解决的）
-✅ 架构决策或技术选型（为什么这么设计）
+# 准入门槛（关键！不是所有对话都值得更新叙事）
+只有满足以下至少一项才能更新叙事：
+✅ 踩坑/故障排查经验
+✅ 架构决策或技术选型
 ✅ 用户明确的偏好/禁忌/工作习惯
 ✅ 跨项目可复用的经验教训
 ✅ 复杂业务逻辑的关键理解
 
-以下内容【禁止】存入潜意识：
-❌ 一次性闲聊（称呼、玩笑、寒暄）
-❌ 通用编程知识（语法、标准库用法）
-❌ 当前对话的上下文信息（这些属于会话记忆，不是潜意识）
+以下内容【禁止】更新叙事：
+❌ 一次性闲聊、寒暄
+❌ 通用编程知识
+❌ 浅层问答
 ❌ 自我介绍/功能说明
-❌ 浅层问答（查个信息、问个概念）
-❌ 对自身能力的描述（那不是经验，是自我认知）
 
-# 三层渐进披露规则（关键！）
-1. topic：主题领域，简短（如\"Claude Code配置\"，不是\"Claude Code配置文件修改踩坑\"）
-2. trigger_keywords：触发词，用户提到这些词时说明可能做过相关的事，最多 8 个
-3. impression：极简印象，只说\"了解过/做过/配置过/开发过X\"，不超过 15 字，不写结论和教训
-4. pitfall_hint：踩坑摘要，一句话直觉级描述坑在哪（如\"配置文件有多个，改错了\"），没有踩坑则为空字符串
-5. reference_hint：精确引用，指向有详情的文件（如\"pitfall/pt-xxx.json\"、\"sessions/sess_xxx\"），只填目录级即可
-6. 每个 topic 独立一条，不要把不相关的事情合并
-7. importance 评估：有踩坑记录且有进化规则 → 0.9+，仅有踩坑 → 0.7-0.8，仅有事实 → 0.5 以下或不生成
-8. 如果本轮对话没有产生有价值的新经验，返回空 entries 数组
-9. 用中文输出
+# 叙事编辑规则（关键！）
+1. **合并**：相关领域的经验自然融合为一句（如\"开发过AI Brain记忆脑（四步分析+三层存储+迭代机制）\"）
+2. **覆盖**：新信息推翻旧结论时，自然替换，不保留被推翻的内容
+3. **追加**：全新领域追加到叙事末尾
+4. **控制篇幅**：叙事总长不超过 300 字，用逗号/顿号连接短语
+5. **关键词**：提取能触发召回的关键词（最多 15 个），不要重复已有叙事中的每个词
+6. 如果本轮对话没有产生有价值的新经验，返回空 narrative
+7. 用中文输出
 
 # 输出格式（严格 JSON）
 {
-  \"entries\": [
-    {
-      \"topic\": \"Claude Code配置\",
-      \"trigger_keywords\": [\"配置文件\", \"settings\", \"Claude Code\", \"修改配置\"],
-      \"impression\": \"了解过Claude Code配置\",
-      \"pitfall_hint\": \"配置文件有多个，改错了文件\",
-      \"reference_hint\": \"pitfall/\",
-      \"importance\": 0.85
-    }
-  ]
+  \"narrative\": \"做过X，做过Y，踩过Z的坑\",
+  \"new_keywords\": [\"关键词1\", \"关键词2\"]
+}
+
+无新经验时：
+{
+  \"narrative\": \"\",
+  \"new_keywords\": []
 }\
 ";
 
@@ -407,7 +399,7 @@ pub const STEP6_SESSION_SUMMARY_PROMPT: &str = "\
 本轮踩坑记录：
 {pitfalls_text}
 
-已有潜意识印象（参考用）：
+已有潜意识叙事（参考用）：
 {existing_subconscious}
 
 # 规则
@@ -565,10 +557,7 @@ mod tests {
 
     #[test]
     fn step1_prompt_with_previous_summary() {
-        let prompt = build_step1_prompt(
-            "[{\"role\":\"user\"}]",
-            Some("之前讨论了 Rust 架构"),
-        );
+        let prompt = build_step1_prompt("[{\"role\":\"user\"}]", Some("之前讨论了 Rust 架构"));
         assert!(prompt.contains("[{\"role\":\"user\"}]"));
         assert!(prompt.contains("之前讨论了 Rust 架构"));
         assert!(prompt.contains("已有的事实摘要"));
@@ -610,256 +599,130 @@ mod tests {
         assert!(!prompt.contains("{existing_rules}"));
     }
 
-    /// ── 场景模拟：DeepSeek 配置 4 轮对话 → Step5 潜意识抽取 ──
-    ///
-    /// 对话内容：
-    ///   R1: 用户想配 DeepSeek 到 Claude Code → 助手查了官网和配置文档
-    ///   R2: 用户不想自己配 → 助手直接改了 settings.local.json（未确认）
-    ///   R3: 配置没生效 → 助手排查内容正确但方向错了
-    ///   R4: 用户指出改错文件了 → 助手改到 settings.json 修复
+    /// ── 场景模拟：DeepSeek 配置踩坑 → Step5 叙事编辑 ──
     #[test]
     fn step5_scenario_deepseek_config() {
-        // ── Step1 产出：事实总结 ──
         let fact_summary = "\
 用户想将DeepSeek最新模型配置到Claude Code中使用。
 助手查询了DeepSeek官网和Claude Code配置文档，找到了配置方法。
 助手在本机找到了多个配置文件：settings.json、settings.local.json等。
 助手未向用户确认，自行判断修改了settings.local.json。
-用户反馈配置未生效。助手排查了配置内容本身，确认格式和参数都正确。
-用户指出是修改了错误的文件，应该是settings.json而非settings.local.json。
+用户反馈配置未生效。用户指出是修改了错误的文件。
 助手最终修改了settings.json，配置生效。";
 
-        // ── Step3 产出：踩坑记录 ──
         let pitfalls_text = "\
-- [ToolFailure] 修改配置文件时未确认正确的文件路径，自行假设settings.local.json是正确的文件
-- [WrongAnswer] 排查配置不生效问题时，只检查了配置内容是否正确，未优先检查是否修改了正确的文件路径
-- [LazyBehavior] 未主动向用户确认要修改哪个配置文件，擅自做了判断";
+- [ToolFailure] 修改配置文件时未确认正确的文件路径
+- [LazyBehavior] 未主动向用户确认要修改哪个配置文件";
 
-        // ── Step4 产出：进化规则 ──
         let evolution_text = "\
-- 修改配置文件前必须先向用户确认正确的文件路径，不能自行假设
-- 排查配置不生效问题时，应优先检查是否修改了正确的文件，而非只检查内容
-- 当存在多个同名/相似配置文件时，必须逐一确认用途后再操作";
+- 修改配置文件前必须先向用户确认正确的文件路径";
 
-        let existing_subconscious = "（无）";
+        let existing_narrative = "无，这是首次生成";
 
-        // ── 构建 Step5 prompt ──
         let prompt = build_step5_prompt(
             fact_summary,
             pitfalls_text,
             evolution_text,
-            existing_subconscious,
+            existing_narrative,
         );
 
-        // 打印完整 prompt 供人工审查
-        eprintln!(
-            "\n========== Step5 Prompt (新版本) ==========\n{prompt}\n========== End ==========\n"
-        );
-
-        // 验证准入门槛存在于 prompt 中
-        assert!(prompt.contains("准入门槛"), "新 prompt 应包含准入门槛");
-        assert!(prompt.contains("踩坑"), "准入标准应包含踩坑经验");
-        assert!(prompt.contains("禁止"), "应包含禁止标准");
-        assert!(prompt.contains("一次性闲聊"), "禁止标准应包含一次性闲聊");
+        // 验证新 prompt 包含叙事编辑器身份
         assert!(
-            prompt.contains("通用编程知识"),
-            "禁止标准应包含通用编程知识"
+            prompt.contains("记忆叙事编辑器"),
+            "新 prompt 应包含叙事编辑器身份"
         );
+        assert!(prompt.contains("准入门槛"));
+        assert!(prompt.contains("narrative"));
+        assert!(prompt.contains("new_keywords"));
+        // 不应包含旧的 entries 数组格式
+        assert!(!prompt.contains("\"entries\""));
 
-        // ── 模拟 LLM 返回（按新 prompt 三层渐进披露） ──
-        // 新 prompt 要求：impression 极简 + pitfall_hint 直觉级 + reference_hint 精确引用
+        // 模拟 LLM 返回叙事更新
         let llm_response = serde_json::json!({
-            "entries": [{
-                "topic": "Claude Code配置",
-                "trigger_keywords": ["配置文件", "settings.json", "Claude Code", "修改配置", "配置不生效"],
-                "impression": "了解过Claude Code配置",
-                "pitfall_hint": "配置文件有多个，改错了文件",
-                "reference_hint": "pitfall/",
-                "importance": 0.85
-            }]
+            "narrative": "配过Claude Code的DeepSeek模型，踩过改错配置文件的坑",
+            "new_keywords": ["DeepSeek", "配置文件", "settings.json", "Claude Code"]
         });
         let response_str = serde_json::to_string(&llm_response).unwrap();
 
-        // ── 解析 LLM 返回（复用 step5 的解析逻辑） ──
+        // 解析
         let parsed: serde_json::Value = serde_json::from_str(&response_str).unwrap();
-        let entries_arr = parsed
-            .get("entries")
+        let narrative = parsed
+            .get("narrative")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new_keywords: Vec<String> = parsed
+            .get("new_keywords")
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
 
-        let mut new_entries: Vec<crate::subconscious::NewSubconsciousEntry> = Vec::new();
-        for e in &entries_arr {
-            let topic = e
-                .get("topic")
-                .and_then(|v: &serde_json::Value| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if topic.is_empty() {
-                continue;
-            }
-            let trigger_keywords: Vec<String> = e
-                .get("trigger_keywords")
-                .and_then(|v: &serde_json::Value| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v: serde_json::Value| v.as_str().map(String::from))
-                .filter(|s: &String| !s.trim().is_empty())
-                .take(8)
-                .collect();
-            let impression = e
-                .get("impression")
-                .and_then(|v: &serde_json::Value| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let pitfall_hint = e
-                .get("pitfall_hint")
-                .and_then(|v: &serde_json::Value| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let reference_hint = e
-                .get("reference_hint")
-                .and_then(|v: &serde_json::Value| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let importance = e
-                .get("importance")
-                .and_then(|v: &serde_json::Value| v.as_f64())
-                .unwrap_or(0.7);
-
-            new_entries.push(crate::subconscious::NewSubconsciousEntry {
-                topic,
-                trigger_keywords,
-                impression,
-                pitfall_hint,
-                reference_hint,
-                importance,
-            });
-        }
-
-        // ── 验证结果 ──
-        eprintln!("\n========== 潜意识抽取结果（三层渐进披露） ==========");
-        for entry in &new_entries {
-            eprintln!(
-                "  topic: {}\n  impression: {}  ← 极简触发\n  pitfall_hint: {}  ← 直觉级踩坑\n  reference: {}  ← 精确引用\n  importance: {}\n",
-                entry.topic, entry.impression, entry.pitfall_hint, entry.reference_hint, entry.importance
-            );
-        }
-
-        // 应该只有 1 条（不是 4 条每轮一条）
-        assert_eq!(new_entries.len(), 1, "应该只生成 1 条高质量潜意识");
-        assert_eq!(new_entries[0].topic, "Claude Code配置");
-        assert!(
-            new_entries[0].importance >= 0.7,
-            "有踩坑+进化规则 importance 应 >= 0.7"
-        );
-        assert!(new_entries[0].trigger_keywords.len() >= 3);
-
-        // impression 极简（<= 15 字）
-        assert!(
-            new_entries[0].impression.chars().count() <= 20,
-            "impression 应极简，实际: {} ({}字)",
-            new_entries[0].impression,
-            new_entries[0].impression.chars().count()
-        );
-        assert!(
-            new_entries[0].impression.contains("了解")
-                || new_entries[0].impression.contains("做过"),
-            "impression 应只表达'我做过这事'"
-        );
-
-        // pitfall_hint 非空且简短直觉
-        assert!(
-            !new_entries[0].pitfall_hint.is_empty(),
-            "有踩坑时 pitfall_hint 不应为空"
-        );
-        assert!(
-            new_entries[0].pitfall_hint.contains("改错"),
-            "pitfall_hint 应直觉级描述坑"
-        );
-
-        // 不应包含结论性内容（那是 L2/L3 的活）
-        assert!(
-            !new_entries[0].impression.contains("必须"),
-            "impression 不应包含结论性指令"
-        );
-        assert!(
-            !new_entries[0].impression.contains("教训"),
-            "impression 不应包含教训总结"
-        );
-
-        // ── 模拟 load_subconscious_summary 过滤 ──
-        let all_passed_filter = new_entries.iter().all(|e| e.importance >= 0.5);
-        assert!(all_passed_filter, "所有条目应通过 importance >= 0.5 过滤");
-        assert!(new_entries.len() <= 6, "条目数应 <= 6");
-
-        eprintln!("========== 过滤验证通过 ==========\n");
+        assert!(!narrative.is_empty(), "叙事不应为空");
+        assert!(narrative.contains("配置文件"), "叙事应包含关键信息");
+        assert!(new_keywords.len() >= 3, "应提取足够关键词");
     }
 
-    /// ── 对照组：旧 prompt 会生成什么垃圾 ──
-    ///
-    /// 旧 prompt 只说"从中提取做过的事情"，LLM 大概率会生成 3-4 条：
-    /// 1. DeepSeek模型配置查询（浅层信息查询，无价值）
-    /// 2. Claude Code配置文件查找（通用操作，无价值）
-    /// 3. 配置文件修改操作（重复了，无价值）
-    /// 4. 配置不生效排查（和#3重复）
-    /// 而"角色称呼"这类直接被忽略（本轮没有）
+    /// ── 场景模拟：已有叙事，网文提示词+记忆脑补充 ──
     #[test]
-    fn step5_old_prompt_would_produce_garbage() {
-        let _fact_summary = "用户想配置DeepSeek最新模型到Claude Code。\
-助手查询了DeepSeek官网。助手修改了settings.local.json。\
-用户说配置没生效。最终改了settings.json。";
+    fn step5_scenario_novel_prompt_merge() {
+        let fact_summary = "用户开发了 ai brain 记忆脑的四步分析和三层存储架构";
+        let pitfalls_text = "（无新增）";
+        let evolution_text = "";
+        let existing_narrative = "优化过网文写作提示词（6部分结构），了解AI味的典型特征";
 
-        // 旧 prompt 没有准入门槛，LLM 会把一切"做过的事"都提取
-        // 模拟旧 prompt 下 LLM 的典型输出：
-        let old_llm_response = serde_json::json!({
-            "entries": [
-                {
-                    "topic": "DeepSeek模型配置",
-                    "trigger_keywords": ["DeepSeek", "模型配置", "最新模型", "Claude Code"],
-                    "impression": "帮用户查询过DeepSeek最新模型的配置方法",
-                    "reference_hint": "sessions/",
-                    "importance": 0.6
-                },
-                {
-                    "topic": "配置文件查找",
-                    "trigger_keywords": ["配置文件", "settings", "查找文件"],
-                    "impression": "查找过Claude Code的配置文件，找到settings.json和settings.local.json",
-                    "reference_hint": "sessions/",
-                    "importance": 0.5
-                },
-                {
-                    "topic": "配置文件修改",
-                    "trigger_keywords": ["修改配置", "settings.local", "settings.json"],
-                    "impression": "修改过Claude Code配置文件",
-                    "reference_hint": "sessions/",
-                    "importance": 0.5
-                },
-                {
-                    "topic": "配置不生效排查",
-                    "trigger_keywords": ["配置不生效", "排查", "不生效"],
-                    "impression": "排查过配置不生效的问题",
-                    "reference_hint": "sessions/",
-                    "importance": 0.5
-                }
-            ]
+        let prompt = build_step5_prompt(
+            fact_summary,
+            pitfalls_text,
+            evolution_text,
+            existing_narrative,
+        );
+
+        // 验证已有叙事被传入
+        assert!(prompt.contains("优化过网文写作提示词"));
+        assert!(prompt.contains("6部分结构"));
+
+        // 模拟 LLM 合并输出
+        let llm_response = serde_json::json!({
+            "narrative": "优化过网文写作提示词（6部分结构），了解AI味的典型特征，开发过AI Brain记忆脑（四步分析+三层存储）",
+            "new_keywords": ["记忆脑", "四步分析", "三层存储"]
         });
 
-        let entries = old_llm_response.get("entries").unwrap().as_array().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&llm_response).unwrap()).unwrap();
+        let narrative = parsed
+            .get("narrative")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
-        eprintln!("\n========== 旧 Prompt 典型输出 (4条垃圾) ==========");
-        for e in entries {
-            eprintln!(
-                "  topic: {} | importance: {} | impression: {}",
-                e["topic"].as_str().unwrap(),
-                e["importance"].as_f64().unwrap(),
-                e["impression"].as_str().unwrap()
-            );
-        }
+        // 验证两个领域都在叙事中
+        assert!(narrative.contains("提示词"), "应保留旧领域");
+        assert!(narrative.contains("记忆脑"), "应包含新领域");
+        // 不是简单末尾追加，而是相关内容自然融合
+        assert!(narrative.contains("四步分析"));
+    }
 
-        // 旧 prompt 生成 4 条，新 prompt 应只生成 1 条
-        assert_eq!(entries.len(), 4, "旧 prompt 会生成 4 条");
-        eprintln!("========== 对比：新 prompt 只生成 1 条高质量条目 ==========\n");
+    #[test]
+    fn step5_prompt_empty_narrative() {
+        let prompt = build_step5_prompt("事实", "踩坑", "规则", "无，这是首次生成");
+        assert!(prompt.contains("无，这是首次生成"));
+        assert!(!prompt.contains("{existing_narrative}"));
+    }
+
+    #[test]
+    fn step5_prompt_existing_narrative() {
+        let prompt = build_step5_prompt("新事实", "新踩坑", "新规则", "做过X，做过Y");
+        assert!(prompt.contains("做过X，做过Y"));
+        assert!(!prompt.contains("{existing_narrative}"));
+    }
+
+    #[test]
+    fn step5_prompt_all_placeholders_replaced() {
+        let prompt = build_step5_prompt("fact", "pitfall", "evolution", "existing");
+        assert!(!prompt.contains("{fact_summary}"));
+        assert!(!prompt.contains("{pitfalls_text}"));
+        assert!(!prompt.contains("{evolution_text}"));
+        assert!(!prompt.contains("{existing_narrative}"));
     }
 }

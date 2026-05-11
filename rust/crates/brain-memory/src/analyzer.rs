@@ -16,7 +16,7 @@ use crate::index_layer::IndexLayer;
 use crate::pitfall::{NewPitfall, PitfallStore};
 use crate::prompts;
 use crate::storage::Storage;
-use crate::subconscious::{NewSubconsciousEntry, SubconsciousStore};
+use crate::subconscious::{NarrativeUpdate, SubconsciousStore};
 use crate::summary::{SessionSummary, SessionSummaryStore};
 use crate::user_profile::UserProfileStore;
 
@@ -35,7 +35,7 @@ pub struct AnalysisReport {
     pub profile_entries_added: usize,
     pub pitfalls_found: usize,
     pub rules_created: usize,
-    pub subconscious_entries: usize,
+    pub subconscious_updated: bool,
     /// L2 会话总结已生成
     pub summary_generated: bool,
     /// Step0 记忆迭代处理条目数
@@ -145,14 +145,16 @@ impl FourStepAnalyzer {
             String::new()
         };
 
-        // Step 5: 潜意识抽象（印象索引）
+        // Step 5: 潜意识叙事更新
         match self
             .step5_subconscious(&fact_summary, &new_pitfalls, &evolution_text)
             .await
         {
-            Ok(entries) => {
-                tracing::info!("四步分析 Step5 完成: 生成 {} 条潜意识印象", entries.len());
-                report.subconscious_entries = entries.len();
+            Ok(updated) => {
+                if updated {
+                    tracing::info!("四步分析 Step5 完成: 潜意识叙事已更新");
+                }
+                report.subconscious_updated = updated;
             }
             Err(e) => tracing::warn!("四步分析 Step5 失败: {e}"),
         }
@@ -179,7 +181,10 @@ impl FourStepAnalyzer {
         }
 
         // Step 7: 用户评估要求提取
-        match self.step7_eval_requirements(&fact_summary, conversation_json).await {
+        match self
+            .step7_eval_requirements(&fact_summary, conversation_json)
+            .await
+        {
             Ok(added) => {
                 if added > 0 {
                     tracing::info!("四步分析 Step7 完成: 提取 {} 条用户评估要求", added);
@@ -197,12 +202,8 @@ impl FourStepAnalyzer {
         // 记忆衰减 + 淘汰
         match crate::importance::ImportanceManager::decay_all(&self.base_dir) {
             Ok(decay_report) => {
-                if decay_report.decayed_count > 0 || decay_report.pruned_count > 0 {
-                    tracing::info!(
-                        "记忆衰减完成: {} 条衰减, {} 条淘汰",
-                        decay_report.decayed_count,
-                        decay_report.pruned_count,
-                    );
+                if decay_report.pruned_count > 0 {
+                    tracing::info!("记忆衰减完成: {} 条淘汰", decay_report.pruned_count,);
                 }
             }
             Err(e) => tracing::warn!("记忆衰减失败: {e}"),
@@ -225,19 +226,6 @@ impl FourStepAnalyzer {
         // 1. 收集已有可召回记忆
         let storage = Storage::new_lazy(self.base_dir.clone());
         let mut existing = Vec::new();
-
-        // Subconscious
-        let sc_store = SubconsciousStore::new(storage.clone());
-        if let Ok(entries) = sc_store.load_recallable() {
-            for e in &entries {
-                existing.push(ExistingMemory {
-                    id: e.id.clone(),
-                    store_type: MemoryStoreType::Subconscious,
-                    content: format!("{}: {}", e.topic, e.impression),
-                    created_at: e.created_at,
-                });
-            }
-        }
 
         // Summary
         let summary_store = SessionSummaryStore::new(storage.clone());
@@ -308,7 +296,10 @@ impl FourStepAnalyzer {
                     crate::memory_iteration::IterationAction::MarkSuperseded
                     | crate::memory_iteration::IterationAction::ReplaceWithNew => {
                         let _ = match em.store_type {
-                            MemoryStoreType::Subconscious => sc_store.mark_superseded(&em.id),
+                            MemoryStoreType::Subconscious => {
+                                // 叙事模型不再支持 mark_superseded，跳过
+                                Ok(())
+                            }
                             MemoryStoreType::Summary => summary_store.mark_superseded(&em.id),
                             MemoryStoreType::Pitfall => pitfall_store.mark_superseded(&em.id),
                             MemoryStoreType::Evolution => evo_store.mark_superseded(&em.id),
@@ -334,7 +325,10 @@ impl FourStepAnalyzer {
         }
         let data = std::fs::read_to_string(&path).ok()?;
         let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
-        parsed.get("summary").and_then(|v| v.as_str()).map(String::from)
+        parsed
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(String::from)
     }
 
     async fn step1_fact_summary(
@@ -530,27 +524,25 @@ impl FourStepAnalyzer {
         Ok(new_rules)
     }
 
-    // ─── Step 5: 潜意识抽象 ──────────────────────────────────────
+    // ─── Step 5: 潜意识叙事更新 ──────────────────────────────────────
 
     async fn step5_subconscious(
         &self,
         fact_summary: &str,
         pitfalls: &[NewPitfall],
         evolution_text: &str,
-    ) -> std::result::Result<Vec<NewSubconsciousEntry>, String> {
+    ) -> std::result::Result<bool, String> {
         let storage = Storage::new_lazy(self.base_dir.clone());
         let sc_store = SubconsciousStore::new(storage);
 
-        // 加载已有潜意识印象
-        let existing = sc_store.load_all().map_err(|e| e.to_string())?;
-        let existing_text = if existing.is_empty() {
-            "（无）".into()
-        } else {
-            existing
-                .iter()
-                .map(|e| format!("- [{}] {}", e.topic, e.impression))
-                .collect::<Vec<_>>()
-                .join("\n")
+        // 加载已有叙事
+        let existing_text = match sc_store.load() {
+            Ok(Some(n)) => n.narrative,
+            Ok(None) => "无，这是首次生成".to_string(),
+            Err(e) => {
+                tracing::warn!("Step5 加载叙事失败: {e}");
+                "无，这是首次生成".to_string()
+            }
         };
 
         let pitfalls_text = if pitfalls.is_empty() {
@@ -574,67 +566,38 @@ impl FourStepAnalyzer {
         let parsed: serde_json::Value = serde_json::from_str(&extract_json(&response))
             .map_err(|e| format!("Step5 JSON 解析失败: {e}"))?;
 
-        let entries_arr = parsed
-            .get("entries")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let narrative = parsed
+            .get("narrative")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
-        let mut new_entries = Vec::new();
-        for e in &entries_arr {
-            let topic = e
-                .get("topic")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if topic.is_empty() {
-                continue;
-            }
-            let trigger_keywords = e
-                .get("trigger_keywords")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .filter(|s| !s.trim().is_empty())
-                .take(8)
-                .collect();
-            let impression = e
-                .get("impression")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let pitfall_hint = e
-                .get("pitfall_hint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let reference_hint = e
-                .get("reference_hint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let importance = e.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.7);
-
-            new_entries.push(NewSubconsciousEntry {
-                topic,
-                trigger_keywords,
-                impression,
-                pitfall_hint,
-                reference_hint,
-                importance,
-            });
+        if narrative.is_empty() {
+            return Ok(false);
         }
 
-        // 持久化（合并去重）
+        let new_keywords: Vec<String> = parsed
+            .get("new_keywords")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+
+        // 持久化更新
         let storage = Storage::new_lazy(self.base_dir.clone());
         let sc_store = SubconsciousStore::new(storage);
-        let _merged = sc_store
-            .merge_entries(&new_entries)
+        sc_store
+            .update(&NarrativeUpdate {
+                narrative,
+                new_keywords,
+            })
             .map_err(|e| e.to_string())?;
 
-        Ok(new_entries)
+        Ok(true)
     }
 
     // ─── Step 7: 用户评估要求提取 ──────────────────────────────────────
@@ -659,8 +622,7 @@ impl FourStepAnalyzer {
                 .join("\n")
         };
 
-        let prompt =
-            prompts::build_step7_prompt(fact_summary, conversation_json, &existing_text);
+        let prompt = prompts::build_step7_prompt(fact_summary, conversation_json, &existing_text);
         let response = self.llm.complete(&prompt).await?;
 
         let parsed: serde_json::Value = serde_json::from_str(&extract_json(&response))
@@ -720,15 +682,8 @@ impl FourStepAnalyzer {
         }
 
         let sc_store = SubconsciousStore::new(Storage::new_lazy(self.base_dir.clone()));
-        let existing_text = match sc_store.load_all() {
-            Ok(entries) if !entries.is_empty() => entries
-                .iter()
-                .map(|e| format!("- [{}] {}", e.topic, e.impression))
-                .collect::<Vec<_>>()
-                .join(
-                    "
-",
-                ),
+        let existing_text = match sc_store.load() {
+            Ok(Some(n)) if !n.narrative.is_empty() => n.narrative,
             _ => "（无）".into(),
         };
 

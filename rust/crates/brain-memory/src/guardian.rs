@@ -166,7 +166,7 @@ impl GuardianEngine {
 
         // 4. 衰减淘汰
         let decay_report = ImportanceManager::decay_all(&self.base_dir)?;
-        report.decayed_count = decay_report.decayed_count;
+        report.decayed_count = 0; // 叙事模型无衰减
         report.pruned_count = decay_report.pruned_count;
 
         Ok(report)

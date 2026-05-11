@@ -351,9 +351,7 @@ impl MainBrain {
             match result {
                 Ok(loop_result) => {
                     let text = loop_result.response.text();
-                    let _ = tx
-                        .send(ProgressEvent::TextDelta { text: text.clone() })
-                        .await;
+                    // 注意：不在这里发 TextDelta，tool_loop 已经发了（避免重复）
                     // P0-4: 通过 oneshot 发送结果供调用者写回历史
                     let _ = result_tx.send(text);
                 }

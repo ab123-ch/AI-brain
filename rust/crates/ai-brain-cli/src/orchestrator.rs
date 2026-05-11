@@ -441,12 +441,12 @@ impl Orchestrator {
                         .run(&format!("[{}]", convs_for_analysis.join(",")))
                         .await;
                     tracing::info!(
-                        "后台四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识={}",
+                        "后台四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识叙事更新={}",
                         report.fact_summary.chars().count(),
                         report.profile_entries_added,
                         report.pitfalls_found,
                         report.rules_created,
-                        report.subconscious_entries,
+                        report.subconscious_updated,
                     );
                 }
             }));
@@ -1164,12 +1164,12 @@ impl Orchestrator {
                         .run(&format!("[{}]", conversations.join(",")))
                         .await;
                     tracing::info!(
-                        "四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识={}",
+                        "四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识叙事更新={}",
                         report.fact_summary.chars().count(),
                         report.profile_entries_added,
                         report.pitfalls_found,
                         report.rules_created,
-                        report.subconscious_entries,
+                        report.subconscious_updated,
                     );
                 }
             });
@@ -1231,12 +1231,12 @@ impl Orchestrator {
                 .run(&format!("[{}]", conversations.join(",")))
                 .await;
             tracing::info!(
-                "四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识={}",
+                "四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识叙事更新={}",
                 report.fact_summary.chars().count(),
                 report.profile_entries_added,
                 report.pitfalls_found,
                 report.rules_created,
-                report.subconscious_entries,
+                report.subconscious_updated,
             );
         } else {
             tracing::warn!("无法创建记忆脑 LLM 客户端，跳过关闭时的四步分析");

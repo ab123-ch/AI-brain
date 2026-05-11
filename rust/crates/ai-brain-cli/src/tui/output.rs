@@ -77,6 +77,8 @@ pub struct OutputArea {
     spinner_frame_char: String,
     /// 当前流式文本缓冲区
     streaming_buf: String,
+    /// 当前流式思考内容缓冲区（模型推理时持续累积）
+    streaming_thinking: String,
     /// 是否有流式文本已经刷入 lines 的标记（避免重复刷入）
     streaming_flushed: bool,
     /// 当前轮工具统计
@@ -98,6 +100,7 @@ impl OutputArea {
             spinner_label: None,
             spinner_frame_char: String::new(),
             streaming_buf: String::new(),
+            streaming_thinking: String::new(),
             streaming_flushed: false,
             tool_count: 0,
             tool_total_ms: 0,
@@ -124,12 +127,15 @@ impl OutputArea {
                 self.spinner_label = Some(format!("{name}-推理中..."));
             }
             ProgressEvent::TextDelta { text } => {
-                // 需求1: 流式展示时分离思考内容
-                // 只将非思考部分放入 streaming_buf，思考部分丢弃（不展示给用户）
-                let (clean, _thinking) = Self::strip_thinking_tags(text);
+                // 分离思考内容：非思考部分入 streaming_buf，思考部分入 streaming_thinking
+                let (clean, thinking) = Self::strip_thinking_tags(text);
                 if !clean.is_empty() {
                     self.streaming_buf.push_str(&clean);
                     self.streaming_flushed = false;
+                }
+                if let Some(t) = thinking {
+                    self.streaming_thinking.push_str(&t);
+                    self.streaming_thinking.push('\n');
                 }
             }
             ProgressEvent::ToolStart { tool_name, .. } => {
@@ -245,6 +251,13 @@ impl OutputArea {
         // 解析并分离思考内容（<think>...</think> 标签）
         let (clean_text, thinking) = Self::strip_thinking_tags(text);
 
+        // 去重：如果 flush_streaming 已推送相同文本，不重复添加
+        if let Some(OutputLine::AssistantReply { text: last_text, .. }) = self.lines.last() {
+            if last_text.trim() == clean_text.trim() {
+                return;
+            }
+        }
+
         self.lines.push(OutputLine::AssistantReply {
             text: clean_text,
             expanded: true, // 默认展开显示正常回复
@@ -254,12 +267,21 @@ impl OutputArea {
     }
 
     /// 解析并分离思考内容
+    /// 支持两种标签格式：
+    /// - <thinking>...</thinking>（原始格式）
+    /// - <thinklh>...</thinklh>（LLM Thinking block 格式）
     /// 返回 (去掉思考标签的文本, 思考内容或None)
     pub fn strip_thinking_tags(text: &str) -> (String, Option<String>) {
-        let start_tag = "<think>";
-        let end_tag = "</think>";
+        let tag_pairs: &[(&str, &str)] = &[
+            ("<thinking>", "</thinking>"),
+            ("<thinklh>", "</thinklh>"),
+        ];
 
-        if !text.contains(start_tag) || !text.contains(end_tag) {
+        // 快速检查：如果没有任何标签对，直接返回
+        let has_any = tag_pairs
+            .iter()
+            .any(|(s, e)| text.contains(s) && text.contains(e));
+        if !has_any {
             return (text.to_string(), None);
         }
 
@@ -267,22 +289,32 @@ impl OutputArea {
         let mut thinking_parts = Vec::new();
         let mut remaining = text;
 
-        while let Some(start_pos) = remaining.find(start_tag) {
-            // 添加思考标签之前的内容
+        'outer: loop {
+            // 找最早出现的标签对
+            let mut earliest: Option<(usize, usize, &str, &str)> = None;
+            for (start_tag, end_tag) in tag_pairs {
+                if let Some(start_pos) = remaining.find(start_tag) {
+                    let after_start = &remaining[start_pos + start_tag.len()..];
+                    if let Some(end_pos) = after_start.find(end_tag) {
+                        if earliest.map_or(true, |(ep, _, _, _)| start_pos < ep) {
+                            earliest = Some((start_pos, end_pos, start_tag, end_tag));
+                        }
+                    }
+                }
+            }
+
+            let Some((start_pos, end_offset, start_tag, end_tag)) = earliest else {
+                break 'outer;
+            };
+
+            // 添加标签之前的内容
             if start_pos > 0 {
                 clean_parts.push(&remaining[..start_pos]);
             }
-            remaining = &remaining[start_pos + start_tag.len()..];
-
-            if let Some(end_pos) = remaining.find(end_tag) {
-                // 提取思考内容
-                thinking_parts.push(&remaining[..end_pos]);
-                remaining = &remaining[end_pos + end_tag.len()..];
-            } else {
-                // 没有结束标签，把剩余的都当思考
-                thinking_parts.push(remaining);
-                remaining = "";
-            }
+            let after_start = &remaining[start_pos + start_tag.len()..];
+            // 提取思考内容
+            thinking_parts.push(&after_start[..end_offset]);
+            remaining = &after_start[end_offset + end_tag.len()..];
         }
 
         // 添加剩余内容
@@ -339,6 +371,18 @@ impl OutputArea {
         }
     }
 
+    /// 获取流式思考内容的最新一行（用于实时展示）
+    pub fn streaming_thinking_latest_line(&self) -> Option<&str> {
+        if self.streaming_thinking.is_empty() {
+            return None;
+        }
+        // 取最后一个非空行
+        self.streaming_thinking
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+    }
+
     fn flush_streaming(&mut self) {
         if self.streaming_flushed {
             return;
@@ -356,6 +400,7 @@ impl OutputArea {
             }
         }
         self.streaming_buf.clear();
+        self.streaming_thinking.clear();
         self.streaming_flushed = true;
     }
 
