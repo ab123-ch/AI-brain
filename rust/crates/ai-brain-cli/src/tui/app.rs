@@ -93,30 +93,53 @@ impl App {
             // 1. 处理待显示结果
             self.flush_pending_result().await;
 
-            // 2. 渲染
-            terminal.draw(|f| self.render(f))?;
+            // 2. 渲染（屏幕休眠时 draw 可能失败，容错跳过）
+            if let Err(e) = terminal.draw(|f| self.render(f)) {
+                tracing::debug!("TUI 渲染失败（可能屏幕休眠）: {e}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
 
-            // 3. 处理键盘/鼠标事件
-            while event::poll(Duration::from_millis(50))? {
-                if ctrl_c_flag.load(Ordering::Relaxed) {
-                    self.handle_ctrl_c();
-                    ctrl_c_flag.store(false, Ordering::Relaxed);
-                    break;
-                }
-
-                match event::read()? {
-                    Event::Key(key) => {
-                        if self.handle_key(key) {
+            // 3. 处理键盘/鼠标事件（屏幕休眠时 poll 可能报错）
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => {
+                    loop {
+                        if ctrl_c_flag.load(Ordering::Relaxed) {
+                            self.handle_ctrl_c();
+                            ctrl_c_flag.store(false, Ordering::Relaxed);
                             break;
                         }
+
+                        match event::read() {
+                            Ok(Event::Key(key)) => {
+                                if self.handle_key(key) {
+                                    break;
+                                }
+                            }
+                            Ok(Event::Mouse(mouse)) => {
+                                self.handle_mouse(mouse);
+                            }
+                            Ok(Event::Paste(text)) => {
+                                self.input.insert_paste(&text);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!("TUI 事件读取失败: {e}");
+                                break;
+                            }
+                        }
+
+                        // 检查是否还有待处理事件（非阻塞）
+                        match event::poll(Duration::from_millis(0)) {
+                            Ok(true) => continue,
+                            _ => break,
+                        }
                     }
-                    Event::Mouse(mouse) => {
-                        self.handle_mouse(mouse);
-                    }
-                    Event::Paste(text) => {
-                        self.input.insert_paste(&text);
-                    }
-                    _ => {}
+                }
+                Ok(false) => {} // 无事件，正常
+                Err(e) => {
+                    tracing::debug!("TUI 事件轮询失败（可能屏幕休眠）: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
 
@@ -133,6 +156,9 @@ impl App {
                 self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
                 self.output.tick_spinner(SPINNER_FRAMES[self.spinner_frame]);
             }
+
+            // 6. 让出 CPU，防止忙等待（屏幕休眠时尤为重要）
+            tokio::task::yield_now().await;
         }
 
         ctrl_c_task.abort();
@@ -188,12 +214,11 @@ impl App {
             ratatui_lines.extend(self.format_output_line(line));
         }
 
-        // 流式缓冲区（正在接收的文本）— 过滤思考标签
+        // 流式缓冲区（正在接收的文本）— 纯文本，thinking 已走 ThinkingDelta 通道
         if let Some(text) = self.output.streaming_text() {
-            let (clean, _thinking) = crate::tui::output::OutputArea::strip_thinking_tags(text);
-            if !clean.is_empty() {
+            if !text.is_empty() {
                 ratatui_lines.extend(self.format_output_line(&OutputLine::AssistantReply {
-                    text: clean,
+                    text: text.to_string(),
                     expanded: true,
                     thinking: None,
                     thinking_visible: false,
@@ -218,18 +243,29 @@ impl App {
         }
 
         // 滚动计算：考虑文本换行后的实际行数
+        // ratatui Wrap 按词边界换行，可能比 ceil(width/area_width) 多产生视觉行
+        // 策略：基础估算 + 换行缓冲 + 安全裕量
         let area_width = area.width as usize;
-        let actual_lines: usize = ratatui_lines
-            .iter()
-            .map(|l| {
-                let line_width = l.width();
-                if line_width == 0 {
-                    1
-                } else {
-                    (line_width + area_width - 1) / area_width
+        let mut actual_lines = 0;
+        for l in &ratatui_lines {
+            let w = l.width();
+            if w == 0 {
+                actual_lines += 1;
+            } else {
+                // 每行至少占 1 行，宽度超过 area_width 时额外加上换行次数
+                let base = (w + area_width - 1) / area_width;
+                actual_lines += base;
+                // 额外缓冲：ratatui 按词边界换行，可能产生更多行
+                // 对于长行，每 80 字符额外加 1 行缓冲
+                if w > area_width {
+                    let extra_buffer = (w / 80).min(10);
+                    actual_lines += extra_buffer;
                 }
-            })
-            .sum();
+            }
+        }
+        // 安全裕量：防止估算不足
+        actual_lines += 20;
+
         let visible_lines = area.height as usize;
         let max_scroll = actual_lines.saturating_sub(visible_lines) as u16;
         let scroll = if self.output.manual_scroll > 0 {
@@ -571,8 +607,12 @@ impl App {
         self.progress_rx = Some(rx);
         self.query_handle = Some(handle);
         self.is_busy = true;
+        let status = self.orch.status_structured();
         self.status.busy = true;
-        self.status.round = self.orch.status_structured().query_count;
+        self.status.round = status.query_count;
+        self.status.context_usage = status.context_usage as f32;
+        self.status.cumulative_prompt_tokens = status.cumulative_prompt_tokens;
+        self.status.cumulative_completion_tokens = status.cumulative_completion_tokens;
     }
 
     /// 非阻塞处理进度事件
@@ -623,6 +663,12 @@ impl App {
         self.status.busy = false;
         self.progress_rx = None;
 
+        // 查询完成后刷新状态（获取最新的累计 token 计数）
+        let status = self.orch.status_structured();
+        self.status.context_usage = status.context_usage as f32;
+        self.status.cumulative_prompt_tokens = status.cumulative_prompt_tokens;
+        self.status.cumulative_completion_tokens = status.cumulative_completion_tokens;
+
         if let Some(handle) = self.query_handle.take() {
             match handle.await {
                 Ok(Ok(output)) => {
@@ -665,8 +711,16 @@ impl App {
     }
 
     /// 处理鼠标事件（滚轮滚动）
-    /// 处理鼠标事件（滚轮滚动）
+    /// 
+    /// **文本选择兼容**：
+    /// - 在 MouseCapture 开启时，终端原生选择功能被拦截
+    /// - 大多数终端（iTerm2/Terminal.app/Alacritty）支持 **按住 Shift/Option** 来绕过 mouse tracking 进行选择
+    /// - 当检测到 SHIFT 修饰键时，完全忽略鼠标事件：TUI 不处理滚轮，终端有机会处理选择/复制
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Shift 按下 → 用户在尝试终端原生选择/复制，不干扰
+        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.output.scroll_up(3);
@@ -705,7 +759,7 @@ impl App {
                     "  Ctrl+P          — 展开/折叠长粘贴",
                     "  Ctrl+A/E        — 跳到行首/行尾",
                     "  鼠标滚轮        — 上下滚动输出",
-                    "  Shift+鼠标选择  — 复制输出内容",
+                    "  Shift+鼠标选择  — 按住Shift选择/复制 (iTerm2); macOS终端按住Option",
                 ] {
                     self.output.push_system(line);
                 }
