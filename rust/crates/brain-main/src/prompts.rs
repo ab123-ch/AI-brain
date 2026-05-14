@@ -92,6 +92,18 @@ pub fn build_context_rebuild_prompt(summary: &str) -> String {
     format!("以下是之前的会话总结：\n\n{summary}\n\n请基于这个上下文继续工作。")
 }
 
+/// 构建完整 system prompt（核心规则 + 环境信息 + 可选记忆上下文）
+///
+/// 这正是 `MainBrain::build_messages` 中构造的 system 消息内容。
+pub fn build_full_system_prompt(memory_context: Option<&str>) -> String {
+    let system_prompt = build_system_prompt_with_tools();
+    let env_info = build_environment_info();
+    match memory_context {
+        Some(ctx) if !ctx.is_empty() => format!("{system_prompt}\n{env_info}\n\n{ctx}"),
+        _ => format!("{system_prompt}\n{env_info}"),
+    }
+}
+
 /// 构建运行环境信息段（注入 system prompt 尾部）
 ///
 /// 让 LLM 感知当前操作系统、工作目录和日期，

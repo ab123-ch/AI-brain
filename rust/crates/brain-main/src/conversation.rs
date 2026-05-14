@@ -124,6 +124,8 @@ impl ConversationHistory {
         }
         let truncated = self.messages.len() - keep_recent;
         self.messages = self.messages.split_off(truncated);
+        // 截断后重置 tracked_prompt_tokens，使用估算值
+        self.tracked_prompt_tokens = 0;
         truncated
     }
 

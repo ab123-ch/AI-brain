@@ -173,6 +173,30 @@ pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// Tokens written to prompt cache (Anthropic/DeepSeek cache write).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Tokens read from prompt cache (cache hit).
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Total input tokens including cache creation and read.
+    pub fn total_input_tokens(&self) -> u64 {
+        self.prompt_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+    }
+
+    /// Cache hit rate: what fraction of total input tokens came from cache.
+    /// Returns None if total input is zero.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        let total = self.total_input_tokens();
+        if total == 0 {
+            None
+        } else {
+            Some(self.cache_read_input_tokens as f64 / total as f64)
+        }
+    }
 }
 
 #[cfg(test)]

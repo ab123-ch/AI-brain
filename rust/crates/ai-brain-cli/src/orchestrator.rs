@@ -2,6 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::llm_usage_logger;
+
 /// 按字符数安全截断 UTF-8 字符串（不会在多字节字符中间切割）
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
@@ -163,6 +165,17 @@ pub struct SystemStatus {
     pub model: String,
     pub query_count: u32,
     pub eval_enabled: bool,
+    pub context_usage: f64,
+    /// 会话累计 input/prompt tokens
+    pub cumulative_prompt_tokens: u64,
+    /// 会话累计 output/completion tokens
+    pub cumulative_completion_tokens: u64,
+    /// 会话累计 cache read tokens
+    pub cumulative_cache_read_tokens: u64,
+    /// 累计压缩次数
+    pub compaction_count: u32,
+    /// 累计节省的字符数
+    pub chars_saved_by_compaction: usize,
 }
 
 impl Orchestrator {
@@ -171,9 +184,10 @@ impl Orchestrator {
         // 1. 三通道消息总线
         let bus = Arc::new(BrainBus::new(64, 64, 64));
 
-        // 2. 感知脑
-        let sensory_llm = create_sensory_llm();
-        let sensory = SensoryBrain::new("glm-4.7", bus.clone(), sensory_llm);
+        // 2. 感知脑（LLM 不可用直接报错，不降级）
+        let sensory_llm_result = create_sensory_llm()?;
+        let model_name = sensory_llm_result.model_name.clone();
+        let sensory = SensoryBrain::new("glm-4.7", bus.clone(), sensory_llm_result.provider);
 
         // 3. 创建各副脑
         let (mut memory, mut reasoning, mut motor, validation, evaluation) = create_sub_brains()?;
@@ -311,19 +325,15 @@ impl Orchestrator {
             tracing::info!("进化脑已创建（EvolverBrain）");
         }
         let evolver = Arc::new(Mutex::new(evolver.unwrap_or_else(|| {
-            // fallback: 用 sensory LLM 创建（不 panic）
-            let config = LlmConfig::load_default().expect("LLM 配置必须存在");
-            let client = config
-                .create_brain_client("sensory")
-                .expect("LLM 客户端创建失败");
-            EvolverBrain::new(Arc::from(client), std::path::Path::new("."))
+            // 此时 create_sensory_llm 已成功，sensory LLM 必定可用
+            let client = try_create_llm_client("sensory")
+                .expect("sensory LLM should be available after successful create_sensory_llm()");
+            EvolverBrain::new(client, std::path::Path::new("."))
         })));
 
         tracing::info!("AI Brain 初始化完成，{} 个副脑任务已启动", tasks.len());
 
-        let model_name = LlmConfig::load_default()
-            .map(|c| c.model_for_brain("sensory").to_string())
-            .unwrap_or_else(|_| "echo".into());
+        // model_name 已从 create_sensory_llm 获取，此处不再重复计算
 
         // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册）
         let v2_brain = create_v2_main_brain(Some(Arc::clone(&memory)));
@@ -544,10 +554,33 @@ impl Orchestrator {
 
     /// 系统状态结构体（TUI 用）
     pub fn status_structured(&self) -> SystemStatus {
+        let (context_usage, cumulative_prompt, cumulative_completion, cumulative_cache_read, compaction_count, chars_saved) = self
+            .v2_brain
+            .try_lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref().map(|b| {
+                    (
+                        b.context_usage(),
+                        b.cumulative_prompt_tokens(),
+                        b.cumulative_completion_tokens(),
+                        b.cumulative_cache_read_tokens(),
+                        b.compaction_count(),
+                        b.chars_saved_by_compaction(),
+                    )
+                })
+            })
+            .unwrap_or((0.0, 0, 0, 0, 0, 0));
         SystemStatus {
             model: self.model_name.clone(),
             query_count: self.query_count.load(std::sync::atomic::Ordering::Relaxed),
             eval_enabled: true,
+            context_usage,
+            cumulative_prompt_tokens: cumulative_prompt,
+            cumulative_completion_tokens: cumulative_completion,
+            cumulative_cache_read_tokens: cumulative_cache_read,
+            compaction_count,
+            chars_saved_by_compaction: chars_saved,
         }
     }
 
@@ -660,6 +693,16 @@ impl Orchestrator {
                             let max_eval_retries = 2u32;
                             for attempt in 0..=max_eval_retries {
                                 let answer = result.as_ref().unwrap().answer.clone();
+
+                                // 工具调用轮次可能无文本输出，跳过评估
+                                if answer.trim().is_empty() {
+                                    tracing::debug!(
+                                        "v2 评估脑跳过：本轮输出为空（可能纯工具调用），attempt={}",
+                                        attempt + 1
+                                    );
+                                    break;
+                                }
+
                                 let _ = tx.send(ProgressEvent::Evaluating).await;
 
                                 match eb
@@ -751,8 +794,24 @@ impl Orchestrator {
 
             match v2_result {
                 Ok(output) => {
+                    // 记录 LLM 使用情况到日志文件
+                    llm_usage_logger::log_llm_usage(
+                        &this.model_name,
+                        &brain_llm::types::TokenUsage {
+                            prompt_tokens: output.usage.prompt_tokens,
+                            completion_tokens: output.usage.completion_tokens,
+                            total_tokens: output.usage.total_tokens,
+                            cache_creation_input_tokens: 0, // MainBrainOutput 不包含此字段
+                            cache_read_input_tokens: 0,     // MainBrainOutput 不包含此字段
+                        },
+                    );
+                    
                     // 触发四步分析（非阻塞，后台执行）
                     this.maybe_trigger_analysis();
+
+                    // 通知 TUI 查询完成（process_input 不走 streaming，不会自行发 Done）
+                    let _ = tx.send(ProgressEvent::Done).await;
+
                     Ok(output)
                 }
                 Err(e) => {
@@ -1129,6 +1188,10 @@ impl Orchestrator {
     /// 关闭时快速保存对话数据（替代 run_analysis_force，毫秒级）
     pub async fn shutdown_with_analysis(&self) {
         self.save_pending_analysis();
+        
+        // 记录会话结束时的 LLM 使用统计
+        llm_usage_logger::log_session_summary();
+        
         self.shutdown();
     }
 
@@ -1473,40 +1536,58 @@ pub fn format_output(output: &MasterOutput) -> String {
 
 // ─── 辅助函数 ────────────────────────────────────────────────────
 
-/// 创建感知脑 LLM（配置必须存在，否则 panic）
-fn create_sensory_llm() -> Box<dyn SensoryLlmProvider> {
-    let config =
-        LlmConfig::load_default().expect("LLM 配置必须存在，请检查 ~/.ai-brain/config.toml");
+/// 结果结构体：LLM provider + 模型名
+struct LlmResult {
+    provider: Box<dyn SensoryLlmProvider>,
+    model_name: String,
+}
+
+/// 创建感知脑 LLM（不降级，失败直接报错）
+fn create_sensory_llm() -> Result<LlmResult, String> {
+    let config = LlmConfig::load_default().map_err(|e| {
+        format!("LLM 配置加载失败: {e}\n请检查 ~/.config/ai-brain/config.toml 或设置 ZHIPU_API_KEY 环境变量")
+    })?;
     let client = config
         .create_brain_client("sensory")
-        .expect("LLM 客户端创建失败，请检查 config.toml 中的 sensory 配置");
-    tracing::info!(
-        "LLM 已加载，感知脑模型: {}",
-        config.model_for_brain("sensory")
-    );
-    Box::new(LlmAdapter { inner: client })
+        .map_err(|e| {
+            format!(
+                "LLM 客户端创建失败: {e}\n请检查 ZHIPU_API_KEY 是否已设置"
+            )
+        })?;
+    let model = config.model_for_brain("sensory").to_string();
+    tracing::info!("LLM 已加载，感知脑模型: {model}");
+    Ok(LlmResult {
+        provider: Box::new(LlmAdapter { inner: client }),
+        model_name: model,
+    })
+}
+
+/// 尝试为指定 brain 创建 LLM 客户端，失败返回 None
+fn try_create_llm_client(brain_name: &str) -> Option<Arc<dyn brain_llm::LlmProvider>> {
+    let config = LlmConfig::load_default().ok()?;
+    config.create_brain_client(brain_name).ok().map(Arc::from)
 }
 
 /// 创建 v2 MainBrain（带 tool_loop + 工具注册）
 ///
-/// LLM 必须可用，否则 panic
+/// LLM 不可用时返回 `Arc<Mutex<None>>`
 fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<MemoryBrain>>>,
 ) -> Arc<Mutex<Option<MainBrain>>> {
-    let config = LlmConfig::load_default()
-        .expect("v2 MainBrain: LLM 配置必须存在，请检查 ~/.ai-brain/config.toml");
-
-    let client: Box<dyn brain_llm::LlmProvider> = config
-        .create_brain_client("sensory")
-        .expect("v2 MainBrain: LLM 客户端创建失败，请检查 config.toml 中的 sensory 配置");
-    let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
+    let client = match try_create_llm_client("sensory") {
+        Some(c) => c,
+        None => {
+            tracing::warn!("v2 MainBrain: LLM 不可用，跳过创建（回声模式）");
+            return Arc::new(Mutex::new(None));
+        }
+    };
 
     let tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
         crate::real_tool_executor::RealToolExecutor::with_memory(memory_brain),
     );
 
     let brain_config = BrainConfig::default();
-    let mut brain = MainBrain::new(llm, tool_executor, brain_config);
+    let mut brain = MainBrain::new(client, tool_executor, brain_config);
 
     // 注册所有 MVP 工具（bash、read_file、write_file、edit_file、glob、grep）
     let tool_defs = crate::real_tool_executor::mvp_tool_definitions();

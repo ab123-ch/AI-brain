@@ -162,14 +162,27 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
 }
 
 #[must_use]
+pub fn is_zhipu_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.starts_with("glm-") || lower.starts_with("chatglm-") || lower.starts_with("cogview-")
+}
+
+#[must_use]
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
+    }
+    // Zhipu (智谱) models are OpenAI-compatible; detect by model prefix
+    if is_zhipu_model(model) {
+        return ProviderKind::OpenAi;
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
+        return ProviderKind::OpenAi;
+    }
+    if openai_compat::has_api_key("ZHIPU_API_KEY") {
         return ProviderKind::OpenAi;
     }
     if openai_compat::has_api_key("XAI_API_KEY") {

@@ -186,10 +186,17 @@ pub fn edit_file(
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
     if old_string == new_string {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "old_string and new_string must differ",
-        ));
+        // 文件内容已经是目标状态，无需修改，直接返回成功
+        return Ok(EditFileOutput {
+            file_path: absolute_path.to_string_lossy().into_owned(),
+            old_string: old_string.to_owned(),
+            new_string: new_string.to_owned(),
+            original_file: original_file.clone(),
+            structured_patch: vec![],
+            user_modified: false,
+            replace_all,
+            git_diff: None,
+        });
     }
     if !original_file.contains(old_string) {
         return Err(io::Error::new(

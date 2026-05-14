@@ -7,6 +7,15 @@ use crate::error::{LlmError, Result};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, MessageRole};
 use crate::types::{ContentBlock, FinishReason, TokenUsage, ToolChoice};
 
+/// 按 UTF-8 字符数安全截断
+fn truncate_chars(s: &str, max: usize) -> &str {
+    if s.chars().count() <= max {
+        return s;
+    }
+    let boundary = s.char_indices().nth(max).map_or(s.len(), |(i, _)| i);
+    &s[..boundary]
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI-compatible API Client
 // ---------------------------------------------------------------------------
@@ -82,6 +91,10 @@ struct ApiUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +115,11 @@ impl OpenAiCompatClient {
             model,
             max_tokens,
             temperature,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(180))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -320,6 +337,8 @@ impl OpenAiCompatClient {
                 prompt_tokens: u.prompt_tokens.unwrap_or(0),
                 completion_tokens: u.completion_tokens.unwrap_or(0),
                 total_tokens: u.total_tokens.unwrap_or(0),
+                cache_creation_input_tokens: u.cache_creation_input_tokens.unwrap_or(0),
+                cache_read_input_tokens: u.cache_read_input_tokens.unwrap_or(0),
             });
 
         ChatResponse {
@@ -474,18 +493,57 @@ impl LlmProvider for OpenAiCompatClient {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "LLM API 非成功响应: status={}, body={}",
+                    status,
+                    truncate_chars(&body, 500)
+                );
                 return Err(LlmError::ApiError {
                     status: status.as_u16(),
                     message: body,
                 });
             }
 
-            let api_resp: ApiChatResponse = response
-                .json()
-                .await
-                .map_err(|e| LlmError::RequestFailed(format!("Failed to parse response: {e}")))?;
+            // 记录原始响应体（用于排查空响应、异常格式等问题）
+            let raw_body = response.text().await.map_err(|e| {
+                LlmError::RequestFailed(format!("Failed to read response body: {e}"))
+            })?;
+            tracing::debug!(
+                "LLM API 原始响应 ({}字节): {}",
+                raw_body.len(),
+                truncate_chars(&raw_body, 2000)
+            );
 
-            Ok(Self::parse_response(api_resp, fallback_model))
+            let api_resp: ApiChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
+                tracing::error!(
+                    "LLM API 响应 JSON 解析失败: {e}, 原始内容: {}",
+                    truncate_chars(&raw_body, 500)
+                );
+                LlmError::RequestFailed(format!("Failed to parse response: {e}"))
+            })?;
+
+            let parsed = Self::parse_response(api_resp, fallback_model);
+
+            // 检测异常：空内容 + 非工具调用
+            let has_text = parsed.content.iter().any(|b| matches!(b, ContentBlock::Text { .. }));
+            let has_tool = parsed.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+            if !has_text && !has_tool {
+                tracing::warn!(
+                    "LLM 返回空响应（无文本无工具调用）: finish_reason={:?}, model={}",
+                    parsed.finish_reason,
+                    parsed.model
+                );
+            }
+            if matches!(parsed.finish_reason, Some(FinishReason::MaxTokens)) {
+                tracing::warn!(
+                    "LLM 因上下文长度限制截断: prompt_tokens={}, completion_tokens={}, model={}",
+                    parsed.usage.prompt_tokens,
+                    parsed.usage.completion_tokens,
+                    parsed.model
+                );
+            }
+
+            Ok(parsed)
         })
     }
 

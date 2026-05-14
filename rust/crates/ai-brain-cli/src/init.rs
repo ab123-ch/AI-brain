@@ -79,16 +79,16 @@ pub fn print_first_run_guide() {
     eprintln!("  已生成默认配置文件:");
     eprintln!("  ~/.ai-brain/config.toml");
     eprintln!();
-    eprintln!("  当前为回声模式（不会调用真实 AI）");
-    eprintln!("  要启用真实 LLM，请配置 API Key:");
+    eprintln!("  要使用 AI Brain，需要配置 LLM API Key:");
     eprintln!();
     eprintln!("    方式1（推荐）：设置环境变量");
     eprintln!("      export ZHIPU_API_KEY=your-key");
     eprintln!();
     eprintln!("    方式2：编辑配置文件");
     eprintln!("      vi ~/.ai-brain/config.toml");
-    eprintln!("      取消 api_key 注释并填入密钥");
+    eprintln!("      在 [llm.providers.zhipu] 下添加 api_key = \"your-key\"");
     eprintln!();
+    eprintln!("  配置完成后重新运行 ai-brain 即可。");
     eprintln!("========================================");
     eprintln!();
 }

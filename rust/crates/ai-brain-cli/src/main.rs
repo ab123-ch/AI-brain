@@ -1,5 +1,6 @@
 mod api_server;
 mod init;
+mod llm_usage_logger;
 mod orchestrator;
 mod real_tool_executor;
 mod repl;
@@ -42,6 +43,8 @@ enum Commands {
     },
     /// v2 路径集成测试（3 轮对话，验证 eval_gate + 评估脑）
     V2Test,
+    /// 导出完整 system prompt 到桌面文件（调试用）
+    DumpSystemPrompt,
 }
 
 #[derive(Subcommand)]
@@ -84,18 +87,52 @@ async fn main() {
             .init();
         init::init_file_logging(&base_dir);
     }
-    if is_first_run && !is_tui {
+    // 首次运行：总是在终端显示引导（TUI 模式也不例外，此时尚未进入 alternate screen）
+    if is_first_run {
         init::print_first_run_guide();
+        // 首次运行没有配置 API key，LLM 初始化必然失败，直接退出
+        std::process::exit(0);
     }
+
     tracing::info!("AI Brain 启动，根目录: {:?}", base_dir);
 
+    // 每次启动时自动导出完整 system prompt 到桌面
+    dump_system_prompt_to_desktop();
+
     run_command(cli).await;
+}
+
+/// 导出完整 system prompt 到桌面文件
+fn dump_system_prompt_to_desktop() {
+    use brain_main::prompts;
+    let prompt = prompts::build_full_system_prompt(None);
+    let desktop = dirs::desktop_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let path = desktop.join("系统提示词.txt");
+    match std::fs::write(&path, &prompt) {
+        Ok(()) => tracing::info!(
+            "系统提示词已导出到: {} ({} tokens)",
+            path.display(),
+            prompt.chars().count() * 3 / 4
+        ),
+        Err(e) => tracing::warn!("系统提示词导出失败: {e}"),
+    }
+}
+
+/// 初始化编排器，失败时打印错误并退出
+async fn init_or_die() -> Orchestrator {
+    match Orchestrator::new().await {
+        Ok(orch) => orch,
+        Err(e) => {
+            eprintln!("初始化失败: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn run_command(cli: Cli) {
     match &cli.command {
         None => {
-            let orch = Orchestrator::new().await.expect("初始化失败");
+            let orch = init_or_die().await;
             // 使用 TUI 模式（修复旧 REPL 的 UTF-8 崩溃）
             if std::io::stdin().is_terminal() {
                 tui::run(orch).await;
@@ -104,30 +141,34 @@ async fn run_command(cli: Cli) {
             }
         }
         Some(Commands::Query { query }) => {
-            let orch = Orchestrator::new().await.expect("初始化失败");
-            let output = orch.query(query).await.expect("查询失败");
-            println!("{}", format_output(&output));
+            let orch = init_or_die().await;
+            match orch.query(query).await {
+                Ok(output) => println!("{}", format_output(&output)),
+                Err(e) => eprintln!("查询失败: {e}"),
+            }
         }
         Some(Commands::Status) => {
-            let orch = Orchestrator::new().await.expect("初始化失败");
-            println!("{}", orch.status());
+            match Orchestrator::new().await {
+                Ok(orch) => println!("{}", orch.status()),
+                Err(e) => println!("=== AI Brain 系统状态 ===\n  LLM 不可用: {e}"),
+            }
         }
         Some(Commands::Weights) => {
-            let orch = Orchestrator::new().await.expect("初始化失败");
+            let orch = init_or_die().await;
             println!("{}", orch.weights().await);
         }
         Some(Commands::Memory { action }) => {
-            let orch = Orchestrator::new().await.expect("初始化失败");
+            let orch = init_or_die().await;
             match action {
                 MemoryAction::Stats => println!("{}", orch.memory_stats().await),
             }
         }
         Some(Commands::Serve { addr }) => {
-            let orch = Orchestrator::new().await.expect("初始化失败");
+            let orch = init_or_die().await;
             api_server::serve(orch, addr).await;
         }
         Some(Commands::Brain { action }) => {
-            let orch = Orchestrator::new().await.expect("初始化失败");
+            let orch = init_or_die().await;
             handle_brain_command(orch, action).await;
         }
         Some(Commands::V2Test) => {
@@ -219,6 +260,11 @@ async fn run_command(cli: Cli) {
             println!("\n=== 测试完成，关闭 ===");
             orch.shutdown_with_analysis().await;
             println!("记忆已保存");
+        }
+        Some(Commands::DumpSystemPrompt) => {
+            dump_system_prompt_to_desktop();
+            let desktop = dirs::desktop_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            println!("系统提示词已导出到: {}", desktop.join("系统提示词.txt").display());
         }
     }
 }

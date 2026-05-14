@@ -45,9 +45,15 @@ impl ProviderClient {
             ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::xai(),
             )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::openai(),
-            )?)),
+            ProviderKind::OpenAi => {
+                // Detect Zhipu models (glm-*) and use their config
+                let config = if providers::is_zhipu_model(&resolved_model) {
+                    OpenAiCompatConfig::zhipu()
+                } else {
+                    OpenAiCompatConfig::openai()
+                };
+                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+            }
         }
     }
 

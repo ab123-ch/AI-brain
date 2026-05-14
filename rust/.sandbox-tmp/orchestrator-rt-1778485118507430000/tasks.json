@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "tasks": {
+    "task_18ae72cadef81870": {
+      "task_id": "task_18ae72cadef81870",
+      "description": "test task",
+      "status": "completed",
+      "subagent_type": "general-purpose",
+      "created_at": "1778485118",
+      "started_at": "1778485118",
+      "completed_at": "1778485118",
+      "output_file": "/Users/chenh/RustObject/claw-code-parity/rust/.sandbox-tmp/orchestrator-rt-1778485118507430000/task_18ae72cadef81870/output.md",
+      "output_text": "done"
+    }
+  }
+}

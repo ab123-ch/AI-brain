@@ -127,14 +127,16 @@ impl OutputArea {
                 self.spinner_label = Some(format!("{name}-推理中..."));
             }
             ProgressEvent::TextDelta { text } => {
-                // 分离思考内容：非思考部分入 streaming_buf，思考部分入 streaming_thinking
-                let (clean, thinking) = Self::strip_thinking_tags(text);
-                if !clean.is_empty() {
-                    self.streaming_buf.push_str(&clean);
+                // 纯文本内容，直接累积到 streaming_buf
+                if !text.is_empty() {
+                    self.streaming_buf.push_str(text);
                     self.streaming_flushed = false;
                 }
-                if let Some(t) = thinking {
-                    self.streaming_thinking.push_str(&t);
+            }
+            ProgressEvent::ThinkingDelta { content } => {
+                // 思考内容走专用通道，默认不显示，只缓存
+                if !content.is_empty() {
+                    self.streaming_thinking.push_str(content);
                     self.streaming_thinking.push('\n');
                 }
             }
@@ -248,89 +250,30 @@ impl OutputArea {
             return;
         }
 
-        // 解析并分离思考内容（<think>...</think> 标签）
-        let (clean_text, thinking) = Self::strip_thinking_tags(text);
-
         // 去重：如果 flush_streaming 已推送相同文本，不重复添加
-        if let Some(OutputLine::AssistantReply { text: last_text, .. }) = self.lines.last() {
-            if last_text.trim() == clean_text.trim() {
-                return;
+        // 注意：Done 事件会在 flush_streaming 之后追加 ToolSummary/Blank，
+        // 所以不能只看 lines.last()，需要倒序查找最近的 AssistantReply
+        for line in self.lines.iter().rev().take(5) {
+            if let OutputLine::AssistantReply { text: prev_text, .. } = line {
+                // 完全匹配 或 包含关系（streaming 可能只推送了部分）
+                if prev_text.trim() == text.trim()
+                    || text.len() > 100 && prev_text.contains(&text.trim())
+                    || prev_text.len() > 100 && text.contains(prev_text.trim())
+                {
+                    return;
+                }
             }
         }
 
         self.lines.push(OutputLine::AssistantReply {
-            text: clean_text,
-            expanded: true, // 默认展开显示正常回复
-            thinking,
-            thinking_visible: false, // 默认隐藏思考内容
+            text: text.trim().to_string(),
+            expanded: true,
+            thinking: None, // thinking 已通过 ThinkingDelta 通道单独处理
+            thinking_visible: false,
         });
+
     }
 
-    /// 解析并分离思考内容
-    /// 支持两种标签格式：
-    /// - <thinking>...</thinking>（原始格式）
-    /// - <thinklh>...</thinklh>（LLM Thinking block 格式）
-    /// 返回 (去掉思考标签的文本, 思考内容或None)
-    pub fn strip_thinking_tags(text: &str) -> (String, Option<String>) {
-        let tag_pairs: &[(&str, &str)] = &[
-            ("<thinking>", "</thinking>"),
-            ("<thinklh>", "</thinklh>"),
-        ];
-
-        // 快速检查：如果没有任何标签对，直接返回
-        let has_any = tag_pairs
-            .iter()
-            .any(|(s, e)| text.contains(s) && text.contains(e));
-        if !has_any {
-            return (text.to_string(), None);
-        }
-
-        let mut clean_parts = Vec::new();
-        let mut thinking_parts = Vec::new();
-        let mut remaining = text;
-
-        'outer: loop {
-            // 找最早出现的标签对
-            let mut earliest: Option<(usize, usize, &str, &str)> = None;
-            for (start_tag, end_tag) in tag_pairs {
-                if let Some(start_pos) = remaining.find(start_tag) {
-                    let after_start = &remaining[start_pos + start_tag.len()..];
-                    if let Some(end_pos) = after_start.find(end_tag) {
-                        if earliest.map_or(true, |(ep, _, _, _)| start_pos < ep) {
-                            earliest = Some((start_pos, end_pos, start_tag, end_tag));
-                        }
-                    }
-                }
-            }
-
-            let Some((start_pos, end_offset, start_tag, end_tag)) = earliest else {
-                break 'outer;
-            };
-
-            // 添加标签之前的内容
-            if start_pos > 0 {
-                clean_parts.push(&remaining[..start_pos]);
-            }
-            let after_start = &remaining[start_pos + start_tag.len()..];
-            // 提取思考内容
-            thinking_parts.push(&after_start[..end_offset]);
-            remaining = &after_start[end_offset + end_tag.len()..];
-        }
-
-        // 添加剩余内容
-        if !remaining.is_empty() {
-            clean_parts.push(remaining);
-        }
-
-        let clean_text = clean_parts.join("").trim().to_string();
-        let thinking = if thinking_parts.is_empty() {
-            None
-        } else {
-            Some(thinking_parts.join("").trim().to_string())
-        };
-
-        (clean_text, thinking)
-    }
 
     pub fn push_system(&mut self, text: &str) {
         self.lines.push(OutputLine::System(text.to_string()));
@@ -387,17 +330,21 @@ impl OutputArea {
         if self.streaming_flushed {
             return;
         }
-        // 将流式文本推入 lines 作为 AssistantReply，而非静默丢弃
+        // 将流式文本推入 lines 作为 AssistantReply
+        // thinking 内容已在 streaming_thinking 中（通过 ThinkingDelta 事件），不走 TextDelta
         if !self.streaming_buf.trim().is_empty() {
-            let (clean_text, thinking) = Self::strip_thinking_tags(&self.streaming_buf);
-            if !clean_text.trim().is_empty() {
-                self.lines.push(OutputLine::AssistantReply {
-                    text: clean_text,
-                    expanded: true,
-                    thinking,
-                    thinking_visible: self.verbose,
-                });
-            }
+            // 取出 thinking 缓存（如有）
+            let thinking = if self.streaming_thinking.trim().is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut self.streaming_thinking))
+            };
+            self.lines.push(OutputLine::AssistantReply {
+                text: self.streaming_buf.trim().to_string(),
+                expanded: true,
+                thinking,
+                thinking_visible: self.verbose,
+            });
         }
         self.streaming_buf.clear();
         self.streaming_thinking.clear();

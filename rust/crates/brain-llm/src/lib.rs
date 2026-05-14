@@ -1,4 +1,5 @@
 pub mod config;
+pub mod echo;
 pub mod error;
 pub mod openai_compat;
 pub mod provider;

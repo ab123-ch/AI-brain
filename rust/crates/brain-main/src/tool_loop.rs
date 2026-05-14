@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use brain_core::guard_check::{guard_check, GuardResult};
 use brain_core::tool_executor::ToolExecutor;
@@ -8,10 +8,70 @@ use brain_core::types::{
 use brain_hooks::runner::HookRunner;
 use brain_hooks::types::{HookDecision, HookEvent, HookInput};
 use brain_llm::{
-    ChatMessage, ChatRequest, ChatResponse, ContentBlock, LlmProvider, ToolDefinition,
+    ChatMessage, ChatRequest, ChatResponse, ContentBlock, FinishReason, LlmProvider,
+    ToolDefinition,
 };
+use brain_llm::types::TokenUsage;
 
 use crate::error::{MainBrainError, Result};
+
+/// 截断工具输出用于日志（避免日志文件爆炸）
+fn truncate_tool_output_for_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max).collect();
+    format!("{truncated}... [共{}字, 截断显示]", s.chars().count())
+}
+
+/// 估算输入 token 数（当 API 不返回 usage 信息时使用）
+///
+/// 中文通常 1 字 ≈ 1.5 token，英文约 4 字符 ≈ 1 token。
+/// 混合场景下用 chars * 3 / 4 作为折中估算。
+fn estimate_input_tokens(messages: &[ChatMessage]) -> u64 {
+    messages
+        .iter()
+        .map(|m| {
+            let mut chars = 0usize;
+            // 统计文本内容
+            chars += m.text_content().chars().count();
+            // 统计工具调用的 JSON 输入
+            for block in &m.content {
+                if let ContentBlock::ToolUse { input, .. } = block {
+                    chars += serde_json::to_string(input)
+                        .unwrap_or_default()
+                        .chars()
+                        .count();
+                }
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    chars += content.chars().count();
+                }
+            }
+            // 中文友好估算：每字符约 0.75 token
+            (chars * 3 / 4) as u64
+        })
+        .sum()
+}
+
+/// 估算输出 token 数（当 API 不返回 usage 信息时使用）
+fn estimate_output_tokens(response: &ChatResponse) -> u64 {
+    let mut chars = 0usize;
+    for block in &response.content {
+        match block {
+            ContentBlock::Text { text } => chars += text.chars().count(),
+            ContentBlock::Thinking { content } => chars += content.chars().count(),
+            ContentBlock::ToolUse { input, .. } => {
+                chars += serde_json::to_string(input)
+                    .unwrap_or_default()
+                    .chars()
+                    .count();
+            }
+            _ => {}
+        }
+    }
+    // 中文友好估算：每字符约 0.75 token
+    (chars * 3 / 4) as u64
+}
 
 /// tool_loop 返回结果
 pub(crate) struct ToolLoopResult {
@@ -21,8 +81,12 @@ pub(crate) struct ToolLoopResult {
     pub(crate) llm_calls: u32,
     /// 完整对话轨迹（每轮 assistant 回复 + 工具调用 + 工具结果）
     pub(crate) turns: Vec<TurnRecord>,
-    /// 累计 prompt_tokens（从 LLM 返回的 usage 中累加）
+    /// 累计 prompt_tokens（从 LLM 返回的 usage 中累加，用于计费）
     pub(crate) total_prompt_tokens: u64,
+    /// 最后一次 LLM 调用的 prompt_tokens（用于上下文使用率计算）
+    pub(crate) last_prompt_tokens: u64,
+    /// 每次 LLM 调用的详细 usage 信息
+    pub(crate) usage_records: Vec<brain_llm::types::TokenUsage>,
 }
 
 /// 运行 tool_loop — LLM ↔ 工具 循环直到 LLM 不再调用工具（默认参数的便捷入口）
@@ -62,6 +126,8 @@ pub async fn run_tool_loop_with_config(
     let mut llm_calls = 0u32;
     let mut turns: Vec<TurnRecord> = Vec::new();
     let mut total_prompt_tokens = 0u64;
+    let mut last_prompt_tokens; // 在循环内赋值
+    let mut usage_records: Vec<brain_llm::types::TokenUsage> = Vec::new();
 
     loop {
         llm_calls += 1;
@@ -120,18 +186,81 @@ pub async fn run_tool_loop_with_config(
             }
         }
 
-        // === 调用 LLM ===
-        let response = match llm.complete(request).await {
-            Ok(resp) => resp,
-            Err(e) => {
+        // === 调用 LLM（带超时保护，防止 API 无响应永久挂起） ===
+        let llm_timeout = Duration::from_secs(180);
+        let response = match tokio::time::timeout(llm_timeout, llm.complete(request)).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
                 let err_msg = format!("{e}");
                 tracing::error!("=== LLM 调用失败 [第{llm_calls}次] === 错误: {err_msg}");
                 return Err(MainBrainError::LlmError(err_msg));
             }
+            Err(_) => {
+                tracing::error!("=== LLM 调用超时 [第{llm_calls}次] === 等待超过180秒");
+                return Err(MainBrainError::LlmError(
+                    "LLM 请求超时（180秒），请检查网络连接或模型服务状态".into(),
+                ));
+            }
+        };
+
+        // 处理 usage 信息：如果 API 不返回（如小米 mimo），使用估算值
+        let estimated_input = estimate_input_tokens(&messages);
+        let estimated_output = estimate_output_tokens(&response);
+        
+        // 如果 API 返回的 prompt_tokens 为 0，使用估算值
+        let prompt_tokens = if response.usage.prompt_tokens > 0 {
+            response.usage.prompt_tokens
+        } else {
+            tracing::info!(
+                "API 未返回 prompt_tokens，使用估算值: {}",
+                estimated_input
+            );
+            estimated_input
+        };
+        
+        // 如果 API 返回的 completion_tokens 为 0，使用估算值
+        let completion_tokens = if response.usage.completion_tokens > 0 {
+            response.usage.completion_tokens
+        } else {
+            tracing::info!(
+                "API 未返回 completion_tokens，使用估算值: {}",
+                estimated_output
+            );
+            estimated_output
+        };
+        
+        // 构建修正后的 usage（用于计费和显示）
+        let corrected_usage = TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: response.usage.cache_read_input_tokens,
         };
 
         // 累计 prompt_tokens
-        total_prompt_tokens += response.usage.prompt_tokens;
+        last_prompt_tokens = prompt_tokens;
+        total_prompt_tokens += last_prompt_tokens;
+        
+        // 记录本次 LLM 调用的 usage 信息（使用修正后的值）
+        usage_records.push(corrected_usage.clone());
+
+        // 日志：显示 usage 来源
+        if response.usage.prompt_tokens > 0 {
+            tracing::info!(
+                "=== LLM Usage (API 返回) === prompt={}, completion={}, total={}",
+                prompt_tokens,
+                completion_tokens,
+                corrected_usage.total_tokens
+            );
+        } else {
+            tracing::info!(
+                "=== LLM Usage (估算) === prompt={}, completion={}, total={}",
+                prompt_tokens,
+                completion_tokens,
+                corrected_usage.total_tokens
+            );
+        }
 
         // === 日志：LLM 响应 ===
         let resp_text = response.text();
@@ -149,10 +278,10 @@ pub async fn run_tool_loop_with_config(
                     .await;
                 }
                 ContentBlock::Thinking { content } if !content.is_empty() => {
-                    // 用 <thinklh> 标签包裹，TUI 的 strip_thinking_tags 会检测并分离
+                    // 走专用 ThinkingDelta 通道，TUI 默认不显示，Ctrl+E 切换
                     send_progress(
                         progress_tx,
-                        ProgressEvent::TextDelta { text: format!("<thinklh>{content}</thinklh>") },
+                        ProgressEvent::ThinkingDelta { content: content.clone() },
                     )
                     .await;
                 }
@@ -160,7 +289,7 @@ pub async fn run_tool_loop_with_config(
             }
         }
         tracing::info!(
-            "=== LLM 响应 [第{llm_calls}次] === text({}字){}{}",
+            "=== LLM 响应 [第{llm_calls}次] === text({}字){}{} finish_reason={:?}",
             resp_text.chars().count(),
             if resp_text.is_empty() {
                 String::new()
@@ -172,7 +301,29 @@ pub async fn run_tool_loop_with_config(
             } else {
                 format!(", tool_calls={}", tool_calls.len())
             },
+            response.finish_reason,
         );
+
+        // 空响应检测：无文本 + 无工具调用 → 可能是上下文超限或模型异常
+        if resp_text.is_empty() && tool_calls.is_empty() {
+            let reason = match response.finish_reason {
+                Some(FinishReason::MaxTokens) => {
+                    "模型因上下文长度限制截断，返回了空响应。请尝试缩短对话或开启压缩。"
+                }
+                Some(FinishReason::ToolUse) => {
+                    "模型返回了工具调用标记但无实际内容（API 响应格式异常）。"
+                }
+                _ => "模型返回了空响应（无文本无工具调用），可能是上下文过长或模型服务异常。",
+            };
+            tracing::warn!("LLM 空响应警告: {reason}");
+            send_progress(
+                progress_tx,
+                ProgressEvent::TextDelta {
+                    text: format!("\n⚠ {reason}\n"),
+                },
+            )
+            .await;
+        }
         for (i, block) in response.content.iter().enumerate() {
             if let brain_llm::ContentBlock::ToolUse { name, input, .. } = block {
                 let input_str = serde_json::to_string(input).unwrap_or_default();
@@ -196,6 +347,8 @@ pub async fn run_tool_loop_with_config(
                 llm_calls,
                 turns,
                 total_prompt_tokens,
+                last_prompt_tokens,
+                usage_records,
             });
         }
 
@@ -367,8 +520,27 @@ async fn execute_tool_calls(
                 "工具执行完成: {name} ({}ms){} | 输出: {}",
                 duration_ms,
                 if result.is_error { " [ERROR]" } else { "" },
-                result.output,
+                truncate_tool_output_for_log(&result.output, 1000),
             );
+
+            // 工具输出截断：超过 50K 字符的内容截断后写入对话历史
+            // 防止 grep_search 等工具返回巨大结果撑爆上下文窗口
+            const MAX_TOOL_OUTPUT_CHARS: usize = 50_000;
+            let output_for_llm = if result.output.chars().count() > MAX_TOOL_OUTPUT_CHARS {
+                let truncated_chars = result.output.chars().count();
+                let kept: String = result.output.chars().take(MAX_TOOL_OUTPUT_CHARS).collect();
+                tracing::warn!(
+                    "工具 {name} 输出过大({}字)，截断至 {} 字符",
+                    truncated_chars,
+                    MAX_TOOL_OUTPUT_CHARS,
+                );
+                format!(
+                    "{kept}\n\n[⚠ 输出已截断：原始 {} 字符，保留前 {} 字符。请使用更精确的搜索条件或 head_limit 参数]",
+                    truncated_chars, MAX_TOOL_OUTPUT_CHARS,
+                )
+            } else {
+                result.output.clone()
+            };
 
             send_progress(
                 progress_tx,
@@ -384,7 +556,7 @@ async fn execute_tool_calls(
 
             messages.push(ChatMessage::tool_result(
                 id,
-                result.output.clone(),
+                output_for_llm.clone(),
                 result.is_error,
             ));
 

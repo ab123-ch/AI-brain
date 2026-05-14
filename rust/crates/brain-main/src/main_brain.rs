@@ -33,6 +33,10 @@ pub struct MainBrain {
     memory_context: Option<String>,
     /// 会话级 prompt_tokens 累计
     session_prompt_tokens: u64,
+    /// 会话级 completion_tokens 累计
+    session_completion_tokens: u64,
+    /// 会话级 cache read tokens 累计
+    session_cache_read_tokens: u64,
     /// 后台压缩结果（消息索引 → 压缩后内容）
     pending_compressions: Arc<Mutex<HashMap<usize, String>>>,
     /// 已压缩的消息索引集合
@@ -41,6 +45,10 @@ pub struct MainBrain {
     compaction_triggered: bool,
     /// 压缩配置
     compaction_config: CompactionConfig,
+    /// 累计压缩次数
+    compaction_count: u32,
+    /// 累计节省的字符数
+    chars_saved_by_compaction: usize,
 }
 
 impl MainBrain {
@@ -64,10 +72,14 @@ impl MainBrain {
             llm_temperature,
             memory_context: None,
             session_prompt_tokens: 0,
+            session_completion_tokens: 0,
+            session_cache_read_tokens: 0,
             pending_compressions: Arc::new(Mutex::new(HashMap::new())),
             compressed_indices: Arc::new(Mutex::new(HashSet::new())),
             compaction_triggered: false,
             compaction_config: CompactionConfig::default(),
+            compaction_count: 0,
+            chars_saved_by_compaction: 0,
         }
     }
 
@@ -104,6 +116,9 @@ impl MainBrain {
             let mut indices = self.compressed_indices.lock().await;
             indices.extend(pending.keys().copied());
             let result = self.history.apply_pending_compaction(&pending);
+            // 更新压缩统计
+            self.compaction_count += result.compacted_groups as u32;
+            self.chars_saved_by_compaction += result.chars_saved;
             tracing::info!(
                 "应用后台压缩: {} 条消息, 节省 {} 字符",
                 result.compacted_groups,
@@ -188,9 +203,14 @@ impl MainBrain {
         };
 
         let answer = loop_result.response.text();
-        let total_tokens = loop_result.response.usage.total_tokens;
+        // 使用 usage_records 中的修正后 usage（如果 API 不返回则使用估算值）
+        let corrected_usage = loop_result.usage_records.last()
+            .cloned()
+            .unwrap_or_default();
+        let total_tokens = corrected_usage.total_tokens;
         let prompt_tokens = loop_result.total_prompt_tokens;
-        let completion_tokens = loop_result.response.usage.completion_tokens;
+        let last_prompt_tokens = loop_result.last_prompt_tokens;
+        let completion_tokens = corrected_usage.completion_tokens;
 
         // ── 4. 成功后一次性写入完整一轮到历史 ──
         self.history.push_user(input);
@@ -230,13 +250,29 @@ impl MainBrain {
         }
 
         // ── 5. 更新 session token 追踪 ──
+        // 使用 usage_records 中的修正后 usage（如果 API 不返回则使用估算值）
+        let cache_read = corrected_usage.cache_read_input_tokens;
         self.session_prompt_tokens += prompt_tokens;
-        self.history.set_tracked_tokens(self.session_prompt_tokens);
+        self.session_completion_tokens += completion_tokens;
+        self.session_cache_read_tokens += cache_read;
+        // 使用最后一次 LLM 调用的 prompt_tokens 计算上下文使用率
+        // （不能用 total_prompt_tokens，那是所有工具调用轮次的累加，会远大于实际上下文窗口）
+        self.history.set_tracked_tokens(last_prompt_tokens);
 
         // ── 6. 后台预压缩：滑动窗口 ──
         let turn_tool_chars = compact::last_turn_tool_chars(self.history.messages());
         if turn_tool_chars > self.compaction_config.tool_result_compress_threshold {
             self.compaction_triggered = true;
+        }
+        
+        // 基于上下文占用率触发压缩：超过 60% 时开始压缩
+        let context_usage_ratio = self.history.context_usage();
+        if context_usage_ratio > 0.6 {
+            self.compaction_triggered = true;
+            tracing::info!(
+                "上下文占用 {:.0}%，触发压缩机制",
+                context_usage_ratio * 100.0
+            );
         }
 
         if self.compaction_triggered {
@@ -437,6 +473,31 @@ impl MainBrain {
     /// 获取上下文使用率
     pub fn context_usage(&self) -> f64 {
         self.history.context_usage()
+    }
+
+    /// 会话累计 prompt tokens
+    pub fn cumulative_prompt_tokens(&self) -> u64 {
+        self.session_prompt_tokens
+    }
+
+    /// 会话累计 completion tokens
+    pub fn cumulative_completion_tokens(&self) -> u64 {
+        self.session_completion_tokens
+    }
+
+    /// 会话累计 cache read tokens
+    pub fn cumulative_cache_read_tokens(&self) -> u64 {
+        self.session_cache_read_tokens
+    }
+
+    /// 累计压缩次数
+    pub fn compaction_count(&self) -> u32 {
+        self.compaction_count
+    }
+
+    /// 累计节省的字符数
+    pub fn chars_saved_by_compaction(&self) -> usize {
+        self.chars_saved_by_compaction
     }
 
     /// 构建完整 messages = system_prompt + 环境信息 + 记忆上下文 + 历史

@@ -210,6 +210,14 @@ fn process_chunk(
                     .get("total_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
+                cache_creation_input_tokens: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                cache_read_input_tokens: u
+                    .get("cache_read_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
             });
 
             events.push(StreamEvent::Done {

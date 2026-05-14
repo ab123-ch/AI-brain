@@ -48,13 +48,13 @@ pub struct ThresholdConfig {
     pub context_warning_threshold: f64,
     /// 上下文使用率危险阈值，默认 0.80（触发强制截断）
     pub context_danger_threshold: f64,
-    /// 上下文窗口 token 上限，默认 1M（1_048_576）
+    /// 上下文窗口 token 上限，默认 128K（131_072），与 deepseek/glm 实际上下文窗口匹配
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u64,
 }
 
 fn default_max_context_tokens() -> u64 {
-    1_048_576
+    131_072 // 128K，与 deepseek/glm 系列模型实际上下文窗口匹配
 }
 
 impl Default for ThresholdConfig {

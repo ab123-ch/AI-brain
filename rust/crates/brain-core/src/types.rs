@@ -542,6 +542,10 @@ pub enum ProgressEvent {
     TextDelta {
         text: String,
     },
+    /// 思考内容增量（与 TextDelta 分离，TUI 默认不显示，Ctrl+E 可切换）
+    ThinkingDelta {
+        content: String,
+    },
     ToolStart {
         brain: String,
         tool_name: String,
