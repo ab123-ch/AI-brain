@@ -211,10 +211,19 @@ impl Orchestrator {
             }
         }
 
-        // 4.1 创建 v2 评估脑（LLM 深度评估）
+        // 4.0 提前包装记忆脑 Arc<Mutex>（评估脑和后续都需要）
+        let memory = Arc::new(Mutex::new(memory));
+
+        // 4.1 创建 v2 评估脑（LLM 深度评估 + 只读工具验证）
+        let eval_tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
+            crate::real_tool_executor::RealToolExecutor::with_memory(Some(memory.clone())),
+        );
         let eval_brain = if let Ok(config) = LlmConfig::load_default() {
             if let Ok(client) = config.create_brain_client("eval") {
-                Some(EvalBrain::new(Arc::from(client)))
+                Some(EvalBrain::with_verification(
+                    Arc::from(client),
+                    eval_tool_executor,
+                ))
             } else {
                 None
             }
@@ -222,7 +231,7 @@ impl Orchestrator {
             None
         };
         if eval_brain.is_some() {
-            tracing::info!("v2 评估脑已创建（LLM 深度评估）");
+            tracing::info!("v2 评估脑已创建（LLM 深度评估 + 只读工具验证）");
         }
 
         // 4.2 初始化 Hook 系统（eval_gate 纯规则判断）
@@ -248,7 +257,6 @@ impl Orchestrator {
             .ok_or("结果接收端已被占用")?;
 
         // 7. 包装 Arc<Mutex>
-        let memory = Arc::new(Mutex::new(memory));
         let reasoning = Arc::new(Mutex::new(reasoning));
         let motor = Arc::new(Mutex::new(motor));
         let validation = Arc::new(Mutex::new(validation));
@@ -706,7 +714,15 @@ impl Orchestrator {
                                 let _ = tx.send(ProgressEvent::Evaluating).await;
 
                                 match eb
-                                    .evaluate(&input_owned, &answer, &pitfalls, &profile, &rules, &eval_requirements)
+                                    .evaluate_with_verification(
+                                        &input_owned,
+                                        &answer,
+                                        &result.as_ref().unwrap().turns,
+                                        &pitfalls,
+                                        &profile,
+                                        &rules,
+                                        &eval_requirements,
+                                    )
                                     .await
                                 {
                                     Ok(eval_result) => {
