@@ -2,10 +2,12 @@ use std::fmt::Write;
 
 use brain_core::types::{EvalRequirement, EvolutionRule, PitfallCategory, PitfallRecord, UserProfile};
 
+use crate::extractor::{FileChange, FileChangeType};
+
 /// 构建评估系统提示词
 ///
 /// 三段式结构：角色定义 + 评估维度 + 用户评估要求
-pub fn build_evaluation_system_prompt(eval_requirements: &[EvalRequirement]) -> String {
+pub fn build_evaluation_system_prompt(eval_requirements: &[EvalRequirement], with_tools: bool) -> String {
     let mut prompt = String::new();
 
     // ── 第一段：角色定义 ──
@@ -26,6 +28,24 @@ pub fn build_evaluation_system_prompt(eval_requirements: &[EvalRequirement]) -> 
 - 只报告确实存在的问题，宁可漏报不误报
 
 "#);
+
+    // ── 验证工具说明（仅在带工具模式时） ──
+    if with_tools {
+        prompt.push_str(r#"# 验证工具
+
+你可以使用以下只读工具来验证主脑的工作成果：
+- **read_file** — 读取文件内容，检查代码是否正确、位置是否正确
+- **grep_search** — 搜索代码内容，检查调用链、引用关系
+- **glob_search** — 搜索文件路径，检查项目结构
+
+## 验证策略
+- 如果用户要求修改代码，你应该验证：代码确实被修改、修改位置正确、修改内容符合预期
+- 如果修改涉及函数定义变更，你应该 grep 搜索该函数名，确认调用方是否受影响
+- 如果主脑输出包含"已修改"的声明，你应该 read_file 确认修改确实存在
+- 如果不需要验证（闲聊、问答、无代码修改），直接给出评估结果
+
+"#);
+    }
 
     // ── 第二段：评估维度（固定不变） ──
     prompt.push_str(r#"# 评估维度
@@ -82,6 +102,7 @@ pub fn build_evaluation_user_prompt(
     pitfalls: &[PitfallRecord],
     user_profile: &UserProfile,
     rules: &[EvolutionRule],
+    file_changes: &[FileChange],
 ) -> String {
     let mut prompt = String::new();
 
@@ -94,6 +115,12 @@ pub fn build_evaluation_user_prompt(
     prompt.push_str("## 主脑输出（待评估）\n");
     prompt.push_str(ai_output);
     prompt.push_str("\n\n");
+
+    // 文件修改记录
+    let changes_text = format_file_changes(file_changes);
+    if !changes_text.is_empty() {
+        prompt.push_str(&changes_text);
+    }
 
     // 踩坑库
     if !pitfalls.is_empty() {
@@ -169,6 +196,35 @@ pub fn build_evaluation_user_prompt(
     prompt
 }
 
+/// 将文件变更列表格式化为 prompt 文本
+pub fn format_file_changes(changes: &[FileChange]) -> String {
+    if changes.is_empty() {
+        return String::new();
+    }
+
+    let mut s = String::from("## 文件修改记录（主脑本轮操作）\n\n");
+    for (i, c) in changes.iter().enumerate() {
+        match c.change_type {
+            FileChangeType::Edit => {
+                let _ = writeln!(s, "{}. 编辑 `{}`", i + 1, c.file_path);
+                if let Some(ref old) = c.old_content {
+                    let truncated: String = old.chars().take(500).collect();
+                    let _ = writeln!(s, "   替换前: {}", truncated);
+                }
+                if let Some(ref new) = c.new_content {
+                    let truncated: String = new.chars().take(500).collect();
+                    let _ = writeln!(s, "   替换后: {}", truncated);
+                }
+            }
+            FileChangeType::Write => {
+                let _ = writeln!(s, "{}. 写入 `{}`（新建或覆盖）", i + 1, c.file_path);
+            }
+        }
+    }
+    s.push('\n');
+    s
+}
+
 fn category_label(category: PitfallCategory) -> &'static str {
     match category {
         PitfallCategory::ToolFailure => "工具失败",
@@ -187,7 +243,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_role_definition() {
-        let prompt = build_evaluation_system_prompt(&[]);
+        let prompt = build_evaluation_system_prompt(&[], false);
         assert!(prompt.contains("角色定义"));
         assert!(prompt.contains("质量审核员"));
         assert!(prompt.contains("核心能力"));
@@ -195,7 +251,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_fixed_dimensions() {
-        let prompt = build_evaluation_system_prompt(&[]);
+        let prompt = build_evaluation_system_prompt(&[], false);
         assert!(prompt.contains("评估维度"));
         assert!(prompt.contains("任务完成度"));
         assert!(prompt.contains("高危操作"));
@@ -207,7 +263,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_output_format() {
-        let prompt = build_evaluation_system_prompt(&[]);
+        let prompt = build_evaluation_system_prompt(&[], false);
         assert!(prompt.contains("评估结果-正常"));
         assert!(prompt.contains("评估结果-存在问题"));
         assert!(prompt.contains("不要输出 JSON"));
@@ -215,7 +271,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_judgment_principles() {
-        let prompt = build_evaluation_system_prompt(&[]);
+        let prompt = build_evaluation_system_prompt(&[], false);
         assert!(prompt.contains("判定原则"));
         assert!(prompt.contains("宁可漏报不误报"));
     }
@@ -238,7 +294,7 @@ mod tests {
                 superseded: false,
             },
         ];
-        let prompt = build_evaluation_system_prompt(&reqs);
+        let prompt = build_evaluation_system_prompt(&reqs, false);
         assert!(prompt.contains("用户评估要求"));
         assert!(prompt.contains("不要将简单问答判定为问题"));
         assert!(prompt.contains("重点关注代码安全性"));
@@ -247,7 +303,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_eval_requirements() {
-        let prompt = build_evaluation_system_prompt(&[]);
+        let prompt = build_evaluation_system_prompt(&[], false);
         assert!(!prompt.contains("用户评估要求"));
     }
 
@@ -258,6 +314,7 @@ mod tests {
             "fn add(a: i32, b: i32) -> i32 { a + b }",
             &[],
             &UserProfile::default(),
+            &[],
             &[],
         );
         assert!(prompt.contains("帮我写一个函数"));
@@ -282,6 +339,7 @@ mod tests {
             &[pitfall],
             &UserProfile::default(),
             &[],
+            &[],
         );
         assert!(prompt.contains("踩坑库"));
         assert!(prompt.contains("unwrap"));
@@ -297,7 +355,7 @@ mod tests {
             .push("使用 Rust 惯用写法".into());
         profile.taboos.push("禁止使用 unsafe".into());
 
-        let prompt = build_evaluation_user_prompt("写代码", "some code", &[], &profile, &[]);
+        let prompt = build_evaluation_user_prompt("写代码", "some code", &[], &profile, &[], &[]);
         assert!(prompt.contains("用户画像"));
         assert!(prompt.contains("显性偏好"));
         assert!(prompt.contains("Rust 惯用写法"));
@@ -321,6 +379,7 @@ mod tests {
             &[],
             &UserProfile::default(),
             &[rule],
+            &[],
         );
         assert!(prompt.contains("自进化规则"));
         assert!(prompt.contains("优先级5"));
@@ -330,7 +389,7 @@ mod tests {
     #[test]
     fn user_prompt_no_profile_section_when_empty() {
         let prompt =
-            build_evaluation_user_prompt("input", "output", &[], &UserProfile::default(), &[]);
+            build_evaluation_user_prompt("input", "output", &[], &UserProfile::default(), &[], &[]);
         assert!(!prompt.contains("用户画像"));
     }
 
@@ -341,5 +400,45 @@ mod tests {
         assert_eq!(category_label(PitfallCategory::FormatIssue), "格式问题");
         assert_eq!(category_label(PitfallCategory::LazyBehavior), "偷懒行为");
         assert_eq!(category_label(PitfallCategory::Other), "其他");
+    }
+
+    #[test]
+    fn system_prompt_with_tools_has_verification_section() {
+        let prompt = build_evaluation_system_prompt(&[], true);
+        assert!(prompt.contains("验证工具"));
+        assert!(prompt.contains("read_file"));
+        assert!(prompt.contains("grep_search"));
+    }
+
+    #[test]
+    fn system_prompt_without_tools_no_verification_section() {
+        let prompt = build_evaluation_system_prompt(&[], false);
+        assert!(!prompt.contains("验证工具"));
+    }
+
+    #[test]
+    fn user_prompt_with_file_changes() {
+        let changes = vec![
+            FileChange {
+                file_path: "src/main.rs".into(),
+                change_type: FileChangeType::Edit,
+                old_content: Some("fn old()".into()),
+                new_content: Some("fn new() {}".into()),
+            },
+        ];
+        let prompt = build_evaluation_user_prompt(
+            "改代码", "已修改", &[], &UserProfile::default(), &[], &changes,
+        );
+        assert!(prompt.contains("文件修改记录"));
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("fn new()"));
+    }
+
+    #[test]
+    fn user_prompt_without_file_changes_no_section() {
+        let prompt = build_evaluation_user_prompt(
+            "闲聊", "你好", &[], &UserProfile::default(), &[], &[],
+        );
+        assert!(!prompt.contains("文件修改记录"));
     }
 }

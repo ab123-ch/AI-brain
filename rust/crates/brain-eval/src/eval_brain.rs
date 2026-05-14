@@ -281,13 +281,14 @@ impl EvalBrain {
         rules: &[EvolutionRule],
         eval_requirements: &[EvalRequirement],
     ) -> Result<String> {
-        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements);
+        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, false);
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
             pitfalls,
             user_profile,
             rules,
+            &[],
         );
 
         let request = ChatRequest {
