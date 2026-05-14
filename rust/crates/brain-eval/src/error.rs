@@ -10,6 +10,10 @@ pub enum EvalError {
     /// 输入无效
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// 工具执行失败
+    #[error("tool execution failed: {0}")]
+    ToolError(String),
 }
 
 pub type Result<T> = std::result::Result<T, EvalError>;
