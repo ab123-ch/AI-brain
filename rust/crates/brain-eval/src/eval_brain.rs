@@ -1,12 +1,94 @@
 use std::sync::Arc;
 
 use brain_core::types::{EvalRequirement, EvolutionRule, PitfallRecord, ProgressEvent, UserProfile};
-use brain_llm::{ChatMessage, ChatRequest, LlmProvider};
+use brain_llm::{ChatMessage, ChatRequest, LlmProvider, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::checker;
 use crate::error::{EvalError, Result};
 use crate::prompts;
+
+/// 评估脑允许使用的只读工具白名单
+const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep_search", "glob_search"];
+
+/// 检查工具名是否在只读白名单中
+pub(crate) fn is_read_only_tool(name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&name)
+}
+
+/// 构建评估脑专用的只读工具定义
+///
+/// 精简版：只暴露 LLM 需要的核心参数，避免 eval 脑误用高级参数
+pub fn build_read_only_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "read_file".into(),
+            description: "读取文件内容（只读）。可以指定行范围。".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "要读取的文件的绝对路径"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "从第几行开始读取（可选，默认从第一行）"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多读取多少行（可选，默认全部）"
+                    }
+                },
+                "required": ["file_path"]
+            }),
+        },
+        ToolDefinition {
+            name: "grep_search".into(),
+            description: "在文件内容中搜索匹配正则表达式的行（只读）。".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "正则表达式搜索模式"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "搜索目录（可选，默认当前目录）"
+                    },
+                    "output_mode": {
+                        "type": "string",
+                        "description": "输出模式：content（显示匹配行）或 files_with_matches（只显示文件名）"
+                    },
+                    "head_limit": {
+                        "type": "integer",
+                        "description": "最多返回多少条结果（建议设为20以内）"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "glob_search".into(),
+            description: "按 glob 模式搜索文件路径（只读）。".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "glob 模式，如 **/*.rs 或 src/**/*.ts"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "搜索目录（可选，默认当前目录）"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+    ]
+}
 
 /// 问题严重程度
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,5 +483,25 @@ mod tests {
 
         // 应该检测到：TODO（lazy）、unsafe（taboo）、unwrap/panic（pitfall repeat）
         assert!(!issues.is_empty());
+    }
+
+    #[test]
+    fn read_only_tool_whitelist() {
+        assert!(is_read_only_tool("read_file"));
+        assert!(is_read_only_tool("grep_search"));
+        assert!(is_read_only_tool("glob_search"));
+        assert!(!is_read_only_tool("edit_file"));
+        assert!(!is_read_only_tool("write_file"));
+        assert!(!is_read_only_tool("bash"));
+    }
+
+    #[test]
+    fn build_read_only_tools_has_three() {
+        let tools = build_read_only_tool_definitions();
+        assert_eq!(tools.len(), 3);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"grep_search"));
+        assert!(names.contains(&"glob_search"));
     }
 }
