@@ -74,6 +74,17 @@ pub struct PrioritizedEvent {
     pub enqueued_at: Instant,
 }
 
+impl PrioritizedEvent {
+    /// Create a new prioritized event with the current timestamp.
+    pub fn new(event: DispatchEvent, priority: Priority) -> Self {
+        Self {
+            event,
+            priority,
+            enqueued_at: Instant::now(),
+        }
+    }
+}
+
 /// Classification of agent type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentType {
