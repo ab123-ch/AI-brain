@@ -850,6 +850,34 @@ impl Orchestrator {
                     // 触发四步分析（非阻塞，后台执行）
                     this.maybe_trigger_analysis();
 
+                    // 检查 dispatch 队列中的异步子代理/副脑通知
+                    {
+                        let mut dispatch_rx = this.dispatch_output_rx.lock().await;
+                        while let Ok(msg) = dispatch_rx.try_recv() {
+                            match msg {
+                                brain_dispatch::MainLoopMessage::AgentNotification(result) => {
+                                    let notification = format!(
+                                        "\n📡 异步子代理完成: {} ({:?})\n",
+                                        result.agent_id, result.status
+                                    );
+                                    let _ = tx.send(ProgressEvent::TextDelta {
+                                        text: notification,
+                                    }).await;
+                                    tracing::info!("异步子代理通知: {} status={:?}", result.agent_id, result.status);
+                                }
+                                brain_dispatch::MainLoopMessage::BrainTaskNotification { brain_id, result } => {
+                                    let notification = format!(
+                                        "\n📡 副脑任务完成: {brain_id}\n",
+                                    );
+                                    let _ = tx.send(ProgressEvent::TextDelta {
+                                        text: notification,
+                                    }).await;
+                                    tracing::info!("副脑任务通知: {brain_id} status={:?}", result.status);
+                                }
+                            }
+                        }
+                    }
+
                     // 通知 TUI 查询完成（process_input 不走 streaming，不会自行发 Done）
                     let _ = tx.send(ProgressEvent::Done).await;
 
