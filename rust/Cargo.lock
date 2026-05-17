@@ -24,6 +24,7 @@ dependencies = [
  "axum",
  "brain-bus",
  "brain-core",
+ "brain-dispatch",
  "brain-eval",
  "brain-evaluation",
  "brain-evolution",
@@ -244,6 +245,19 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "brain-dispatch"
+version = "0.1.0"
+dependencies = [
+ "brain-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2724,12 +2738,14 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "api",
+ "brain-llm",
  "plugins",
  "reqwest",
  "runtime",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
