@@ -422,7 +422,8 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                     "prompt": { "type": "string", "description": "Detailed instructions for the agent" },
                     "subagent_type": { "type": "string", "description": "Agent type: 'Explore' for read-only research, 'general-purpose' for full access. Defaults to 'general-purpose'." },
                     "name": { "type": "string", "description": "Optional short name for the agent" },
-                    "model": { "type": "string", "description": "Optional model override (leave empty to use default)" }
+                    "model": { "type": "string", "description": "Optional model override (leave empty to use default)" },
+                    "run_in_background": { "type": "boolean", "description": "Set to true to run this agent in the background. You will be automatically notified when it completes.", "default": false }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -1031,6 +1032,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    run_in_background: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1969,7 +1972,13 @@ where
         err
     })?;
 
-    // 同步阻塞等待子代理完成
+    if input.run_in_background {
+        // 异步模式：立即返回 "running" manifest，不等待完成
+        // 子代理完成后由调用者通过回调或轮询获取结果
+        return Ok(manifest);
+    }
+
+    // 同步模式：阻塞等待子代理完成
     let agent_done = result_rx.recv().map_err(|_| {
         String::from("sub-agent channel closed unexpectedly (thread panicked?)")
     })?;
@@ -4396,6 +4405,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                run_in_background: false,
             },
             move |job| {
                 *captured_for_spawn
@@ -4478,6 +4488,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                run_in_background: false,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -4512,6 +4523,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                run_in_background: false,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -4547,6 +4559,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                run_in_background: false,
             },
             |_| Err(String::from("thread creation failed")),
         )
