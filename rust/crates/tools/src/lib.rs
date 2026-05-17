@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
+    max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
@@ -408,15 +409,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
+            description: "Launch a background sub-agent to perform a delegated task autonomously. \
+The sub-agent runs in an isolated session with its own tools and returns results when done. \
+Use this when the task benefits from focused, independent work (e.g., codebase exploration, \
+code review, verification, research). Do NOT use for simple lookups — use read_file/grep/glob directly. \
+Available subagent_type values: 'Explore' (read-only research), 'general-purpose' (full tool access). \
+The sub-agent inherits your model and API credentials automatically — do NOT research how to launch it, just call this tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "description": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "subagent_type": { "type": "string" },
-                    "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "description": { "type": "string", "description": "Short description of what the agent will do" },
+                    "prompt": { "type": "string", "description": "Detailed instructions for the agent" },
+                    "subagent_type": { "type": "string", "description": "Agent type: 'Explore' for read-only research, 'general-purpose' for full access. Defaults to 'general-purpose'." },
+                    "name": { "type": "string", "description": "Optional short name for the agent" },
+                    "model": { "type": "string", "description": "Optional model override (leave empty to use default)" }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -1237,6 +1243,14 @@ struct AgentOutput {
     error: Option<String>,
 }
 
+/// Agent 子代理执行结果（从子代理线程通过 channel 发送回来）
+pub(crate) struct AgentDone {
+    status: String,
+    final_text: Option<String>,
+    error: Option<String>,
+    duration_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 struct AgentJob {
     manifest: AgentOutput,
@@ -1883,7 +1897,7 @@ fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
 
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
 where
-    F: FnOnce(AgentJob) -> Result<(), String>,
+    F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
 {
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
@@ -1949,47 +1963,101 @@ where
         system_prompt,
         allowed_tools,
     };
-    if let Err(error) = spawn_fn(job) {
-        let error = format!("failed to spawn sub-agent: {error}");
-        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
-        return Err(error);
-    }
+    let result_rx = spawn_fn(job).map_err(|error| {
+        let err = format!("failed to spawn sub-agent: {error}");
+        let _ = persist_agent_terminal_state(&manifest, "failed", None, Some(err.clone()));
+        err
+    })?;
 
-    Ok(manifest)
+    // 同步阻塞等待子代理完成
+    let agent_done = result_rx.recv().map_err(|_| {
+        String::from("sub-agent channel closed unexpectedly (thread panicked?)")
+    })?;
+
+    // 构建最终 manifest
+    let final_manifest = AgentOutput {
+        status: agent_done.status,
+        completed_at: Some(iso8601_now()),
+        error: agent_done.error,
+        ..manifest
+    };
+    Ok(final_manifest)
 }
 
-fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
+fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            let start = std::time::Instant::now();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {}
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let done = match result {
+                Ok(Ok(())) => {
+                    // run_agent_job 内部已经调用了 persist_agent_terminal_state
+                    // 从 output_file 读取最后输出段落
+                    let final_text = std::fs::read_to_string(&job.manifest.output_file)
+                        .ok()
+                        .and_then(|content| {
+                            content.split("## Output\n").last()
+                                .or_else(|| content.split("## Result\n").last())
+                                .map(|s| s.trim().to_string())
+                        });
+                    AgentDone {
+                        status: "completed".into(),
+                        final_text,
+                        error: None,
+                        duration_ms,
+                    }
+                }
                 Ok(Err(error)) => {
                     let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.clone()));
+                    AgentDone {
+                        status: "failed".into(),
+                        final_text: None,
+                        error: Some(error),
+                        duration_ms,
+                    }
                 }
                 Err(_) => {
+                    let error = String::from("sub-agent thread panicked");
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
                         None,
-                        Some(String::from("sub-agent thread panicked")),
+                        Some(error.clone()),
                     );
+                    AgentDone {
+                        status: "failed".into(),
+                        final_text: None,
+                        error: Some(error),
+                        duration_ms,
+                    }
                 }
-            }
+            };
+            let _ = tx.send(done);
         })
-        .map(|_| ())
+        .map(|_| rx)
         .map_err(|error| error.to_string())
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    tracing::debug!("[子代理] run_agent_job 开始: agent={}, model={:?}", job.manifest.agent_id, job.manifest.model);
+    let mut runtime = build_agent_runtime(job).map_err(|e| {
+        tracing::error!("[子代理] build_agent_runtime 失败: {e}");
+        e
+    })?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    tracing::debug!("[子代理] build_agent_runtime 成功，开始 run_turn");
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            tracing::error!("[子代理] run_turn 失败: {error}");
+            error.to_string()
+        })?;
+    tracing::debug!("[子代理] run_turn 完成，迭代次数: {}", summary.iterations);
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
@@ -2172,6 +2240,30 @@ fn format_agent_terminal_output(status: &str, result: Option<&str>, error: Optio
     sections.join("")
 }
 
+/// 子代理配置文件结构（从 .ai-brain/subagent.json 加载）
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SubagentConfig {
+    /// 可选的模型覆盖
+    model: Option<String>,
+    /// 可选的API地址覆盖
+    base_url: Option<String>,
+}
+
+/// 加载子代理配置文件
+fn load_subagent_config() -> Option<SubagentConfig> {
+    let cwd = std::env::current_dir().ok()?;
+    let config_path = cwd.join(".ai-brain").join("subagent.json");
+
+    let contents = fs::read_to_string(&config_path).ok()?;
+    if contents.trim().is_empty() {
+        return None;
+    }
+
+    serde_json::from_str(&contents).ok()
+}
+
+use brain_llm::config::LlmConfig;
+
 struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ProviderClient,
@@ -2181,9 +2273,62 @@ struct ProviderRuntimeClient {
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let model = resolve_model_alias(&model).clone();
-        let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
+    fn new(_model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+        // 1. 加载主脑 LLM 配置
+        let llm_config = LlmConfig::load_default()
+            .map_err(|e| format!("无法加载主脑 LLM 配置: {e}"))?;
+        let default_provider = &llm_config.llm.default_provider;
+        tracing::debug!("[子代理] 主脑配置: provider={default_provider}");
+
+        // 2. 加载子代理配置（可选覆盖）
+        let subagent_config = load_subagent_config().unwrap_or_default();
+
+        // 3. 模型优先级：subagent.json 配置 > brain_models.subagent > 主脑默认
+        //    子代理需要 tool calling 支持，默认模型不一定兼容
+        let subagent_brain_model = llm_config.model_for_brain("subagent").to_string();
+        let model = subagent_config
+            .model
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .unwrap_or(subagent_brain_model);
+        tracing::debug!("[子代理] 使用模型: {model}");
+
+        // 4. 提供商选择：遍历已配置的提供商，找能服务这个模型的
+        //    策略：模型名以提供商名开头（如 deepseek-chat → deepseek），匹配则用
+        //    找不到时回退到 default_provider
+        let provider_name = llm_config
+            .llm
+            .providers
+            .keys()
+            .find(|name| model.starts_with(name.as_str()))
+            .map(String::as_str)
+            .unwrap_or(default_provider);
+        tracing::debug!("[子代理] 选择提供商: {provider_name}");
+
+        let provider_config = llm_config.llm.providers.get(provider_name)
+            .ok_or_else(|| format!("提供商配置不存在: {provider_name}"))?;
+
+        let api_key = llm_config.resolve_api_key(provider_name)
+            .map_err(|e| format!("无法获取 API Key (provider={provider_name}): {e}"))?;
+
+        // 5. 创建 OpenAI 兼容客户端
+        let openai_config = api::OpenAiCompatConfig {
+            provider_name: "subagent",
+            api_key_env: "",
+            base_url_env: "",
+            default_base_url: "",
+        };
+        let mut api_base = provider_config.api_base.clone();
+        // 子代理配置可覆盖 base_url
+        if let Some(base_url) = &subagent_config.base_url {
+            api_base = base_url.clone();
+        }
+        let openai_client = api::OpenAiCompatClient::new(api_key, openai_config)
+            .with_base_url(api_base.clone());
+        let client = api::ProviderClient::OpenAi(openai_client);
+        tracing::debug!("[子代理] 客户端就绪: model={model}, api_base={api_base}");
+
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             client,
@@ -2213,6 +2358,19 @@ impl ApiClient for ProviderRuntimeClient {
             tool_choice: (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto),
             stream: true,
         };
+
+        // 诊断：打印请求摘要
+        tracing::info!(
+            "[子代理] API 请求: model={}, max_tokens={}, msgs={}, tools={}, system={}",
+            message_request.model,
+            message_request.max_tokens,
+            message_request.messages.len(),
+            message_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            message_request.system.as_ref().map(|s| s.len()).unwrap_or(0),
+        );
+        for (i, msg) in message_request.messages.iter().enumerate() {
+            tracing::info!("[子代理]   msg[{i}] role={}, blocks={}", msg.role, msg.content.len());
+        }
 
         self.runtime.block_on(async {
             let mut stream = self
@@ -2478,13 +2636,32 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     }
 }
 
-fn deferred_tool_specs() -> Vec<ToolSpec> {
+/// 基础工具 — 始终注册，不过载模型决策空间
+///
+/// 只包含 6 个核心工具：bash, read_file, write_file, edit_file, glob_search, grep_search
+/// 其余工具通过 ToolSearch 按需加载（仿 Claude Code 的分层工具加载机制）。
+#[must_use]
+pub fn base_tool_specs() -> Vec<ToolSpec> {
+    mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| {
+            matches!(
+                spec.name,
+                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search" | "Agent"
+            )
+        })
+        .collect()
+}
+
+/// 延迟加载工具 — 不默认注册，通过 ToolSearch 按需发现
+#[must_use]
+pub fn deferred_tool_specs() -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
         .filter(|spec| {
             !matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
+                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search" | "Agent"
             )
         })
         .collect()
@@ -3724,11 +3901,11 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
         execute_tool, final_assistant_text, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, AgentInput, AgentJob,
-        SubagentToolExecutor,
+        persist_agent_terminal_state, push_output_block, AgentDone, AgentInput, AgentJob,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
-    use runtime::{ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session};
+    use runtime::{ApiRequest, ApiClient, AssistantEvent, ConversationMessage, ConversationRuntime, RuntimeError, Session};
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -4224,7 +4401,14 @@ mod tests {
                 *captured_for_spawn
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
-                Ok(())
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(AgentDone {
+                    status: "completed".into(),
+                    final_text: None,
+                    error: None,
+                    duration_ms: 0,
+                }).expect("send AgentDone");
+                Ok(rx)
             },
         )
         .expect("Agent should succeed");
@@ -4232,10 +4416,10 @@ mod tests {
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
-        assert_eq!(manifest.status, "running");
+        assert_eq!(manifest.status, "completed");
         assert!(!manifest.created_at.is_empty());
         assert!(manifest.started_at.is_some());
-        assert!(manifest.completed_at.is_none());
+        assert!(manifest.completed_at.is_some());
         let contents = std::fs::read_to_string(&manifest.output_file).expect("agent file exists");
         let manifest_contents =
             std::fs::read_to_string(&manifest.manifest_file).expect("manifest file exists");
@@ -4301,7 +4485,15 @@ mod tests {
                     "completed",
                     Some("Finished successfully"),
                     None,
-                )
+                )?;
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(AgentDone {
+                    status: "completed".into(),
+                    final_text: Some("Finished successfully".into()),
+                    error: None,
+                    duration_ms: 0,
+                }).expect("send AgentDone");
+                Ok(rx)
             },
         )
         .expect("completed agent should succeed");
@@ -4327,7 +4519,15 @@ mod tests {
                     "failed",
                     None,
                     Some(String::from("simulated failure")),
-                )
+                )?;
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(AgentDone {
+                    status: "failed".into(),
+                    final_text: None,
+                    error: Some("simulated failure".into()),
+                    duration_ms: 0,
+                }).expect("send AgentDone");
+                Ok(rx)
             },
         )
         .expect("failed agent should still spawn");
@@ -5333,5 +5533,282 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+
+    /// 验证 ProviderRuntimeClient 能用配置文件的 default provider 创建成功
+    #[test]
+    fn provider_runtime_client_creates_with_default_config() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let client = ProviderRuntimeClient::new(
+            String::from("claude-opus-4-6"),
+            BTreeSet::from([String::from("read_file")]),
+        );
+
+        match &client {
+            Ok(c) => {
+                // 应该使用配置文件的 default model，不是 claude-opus-4-6
+                let config = brain_llm::config::LlmConfig::load_default().expect("config");
+                assert_eq!(
+                    c.model, config.llm.default_model,
+                    "子代理应该用配置文件的 default_model"
+                );
+                eprintln!("[测试] ProviderRuntimeClient 创建成功: model={}", c.model);
+            }
+            Err(e) => {
+                panic!("ProviderRuntimeClient 创建失败: {e}");
+            }
+        }
+    }
+
+    /// 验证 stream() 能真正调用 API 并拿到响应
+    /// 用 default provider（不走 subagent 专用模型）
+    #[test]
+    fn provider_runtime_client_stream_makes_real_api_call() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = brain_llm::config::LlmConfig::load_default().expect("config");
+        let default_model = config.llm.default_model.clone();
+        let default_provider = &config.llm.default_provider;
+
+        // 直接构建 client，不走 ProviderRuntimeClient::new()（它会用 subagent 模型）
+        let api_key = config.resolve_api_key(default_provider).expect("api key");
+        let provider_config = config.llm.providers.get(default_provider.as_str()).expect("provider");
+        let openai_config = api::OpenAiCompatConfig {
+            provider_name: "test",
+            api_key_env: "",
+            base_url_env: "",
+            default_base_url: "",
+        };
+        let openai_client = api::OpenAiCompatClient::new(api_key, openai_config)
+            .with_base_url(provider_config.api_base.clone());
+        let mut client = ProviderRuntimeClient {
+            runtime: tokio::runtime::Runtime::new().expect("runtime"),
+            client: api::ProviderClient::OpenAi(openai_client),
+            model: default_model.clone(),
+            allowed_tools: BTreeSet::new(),
+        };
+
+        eprintln!("[测试] client model={}, provider={}", client.model, default_provider);
+
+        let request = ApiRequest {
+            system_prompt: vec![String::from("You are a helpful assistant. Reply in one short sentence.")],
+            messages: vec![ConversationMessage::user_text("What is 1+1?")],
+        };
+
+        let result = client.stream(request);
+
+        match &result {
+            Ok(events) => {
+                eprintln!("[测试] stream 返回 {} 个事件", events.len());
+                for (i, event) in events.iter().enumerate() {
+                    eprintln!("[测试]   event[{}]: {:?}", i, event);
+                }
+                // 至少要有一个 TextDelta 或 ToolUse
+                let has_content = events.iter().any(|e| {
+                    matches!(e, AssistantEvent::TextDelta(t) if !t.is_empty())
+                        || matches!(e, AssistantEvent::ToolUse { .. })
+                });
+                assert!(has_content, "stream 应该返回文本或工具调用");
+                assert!(
+                    events.iter().any(|e| matches!(e, AssistantEvent::MessageStop)),
+                    "stream 应该包含 MessageStop"
+                );
+            }
+            Err(e) => {
+                panic!("stream() 调用失败: {e}\n这是子代理不可用的根因——API 调用本身就有问题");
+            }
+        }
+    }
+
+    /// 端到端：用 default provider 跑一轮 run_turn（无工具，纯对话）
+    #[test]
+    fn subagent_real_run_turn_no_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = brain_llm::config::LlmConfig::load_default().expect("config");
+        let default_model = config.llm.default_model.clone();
+        let default_provider = &config.llm.default_provider;
+        let api_key = config.resolve_api_key(default_provider).expect("api key");
+        let provider_config = config.llm.providers.get(default_provider.as_str()).expect("provider");
+        let openai_config = api::OpenAiCompatConfig {
+            provider_name: "test",
+            api_key_env: "",
+            base_url_env: "",
+            default_base_url: "",
+        };
+        let openai_client = api::OpenAiCompatClient::new(api_key, openai_config)
+            .with_base_url(provider_config.api_base.clone());
+        let api_client = ProviderRuntimeClient {
+            runtime: tokio::runtime::Runtime::new().expect("runtime"),
+            client: api::ProviderClient::OpenAi(openai_client),
+            model: default_model.clone(),
+            allowed_tools: BTreeSet::new(),
+        };
+
+        eprintln!("[测试] 创建 runtime, model={}", api_client.model);
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api_client,
+            SubagentToolExecutor::new(BTreeSet::new()),
+            agent_permission_policy(),
+            vec![String::from("You are a helpful assistant. Reply in one short sentence.")],
+        );
+
+        let result = runtime.run_turn("What is the capital of France?", None);
+
+        match &result {
+            Ok(summary) => {
+                let text = final_assistant_text(summary);
+                eprintln!("[测试] run_turn 成功, iterations={}, answer={}", summary.iterations, &text[..text.len().min(200)]);
+                assert!(!text.is_empty(), "run_turn 应该返回非空文本");
+            }
+            Err(e) => {
+                panic!("run_turn 失败: {e}\n这就是子代理卡死的根因");
+            }
+        }
+    }
+
+    /// 诊断测试：用全部 MVP 工具定义（和子代理完全一致）测 MiMo
+    #[test]
+    fn diagnose_mimo_stream_with_all_mvp_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = brain_llm::config::LlmConfig::load_default().expect("config");
+        let default_provider = &config.llm.default_provider;
+        let api_key = config.resolve_api_key(default_provider).expect("api key");
+        let provider_config = config.llm.providers.get(default_provider.as_str()).expect("provider");
+        let model = &config.llm.default_model;
+        let endpoint = format!("{}/chat/completions", provider_config.api_base);
+
+        // 用和子代理完全一样的工具集
+        let allowed_tools = allowed_tools_for_subagent("Explore");
+        let tools: Vec<serde_json::Value> = super::tool_specs_for_allowed_tools(Some(&allowed_tools))
+            .into_iter()
+            .map(|spec| serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.input_schema,
+                }
+            }))
+            .collect();
+
+        eprintln!("[测试] 工具数量: {}", tools.len());
+        for t in &tools {
+            eprintln!("  - {}", t["function"]["name"]);
+        }
+
+        let payload = serde_json::json!({
+            "model": model,
+            "max_tokens": 64000,
+            "messages": [
+                {"role": "system", "content": "You are a sub-agent."},
+                {"role": "user", "content": "Read the file /tmp/test.txt"}
+            ],
+            "stream": true,
+            "tools": tools,
+            "tool_choice": "auto"
+        });
+
+        let payload_str = serde_json::to_string(&payload).expect("json");
+        eprintln!("[测试] 请求大小: {} bytes", payload_str.len());
+
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(&endpoint)
+            .header("content-type", "application/json")
+            .bearer_auth(&api_key)
+            .body(payload_str)
+            .send()
+            .expect("HTTP 请求失败");
+
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        eprintln!("[测试] MiMo 响应: {}\n{}", status, &body[..body.len().min(1000)]);
+        assert!(status.is_success(), "MiMo 全工具 stream 返回 {}: {}", status, body);
+    }
+
+    /// 端到端：模拟真实子代理场景 — 带工具（read_file + glob_search）+ tool loop
+    /// 这是最接近实际使用的测试：LLM 需要调用工具、拿到结果、再生成最终回答
+    /// 需要配置支持 tool calling 的模型（如 deepseek），在 brain_models.subagent 中指定
+    #[test]
+    fn subagent_real_run_turn_with_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // 用 subagent 模型跑完整 tool loop
+        let llm_config = brain_llm::config::LlmConfig::load_default().expect("config");
+        let subagent_model = llm_config.model_for_brain("subagent").to_string();
+        eprintln!("[测试] 子代理模型: {subagent_model}");
+
+        // 创建一个临时文件让子代理去读
+        let tmp_file = temp_path("subagent-e2e-test.txt");
+        std::fs::write(&tmp_file, "AI Brain v2 sub-agent test file.\nThe answer is 42.").expect("write tmp file");
+        let tmp_path_str = tmp_file.display().to_string();
+
+        let allowed_tools = BTreeSet::from([
+            String::from("read_file"),
+            String::from("glob_search"),
+            String::from("grep_search"),
+        ]);
+
+        let api_client = ProviderRuntimeClient::new(
+            String::new(),
+            allowed_tools.clone(),
+        )
+        .expect("ProviderRuntimeClient 应该创建成功");
+
+        eprintln!("[测试] 创建带工具的 runtime, model={}", api_client.model);
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api_client,
+            SubagentToolExecutor::new(allowed_tools),
+            agent_permission_policy(),
+            vec![format!(
+                "You are a sub-agent. Read the file at {tmp_path_str} and report its contents. Use the read_file tool."
+            )],
+        )
+        .with_max_iterations(10);
+
+        let prompt = format!("Please read the file at {tmp_path_str} and tell me what it says.");
+        let result = runtime.run_turn(&prompt, None);
+
+        match &result {
+            Ok(summary) => {
+                let text = final_assistant_text(summary);
+                eprintln!("[测试] run_turn (with tools) 成功, iterations={}, answer={}", summary.iterations, &text[..text.len().min(300)]);
+                assert!(!text.is_empty(), "带工具的 run_turn 应该返回非空文本");
+                assert!(summary.iterations >= 1, "带工具的 run_turn 至少要有 1 次迭代");
+
+                // 验证 session 里确实有工具调用
+                let has_tool_use = runtime.session().messages.iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .any(|b| matches!(b, runtime::ContentBlock::ToolUse { .. }));
+                let has_tool_result = runtime.session().messages.iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .any(|b| matches!(b, runtime::ContentBlock::ToolResult { .. }));
+                eprintln!("[测试] has_tool_use={}, has_tool_result={}", has_tool_use, has_tool_result);
+                assert!(has_tool_use, "session 应该包含工具调用");
+                assert!(has_tool_result, "session 应该包含工具结果");
+            }
+            Err(e) => {
+                panic!("带工具的 run_turn 失败: {e}\n这是子代理带工具不可用的根因");
+            }
+        }
+
+        let _ = std::fs::remove_file(&tmp_file);
     }
 }
