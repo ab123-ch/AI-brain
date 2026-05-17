@@ -12,7 +12,7 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
+    edit_file, execute_bash, glob_search, grep_search, read_file, write_file,
     ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
     PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
@@ -2093,17 +2093,21 @@ fn build_agent_runtime(
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut prompt = load_system_prompt(
-        cwd,
-        DEFAULT_AGENT_SYSTEM_DATE.to_string(),
-        std::env::consts::OS,
-        "unknown",
-    )
-    .map_err(|error| error.to_string())?;
-    prompt.push(format!(
-        "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
-    ));
-    Ok(prompt)
+    // 子代理用轻量级系统提示词，不加载完整主脑 prompt（避免 60 万+ 字符撑爆弱模型上下文）
+    let os = std::env::consts::OS;
+    let prompt = format!(
+        "You are a background sub-agent of type `{subagent_type}`.\n\
+         Current date: {DEFAULT_AGENT_SYSTEM_DATE}\n\
+         Operating system: {os}\n\
+         Working directory: {}\n\n\
+         Instructions:\n\
+         - Work only on the delegated task described below.\n\
+         - Use only the tools available to you.\n\
+         - Do not ask the user questions.\n\
+         - Finish with a concise result.",
+        cwd.display()
+    );
+    Ok(vec![prompt])
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
