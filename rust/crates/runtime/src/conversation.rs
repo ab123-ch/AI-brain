@@ -27,6 +27,7 @@ pub struct ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    ThinkingDelta(String),
     ToolUse {
         id: String,
         name: String,
@@ -669,10 +670,12 @@ fn build_assistant_message(
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
     let mut usage = None;
+    let mut thinking = String::new();
 
     for event in events {
         match event {
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::ThinkingDelta(delta) => thinking.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
@@ -686,6 +689,11 @@ fn build_assistant_message(
     }
 
     flush_text_block(&mut text, &mut blocks);
+
+    // Thinking block 放在最前面（MiMo 要求 reasoning_content 在 assistant 消息中）
+    if !thinking.is_empty() {
+        blocks.insert(0, ContentBlock::Thinking { thinking });
+    }
 
     if !finished {
         return Err(RuntimeError::new(

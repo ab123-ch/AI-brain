@@ -49,8 +49,18 @@ struct ApiChatRequest {
     tool_choice: Option<serde_json::Value>,
 }
 
+/// Deserialize `null` as empty Vec (some OpenAI-compatible APIs return null instead of []).
+fn deserialize_vec_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     choices: Vec<ApiChoice>,
     model: Option<String>,
     usage: Option<ApiUsage>,

@@ -326,10 +326,13 @@ struct StreamState {
     message_started: bool,
     text_started: bool,
     text_finished: bool,
+    thinking_started: bool,
     finished: bool,
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    /// MiMo streaming 拼接的 reasoning_content
+    reasoning_buffer: String,
 }
 
 impl StreamState {
@@ -339,10 +342,12 @@ impl StreamState {
             message_started: false,
             text_started: false,
             text_finished: false,
+            thinking_started: false,
             finished: false,
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            reasoning_buffer: String::new(),
         }
     }
 
@@ -380,6 +385,24 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // 处理 MiMo 的 reasoning_content（增量 delta，需拼接）
+            if let Some(reasoning) = choice.delta.reasoning_content.filter(|r| !r.is_empty()) {
+                if !self.thinking_started {
+                    self.thinking_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                self.reasoning_buffer.push_str(&reasoning);
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                }));
+            }
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
                 if !self.text_started {
                     self.text_started = true;
@@ -555,10 +578,20 @@ impl ToolCallState {
     }
 }
 
+/// Deserialize `null` as empty Vec (some OpenAI-compatible APIs return null instead of []).
+fn deserialize_vec_or_null<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     id: String,
     model: String,
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -576,8 +609,11 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     tool_calls: Vec<ResponseToolCall>,
+    /// MiMo 等模型返回的思考内容，多轮调用时必须原样传回
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -605,7 +641,7 @@ struct ChatCompletionChunk {
     id: String,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     choices: Vec<ChunkChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -622,8 +658,11 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_null")]
     tool_calls: Vec<DeltaToolCall>,
+    /// MiMo 等模型的流式思考内容，多轮调用时必须原样传回
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,9 +734,11 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
         "assistant" => {
             let mut text = String::new();
             let mut tool_calls = Vec::new();
+            let mut reasoning_content = String::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
+                    InputContentBlock::Thinking { thinking } => reasoning_content.push_str(thinking),
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -709,14 +750,23 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            if text.is_empty() && tool_calls.is_empty() {
+            if text.is_empty() && tool_calls.is_empty() && reasoning_content.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
+                let mut msg = json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
                     "tool_calls": tool_calls,
-                })]
+                });
+                if !text.is_empty() {
+                    msg["content"] = json!(text);
+                } else {
+                    msg["content"] = json!("");
+                }
+                // MiMo 要求 reasoning_content 原样传回
+                if !reasoning_content.is_empty() {
+                    msg["reasoning_content"] = json!(reasoning_content);
+                }
+                vec![msg]
             }
         }
         _ => message
@@ -731,13 +781,23 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
-                } => Some(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
-                })),
-                InputContentBlock::ToolUse { .. } => None,
+                } => {
+                    // OpenAI 标准 tool result 格式只有 role/tool_call_id/content，
+                    // 不含 is_error 字段。某些 API（如 mimo）会拒绝多余字段。
+                    // 错误信息通过 content 前缀传递给 LLM。
+                    let result_content = flatten_tool_result_content(content);
+                    let final_content = if *is_error {
+                        format!("[Tool Error] {result_content}")
+                    } else {
+                        result_content
+                    };
+                    Some(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": final_content,
+                    }))
+                }
+                InputContentBlock::ToolUse { .. } | InputContentBlock::Thinking { .. } => None,
             })
             .collect(),
     }
@@ -792,6 +852,13 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    // MiMo 等模型的 reasoning_content 必须在多轮时传回
+    if let Some(reasoning) = choice.message.reasoning_content.filter(|r| !r.is_empty()) {
+        content.push(OutputContentBlock::Thinking {
+            thinking: reasoning,
+            signature: None,
+        });
+    }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
@@ -1118,5 +1185,108 @@ mod tests {
     fn normalizes_stop_reasons() {
         assert_eq!(normalize_finish_reason("stop"), "end_turn");
         assert_eq!(normalize_finish_reason("tool_calls"), "tool_use");
+    }
+
+    #[test]
+    fn chat_completion_chunk_handles_null_choices_and_tool_calls() {
+        use super::{ChatCompletionChunk, ChatCompletionResponse};
+
+        // Streaming chunk with null choices (some APIs return this)
+        let chunk: ChatCompletionChunk =
+            serde_json::from_str(r#"{"id":"test","choices":null}"#).unwrap();
+        assert!(chunk.choices.is_empty());
+
+        // Streaming chunk with null tool_calls in delta
+        let chunk: ChatCompletionChunk = serde_json::from_str(
+            r#"{"id":"test","choices":[{"delta":{"content":"hi","tool_calls":null}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+        assert!(chunk.choices[0].delta.tool_calls.is_empty());
+
+        // Non-streaming response with null choices
+        let resp: ChatCompletionResponse =
+            serde_json::from_str(r#"{"id":"test","model":"x","choices":null}"#).unwrap();
+        assert!(resp.choices.is_empty());
+
+        // Non-streaming response with null tool_calls in message
+        let resp: ChatCompletionResponse = serde_json::from_str(
+            r#"{"id":"test","model":"x","choices":[{"message":{"role":"assistant","content":"hi","tool_calls":null}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.choices.len(), 1);
+        assert!(resp.choices[0].message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn translate_message_assistant_tool_only_has_empty_string_content() {
+        use super::{translate_message, InputContentBlock, InputMessage};
+
+        // Assistant with only tool_use (no text) → content must be "", not null
+        let msg = InputMessage {
+            role: "assistant".to_string(),
+            content: vec![InputContentBlock::ToolUse {
+                id: "call_123".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/test.rs"}),
+            }],
+        };
+        let results = translate_message(&msg);
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        // content should be empty string, NOT null
+        assert_eq!(result["content"].as_str(), Some(""));
+        // tool_calls should be present
+        let tool_calls = result["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn translate_message_tool_result_no_extra_fields() {
+        use super::{translate_message, InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Tool result should only have role/tool_call_id/content (no is_error)
+        let msg = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_123".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "file contents".to_string(),
+                }],
+                is_error: false,
+            }],
+        };
+        let results = translate_message(&msg);
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result["role"], "tool");
+        assert_eq!(result["tool_call_id"], "call_123");
+        assert_eq!(result["content"], "file contents");
+        // Should NOT have is_error field
+        assert!(result.get("is_error").is_none());
+    }
+
+    #[test]
+    fn translate_message_tool_result_error_prefixed_in_content() {
+        use super::{translate_message, InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Error tool result → content prefixed with [Tool Error]
+        let msg = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_456".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "file not found".to_string(),
+                }],
+                is_error: true,
+            }],
+        };
+        let results = translate_message(&msg);
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result["content"], "[Tool Error] file not found");
+        assert!(result.get("is_error").is_none());
     }
 }

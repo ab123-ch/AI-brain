@@ -65,6 +65,9 @@ pub enum InputContentBlock {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+    },
     ToolUse {
         id: String,
         name: String,

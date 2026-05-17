@@ -2384,6 +2384,27 @@ impl ApiClient for ProviderRuntimeClient {
         for (i, msg) in message_request.messages.iter().enumerate() {
             tracing::info!("[子代理]   msg[{i}] role={}, blocks={}", msg.role, msg.content.len());
         }
+        // 诊断：多轮调用时打印详细消息结构（排查 400 错误）
+        if message_request.messages.len() > 1 {
+            for (i, msg) in message_request.messages.iter().enumerate() {
+                for (j, block) in msg.content.iter().enumerate() {
+                    match block {
+                        InputContentBlock::Text { text } => {
+                            tracing::info!("[子代理]     msg[{i}].block[{j}] Text ({}chars)", text.len());
+                        }
+                        InputContentBlock::Thinking { thinking } => {
+                            tracing::info!("[子代理]     msg[{i}].block[{j}] Thinking ({}chars)", thinking.len());
+                        }
+                        InputContentBlock::ToolUse { id, name, input } => {
+                            tracing::info!("[子代理]     msg[{i}].block[{j}] ToolUse id={}, name={}, input={}chars", id, name, input.to_string().len());
+                        }
+                        InputContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                            tracing::info!("[子代理]     msg[{i}].block[{j}] ToolResult tool_use_id={}, content_items={}, is_error={}", tool_use_id, content.len(), is_error);
+                        }
+                    }
+                }
+            }
+        }
 
         self.runtime.block_on(async {
             let mut stream = self
@@ -2426,8 +2447,12 @@ impl ApiClient for ProviderRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            if !thinking.is_empty() {
+                                events.push(AssistantEvent::ThinkingDelta(thinking));
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(stop) => {
                         if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
@@ -2518,26 +2543,27 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
+                    ContentBlock::Thinking { thinking } => Some(InputContentBlock::Thinking { thinking: thinking.clone() }),
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -2572,7 +2598,12 @@ fn push_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking { thinking, .. } => {
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::ThinkingDelta(thinking));
+            }
+        }
+        OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
 
