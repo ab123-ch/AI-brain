@@ -24,6 +24,7 @@ brain-llm = { path = "../brain-llm" }
 brain-evolution = { path = "../brain-evolution" }
 brain-evolver = { path = "../brain-evolver" }
 brain-hooks = { path = "../brain-hooks" }
+brain-dispatch = { path = "../brain-dispatch" }
 
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-std", "io-util", "signal"] }
 clap = { version = "4", features = ["derive"] }

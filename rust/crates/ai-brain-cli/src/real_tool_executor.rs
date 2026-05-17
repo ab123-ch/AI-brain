@@ -17,6 +17,8 @@ pub struct RealToolExecutor {
     tool_descriptors: HashMap<String, ToolDescriptor>,
     /// MemoryBrain for search_memory tool
     memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>,
+    /// Dispatch bus for async agent completion notifications
+    dispatch: Option<brain_dispatch::TokioDispatch>,
 }
 
 impl RealToolExecutor {
@@ -39,6 +41,7 @@ impl RealToolExecutor {
         Self {
             tool_descriptors,
             memory_brain: None,
+            dispatch: None,
         }
     }
 
@@ -46,6 +49,16 @@ impl RealToolExecutor {
     pub fn with_memory(memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>) -> Self {
         let mut exec = Self::new();
         exec.memory_brain = memory_brain;
+        exec
+    }
+
+    /// Create with MemoryBrain and dispatch bus for async agent notifications.
+    pub fn with_dispatch(
+        memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>,
+        dispatch: brain_dispatch::TokioDispatch,
+    ) -> Self {
+        let mut exec = Self::with_memory(memory_brain);
+        exec.dispatch = Some(dispatch);
         exec
     }
 }
@@ -188,6 +201,14 @@ impl ToolExecutor for RealToolExecutor {
 
         Box::pin(async move {
             let start = std::time::Instant::now();
+
+            // 检查是否是异步子代理 (run_in_background=true)
+            let is_async_agent = name == "Agent"
+                && input
+                    .get("run_in_background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
             let result = tokio::task::spawn_blocking(move || tools::execute_tool(&name, &input))
                 .await
                 .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
@@ -196,6 +217,33 @@ impl ToolExecutor for RealToolExecutor {
                 Ok(output) => (output, false),
                 Err(e) => (e, true),
             };
+
+            // 异步子代理完成后，通过 dispatch 注入通知
+            if is_async_agent && !is_error {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) {
+                    if let Some(dispatch) = &self.dispatch {
+                        let agent_id = parsed
+                            .get("agentId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let agent_name = parsed
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        dispatch.inject_sync(
+                            agent_id,
+                            agent_name,
+                            brain_dispatch::AgentStatus::Completed,
+                            output.clone(),
+                            None,
+                            start.elapsed().as_millis() as u64,
+                        );
+                    }
+                }
+            }
+
             let duration_ms = start.elapsed().as_millis() as u64;
 
             ToolExecutionResult {

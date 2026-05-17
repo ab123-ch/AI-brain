@@ -158,6 +158,10 @@ pub struct Orchestrator {
     model_name: String,
     /// v2 主脑（带 tool_loop），None 表示 LLM 不可用
     v2_brain: Arc<Mutex<Option<MainBrain>>>,
+    /// 消息调度中间件（异步子代理通知、副脑任务编排）
+    dispatch: brain_dispatch::TokioDispatch,
+    /// dispatch_loop 输出通道（主脑消费异步通知）
+    dispatch_output_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<brain_dispatch::MainLoopMessage>>>,
 }
 
 /// 系统状态结构体（TUI 状态栏用）
@@ -343,8 +347,27 @@ impl Orchestrator {
 
         // model_name 已从 create_sensory_llm 获取，此处不再重复计算
 
-        // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册）
-        let v2_brain = create_v2_main_brain(Some(Arc::clone(&memory)));
+        // 11.5 初始化消息调度中间件（必须在 v2_brain 之前，因为 dispatch 要注入 RealToolExecutor）
+        let dispatch = brain_dispatch::TokioDispatch::new(256);
+        let (dispatch_output_tx, dispatch_output_rx) =
+            tokio::sync::mpsc::channel::<brain_dispatch::MainLoopMessage>(64);
+
+        // 启动 dispatch loop
+        {
+            let dispatch_clone = dispatch.clone();
+            let mut shutdown_rx_clone = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                tokio::select! {
+                    _ = dispatch_clone.run_dispatch_loop(dispatch_output_tx) => {}
+                    _ = shutdown_rx_clone.changed() => {
+                        tracing::info!("dispatch loop shutting down");
+                    }
+                }
+            }));
+        }
+
+        // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册 + dispatch）
+        let v2_brain = create_v2_main_brain(Some(Arc::clone(&memory)), dispatch.clone());
 
         // 12.1 启动守护线程（L2→L1 归档）
         {
@@ -486,6 +509,8 @@ impl Orchestrator {
             query_count: std::sync::atomic::AtomicU32::new(0),
             model_name: model_name.to_string(),
             v2_brain,
+            dispatch,
+            dispatch_output_rx: Arc::new(Mutex::new(dispatch_output_rx)),
         })
     }
 
@@ -1589,6 +1614,7 @@ fn try_create_llm_client(brain_name: &str) -> Option<Arc<dyn brain_llm::LlmProvi
 /// LLM 不可用时返回 `Arc<Mutex<None>>`
 fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<MemoryBrain>>>,
+    dispatch: brain_dispatch::TokioDispatch,
 ) -> Arc<Mutex<Option<MainBrain>>> {
     let client = match try_create_llm_client("sensory") {
         Some(c) => c,
@@ -1599,7 +1625,7 @@ fn create_v2_main_brain(
     };
 
     let tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
-        crate::real_tool_executor::RealToolExecutor::with_memory(memory_brain),
+        crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch),
     );
 
     let brain_config = BrainConfig::default();
