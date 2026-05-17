@@ -107,6 +107,7 @@ pub struct MessageResponse {
     #[serde(rename = "type")]
     pub kind: String,
     pub role: String,
+    #[serde(default)]
     pub content: Vec<OutputContentBlock>,
     pub model: String,
     #[serde(default)]
