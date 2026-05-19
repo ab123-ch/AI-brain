@@ -9,13 +9,36 @@ use crate::checker;
 use crate::error::{EvalError, Result};
 use crate::extractor;
 use crate::prompts;
+use crate::skills::SkillRegistry;
 
 /// 评估脑允许使用的只读工具白名单
-const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep_search", "glob_search"];
+const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep_search", "glob_search", "Skill"];
 
 /// 检查工具名是否在只读白名单中
 pub(crate) fn is_read_only_tool(name: &str) -> bool {
     READ_ONLY_TOOLS.contains(&name)
+}
+
+/// bash 只读命令白名单（前缀匹配）
+const READ_ONLY_BASH_COMMANDS: &[&str] = &[
+    "cargo check",
+    "cargo clippy",
+    "cargo test",
+    "git diff",
+    "git log",
+    "git status",
+    "ls",
+    "cat",
+    "head",
+    "wc",
+];
+
+/// 检查 bash 命令是否在只读白名单中
+pub(crate) fn is_read_only_bash_command(cmd: &str) -> bool {
+    let cmd_lower = cmd.trim().to_lowercase();
+    READ_ONLY_BASH_COMMANDS.iter().any(|allowed| {
+        cmd_lower.starts_with(&allowed.to_lowercase())
+    })
 }
 
 /// 构建评估脑专用的只读工具定义
@@ -23,6 +46,21 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
 /// 精简版：只暴露 LLM 需要的核心参数，避免 eval 脑误用高级参数
 pub fn build_read_only_tool_definitions() -> Vec<ToolDefinition> {
     vec![
+        // Skill tool
+        ToolDefinition {
+            name: "Skill".into(),
+            description: "加载审查技能的完整规则。可用技能：code-review, fact-check, task-completion, writing-quality。".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要加载的技能名称，如 code-review 或 fact-check"
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
         ToolDefinition {
             name: "read_file".into(),
             description: "读取文件内容（只读）。可以指定行范围。".into(),
@@ -87,6 +125,21 @@ pub fn build_read_only_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        // bash（只读）
+        ToolDefinition {
+            name: "bash".into(),
+            description: "执行只读 shell 命令（如 cargo check、git diff）。只允许白名单命令。".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的只读命令（必须在白名单中：cargo check/clippy/test, git diff/log/status, ls, cat, head, wc）"
+                    }
+                },
+                "required": ["command"]
             }),
         },
     ]
@@ -301,7 +354,7 @@ impl EvalBrain {
         }
 
         let has_tools = self.tool_executor.is_some() && !file_changes.is_empty();
-        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, has_tools);
+        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, &SkillRegistry::new(), has_tools);
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
@@ -462,7 +515,7 @@ impl EvalBrain {
         rules: &[EvolutionRule],
         eval_requirements: &[EvalRequirement],
     ) -> Result<String> {
-        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, false);
+        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, &SkillRegistry::new(), false);
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
@@ -672,19 +725,22 @@ mod tests {
         assert!(is_read_only_tool("read_file"));
         assert!(is_read_only_tool("grep_search"));
         assert!(is_read_only_tool("glob_search"));
+        assert!(is_read_only_tool("Skill"));
         assert!(!is_read_only_tool("edit_file"));
         assert!(!is_read_only_tool("write_file"));
         assert!(!is_read_only_tool("bash"));
     }
 
     #[test]
-    fn build_read_only_tools_has_three() {
+    fn build_read_only_tools_has_five() {
         let tools = build_read_only_tool_definitions();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 5);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"Skill"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"grep_search"));
         assert!(names.contains(&"glob_search"));
+        assert!(names.contains(&"bash"));
     }
 
     // ── evaluate_with_verification tests ──

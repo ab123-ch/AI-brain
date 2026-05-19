@@ -75,13 +75,24 @@ pub fn build_evaluation_system_prompt(
 - **事实正确性校验**：验证日期、技术细节是否准确（以环境信息为准）
 - **偏好合规检查**：确认输出遵守用户的偏好和禁忌（只在直接相关时）
 
-## 工作方式
+"#);
+
+    // 如果有工具能力，添加工作方式说明
+    if with_tools {
+        prompt.push_str(r#"## 工作方式
 - 你可以调用 Skill 工具加载具体的审查规则
 - 你可以使用只读工具（read_file、grep、bash）验证代码
 - 只报告确实存在的问题，宁可漏报不误报
 - 不确定的事实不要标记为错误
 
 "#);
+    } else {
+        prompt.push_str(r#"## 工作方式
+- 只报告确实存在的问题，宁可漏报不误报
+- 不确定的事实不要标记为错误
+
+"#);
+    }
 
     // 第二段：环境信息
     prompt.push_str(&build_environment_info());
@@ -280,7 +291,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_role_definition() {
-        let prompt = build_evaluation_system_prompt(&[], false);
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
         assert!(prompt.contains("角色定义"));
         assert!(prompt.contains("质量审核员"));
         assert!(prompt.contains("核心能力"));
@@ -288,19 +299,17 @@ mod tests {
 
     #[test]
     fn system_prompt_has_fixed_dimensions() {
-        let prompt = build_evaluation_system_prompt(&[], false);
-        assert!(prompt.contains("评估维度"));
-        assert!(prompt.contains("任务完成度"));
-        assert!(prompt.contains("高危操作"));
-        assert!(prompt.contains("代码完整性"));
-        assert!(prompt.contains("事实正确性"));
-        assert!(prompt.contains("用户偏好遵守"));
-        assert!(prompt.contains("已知错误复现"));
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
+        // 新版本的系统提示词使用"核心能力"替代"评估维度"
+        assert!(prompt.contains("任务完成度审查"));
+        assert!(prompt.contains("安全风险识别"));
+        assert!(prompt.contains("事实正确性校验"));
+        assert!(prompt.contains("偏好合规检查"));
     }
 
     #[test]
     fn system_prompt_has_output_format() {
-        let prompt = build_evaluation_system_prompt(&[], false);
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
         assert!(prompt.contains("评估结果-正常"));
         assert!(prompt.contains("评估结果-存在问题"));
         assert!(prompt.contains("不要输出 JSON"));
@@ -308,8 +317,8 @@ mod tests {
 
     #[test]
     fn system_prompt_has_judgment_principles() {
-        let prompt = build_evaluation_system_prompt(&[], false);
-        assert!(prompt.contains("判定原则"));
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
+        // 新版本的系统提示词在"工作方式"中包含判定原则
         assert!(prompt.contains("宁可漏报不误报"));
     }
 
@@ -331,7 +340,7 @@ mod tests {
                 superseded: false,
             },
         ];
-        let prompt = build_evaluation_system_prompt(&reqs, false);
+        let prompt = build_evaluation_system_prompt(&reqs, &SkillRegistry::new(), false);
         assert!(prompt.contains("用户评估要求"));
         assert!(prompt.contains("不要将简单问答判定为问题"));
         assert!(prompt.contains("重点关注代码安全性"));
@@ -340,7 +349,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_eval_requirements() {
-        let prompt = build_evaluation_system_prompt(&[], false);
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
         assert!(!prompt.contains("用户评估要求"));
     }
 
@@ -441,16 +450,17 @@ mod tests {
 
     #[test]
     fn system_prompt_with_tools_has_verification_section() {
-        let prompt = build_evaluation_system_prompt(&[], true);
-        assert!(prompt.contains("验证工具"));
-        assert!(prompt.contains("read_file"));
-        assert!(prompt.contains("grep_search"));
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), true);
+        // 新版本的系统提示词使用 Skill 工具说明替代验证工具
+        assert!(prompt.contains("Skill 工具"));
+        assert!(prompt.contains("code-review"));
+        assert!(prompt.contains("fact-check"));
     }
 
     #[test]
     fn system_prompt_without_tools_no_verification_section() {
-        let prompt = build_evaluation_system_prompt(&[], false);
-        assert!(!prompt.contains("验证工具"));
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
+        assert!(!prompt.contains("Skill 工具"));
     }
 
     #[test]
