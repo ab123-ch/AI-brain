@@ -222,7 +222,7 @@ impl Orchestrator {
         let eval_tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
             crate::real_tool_executor::RealToolExecutor::with_memory(Some(memory.clone())),
         );
-        let eval_brain = if let Ok(config) = LlmConfig::load_default() {
+        let mut eval_brain = if let Ok(config) = LlmConfig::load_default() {
             if let Ok(client) = config.create_brain_client("eval") {
                 Some(EvalBrain::with_verification(
                     Arc::from(client),
@@ -234,6 +234,15 @@ impl Orchestrator {
         } else {
             None
         };
+        // 加载评估脑内置 skills
+        if let Some(ref mut eb) = eval_brain {
+            let skills_dir = std::path::Path::new("rust/crates/brain-eval/skills");
+            if let Err(e) = eb.load_skills_from_dir(skills_dir) {
+                tracing::warn!("加载评估脑 skills 失败: {e}");
+            } else {
+                tracing::info!("评估脑 skills 加载成功");
+            }
+        }
         if eval_brain.is_some() {
             tracing::info!("v2 评估脑已创建（LLM 深度评估 + 只读工具验证）");
         }
