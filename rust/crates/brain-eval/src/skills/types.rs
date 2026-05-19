@@ -105,3 +105,91 @@ impl SkillRegistry {
         self.skills.contains_key(name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn create_skill_file(dir: &Path, name: &str, description: &str, content: &str) {
+        let skill_dir = dir.join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = format!(
+            "---\nname: {name}\ndescription: {description}\n---\n\n{content}"
+        );
+        fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+    }
+
+    #[test]
+    fn parse_skill_content_extracts_name_and_description() {
+        let registry = SkillRegistry::new();
+        let content = "---\nname: test-skill\ndescription: A test skill\n---\n\n# Test Content\n\nSome instructions.";
+        let meta = registry.parse_skill_content(content).unwrap();
+
+        assert_eq!(meta.name, "test-skill");
+        assert_eq!(meta.description, "A test skill");
+        assert!(meta.content.contains("Test Content"));
+    }
+
+    #[test]
+    fn parse_skill_content_handles_quoted_values() {
+        let registry = SkillRegistry::new();
+        let content = "---\nname: \"quoted-name\"\ndescription: \"quoted description\"\n---\n\nContent";
+        let meta = registry.parse_skill_content(content).unwrap();
+
+        assert_eq!(meta.name, "quoted-name");
+        assert_eq!(meta.description, "quoted description");
+    }
+
+    #[test]
+    fn parse_skill_content_returns_none_without_frontmatter() {
+        let registry = SkillRegistry::new();
+        let content = "No frontmatter here\nJust content";
+        assert!(registry.parse_skill_content(content).is_none());
+    }
+
+    #[test]
+    fn load_from_dir_loads_all_skills() {
+        let tmp_dir = TempDir::new().unwrap();
+        create_skill_file(tmp_dir.path(), "skill-a", "Skill A desc", "# Skill A\n\nContent A");
+        create_skill_file(tmp_dir.path(), "skill-b", "Skill B desc", "# Skill B\n\nContent B");
+
+        let mut registry = SkillRegistry::new();
+        registry.load_from_dir(tmp_dir.path()).unwrap();
+
+        assert_eq!(registry.all_skills().len(), 2);
+        assert!(registry.has_skill("skill-a"));
+        assert!(registry.has_skill("skill-b"));
+    }
+
+    #[test]
+    fn load_from_dir_handles_empty_directory() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut registry = SkillRegistry::new();
+        registry.load_from_dir(tmp_dir.path()).unwrap();
+
+        assert_eq!(registry.all_skills().len(), 0);
+    }
+
+    #[test]
+    fn load_from_dir_handles_nonexistent_directory() {
+        let mut registry = SkillRegistry::new();
+        let result = registry.load_from_dir(Path::new("/nonexistent/path"));
+        assert!(result.is_ok());
+        assert_eq!(registry.all_skills().len(), 0);
+    }
+
+    #[test]
+    fn get_skill_content_returns_correct_content() {
+        let tmp_dir = TempDir::new().unwrap();
+        create_skill_file(tmp_dir.path(), "my-skill", "My skill", "# Instructions\n\nDo this.");
+
+        let mut registry = SkillRegistry::new();
+        registry.load_from_dir(tmp_dir.path()).unwrap();
+
+        let content = registry.get_skill_content("my-skill").unwrap();
+        assert!(content.contains("Instructions"));
+        assert!(content.contains("Do this"));
+    }
+}
