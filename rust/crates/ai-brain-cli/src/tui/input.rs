@@ -16,6 +16,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::block::Position;
 use ratatui::widgets::Block;
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthChar;
 
 use super::completion::{
     CompletionPopup, EvolutionCompleter, InputContext,
@@ -775,7 +776,7 @@ impl InputArea {
     fn map_byte_to_visual(original: &str, target_byte: usize, wrap_width: usize) -> (usize, usize) {
         let mut vrow: usize = 0;
         let mut vcol: usize = 0;
-        let mut line_chars: usize = 0;
+        let mut line_width: usize = 0;
         let mut byte_pos: usize = 0;
 
         for ch in original.chars() {
@@ -785,14 +786,15 @@ impl InputArea {
             if ch == '\n' {
                 vrow += 1;
                 vcol = 0;
-                line_chars = 0;
+                line_width = 0;
             } else {
-                vcol += 1;
-                line_chars += 1;
-                if line_chars >= wrap_width {
+                let w = ch.width().unwrap_or(1);
+                vcol += w;
+                line_width += w;
+                if line_width >= wrap_width {
                     vrow += 1;
                     vcol = 0;
-                    line_chars = 0;
+                    line_width = 0;
                 }
             }
             byte_pos += ch.len_utf8();
@@ -804,7 +806,7 @@ impl InputArea {
         let wrap_width = self.wrap_width;
         let mut vrow: usize = 0;
         let mut vcol: usize = 0;
-        let mut line_chars: usize = 0;
+        let mut line_width: usize = 0;
         let mut byte_pos: usize = 0;
 
         for ch in self.original.chars() {
@@ -817,17 +819,18 @@ impl InputArea {
                 }
                 vrow += 1;
                 vcol = 0;
-                line_chars = 0;
+                line_width = 0;
             } else {
                 if vrow == target_row && vcol == target_col {
                     break;
                 }
-                vcol += 1;
-                line_chars += 1;
-                if line_chars >= wrap_width {
+                let w = ch.width().unwrap_or(1);
+                vcol += w;
+                line_width += w;
+                if line_width >= wrap_width {
                     vrow += 1;
                     vcol = 0;
-                    line_chars = 0;
+                    line_width = 0;
                 }
             }
             byte_pos += ch.len_utf8();
@@ -939,21 +942,25 @@ impl Default for InputArea {
 
 // ─── 自动折行 ──────────────────────────────────────────────────────
 
-pub fn auto_wrap(text: &str, max_chars: usize) -> String {
+pub fn auto_wrap(text: &str, max_width: usize) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let mut out = String::with_capacity(text.len() + text.len() / max_chars.max(1));
+    let mut out = String::with_capacity(text.len() + text.len() / max_width.max(1));
     for line in text.lines() {
-        let char_count = line.chars().count();
-        if char_count <= max_chars {
+        let display_w: usize = line.chars().map(|c| c.width().unwrap_or(1)).sum();
+        if display_w <= max_width {
             out.push_str(line);
         } else {
-            for (i, ch) in line.chars().enumerate() {
-                if i > 0 && i % max_chars == 0 {
+            let mut col: usize = 0;
+            for ch in line.chars() {
+                let w = ch.width().unwrap_or(1);
+                if col > 0 && col + w > max_width {
                     out.push('\n');
+                    col = 0;
                 }
                 out.push(ch);
+                col += w;
             }
         }
         out.push('\n');

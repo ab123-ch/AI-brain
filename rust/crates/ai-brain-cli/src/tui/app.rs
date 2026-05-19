@@ -15,7 +15,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
 use crate::orchestrator::Orchestrator;
@@ -45,6 +45,19 @@ pub struct App {
     pending_queue: Vec<String>,
     /// 上一次键盘事件时间
     last_event_time: Instant,
+    // --- 光标调试 ---
+    /// 输出区域位置（render 时缓存）
+    output_rect: Rect,
+    /// 当前滚动偏移（render 时缓存）
+    current_scroll: u16,
+    /// 鼠标点击的原始终端坐标 (row, col)
+    cursor_pos: Option<(u16, u16)>,
+    /// 旧的 selection_anchor（暂时不用）
+    selection_anchor: Option<(usize, usize)>,
+    /// 旧的 selection_end（暂时不用）
+    selection_end: Option<(usize, usize)>,
+    /// 渲染后的纯文本行（用于复制）
+    rendered_text: Vec<String>,
 }
 
 impl App {
@@ -54,6 +67,7 @@ impl App {
         let mut output = OutputArea::new();
         output.push_system("AI Brain v2 一主二从系统");
         output.push_system("输入查询 | :help 命令 | Enter 提交 | Tab 补全 | ↑↓ 历史 | Shift+Enter 换行");
+        output.push_system("文本选择: 单击起点 → 滚动 → 再次单击终点 → Ctrl+Y 复制 | Esc 清除");
 
         // 从 orchestrator 获取 brain-evolution 数据
         let completer = {
@@ -74,6 +88,12 @@ impl App {
             done_received: false,
             pending_queue: Vec::new(),
             last_event_time: Instant::now(),
+            output_rect: Rect::default(),
+            current_scroll: 0,
+            cursor_pos: None,
+            selection_anchor: None,
+            selection_end: None,
+            rendered_text: Vec::new(),
         }
     }
 
@@ -198,7 +218,9 @@ impl App {
         f.render_widget(&self.input.textarea, chunks[2]);
     }
 
-    fn render_output(&self, f: &mut ratatui::Frame, area: Rect) {
+
+
+    fn render_output(&mut self, f: &mut ratatui::Frame, area: Rect) {
         let mut ratatui_lines: Vec<Line> = Vec::new();
 
         for line in &self.output.lines {
@@ -242,46 +264,100 @@ impl App {
             )));
         }
 
-        // 滚动计算：考虑文本换行后的实际行数
-        // ratatui Wrap 按词边界换行，可能比 ceil(width/area_width) 多产生视觉行
-        // 策略：基础估算 + 换行缓冲 + 安全裕量
+        // 预换行：将逻辑行拆成屏幕行（每个 Line 恰好占一个屏幕行）
+        // 渲染和选择共用同一份换行结果，消除坐标映射偏差
         let area_width = area.width as usize;
-        let mut actual_lines = 0;
-        for l in &ratatui_lines {
-            let w = l.width();
-            if w == 0 {
-                actual_lines += 1;
+        let mut final_lines: Vec<Line<'static>> = Vec::new();
+        self.rendered_text.clear();
+
+        for line in &ratatui_lines {
+            let full_text: String = line.iter().map(|span| span.content.as_ref()).collect();
+            let segments = Self::wrap_text_to_width(&full_text, area_width);
+
+            if segments.len() <= 1 {
+                // 不需要换行，保持原始样式
+                final_lines.push(line.clone());
+                self.rendered_text.extend(segments);
             } else {
-                // 每行至少占 1 行，宽度超过 area_width 时额外加上换行次数
-                let base = (w + area_width - 1) / area_width;
-                actual_lines += base;
-                // 额外缓冲：ratatui 按词边界换行，可能产生更多行
-                // 对于长行，每 80 字符额外加 1 行缓冲
-                if w > area_width {
-                    let extra_buffer = (w / 80).min(10);
-                    actual_lines += extra_buffer;
+                // 需要换行：检测前缀样式（如 "> "、"✓ "）
+                let content_style =
+                    line.iter().last().map(|s| s.style).unwrap_or_default();
+                let (prefix_style, prefix_end_col) =
+                    if let Some(first) = line.iter().next() {
+                        let w: usize = first
+                            .content
+                            .chars()
+                            .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+                            .sum();
+                        if w > 0 && w <= 4 {
+                            (first.style, w)
+                        } else {
+                            (Style::default(), 0)
+                        }
+                    } else {
+                        (Style::default(), 0)
+                    };
+
+                for (i, seg) in segments.iter().enumerate() {
+                    if i == 0 && prefix_end_col > 0 {
+                        // 首段：在前缀边界拆分，保持前缀+内容双样式
+                        let mut col = 0usize;
+                        let mut split = 0usize;
+                        for (j, ch) in seg.chars().enumerate() {
+                            if col >= prefix_end_col {
+                                split = j;
+                                break;
+                            }
+                            col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                        }
+                        let pre: String = seg.chars().take(split).collect();
+                        let rest: String = seg.chars().skip(split).collect();
+                        final_lines.push(Line::from(vec![
+                            Span::styled(pre, prefix_style),
+                            Span::styled(rest, content_style),
+                        ]));
+                    } else {
+                        // 续行或无前缀行：使用内容样式
+                        final_lines
+                            .push(Line::from(Span::styled(seg.clone(), content_style)));
+                    }
+                    self.rendered_text.push(seg.clone());
                 }
             }
         }
-        // 安全裕量：防止估算不足
-        actual_lines += 20;
 
+        // 滚动计算：rendered_text 已经是屏幕行，直接计数
         let visible_lines = area.height as usize;
-        let max_scroll = actual_lines.saturating_sub(visible_lines) as u16;
+        let max_scroll = self.rendered_text.len().saturating_sub(visible_lines) as u16;
+
+        // resize 后 clamp manual_scroll，防止溢出
+        self.output.clamp_scroll(max_scroll);
+
         let scroll = if self.output.manual_scroll > 0 {
-            // 手动模式：用户在往上翻，从底部往上偏移
             max_scroll.saturating_sub(self.output.manual_scroll)
         } else {
-            // 自动模式：始终显示最新内容
             max_scroll
         };
 
-        let paragraph = Paragraph::new(ratatui_lines)
+        // 缓存供鼠标事件使用
+        self.output_rect = area;
+        self.current_scroll = scroll;
+
+        // 用预换行后的 Lines 渲染，不用 .wrap()，保证坐标一一对应
+        let paragraph = Paragraph::new(final_lines)
             .block(Block::default().borders(Borders::NONE))
-            .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
 
         f.render_widget(paragraph, area);
+
+        // 用背景色标记点击位置
+        if let Some((row, col)) = self.cursor_pos {
+            let buf = f.buffer_mut();
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.set_bg(Color::Yellow);
+                cell.set_fg(Color::Black);
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -528,8 +604,14 @@ impl App {
 
         // ── App 层独占按键 ──
         match (key.modifiers, key.code) {
-            // Ctrl+C / Esc — 取消查询或退出
+            // Ctrl+C / Esc — 清除选择、取消查询或退出
             (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
+                // 有选择时先清除选择
+                if self.selection_anchor.is_some() {
+                    self.selection_anchor = None;
+                    self.selection_end = None;
+                    return true;
+                }
                 if self.is_busy {
                     self.cancel_query();
                     return true;
@@ -545,6 +627,11 @@ impl App {
             // Ctrl+E — 切换 Verbose 模式
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
                 self.output.toggle_verbose();
+                return true;
+            }
+            // Ctrl+Y — 复制选中内容到剪贴板
+            (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
+                self.copy_selection();
                 return true;
             }
             // Shift+↑ / PageUp — 向上滚动输出
@@ -690,6 +777,91 @@ impl App {
         }
     }
 
+    /// 复制选中内容到系统剪贴板（macOS: pbcopy）
+    fn copy_selection(&mut self) {
+        if let (Some(anchor), Some(end)) = (self.selection_anchor, self.selection_end) {
+            let ((start_line, start_col), (end_line, end_col)) =
+                if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
+                    (anchor, end)
+                } else {
+                    (end, anchor)
+                };
+
+            // 字符级别提取选中文本
+            let mut parts: Vec<String> = Vec::new();
+            for (i, line_text) in self.rendered_text.iter().enumerate() {
+                if i < start_line || i > end_line {
+                    continue;
+                }
+
+                if start_line == end_line {
+                    // 单行选择：提取 start_col..=end_col
+                    let ci_s = Self::screen_col_to_char_idx(line_text, start_col);
+                    let ci_e = Self::screen_col_to_char_idx(line_text, end_col + 1);
+                    let selected: String =
+                        line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+                    parts.push(selected);
+                } else if i == start_line {
+                    // 首行：从 start_col 到行尾
+                    let ci = Self::screen_col_to_char_idx(line_text, start_col);
+                    let selected: String = line_text.chars().skip(ci).collect();
+                    parts.push(selected);
+                } else if i == end_line {
+                    // 尾行：从行首到 end_col
+                    let ci = Self::screen_col_to_char_idx(line_text, end_col + 1);
+                    let selected: String = line_text.chars().take(ci).collect();
+                    parts.push(selected);
+                } else {
+                    // 中间行：整行
+                    parts.push(line_text.clone());
+                }
+            }
+
+            let text = parts.join("\n");
+
+            let text_preview: String = text.chars().take(60).collect();
+            let start_preview: String = self.rendered_text.get(start_line).map(|s| s.chars().take(30).collect()).unwrap_or_default();
+            let end_preview: String = self.rendered_text.get(end_line).map(|s| s.chars().take(30).collect()).unwrap_or_default();
+            Self::dbg_log(&format!(
+                "COPY: anchor={:?} end={:?} -> start=({},{}) end=({},{}) | text={:?} | line[{}]={:?} | line[{}]={:?}",
+                self.selection_anchor, self.selection_end,
+                start_line, start_col, end_line, end_col,
+                text_preview, start_line, start_preview, end_line, end_preview
+            ));
+
+            if text.is_empty() {
+                self.output.push_system("选择范围为空");
+                return;
+            }
+
+            // 用 pbcopy 复制到剪贴板
+            match std::process::Command::new("pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write as _;
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    let _ = child.wait();
+                    let char_count = text.chars().count();
+                    self.output
+                        .push_system(&format!("已复制 {char_count} 个字符到剪贴板"));
+                }
+                Err(_) => {
+                    self.output.push_system("复制失败: pbcopy 不可用");
+                }
+            }
+
+            // 复制后清除选择
+            self.selection_anchor = None;
+            self.selection_end = None;
+        } else {
+            self.output.push_system("未选择文本（单击设起点 → 滚动 → 再次单击设终点）");
+        }
+    }
+
     fn cancel_query(&mut self) {
         if let Some(handle) = self.query_handle.take() {
             handle.abort();
@@ -710,23 +882,106 @@ impl App {
         }
     }
 
-    /// 处理鼠标事件（滚轮滚动）
-    /// 
-    /// **文本选择兼容**：
-    /// - 在 MouseCapture 开启时，终端原生选择功能被拦截
-    /// - 大多数终端（iTerm2/Terminal.app/Alacritty）支持 **按住 Shift/Option** 来绕过 mouse tracking 进行选择
-    /// - 当检测到 SHIFT 修饰键时，完全忽略鼠标事件：TUI 不处理滚轮，终端有机会处理选择/复制
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // Shift 按下 → 用户在尝试终端原生选择/复制，不干扰
-        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-            return;
+    /// 处理鼠标事件
+    ///
+    /// - 滚轮: 上下滚动
+    /// - 第一次单击: 设置选择起点
+    /// - 第二次单击: 设置选择终点，高亮两点之间的字符
+    /// 将屏幕列号转换为字符索引（考虑 CJK 双宽字符）
+    fn screen_col_to_char_idx(text: &str, col: usize) -> usize {
+        let mut current_col = 0;
+        for (i, ch) in text.chars().enumerate() {
+            if current_col >= col {
+                return i;
+            }
+            current_col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
         }
+        text.chars().count()
+    }
+
+    /// 按显示宽度将文本换行，返回每个屏幕行的文本片段
+    fn wrap_text_to_width(text: &str, max_width: usize) -> Vec<String> {
+        if max_width == 0 {
+            return vec![text.to_string()];
+        }
+        let mut result = Vec::new();
+        let mut current = String::new();
+        let mut current_width = 0;
+
+        for ch in text.chars() {
+            let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            if current_width + ch_width > max_width && !current.is_empty() {
+                result.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        if !current.is_empty() {
+            result.push(current);
+        }
+        if result.is_empty() {
+            result.push(String::new());
+        }
+        result
+    }
+
+    /// 写调试日志到 /tmp/tui_sel.log
+    fn dbg_log(msg: &str) {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/tui_sel.log")
+        {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{ts}] {msg}");
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // 判断是否在输出区域
+        let in_output = mouse.row >= self.output_rect.top()
+            && mouse.row < self.output_rect.top() + self.output_rect.height;
+
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.output.scroll_up(3);
             }
             MouseEventKind::ScrollDown => {
                 self.output.scroll_down(3);
+            }
+            MouseEventKind::Down(event::MouseButton::Left) if in_output => {
+                // 终端可能报告字符偏移而非显示列偏移（CJK 字符占 1 列 vs 2 列）
+                // 需要用 rendered_text 做 char_offset → display_col 转换
+                let scroll = self.current_scroll;
+                let local_row = mouse.row as usize;
+                let scroll_row = if scroll as usize + local_row < self.rendered_text.len() {
+                    scroll as usize + local_row
+                } else {
+                    local_row
+                };
+
+                let display_col = if scroll_row < self.rendered_text.len() {
+                    let line = &self.rendered_text[scroll_row];
+                    let col = mouse.column as usize;
+                    // 将终端报告的列号视为 char offset，转为 display column
+                    let mut dcol: usize = 0;
+                    for (i, ch) in line.chars().enumerate() {
+                        if i >= col {
+                            break;
+                        }
+                        dcol += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                    }
+                    dcol as u16
+                } else {
+                    mouse.column
+                };
+
+                self.cursor_pos = Some((mouse.row, display_col));
             }
             _ => {}
         }
@@ -759,7 +1014,8 @@ impl App {
                     "  Ctrl+P          — 展开/折叠长粘贴",
                     "  Ctrl+A/E        — 跳到行首/行尾",
                     "  鼠标滚轮        — 上下滚动输出",
-                    "  Shift+鼠标选择  — 按住Shift选择/复制 (iTerm2); macOS终端按住Option",
+                    "  文本选择        — 单击起点 → 滚动 → 再次单击终点 → Ctrl+Y 复制",
+                    "  Esc             — 清除选择",
                 ] {
                     self.output.push_system(line);
                 }
@@ -1078,5 +1334,226 @@ fn collect_link(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String
             None => return (text, false),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── wrap_text_to_width 测试 ───
+
+    #[test]
+    fn wrap_ascii_short_line_no_wrap() {
+        let result = App::wrap_text_to_width("Hello", 80);
+        assert_eq!(result, vec!["Hello"]);
+    }
+
+    #[test]
+    fn wrap_ascii_exact_width() {
+        let result = App::wrap_text_to_width("12345", 5);
+        assert_eq!(result, vec!["12345"]);
+    }
+
+    #[test]
+    fn wrap_ascii_overflow() {
+        let result = App::wrap_text_to_width("1234567890", 5);
+        assert_eq!(result, vec!["12345", "67890"]);
+    }
+
+    #[test]
+    fn wrap_cjk_basic() {
+        // 每个 CJK 字符宽度 2，max_width=6 可以放 3 个 CJK 字符
+        let result = App::wrap_text_to_width("你好世界再见", 6);
+        assert_eq!(result, vec!["你好世", "界再见"]);
+    }
+
+    #[test]
+    fn wrap_mixed_ascii_cjk() {
+        // "> 你好" → "> " (2) + "你好" (4) = 6，max_width=6 刚好
+        let result = App::wrap_text_to_width("> 你好", 6);
+        assert_eq!(result, vec!["> 你好"]);
+    }
+
+    #[test]
+    fn wrap_cjk_overflow() {
+        // "> 你好世界" → width 10, max_width=6 → "> 你好" (6) + "世界" (4)
+        let result = App::wrap_text_to_width("> 你好世界", 6);
+        assert_eq!(result, vec!["> 你好", "世界"]);
+    }
+
+    #[test]
+    fn wrap_empty() {
+        let result = App::wrap_text_to_width("", 80);
+        assert_eq!(result, vec![""]);
+    }
+
+    // ─── screen_col_to_char_idx 测试 ───
+
+    #[test]
+    fn char_idx_ascii_start() {
+        assert_eq!(App::screen_col_to_char_idx("Hello", 0), 0);
+    }
+
+    #[test]
+    fn char_idx_ascii_middle() {
+        assert_eq!(App::screen_col_to_char_idx("Hello", 3), 3); // 'l'
+    }
+
+    #[test]
+    fn char_idx_ascii_end() {
+        assert_eq!(App::screen_col_to_char_idx("Hello", 5), 5); // past end
+    }
+
+    #[test]
+    fn char_idx_cjk() {
+        // "你好世界" → display: 0:你 2:好 4:世 6:界
+        assert_eq!(App::screen_col_to_char_idx("你好世界", 0), 0); // 你
+        assert_eq!(App::screen_col_to_char_idx("你好世界", 2), 1); // 好
+        assert_eq!(App::screen_col_to_char_idx("你好世界", 4), 2); // 世
+        assert_eq!(App::screen_col_to_char_idx("你好世界", 6), 3); // 界
+    }
+
+    #[test]
+    fn char_idx_mixed() {
+        // "> 你好" → display: 0:> 1:  2:你 4:好
+        assert_eq!(App::screen_col_to_char_idx("> 你好", 0), 0); // >
+        assert_eq!(App::screen_col_to_char_idx("> 你好", 2), 2); // 你
+        assert_eq!(App::screen_col_to_char_idx("> 你好", 4), 3); // 好
+    }
+
+    // ─── 完整选择流程模拟测试 ───
+
+    /// 模拟选择流程：构建 rendered_text，模拟点击，验证提取文本
+    #[test]
+    fn selection_single_line_ascii() {
+        // 模拟 rendered_text 有一行 "Hello World" (width 11)
+        let rendered = vec!["Hello World".to_string()];
+
+        // 模拟点击 col=2 ('l'), Shift+Click col=8 ('r')
+        let start_col = 2;
+        let end_col = 8;
+
+        let line_text = &rendered[0];
+        let ci_s = App::screen_col_to_char_idx(line_text, start_col);
+        let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
+        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+
+        assert_eq!(selected, "llo Wor");
+    }
+
+    #[test]
+    fn selection_single_line_last_chars() {
+        // 测试选中行末最后几个字符 — 这是用户报告的问题场景
+        let rendered = vec!["Hello World".to_string()]; // width 11
+
+        // 点击 col=6 ('W'), Shift+Click col=10 ('d')
+        let start_col = 6;
+        let end_col = 10;
+
+        let line_text = &rendered[0];
+        let ci_s = App::screen_col_to_char_idx(line_text, start_col);
+        let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
+        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+
+        assert_eq!(ci_s, 6, "start char index should be 6 (W)");
+        assert_eq!(ci_e, 11, "end char index should be 11 (past 'd')");
+        assert_eq!(selected, "World", "should select 'World'");
+    }
+
+    #[test]
+    fn selection_single_line_first_char_to_end() {
+        // 用户说从第一个字符开始可以选中到行末
+        let rendered = vec!["Hello World".to_string()];
+
+        let start_col = 0;
+        let end_col = 10;
+
+        let line_text = &rendered[0];
+        let ci_s = App::screen_col_to_char_idx(line_text, start_col);
+        let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
+        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+
+        assert_eq!(selected, "Hello World");
+    }
+
+    #[test]
+    fn selection_multi_line() {
+        let rendered = vec![
+            "Line one content".to_string(),
+            "Line two content".to_string(),
+            "Line three content".to_string(),
+        ];
+
+        // Start: line 0, col 5
+        // End: line 2, col 10
+        let start_line = 0;
+        let start_col = 5;
+        let end_line = 2;
+        let end_col = 10;
+
+        let mut parts: Vec<String> = Vec::new();
+        for (i, line_text) in rendered.iter().enumerate() {
+            if i < start_line || i > end_line {
+                continue;
+            }
+            if start_line == end_line {
+                let ci_s = App::screen_col_to_char_idx(line_text, start_col);
+                let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
+                let sel: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+                parts.push(sel);
+            } else if i == start_line {
+                let ci = App::screen_col_to_char_idx(line_text, start_col);
+                parts.push(line_text.chars().skip(ci).collect());
+            } else if i == end_line {
+                let ci = App::screen_col_to_char_idx(line_text, end_col + 1);
+                parts.push(line_text.chars().take(ci).collect());
+            } else {
+                parts.push(line_text.clone());
+            }
+        }
+
+        let text = parts.join("\n");
+        assert_eq!(text, "one content\nLine two content\nLine three ");
+    }
+
+    #[test]
+    fn selection_cjk_line_end() {
+        // 测试 CJK 文本行末选择
+        let rendered = vec!["这是一段中文测试文本".to_string()]; // 每个 CJK 宽度2
+
+        // 选中最后4个字符 "试文本"
+        // "这"(0-1) "是"(2-3) "一"(4-5) "段"(6-7) "中"(8-9) "文"(10-11) "测"(12-13) "试"(14-15) "文"(16-17) "本"(18-19)
+        let start_col = 12; // '测'
+        let end_col = 18;   // '本' 的起始列
+        let line_text = &rendered[0];
+
+        let ci_s = App::screen_col_to_char_idx(line_text, start_col);
+        let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1); // past '本'
+        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+
+        // 每个屏幕列=2单位, 所以 col 12 → char idx 6 ('测')
+        assert_eq!(ci_s, 6, "start at char 6 (测)");
+        assert_eq!(selected, "测试文本");
+    }
+
+    // ─── 宽度计算测试 ───
+
+    #[test]
+    fn display_width_ascii() {
+        let w: usize = "Hello".chars().map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)).sum();
+        assert_eq!(w, 5);
+    }
+
+    #[test]
+    fn display_width_cjk() {
+        let w: usize = "你好世界".chars().map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)).sum();
+        assert_eq!(w, 8); // 4 chars × 2 width
+    }
+
+    #[test]
+    fn display_width_mixed() {
+        let w: usize = "> 你好".chars().map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)).sum();
+        assert_eq!(w, 6); // "> " = 2, "你好" = 4
     }
 }

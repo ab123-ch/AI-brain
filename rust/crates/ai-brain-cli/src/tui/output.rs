@@ -370,6 +370,13 @@ impl OutputArea {
     pub fn is_manual_scrolling(&self) -> bool {
         self.manual_scroll > 0
     }
+
+    /// 将 manual_scroll 限制在 [0, max_scroll] 范围内
+    pub fn clamp_scroll(&mut self, max_scroll: u16) {
+        if self.manual_scroll > max_scroll {
+            self.manual_scroll = max_scroll;
+        }
+    }
 }
 
 impl Default for OutputArea {

@@ -1,20 +1,15 @@
-   0.301588000s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: dependency on `brain_core` is newer than we are 1779012520.205545785s > 1779012314.808977750s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch"
-   0.315961125s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: dependency on `brain_llm` is newer than we are 1779022281.631675387s > 1779012529.175750786s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution"
-   0.330583083s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: stale: changed "/Users/chenh/RustObject/claw-code-parity/rust/crates/tools/src/lib.rs"
-   0.330593917s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:           (vs) "/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/tools-b425f19919d5f7b3/dep-lib-tools"
-   0.330597500s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1779028456, nanos: 859803956 } < FileTime { seconds: 1779028466, nanos: 455809961 }
-   0.332908333s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: fingerprint dirty for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: false }/TargetInner { name: "ai-brain", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/main.rs", Edition2021) }
-   0.332924708s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tools" })
-   0.354638083s  INFO prepare_target{force=false package_id=brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch) target="brain_dispatch"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_dispatch", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch/src/lib.rs", Edition2021) }
-   0.354662500s  INFO prepare_target{force=false package_id=brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch) target="brain_dispatch"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_core", dep_mtime: FileTime { seconds: 1779012520, nanos: 205545785 }, max_mtime: FileTime { seconds: 1779012314, nanos: 808977750 } })
-   0.370380292s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_evolution", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution/src/lib.rs", Edition2021) }
-   0.370403000s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_llm", dep_mtime: FileTime { seconds: 1779022281, nanos: 631675387 }, max_mtime: FileTime { seconds: 1779012529, nanos: 175750786 } })
-   0.384201083s  INFO prepare_target{force=false package_id=tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools) target="tools"}: cargo::core::compiler::fingerprint: fingerprint dirty for tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("tools", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/tools/src/lib.rs", Edition2021) }
-   0.384220667s  INFO prepare_target{force=false package_id=tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools) target="tools"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/tools-b425f19919d5f7b3/dep-lib-tools", reference_mtime: FileTime { seconds: 1779028456, nanos: 859803956 }, stale: "/Users/chenh/RustObject/claw-code-parity/rust/crates/tools/src/lib.rs", stale_mtime: FileTime { seconds: 1779028466, nanos: 455809961 } }))
-   0.390862708s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: fingerprint dirty for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: true }/TargetInner { name: "ai-brain", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/main.rs", Edition2021) }
-   0.390877917s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tools" })
-   0.392445125s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="v2_integration_test"}: cargo::core::compiler::fingerprint: fingerprint error for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: true }/TargetInner { kind: "test", name: "v2_integration_test", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/tests/v2_integration_test.rs", Edition2021) }
-   0.392458000s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="v2_integration_test"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/ai-brain-cli-9099c709cc6c7803/test-integration-test-v2_integration_test`
+   0.305197167s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: dependency on `brain_core` is newer than we are 1779012520.205545785s > 1779012314.808977750s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch"
+   0.319982667s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: dependency on `brain_llm` is newer than we are 1779022281.631675387s > 1779012529.175750786s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution"
+   0.339790917s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: fingerprint dirty for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: false }/TargetInner { name: "ai-brain", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/main.rs", Edition2021) }
+   0.339799375s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "brain_evolution" })
+   0.356811458s  INFO prepare_target{force=false package_id=brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch) target="brain_dispatch"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_dispatch", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch/src/lib.rs", Edition2021) }
+   0.356829125s  INFO prepare_target{force=false package_id=brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch) target="brain_dispatch"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_core", dep_mtime: FileTime { seconds: 1779012520, nanos: 205545785 }, max_mtime: FileTime { seconds: 1779012314, nanos: 808977750 } })
+   0.373154000s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_evolution", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution/src/lib.rs", Edition2021) }
+   0.373162042s  INFO prepare_target{force=false package_id=brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution) target="brain_evolution"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_llm", dep_mtime: FileTime { seconds: 1779022281, nanos: 631675387 }, max_mtime: FileTime { seconds: 1779012529, nanos: 175750786 } })
+   0.389906833s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint: fingerprint dirty for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: true }/TargetInner { name: "ai-brain", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/main.rs", Edition2021) }
+   0.389916708s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="ai-brain"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "brain_evolution" })
+   0.390950583s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="v2_integration_test"}: cargo::core::compiler::fingerprint: fingerprint error for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: true }/TargetInner { kind: "test", name: "v2_integration_test", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/tests/v2_integration_test.rs", Edition2021) }
+   0.390955958s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="v2_integration_test"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/ai-brain-cli-53f11f7ef5615d08/test-integration-test-v2_integration_test`
 
 Caused by:
     No such file or directory (os error 2)
@@ -38,112 +33,10 @@ Stack backtrace:
   15: std::rt::lang_start::<()>::{closure#0}
   16: std::rt::lang_start_internal
   17: _main
-   0.401570917s  INFO prepare_target{force=false package_id=brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch) target="integration_test"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch)/Check { test: true }/TargetInner { kind: "test", name: "integration_test", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch/tests/integration_test.rs", Edition2021) }
-   0.401582917s  INFO prepare_target{force=false package_id=brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch) target="integration_test"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "brain_dispatch" })
-   0.405213958s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="brain_integration_tests"}: cargo::core::compiler::fingerprint: dependency on `brain_reasoning` is newer than we are 1779022285.430337290s > 1776828624.017676449s "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests"
-   0.405299375s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="brain_integration_tests"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("brain_integration_tests", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/src/lib.rs", Edition2021) }
-   0.405311417s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="brain_integration_tests"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "brain_reasoning", dep_mtime: FileTime { seconds: 1779022285, nanos: 430337290 }, max_mtime: FileTime { seconds: 1776828624, nanos: 17676449 } })
-   0.406828958s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: true }/TargetInner { kind: "test", name: "e2e", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/tests/e2e.rs", Edition2021) }
-   0.406837958s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "brain_integration_tests" })
-   0.407635167s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e_real_llm"}: cargo::core::compiler::fingerprint: fingerprint error for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: true }/TargetInner { kind: "test", name: "e2e_real_llm", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/tests/e2e_real_llm.rs", Edition2021) }
-   0.407642833s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="e2e_real_llm"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/brain-integration-tests-bdfee11061d4f524/test-integration-test-e2e_real_llm`
-
-Caused by:
-    No such file or directory (os error 2)
-
-Stack backtrace:
-   0: std::backtrace::Backtrace::create
-   1: std::backtrace::Backtrace::capture
-   2: cargo_util::paths::read_bytes
-   3: cargo_util::paths::read
-   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
-   5: cargo::core::compiler::fingerprint::prepare_target
-   6: cargo::core::compiler::compile
-   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
-   8: cargo::ops::cargo_compile::compile_ws
-   9: cargo::ops::cargo_compile::compile_with_exec
-  10: cargo::ops::cargo_compile::compile
-  11: cargo::commands::check::exec
-  12: <cargo::cli::Exec>::exec
-  13: cargo::main
-  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
-  15: std::rt::lang_start::<()>::{closure#0}
-  16: std::rt::lang_start_internal
-  17: _main
-   0.409175375s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="minimal_loop"}: cargo::core::compiler::fingerprint: fingerprint dirty for brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)/Check { test: true }/TargetInner { kind: "test", name: "minimal_loop", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests/tests/minimal_loop.rs", Edition2021) }
-   0.409182583s  INFO prepare_target{force=false package_id=brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests) target="minimal_loop"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "brain_integration_tests" })
-   0.413552750s  INFO prepare_target{force=false package_id=compat-harness v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness) target="compat_harness"}: cargo::core::compiler::fingerprint: fingerprint dirty for compat-harness v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("compat_harness", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness/src/lib.rs", Edition2021) }
-   0.413579042s  INFO prepare_target{force=false package_id=compat-harness v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness) target="compat_harness"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tools" })
-   0.414182542s  INFO prepare_target{force=false package_id=compat-harness v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness) target="compat_harness"}: cargo::core::compiler::fingerprint: fingerprint dirty for compat-harness v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("compat_harness", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness/src/lib.rs", Edition2021) }
-   0.414190583s  INFO prepare_target{force=false package_id=compat-harness v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness) target="compat_harness"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tools" })
-   0.421994125s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="claw"}: cargo::core::compiler::fingerprint: fingerprint error for rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli)/Check { test: false }/TargetInner { name: "claw", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli/src/main.rs", Edition2021) }
-   0.422006542s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="claw"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/rusty-claude-cli-81f0c420788f74a4/bin-claw`
-
-Caused by:
-    No such file or directory (os error 2)
-
-Stack backtrace:
-   0: std::backtrace::Backtrace::create
-   1: std::backtrace::Backtrace::capture
-   2: cargo_util::paths::read_bytes
-   3: cargo_util::paths::read
-   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
-   5: cargo::core::compiler::fingerprint::prepare_target
-   6: cargo::core::compiler::compile
-   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
-   8: cargo::ops::cargo_compile::compile_ws
-   9: cargo::ops::cargo_compile::compile_with_exec
-  10: cargo::ops::cargo_compile::compile
-  11: cargo::commands::check::exec
-  12: <cargo::cli::Exec>::exec
-  13: cargo::main
-  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
-  15: std::rt::lang_start::<()>::{closure#0}
-  16: std::rt::lang_start_internal
-  17: _main
-   0.430419000s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="claw"}: cargo::core::compiler::fingerprint: fingerprint error for rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli)/Check { test: true }/TargetInner { name: "claw", doc: true, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli/src/main.rs", Edition2021) }
-   0.430431417s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="claw"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/rusty-claude-cli-a7bf66e6461a54bf/test-bin-claw`
-
-Caused by:
-    No such file or directory (os error 2)
-
-Stack backtrace:
-   0: std::backtrace::Backtrace::create
-   1: std::backtrace::Backtrace::capture
-   2: cargo_util::paths::read_bytes
-   3: cargo_util::paths::read
-   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
-   5: cargo::core::compiler::fingerprint::prepare_target
-   6: cargo::core::compiler::compile
-   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
-   8: cargo::ops::cargo_compile::compile_ws
-   9: cargo::ops::cargo_compile::compile_with_exec
-  10: cargo::ops::cargo_compile::compile
-  11: cargo::commands::check::exec
-  12: <cargo::cli::Exec>::exec
-  13: cargo::main
-  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
-  15: std::rt::lang_start::<()>::{closure#0}
-  16: std::rt::lang_start_internal
-  17: _main
-   0.431647458s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="cli_flags_and_config_defaults"}: cargo::core::compiler::fingerprint: fingerprint dirty for rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli)/Check { test: true }/TargetInner { kind: "test", name: "cli_flags_and_config_defaults", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli/tests/cli_flags_and_config_defaults.rs", Edition2021) }
-   0.431658167s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="cli_flags_and_config_defaults"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tools" })
-   0.432581208s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="resume_slash_commands"}: cargo::core::compiler::fingerprint: fingerprint dirty for rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli)/Check { test: true }/TargetInner { kind: "test", name: "resume_slash_commands", benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli/tests/resume_slash_commands.rs", Edition2021) }
-   0.432587625s  INFO prepare_target{force=false package_id=rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli) target="resume_slash_commands"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "tools" })
-   0.433685500s  INFO prepare_target{force=false package_id=tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools) target="tools"}: cargo::core::compiler::fingerprint: stale: changed "/Users/chenh/RustObject/claw-code-parity/rust/crates/tools/src/lib.rs"
-   0.433689583s  INFO prepare_target{force=false package_id=tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools) target="tools"}: cargo::core::compiler::fingerprint:           (vs) "/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/tools-30e838f8f8886f7f/dep-test-lib-tools"
-   0.433692125s  INFO prepare_target{force=false package_id=tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools) target="tools"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1779028456, nanos: 865143206 } < FileTime { seconds: 1779028466, nanos: 455809961 }
-   0.433777417s  INFO prepare_target{force=false package_id=tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools) target="tools"}: cargo::core::compiler::fingerprint: fingerprint dirty for tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("tools", ["lib"], "/Users/chenh/RustObject/claw-code-parity/rust/crates/tools/src/lib.rs", Edition2021) }
-   0.433784917s  INFO prepare_target{force=false package_id=tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools) target="tools"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/chenh/RustObject/claw-code-parity/rust/target/debug/.fingerprint/tools-30e838f8f8886f7f/dep-test-lib-tools", reference_mtime: FileTime { seconds: 1779028456, nanos: 865143206 }, stale: "/Users/chenh/RustObject/claw-code-parity/rust/crates/tools/src/lib.rs", stale_mtime: FileTime { seconds: 1779028466, nanos: 455809961 } }))
-    Checking tools v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/tools)
-    Checking brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch)
-    Checking brain-integration-tests v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-integration-tests)
+   0.401383375s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="test_mouse"}: cargo::core::compiler::fingerprint: fingerprint dirty for ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)/Check { test: false }/TargetInner { kind: "example", name: "test_mouse", tested: false, benched: false, ..: with_path("/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/examples/test_mouse.rs", Edition2021) }
+   0.401390792s  INFO prepare_target{force=false package_id=ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli) target="test_mouse"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "brain_evolution" })
     Checking brain-evolution v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-evolution)
-    Checking compat-harness v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/compat-harness)
+    Checking brain-dispatch v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/brain-dispatch)
     Checking ai-brain-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli)
-error: could not compile `brain-integration-tests` (test "e2e_real_llm") due to 4 previous errors
-warning: build failed, waiting for other jobs to finish...
 error: could not compile `ai-brain-cli` (test "v2_integration_test") due to 4 previous errors
-    Checking rusty-claude-cli v0.1.0 (/Users/chenh/RustObject/claw-code-parity/rust/crates/rusty-claude-cli)
-error: could not compile `rusty-claude-cli` (bin "claw") due to 11 previous errors
-error: could not compile `rusty-claude-cli` (bin "claw" test) due to 11 previous errors
+warning: build failed, waiting for other jobs to finish...

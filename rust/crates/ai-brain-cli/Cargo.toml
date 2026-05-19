@@ -32,6 +32,7 @@ axum = "0.8"
 crossterm = { version = "0.28", features = ["event-stream"] }
 ratatui = "0.29"
 tui-textarea = "0.7"
+unicode-width = "0.2"
 brain-main = { path = "../brain-main" }
 tools = { path = "../tools" }
 serde = { version = "1", features = ["derive"] }
