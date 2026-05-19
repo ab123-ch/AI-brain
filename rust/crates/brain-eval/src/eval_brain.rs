@@ -240,22 +240,26 @@ impl EvalResult {
     }
 }
 
-/// v2 评估脑 — 常驻后台的监听者
+/// v2 评估脑 — Skill 化版本
 ///
 /// 主脑每次产生输出后自动触发评估。基于记忆脑的踩坑库 + 用户画像 + 自进化规则，
 /// 由 LLM 对主脑输出进行自然语言评估，结果直接作为反馈文本返回给主脑。
 pub struct EvalBrain {
     llm: Arc<dyn LlmProvider>,
     tool_executor: Option<Arc<dyn ToolExecutor>>,
+    /// Skill 注册表（管理可用审查技能）
+    skill_registry: SkillRegistry,
     progress_tx: Option<tokio::sync::mpsc::Sender<brain_core::types::ProgressEvent>>,
 }
 
 impl EvalBrain {
-    /// 创建评估脑实例（纯文本评估，无工具验证）
+    /// 创建评估脑实例（无工具验证）
     pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
+        let skill_registry = SkillRegistry::new();
         Self {
             llm,
             tool_executor: None,
+            skill_registry,
             progress_tx: None,
         }
     }
@@ -265,9 +269,11 @@ impl EvalBrain {
         llm: Arc<dyn LlmProvider>,
         tool_executor: Arc<dyn ToolExecutor>,
     ) -> Self {
+        let skill_registry = SkillRegistry::new();
         Self {
             llm,
             tool_executor: Some(tool_executor),
+            skill_registry,
             progress_tx: None,
         }
     }
@@ -280,51 +286,24 @@ impl EvalBrain {
         self.progress_tx = Some(tx);
     }
 
-    /// 评估主脑输出
-    ///
-    /// 调用 LLM 进行评估，LLM 返回自然语言反馈文本。
-    /// 通过检测响应中是否包含"存在问题"来判断 passed/failed。
-    pub async fn evaluate(
-        &self,
-        user_input: &str,
-        ai_output: &str,
-        pitfalls: &[PitfallRecord],
-        user_profile: &UserProfile,
-        rules: &[EvolutionRule],
-        eval_requirements: &[EvalRequirement],
-    ) -> Result<EvalResult> {
-        if user_input.trim().is_empty() || ai_output.trim().is_empty() {
-            return Err(EvalError::InvalidInput(
-                "user_input and ai_output must not be empty".into(),
-            ));
-        }
-
-        // 发送评估开始事件
-        if let Some(tx) = &self.progress_tx {
-            let _ = tx.try_send(ProgressEvent::EvaluationStart);
-        }
-
-        // LLM 评估
-        let feedback = self
-            .llm_evaluate(user_input, ai_output, pitfalls, user_profile, rules, eval_requirements)
-            .await?;
-
-        // 判断是否通过：包含"存在问题"则不通过
-        let passed = !feedback.contains("存在问题");
-
-        self.emit_result(passed, &feedback);
-
-        Ok(EvalResult { passed, feedback })
+    /// 设置 skills 目录并加载
+    pub fn load_skills_from_dir(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.skill_registry.load_from_dir(dir)
     }
 
-    /// 带工具验证的评估
+    /// 获取 SkillRegistry 引用
+    pub fn skill_registry(&self) -> &SkillRegistry {
+        &self.skill_registry
+    }
+
+    /// 评估主脑输出（统一入口）
     ///
     /// 流程：
-    /// 1. 提取文件变更 → 无变更时降级到纯文本评估
+    /// 1. 无 tool_executor 或无文件变更 → 降级到纯文本评估
     /// 2. Round 1: LLM 分析，可选调用只读工具
-    /// 3. 执行工具（只允许 read_only 白名单）
+    /// 3. 执行工具（只允许 read_only 白名单 + Skill/bash 特殊处理）
     /// 4. Round 2: LLM 基于工具证据出最终评估
-    pub async fn evaluate_with_verification(
+    pub async fn evaluate(
         &self,
         user_input: &str,
         ai_output: &str,
@@ -337,9 +316,15 @@ impl EvalBrain {
         // 降级条件：无 tool_executor 或无文件变更
         let file_changes = extractor::extract_file_changes(turns);
         if self.tool_executor.is_none() || file_changes.is_empty() {
-            return self
-                .evaluate(user_input, ai_output, pitfalls, user_profile, rules, eval_requirements)
-                .await;
+            // 降级为纯文本评估时，直接构建消息并调用 LLM
+            return self.llm_evaluate_fallback(
+                user_input,
+                ai_output,
+                pitfalls,
+                user_profile,
+                rules,
+                eval_requirements,
+            ).await;
         }
 
         if user_input.trim().is_empty() || ai_output.trim().is_empty() {
@@ -354,7 +339,11 @@ impl EvalBrain {
         }
 
         let has_tools = self.tool_executor.is_some() && !file_changes.is_empty();
-        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, &SkillRegistry::new(), has_tools);
+        let system_prompt = prompts::build_evaluation_system_prompt(
+            eval_requirements,
+            &self.skill_registry,
+            has_tools,
+        );
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
@@ -420,6 +409,35 @@ impl EvalBrain {
                         true,
                     ));
                     continue;
+                }
+
+                // Skill tool 特殊处理：从 registry 获取内容
+                if name == "Skill" {
+                    let skill_name = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let content = self.skill_registry
+                        .get_skill_content(skill_name)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("Skill '{skill_name}' 不存在"));
+                    messages.push(ChatMessage::tool_result(id, content, false));
+                    continue;
+                }
+
+                // bash 命令白名单检查
+                if name == "bash" {
+                    let cmd = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !is_read_only_bash_command(cmd) {
+                        tracing::warn!("评估脑 bash 命令安全拒绝: {cmd}");
+                        messages.push(ChatMessage::tool_result(
+                            id,
+                            format!("命令 '{cmd}' 不在只读白名单中"),
+                            true,
+                        ));
+                        continue;
+                    }
                 }
 
                 let tool_call = ToolCall {
@@ -505,8 +523,10 @@ impl EvalBrain {
         issues
     }
 
-    /// LLM 评估 — 返回自然语言反馈
-    async fn llm_evaluate(
+    /// 纯文本评估降级路径（无工具能力）
+    ///
+    /// 当无 tool_executor 或无文件变更时使用此方法
+    async fn llm_evaluate_fallback(
         &self,
         user_input: &str,
         ai_output: &str,
@@ -514,8 +534,19 @@ impl EvalBrain {
         user_profile: &UserProfile,
         rules: &[EvolutionRule],
         eval_requirements: &[EvalRequirement],
-    ) -> Result<String> {
-        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, &SkillRegistry::new(), false);
+    ) -> Result<EvalResult> {
+        if user_input.trim().is_empty() || ai_output.trim().is_empty() {
+            return Err(EvalError::InvalidInput(
+                "user_input and ai_output must not be empty".into(),
+            ));
+        }
+
+        // 发送评估开始事件
+        if let Some(tx) = &self.progress_tx {
+            let _ = tx.try_send(ProgressEvent::EvaluationStart);
+        }
+
+        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, &self.skill_registry, false);
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
@@ -528,8 +559,8 @@ impl EvalBrain {
         let request = ChatRequest {
             model: None,
             messages: vec![
-                ChatMessage::system(system_prompt),
-                ChatMessage::user(user_prompt),
+                ChatMessage::system(&system_prompt),
+                ChatMessage::user(&user_prompt),
             ],
             max_tokens: Some(2048),
             temperature: Some(0.1),
@@ -543,12 +574,18 @@ impl EvalBrain {
             .await
             .map_err(|e| EvalError::LlmError(e.to_string()))?;
 
-        let text = response.text();
-        if text.trim().is_empty() {
-            return Ok("评估结果-正常".to_string());
+        let feedback = response.text();
+        if feedback.trim().is_empty() {
+            self.emit_result(true, "评估结果-正常");
+            return Ok(EvalResult::passed());
         }
 
-        Ok(text.trim().to_string())
+        let passed = !feedback.contains("存在问题");
+        self.emit_result(passed, &feedback);
+        Ok(EvalResult {
+            passed,
+            feedback: feedback.trim().to_string(),
+        })
     }
 }
 
@@ -625,10 +662,11 @@ mod tests {
             .evaluate(
                 "写一个函数",
                 "fn add(a: i32, b: i32) -> i32 { a + b }",
-                &[],
+                &[], // turns
+                &[], // pitfalls
                 &UserProfile::default(),
-                &[],
-                &[],
+                &[], // rules
+                &[], // eval_requirements
             )
             .await
             .unwrap();
@@ -645,10 +683,11 @@ mod tests {
             .evaluate(
                 "写代码",
                 "fn process() {\n    // TODO: implement this\n}",
-                &[],
+                &[], // turns
+                &[], // pitfalls
                 &UserProfile::default(),
-                &[],
-                &[],
+                &[], // rules
+                &[], // eval_requirements
             )
             .await
             .unwrap();
@@ -661,7 +700,7 @@ mod tests {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
         let result = brain
-            .evaluate("", "some output", &[], &UserProfile::default(), &[], &[])
+            .evaluate("", "some output", &[], &[], &UserProfile::default(), &[], &[])
             .await;
         assert!(result.is_err());
     }
@@ -671,7 +710,7 @@ mod tests {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
         let result = brain
-            .evaluate("some input", "", &[], &UserProfile::default(), &[], &[])
+            .evaluate("some input", "", &[], &[], &UserProfile::default(), &[], &[])
             .await;
         assert!(result.is_err());
     }
@@ -684,10 +723,11 @@ mod tests {
             .evaluate(
                 "写代码",
                 "fn add(a: i32, b: i32) -> i32 { a + b }",
-                &[],
+                &[], // turns
+                &[], // pitfalls
                 &UserProfile::default(),
-                &[],
-                &[],
+                &[], // rules
+                &[], // eval_requirements
             )
             .await
             .unwrap();
@@ -767,21 +807,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_with_verification_no_changes_falls_back() {
+    async fn evaluate_no_changes_falls_back() {
         // 无文件变更时降级到纯文本评估
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let executor = Arc::new(brain_core::tool_executor::StubToolExecutor::new());
         let brain = EvalBrain::with_verification(llm, executor);
 
         let result = brain
-            .evaluate_with_verification(
+            .evaluate(
                 "写代码",
                 "fn add() {}",
                 &[], // turns 为空，无文件变更
-                &[],
+                &[], // pitfalls
                 &UserProfile::default(),
-                &[],
-                &[],
+                &[], // rules
+                &[], // eval_requirements
             )
             .await
             .unwrap();
@@ -789,21 +829,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_with_verification_skips_tools_when_no_changes() {
+    async fn evaluate_skips_tools_when_no_changes() {
         // 有 tool_executor 但 turns 为空 → 降级
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let executor = Arc::new(brain_core::tool_executor::StubToolExecutor::new());
         let brain = EvalBrain::with_verification(llm, executor);
 
         let result = brain
-            .evaluate_with_verification(
+            .evaluate(
                 "闲聊",
                 "你好",
-                &[],
-                &[],
+                &[], // turns 为空
+                &[], // pitfalls
                 &UserProfile::default(),
-                &[],
-                &[],
+                &[], // rules
+                &[], // eval_requirements
             )
             .await
             .unwrap();
@@ -811,7 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_with_verification_calls_tools_two_rounds() {
+    async fn evaluate_calls_tools_two_rounds() {
         // LLM Round 1 调用 read_file → Round 2 出评估
         use std::sync::atomic::{AtomicUsize, Ordering};
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -871,14 +911,14 @@ mod tests {
         let turns = vec![make_edit_turn("/tmp/test.rs", "old", "new")];
 
         let result = brain
-            .evaluate_with_verification(
+            .evaluate(
                 "改代码",
                 "已修改",
                 &turns,
-                &[],
+                &[], // pitfalls
                 &UserProfile::default(),
-                &[],
-                &[],
+                &[], // rules
+                &[], // eval_requirements
             )
             .await
             .unwrap();
@@ -888,7 +928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_with_verification_rejects_write_tools() {
+    async fn evaluate_rejects_write_tools() {
         // LLM 尝试调用 write_file → 安全拒绝 → Round 2 仍能出评估
         use std::sync::atomic::{AtomicUsize, Ordering};
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -944,14 +984,14 @@ mod tests {
 
         let turns = vec![make_edit_turn("/tmp/test.rs", "old", "new")];
         let result = brain
-            .evaluate_with_verification(
+            .evaluate(
                 "改代码",
                 "已修改",
                 &turns,
-                &[],
+                &[], // pitfalls
                 &UserProfile::default(),
-                &[],
-                &[],
+                &[], // rules
+                &[], // eval_requirements
             )
             .await
             .unwrap();

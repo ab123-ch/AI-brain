@@ -739,7 +739,7 @@ impl Orchestrator {
                                 let _ = tx.send(ProgressEvent::Evaluating).await;
 
                                 match eb
-                                    .evaluate_with_verification(
+                                    .evaluate(
                                         &input_owned,
                                         &answer,
                                         &result.as_ref().unwrap().turns,
