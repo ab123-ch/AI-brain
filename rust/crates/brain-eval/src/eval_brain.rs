@@ -12,7 +12,7 @@ use crate::prompts;
 use crate::skills::SkillRegistry;
 
 /// 评估脑允许使用的只读工具白名单
-const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep_search", "glob_search", "Skill"];
+const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep_search", "glob_search", "Skill", "bash"];
 
 /// 检查工具名是否在只读白名单中
 pub(crate) fn is_read_only_tool(name: &str) -> bool {
@@ -726,9 +726,9 @@ mod tests {
         assert!(is_read_only_tool("grep_search"));
         assert!(is_read_only_tool("glob_search"));
         assert!(is_read_only_tool("Skill"));
+        assert!(is_read_only_tool("bash"));
         assert!(!is_read_only_tool("edit_file"));
         assert!(!is_read_only_tool("write_file"));
-        assert!(!is_read_only_tool("bash"));
     }
 
     #[test]
