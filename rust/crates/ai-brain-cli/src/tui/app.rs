@@ -45,17 +45,19 @@ pub struct App {
     pending_queue: Vec<String>,
     /// 上一次键盘事件时间
     last_event_time: Instant,
-    // --- 光标调试 ---
+    // --- 选择系统 ---
     /// 输出区域位置（render 时缓存）
     output_rect: Rect,
     /// 当前滚动偏移（render 时缓存）
     current_scroll: u16,
     /// 鼠标点击的原始终端坐标 (row, col)
     cursor_pos: Option<(u16, u16)>,
-    /// 旧的 selection_anchor（暂时不用）
+    /// 选择起点 (rendered_text 行号, 显示列号)
     selection_anchor: Option<(usize, usize)>,
-    /// 旧的 selection_end（暂时不用）
+    /// 选择终点 (rendered_text 行号, 显示列号)
     selection_end: Option<(usize, usize)>,
+    /// 扩展模式：点击时设终点而非重设锚点
+    selection_extend_mode: bool,
     /// 渲染后的纯文本行（用于复制）
     rendered_text: Vec<String>,
 }
@@ -67,7 +69,7 @@ impl App {
         let mut output = OutputArea::new();
         output.push_system("AI Brain v2 一主二从系统");
         output.push_system("输入查询 | :help 命令 | Enter 提交 | Tab 补全 | ↑↓ 历史 | Shift+Enter 换行");
-        output.push_system("文本选择: 单击起点 → 滚动 → 再次单击终点 → Ctrl+Y 复制 | Esc 清除");
+        output.push_system("文本选择: 单击拖选 | 单击→Ctrl+F→单击扩展 → Ctrl+Y 复制 | Esc 清除");
 
         // 从 orchestrator 获取 brain-evolution 数据
         let completer = {
@@ -93,6 +95,7 @@ impl App {
             cursor_pos: None,
             selection_anchor: None,
             selection_end: None,
+            selection_extend_mode: false,
             rendered_text: Vec::new(),
         }
     }
@@ -350,12 +353,36 @@ impl App {
 
         f.render_widget(paragraph, area);
 
-        // 用背景色标记点击位置
-        if let Some((row, col)) = self.cursor_pos {
+        // 光标和高亮标记
+        {
             let buf = f.buffer_mut();
-            if let Some(cell) = buf.cell_mut((col, row)) {
-                cell.set_bg(Color::Yellow);
-                cell.set_fg(Color::Black);
+
+            // 单点光标（仅无选择时显示）
+            if self.selection_anchor.is_none() && self.selection_end.is_none() {
+                if let Some((row, col)) = self.cursor_pos {
+                    if let Some(cell) = buf.cell_mut((col, row)) {
+                        cell.set_bg(Color::Yellow);
+                        cell.set_fg(Color::Black);
+                    }
+                }
+            }
+
+            // 选择起点标记（仅 anchor 无 end 时显示黄点）
+            if let Some((rt_row, dcol)) = self.selection_anchor {
+                if self.selection_end.is_none() {
+                    let buf_row = self.output_rect.top()
+                        + (rt_row as u16).saturating_sub(self.current_scroll);
+                    let buf_col = self.output_rect.left() + dcol as u16;
+                    if let Some(cell) = buf.cell_mut((buf_col, buf_row)) {
+                        cell.set_bg(Color::Yellow);
+                        cell.set_fg(Color::Black);
+                    }
+                }
+            }
+
+            // 选择区域高亮（anchor + end 都有值时显示青色背景）
+            if self.selection_anchor.is_some() && self.selection_end.is_some() {
+                self.render_selection_highlight(buf);
             }
         }
     }
@@ -606,10 +633,14 @@ impl App {
         match (key.modifiers, key.code) {
             // Ctrl+C / Esc — 清除选择、取消查询或退出
             (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
-                // 有选择时先清除选择
-                if self.selection_anchor.is_some() {
+                // 清除选择、光标和扩展模式
+                if self.selection_anchor.is_some() || self.cursor_pos.is_some()
+                    || self.selection_extend_mode
+                {
                     self.selection_anchor = None;
                     self.selection_end = None;
+                    self.cursor_pos = None;
+                    self.selection_extend_mode = false;
                     return true;
                 }
                 if self.is_busy {
@@ -627,6 +658,20 @@ impl App {
             // Ctrl+E — 切换 Verbose 模式
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
                 self.output.toggle_verbose();
+                return true;
+            }
+            // Ctrl+F — 切换选择扩展模式
+            (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
+                if self.selection_anchor.is_some() && self.selection_end.is_none() {
+                    self.selection_extend_mode = !self.selection_extend_mode;
+                    if self.selection_extend_mode {
+                        self.output.push_system(
+                            "  选择扩展模式: 点击或拖拽设终点 (Esc取消)",
+                        );
+                    }
+                } else {
+                    self.selection_extend_mode = false;
+                }
                 return true;
             }
             // Ctrl+Y — 复制选中内容到剪贴板
@@ -858,7 +903,7 @@ impl App {
             self.selection_anchor = None;
             self.selection_end = None;
         } else {
-            self.output.push_system("未选择文本（单击设起点 → 滚动 → 再次单击设终点）");
+            self.output.push_system("未选择文本（单击拖选 / 单击后右键扩展）");
         }
     }
 
@@ -942,6 +987,121 @@ impl App {
         }
     }
 
+    /// 将终端坐标转换为 rendered_text 行号和显示列号
+    fn terminal_to_rendered_coords(&self, term_row: u16, term_col: u16) -> (usize, u16) {
+        let scroll = self.current_scroll as usize;
+        let top = self.output_rect.top() as usize;
+        let left = self.output_rect.left() as usize;
+
+        // rendered_text 行号 = scroll + (term_row - output_area_top)
+        let rt_row = scroll + term_row.saturating_sub(top as u16) as usize;
+
+        // 终端列号减去输出区域左偏移后，视为 char offset，再转 display_col
+        let char_offset = term_col.saturating_sub(left as u16) as usize;
+        let display_col = if rt_row < self.rendered_text.len() {
+            let line = &self.rendered_text[rt_row];
+            let mut dcol: usize = 0;
+            for (i, ch) in line.chars().enumerate() {
+                if i >= char_offset {
+                    break;
+                }
+                dcol += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            }
+            dcol as u16
+        } else {
+            0
+        };
+
+        (rt_row, display_col)
+    }
+
+    /// 渲染文本选择高亮到 buffer
+    fn render_selection_highlight(&self, buf: &mut ratatui::buffer::Buffer) {
+        let (anchor, end) = match (self.selection_anchor, self.selection_end) {
+            (Some(a), Some(e)) => (a, e),
+            _ => return,
+        };
+
+        // 排序起点/终点
+        let ((start_line, start_col), (end_line, end_col)) =
+            if anchor.0 < end.0 || (anchor.0 == end.0 && anchor.1 <= end.1) {
+                (anchor, end)
+            } else {
+                (end, anchor)
+            };
+
+        let scroll = self.current_scroll as usize;
+        let top = self.output_rect.top() as usize;
+        let left = self.output_rect.left() as usize;
+        let height = self.output_rect.height as usize;
+        let width = self.output_rect.width as usize;
+
+        // 可见行范围
+        let visible_start = scroll;
+        let visible_end = scroll + height;
+
+        // 限制到可见范围
+        let sel_start = start_line.max(visible_start);
+        let sel_end = end_line.min(visible_end.saturating_sub(1));
+
+        if sel_start > sel_end {
+            return;
+        }
+
+        for rt_row in sel_start..=sel_end {
+            let buf_row = top + (rt_row - scroll);
+            if buf_row >= top + height {
+                break;
+            }
+
+            // 计算该行文本的显示宽度
+            let line_width: usize = if rt_row < self.rendered_text.len() {
+                self.rendered_text[rt_row]
+                    .chars()
+                    .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+                    .sum()
+            } else {
+                0
+            };
+
+            // 计算该行的列范围
+            let (col_start, col_end) = if rt_row == start_line && rt_row == end_line {
+                // 单行选择：需要包含 end_col 处字符的完整宽度
+                let ci = Self::screen_col_to_char_idx(&self.rendered_text[rt_row], end_col);
+                let ch_w = self.rendered_text[rt_row]
+                    .chars()
+                    .nth(ci)
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                    .unwrap_or(1);
+                (start_col, (end_col + ch_w).min(width))
+            } else if rt_row == start_line {
+                // 首行：从 start_col 到行尾
+                (start_col, line_width)
+            } else if rt_row == end_line {
+                // 尾行：从行首到 end_col（含该字符完整宽度）
+                let ci = Self::screen_col_to_char_idx(&self.rendered_text[rt_row], end_col);
+                let ch_w = self.rendered_text[rt_row]
+                    .chars()
+                    .nth(ci)
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                    .unwrap_or(1);
+                (0, (end_col + ch_w).min(width))
+            } else {
+                // 中间行：整行
+                (0, line_width)
+            };
+
+            // 高亮每个 cell
+            for col in col_start..col_end {
+                let buf_col = left + col;
+                if let Some(cell) = buf.cell_mut((buf_col as u16, buf_row as u16)) {
+                    cell.set_bg(Color::Cyan);
+                    cell.set_fg(Color::Black);
+                }
+            }
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         // 判断是否在输出区域
         let in_output = mouse.row >= self.output_rect.top()
@@ -955,33 +1115,44 @@ impl App {
                 self.output.scroll_down(3);
             }
             MouseEventKind::Down(event::MouseButton::Left) if in_output => {
-                // 终端可能报告字符偏移而非显示列偏移（CJK 字符占 1 列 vs 2 列）
-                // 需要用 rendered_text 做 char_offset → display_col 转换
-                let scroll = self.current_scroll;
-                let local_row = mouse.row as usize;
-                let scroll_row = if scroll as usize + local_row < self.rendered_text.len() {
-                    scroll as usize + local_row
-                } else {
-                    local_row
-                };
+                let (rt_row, display_col) =
+                    self.terminal_to_rendered_coords(mouse.row, mouse.column);
 
-                let display_col = if scroll_row < self.rendered_text.len() {
-                    let line = &self.rendered_text[scroll_row];
-                    let col = mouse.column as usize;
-                    // 将终端报告的列号视为 char offset，转为 display column
-                    let mut dcol: usize = 0;
-                    for (i, ch) in line.chars().enumerate() {
-                        if i >= col {
-                            break;
-                        }
-                        dcol += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                if rt_row >= self.rendered_text.len() {
+                    return;
+                }
+
+                if self.selection_extend_mode && self.selection_anchor.is_some() {
+                    // 扩展模式: 点击设终点
+                    self.selection_end = Some((rt_row, display_col as usize));
+                    self.selection_extend_mode = false; // 设完终点自动退出
+                } else {
+                    // 普通点击: 重设锚点
+                    self.selection_anchor = Some((rt_row, display_col as usize));
+                    self.selection_end = None;
+                    self.selection_extend_mode = false;
+                }
+                self.cursor_pos = None;
+            }
+            // 右键点击: 扩展选择（macOS 双指点击 / Ctrl+Click 都会触发）
+            MouseEventKind::Down(event::MouseButton::Right) if in_output => {
+                if self.selection_anchor.is_some() {
+                    let (rt_row, display_col) =
+                        self.terminal_to_rendered_coords(mouse.row, mouse.column);
+                    if rt_row < self.rendered_text.len() {
+                        self.selection_end = Some((rt_row, display_col as usize));
+                        self.cursor_pos = None;
                     }
-                    dcol as u16
-                } else {
-                    mouse.column
-                };
-
-                self.cursor_pos = Some((mouse.row, display_col));
+                }
+            }
+            MouseEventKind::Drag(event::MouseButton::Left) if in_output => {
+                if self.selection_anchor.is_some() {
+                    let (rt_row, display_col) =
+                        self.terminal_to_rendered_coords(mouse.row, mouse.column);
+                    if rt_row < self.rendered_text.len() {
+                        self.selection_end = Some((rt_row, display_col as usize));
+                    }
+                }
             }
             _ => {}
         }
@@ -1014,7 +1185,7 @@ impl App {
                     "  Ctrl+P          — 展开/折叠长粘贴",
                     "  Ctrl+A/E        — 跳到行首/行尾",
                     "  鼠标滚轮        — 上下滚动输出",
-                    "  文本选择        — 单击起点 → 滚动 → 再次单击终点 → Ctrl+Y 复制",
+                    "  文本选择        — 单击拖选 / Ctrl+F切换扩展模式",
                     "  Esc             — 清除选择",
                 ] {
                     self.output.push_system(line);

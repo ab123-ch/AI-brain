@@ -91,15 +91,17 @@ impl MainBrain {
 
     /// 处理一轮用户输入
     ///
-    /// 事务式写入：失败不污染历史。
+    /// 用户消息在开头立即保存，确保取消时上下文不丢失。
+    /// LLM 响应在成功/失败后保存。
     ///
     /// 流程：
-    /// 1. 应用后台预压缩结果（零阻塞）
-    /// 2. 检查上下文使用率 — 超危险阈值截断
-    /// 3. 构建 messages（system_prompt + 历史 + 用户输入）
-    /// 4. 跑 tool_loop
-    /// 5. 成功后一次性写入完整一轮到历史
-    /// 6. 更新 session token 追踪 + 触发后台预压缩
+    /// 1. 立即保存用户消息到历史（防止取消时丢失上下文）
+    /// 2. 应用后台预压缩结果（零阻塞）
+    /// 3. 检查上下文使用率 — 超危险阈值截断
+    /// 4. 构建 messages（system_prompt + 历史）
+    /// 5. 跑 tool_loop
+    /// 6. 成功后写入 LLM 响应和工具调用到历史
+    /// 7. 更新 session token 追踪 + 触发后台预压缩
     pub async fn process_input(
         &mut self,
         input: &str,
@@ -107,7 +109,10 @@ impl MainBrain {
     ) -> Result<MainBrainOutput> {
         let start = std::time::Instant::now();
 
-        // ── 0. 应用后台预压缩结果（零阻塞内存操作）──
+        // ── 0. 立即保存用户消息（防止取消时上下文丢失）──
+        self.history.push_user(input);
+
+        // ── 1. 应用后台预压缩结果（零阻塞内存操作）──
         let pending = {
             let mut p = self.pending_compressions.lock().await;
             std::mem::take(&mut *p)
@@ -126,7 +131,7 @@ impl MainBrain {
             );
         }
 
-        // ── 1. 检查上下文使用率 ──
+        // ── 2. 检查上下文使用率 ──
         let thresholds = &self.config.brain.thresholds;
 
         // 超过危险阈值：强制截断
@@ -141,8 +146,8 @@ impl MainBrain {
             );
         }
 
-        // ── 2. 构建 messages ──
-        let mut messages = self.build_messages_with_user(input);
+        // ── 3. 构建 messages（用户消息已在 history 中）──
+        let mut messages = self.build_messages();
 
         // 发送 Connecting 事件
         if let Some(tx) = progress_tx {
@@ -154,7 +159,7 @@ impl MainBrain {
                 .await;
         }
 
-        // ── 3. 跑 tool_loop ──
+        // ── 4. 跑 tool_loop ──
         let loop_result = match tool_loop::run_tool_loop_with_config(
             self.llm.as_ref(),
             self.tool_executor.as_ref(),
@@ -169,8 +174,7 @@ impl MainBrain {
         {
             Ok(r) => r,
             Err(e) => {
-                // 失败时仍写入历史，确保后续轮次上下文连续
-                self.history.push_user(input);
+                // 失败时：用户消息已保存，继续写入已执行的部分和错误信息
                 // 将 tool_loop 中已执行的部分（assistant 中间回复 + tool 结果）写入
                 let old_len = self.history.len() - 1;
                 let skip = 1 + old_len + 1;
@@ -212,9 +216,7 @@ impl MainBrain {
         let last_prompt_tokens = loop_result.last_prompt_tokens;
         let completion_tokens = corrected_usage.completion_tokens;
 
-        // ── 4. 成功后一次性写入完整一轮到历史 ──
-        self.history.push_user(input);
-
+        // ── 5. 成功后写入 LLM 响应和工具调用到历史（用户消息已在开头保存）──
         let old_history_len = self.history.len() - 1;
         let skip_count = 1 + old_history_len + 1;
 
@@ -520,14 +522,6 @@ impl MainBrain {
         };
         let mut messages = vec![ChatMessage::system(full_prompt)];
         messages.extend(self.history.to_chat_messages());
-        messages
-    }
-
-    /// 构建 messages 并临时追加用户输入（不写入历史）。
-    /// 用于事务式写入：失败时历史不变。
-    fn build_messages_with_user(&self, user_input: &str) -> Vec<ChatMessage> {
-        let mut messages = self.build_messages();
-        messages.push(ChatMessage::user(user_input));
         messages
     }
 }
