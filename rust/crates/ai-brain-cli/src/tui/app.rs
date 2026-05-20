@@ -771,19 +771,28 @@ impl App {
                             self.try_collect_result();
                             return;
                         }
-                        // AskUser 事件：提取 sender，显示问题，等待用户输入
+                        // AskUser 事件：提取 sender 存储，显示问题和选项
                         if let ProgressEvent::AskUser {
                             question,
-                            options: _,
+                            options,
                             response_tx,
                         } = event
                         {
+                            self.pending_ask_response = Some(response_tx.0);
+                            // 显示 ToolStart 行（和 handle_event 中 ToolStart 一样）
                             self.output.handle_event(&ProgressEvent::ToolStart {
                                 brain: "main".into(),
                                 tool_name: "AskUserQuestion".into(),
-                                input: format!("问题: {question}"),
+                                input: serde_json::to_string(&serde_json::json!({
+                                    "question": &question,
+                                    "options": &options,
+                                })).unwrap_or_default(),
                             });
-                            self.pending_ask_response = Some(response_tx.0);
+                            // 显示问题文本
+                            self.output.push_system(&format!("❓ {question}"));
+                            if let Some(opts) = &options {
+                                self.output.push_system(&format!("   选项: {}", opts.join(" / ")));
+                            }
                             continue;
                         }
                         self.output.handle_event(&event);
