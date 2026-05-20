@@ -45,6 +45,8 @@ pub struct App {
     pending_queue: Vec<String>,
     /// 上一次键盘事件时间
     last_event_time: Instant,
+    /// 等待用户回答 AskUserQuestion 的 sender
+    pending_ask_response: Option<tokio::sync::oneshot::Sender<String>>,
     // --- 选择系统 ---
     /// 输出区域位置（render 时缓存）
     output_rect: Rect,
@@ -90,6 +92,7 @@ impl App {
             done_received: false,
             pending_queue: Vec::new(),
             last_event_time: Instant::now(),
+            pending_ask_response: None,
             output_rect: Rect::default(),
             current_scroll: 0,
             cursor_pos: None,
@@ -709,6 +712,13 @@ impl App {
             return;
         }
 
+        // 如果有等待中的 AskUserQuestion，直接发送响应
+        if let Some(tx) = self.pending_ask_response.take() {
+            self.output.push_user_input(&text);
+            let _ = tx.send(text);
+            return;
+        }
+
         // 内置命令始终立即处理
         match self.handle_builtin_command_sync(&text) {
             CommandResult::Handled => return,
@@ -760,6 +770,21 @@ impl App {
                             self.output.handle_event(&ProgressEvent::Done);
                             self.try_collect_result();
                             return;
+                        }
+                        // AskUser 事件：提取 sender，显示问题，等待用户输入
+                        if let ProgressEvent::AskUser {
+                            question,
+                            options: _,
+                            response_tx,
+                        } = event
+                        {
+                            self.output.handle_event(&ProgressEvent::ToolStart {
+                                brain: "main".into(),
+                                tool_name: "AskUserQuestion".into(),
+                                input: format!("问题: {question}"),
+                            });
+                            self.pending_ask_response = Some(response_tx.0);
+                            continue;
                         }
                         self.output.handle_event(&event);
                     }

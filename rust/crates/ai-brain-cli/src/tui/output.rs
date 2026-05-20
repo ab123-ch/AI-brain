@@ -219,6 +219,16 @@ impl OutputArea {
                 self.spinner_label = Some("主脑-评估答案中...".into());
             }
             ProgressEvent::LlmRetry { .. } => {}
+            ProgressEvent::AskUser { question, .. } => {
+                self.flush_streaming();
+                self.lines.push(OutputLine::ToolStart {
+                    name: "AskUserQuestion".into(),
+                });
+                self.lines.push(OutputLine::System(format!(
+                    "等待用户回答: {question}"
+                )));
+                self.spinner_label = Some("等待用户回答...".into());
+            }
             ProgressEvent::Done => {
                 self.flush_streaming();
                 self.spinner_label = None;

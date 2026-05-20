@@ -4,6 +4,7 @@ use brain_core::guard_check::{guard_check, GuardResult};
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{
     ProgressEvent, ToolCall, ToolCallRecord, ToolExecutionResult, TurnRecord, TurnRole,
+    UserResponseSender,
 };
 use brain_hooks::runner::HookRunner;
 use brain_hooks::types::{HookDecision, HookEvent, HookInput};
@@ -440,6 +441,67 @@ async fn execute_tool_calls(
                         duration_ms: 0,
                         output_preview: format!("安全拒绝: {reason}"),
                         is_error: true,
+                    },
+                )
+                .await;
+                continue;
+            }
+
+            // === AskUserQuestion 特殊处理：阻塞等待用户响应 ===
+            if name == "AskUserQuestion" {
+                let question = input
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let options: Option<Vec<String>> = input
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+                send_progress(
+                    progress_tx,
+                    ProgressEvent::AskUser {
+                        question: question.clone(),
+                        options: options.clone(),
+                        response_tx: UserResponseSender(response_tx),
+                    },
+                )
+                .await;
+
+                // 阻塞等待用户响应
+                let user_response = response_rx
+                    .await
+                    .unwrap_or_else(|_| "用户未响应".to_string());
+
+                let duration_ms = 0u64;
+                messages.push(ChatMessage::tool_result(id, &user_response, false));
+                turns.push(TurnRecord {
+                    role: TurnRole::ToolCall,
+                    content: String::new(),
+                    tool_call: Some(ToolCallRecord {
+                        tool_name: name.clone(),
+                        input: input.clone(),
+                        output: user_response.clone(),
+                        duration_ms,
+                        is_error: false,
+                    }),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                });
+                send_progress(
+                    progress_tx,
+                    ProgressEvent::ToolDone {
+                        brain: "main".into(),
+                        tool_name: name.clone(),
+                        duration_ms,
+                        output_preview: user_response,
+                        is_error: false,
                     },
                 )
                 .await;

@@ -529,8 +529,17 @@ pub struct MainBrainOutput {
 
 // ─── 进度事件 ──────────────────────────────────────────────────────
 
+/// oneshot::Sender 的 Debug 包装（oneshot::Sender 不 impl Debug）
+pub struct UserResponseSender(pub tokio::sync::oneshot::Sender<String>);
+
+impl std::fmt::Debug for UserResponseSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UserResponseSender")
+    }
+}
+
 /// 进度事件（主脑→TUI/终端 的实时通知）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum ProgressEvent {
     Connecting {
         brain: String,
@@ -582,6 +591,12 @@ pub enum ProgressEvent {
         attempt: u32,
         max_attempts: u32,
         error: String,
+    },
+    /// 主脑询问用户问题，等待用户响应
+    AskUser {
+        question: String,
+        options: Option<Vec<String>>,
+        response_tx: UserResponseSender,
     },
     Done,
 }
