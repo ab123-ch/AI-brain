@@ -1,6 +1,7 @@
 use brain_core::types::{ToolCallRecord, TurnRecord, TurnRole};
 
 /// 单个文件变更记录
+#[allow(dead_code)] // Task 4 将清理
 #[derive(Debug, Clone)]
 pub struct FileChange {
     /// 文件路径
@@ -14,6 +15,7 @@ pub struct FileChange {
 }
 
 /// 变更类型
+#[allow(dead_code)] // Task 4 将清理
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileChangeType {
     /// 编辑（edit_file）
@@ -28,7 +30,7 @@ pub fn extract_file_changes(turns: &[TurnRecord]) -> Vec<FileChange> {
         .iter()
         .filter(|t| {
             matches!(t.role, TurnRole::ToolCall)
-                && t.tool_call.as_ref().map_or(false, |tc| !tc.is_error)
+                && t.tool_call.as_ref().is_some_and(|tc| !tc.is_error)
         })
         .filter_map(|t| {
             let tc = t.tool_call.as_ref()?;

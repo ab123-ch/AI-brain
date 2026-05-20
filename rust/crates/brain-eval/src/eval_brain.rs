@@ -49,13 +49,13 @@ pub fn build_read_only_tool_definitions() -> Vec<ToolDefinition> {
         // Skill tool
         ToolDefinition {
             name: "Skill".into(),
-            description: "加载审查技能的完整规则。可用技能：code-review, fact-check, task-completion, writing-quality。".into(),
+            description: "加载审查技能的完整规则。可用技能：code-verification（代码变更验证）、conclusion-verification（结论真实性验证）。".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "要加载的技能名称，如 code-review 或 fact-check"
+                        "description": "要加载的技能名称，如 code-verification 或 conclusion-verification"
                     }
                 },
                 "required": ["command"]
@@ -303,6 +303,7 @@ impl EvalBrain {
     /// 2. Round 1: LLM 分析，可选调用只读工具
     /// 3. 执行工具（只允许 read_only 白名单 + Skill/bash 特殊处理）
     /// 4. Round 2: LLM 基于工具证据出最终评估
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn evaluate(
         &self,
         user_input: &str,
@@ -336,6 +337,15 @@ impl EvalBrain {
         // 发送评估开始事件
         if let Some(tx) = &self.progress_tx {
             let _ = tx.try_send(ProgressEvent::EvaluationStart);
+            // 发送评估上下文事件
+            let ai_output_preview: String = ai_output.chars().take(200).collect();
+            let _ = tx.try_send(ProgressEvent::EvaluationContext {
+                user_input: user_input.to_string(),
+                ai_output_preview,
+                pitfalls_count: pitfalls.len(),
+                rules_count: rules.len(),
+                file_changes_count: file_changes.len(),
+            });
         }
 
         let has_tools = self.tool_executor.is_some() && !file_changes.is_empty();
@@ -350,7 +360,7 @@ impl EvalBrain {
             pitfalls,
             user_profile,
             rules,
-            &file_changes,
+            turns,
         );
 
         // ── Round 1: 带工具定义，LLM 可选调用工具 ──
@@ -416,10 +426,15 @@ impl EvalBrain {
                     let skill_name = input.get("command")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
+                    // 发送 Skill 调用事件
+                    if let Some(tx) = &self.progress_tx {
+                        let _ = tx.try_send(ProgressEvent::EvaluationSkillCalled {
+                            skill_name: skill_name.to_string(),
+                        });
+                    }
                     let content = self.skill_registry
                         .get_skill_content(skill_name)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("Skill '{skill_name}' 不存在"));
+                        .map_or_else(|| format!("Skill '{skill_name}' 不存在"), std::string::ToString::to_string);
                     messages.push(ChatMessage::tool_result(id, content, false));
                     continue;
                 }
@@ -544,6 +559,15 @@ impl EvalBrain {
         // 发送评估开始事件
         if let Some(tx) = &self.progress_tx {
             let _ = tx.try_send(ProgressEvent::EvaluationStart);
+            // 发送评估上下文事件（fallback 路径无文件变更）
+            let ai_output_preview: String = ai_output.chars().take(200).collect();
+            let _ = tx.try_send(ProgressEvent::EvaluationContext {
+                user_input: user_input.to_string(),
+                ai_output_preview,
+                pitfalls_count: pitfalls.len(),
+                rules_count: rules.len(),
+                file_changes_count: 0,
+            });
         }
 
         let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, &self.skill_registry, false);

@@ -148,7 +148,7 @@ pub fn build_evaluation_user_prompt(
     pitfalls: &[PitfallRecord],
     user_profile: &UserProfile,
     rules: &[EvolutionRule],
-    file_changes: &[FileChange],
+    turns: &[TurnRecord],
 ) -> String {
     let mut prompt = String::new();
 
@@ -162,10 +162,10 @@ pub fn build_evaluation_user_prompt(
     prompt.push_str(ai_output);
     prompt.push_str("\n\n");
 
-    // 文件修改记录
-    let changes_text = format_file_changes(file_changes);
-    if !changes_text.is_empty() {
-        prompt.push_str(&changes_text);
+    // 主脑操作轨迹（工具调用）
+    let trace_text = format_tool_trace(turns);
+    if !trace_text.is_empty() {
+        prompt.push_str(&trace_text);
     }
 
     // 踩坑库
@@ -243,6 +243,7 @@ pub fn build_evaluation_user_prompt(
 }
 
 /// 将文件变更列表格式化为 prompt 文本
+#[allow(dead_code)] // Task 4 将清理
 pub fn format_file_changes(changes: &[FileChange]) -> String {
     if changes.is_empty() {
         return String::new();
@@ -526,19 +527,27 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_with_file_changes() {
-        let changes = vec![
-            FileChange {
-                file_path: "src/main.rs".into(),
-                change_type: FileChangeType::Edit,
-                old_content: Some("fn old()".into()),
-                new_content: Some("fn new() {}".into()),
-            },
-        ];
+    fn user_prompt_with_file_changes_shows_trace() {
+        let turns = vec![TurnRecord {
+            role: TurnRole::ToolCall,
+            content: String::new(),
+            tool_call: Some(ToolCallRecord {
+                tool_name: "edit_file".into(),
+                input: serde_json::json!({
+                    "file_path": "src/main.rs",
+                    "old_string": "fn old()",
+                    "new_string": "fn new() {}"
+                }),
+                output: "OK".into(),
+                duration_ms: 10,
+                is_error: false,
+            }),
+            timestamp: String::new(),
+        }];
         let prompt = build_evaluation_user_prompt(
-            "改代码", "已修改", &[], &UserProfile::default(), &[], &changes,
+            "改代码", "已修改", &[], &UserProfile::default(), &[], &turns,
         );
-        assert!(prompt.contains("文件修改记录"));
+        assert!(prompt.contains("主脑操作轨迹"));
         assert!(prompt.contains("src/main.rs"));
         assert!(prompt.contains("fn new()"));
     }
@@ -548,7 +557,7 @@ mod tests {
         let prompt = build_evaluation_user_prompt(
             "闲聊", "你好", &[], &UserProfile::default(), &[], &[],
         );
-        assert!(!prompt.contains("文件修改记录"));
+        assert!(!prompt.contains("主脑操作轨迹"));
     }
 
     // ─── format_tool_trace 测试 ──────────────────────────────────
