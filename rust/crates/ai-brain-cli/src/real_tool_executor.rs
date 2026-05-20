@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
+use brain_mcp::McpClientPool;
 use brain_memory::memory_brain::MemoryBrain;
+use brain_plugin::SkillCatalog;
 
 /// Production tool executor that delegates to `tools::execute_tool` for built-in tools
 /// and handles `search_memory` directly via MemoryBrain.
@@ -19,6 +21,10 @@ pub struct RealToolExecutor {
     memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>,
     /// Dispatch bus for async agent completion notifications
     dispatch: Option<brain_dispatch::TokioDispatch>,
+    /// Skill catalog for skill-based tool routing
+    skill_catalog: Option<Arc<SkillCatalog>>,
+    /// MCP client pool for external tool routing (mcp__server__tool)
+    mcp_pool: Option<Arc<McpClientPool>>,
 }
 
 impl RealToolExecutor {
@@ -42,6 +48,8 @@ impl RealToolExecutor {
             tool_descriptors,
             memory_brain: None,
             dispatch: None,
+            skill_catalog: None,
+            mcp_pool: None,
         }
     }
 
@@ -60,6 +68,18 @@ impl RealToolExecutor {
         let mut exec = Self::with_memory(memory_brain);
         exec.dispatch = Some(dispatch);
         exec
+    }
+
+    /// Attach a SkillCatalog for skill-based tool routing.
+    pub fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.skill_catalog = Some(catalog);
+        self
+    }
+
+    /// Attach an McpClientPool for external MCP tool routing.
+    pub fn with_mcp_pool(mut self, pool: Arc<McpClientPool>) -> Self {
+        self.mcp_pool = Some(pool);
+        self
     }
 }
 
@@ -195,6 +215,88 @@ impl ToolExecutor for RealToolExecutor {
                     output,
                     is_error: false,
                     duration_ms: start.elapsed().as_millis() as u64,
+                }
+            });
+        }
+
+        // Skill 工具 → SkillCatalog
+        if name == "Skill" {
+            let catalog = self.skill_catalog.clone();
+            let n = name;
+            let inp = input;
+            return Box::pin(async move {
+                if let Some(ref catalog) = catalog {
+                    let skill_name = inp
+                        .get("skill")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    match catalog.resolve(skill_name) {
+                        Some(meta) => match catalog.load_content(meta) {
+                            Ok(content) => ToolExecutionResult {
+                                tool_name: n,
+                                output: content,
+                                is_error: false,
+                                duration_ms: 0,
+                            },
+                            Err(e) => ToolExecutionResult {
+                                tool_name: n,
+                                output: format!("加载技能失败: {e}"),
+                                is_error: true,
+                                duration_ms: 0,
+                            },
+                        },
+                        None => ToolExecutionResult {
+                            tool_name: n,
+                            output: format!("未知技能: {skill_name}"),
+                            is_error: true,
+                            duration_ms: 0,
+                        },
+                    }
+                } else {
+                    // 没有 SkillCatalog 时走旧的 tools::execute_tool 路径
+                    let n_clone = n.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        tools::execute_tool(&n_clone, &inp)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
+                    match result {
+                        Ok(output) => ToolExecutionResult {
+                            tool_name: n,
+                            output,
+                            is_error: false,
+                            duration_ms: 0,
+                        },
+                        Err(e) => ToolExecutionResult {
+                            tool_name: n,
+                            output: e,
+                            is_error: true,
+                            duration_ms: 0,
+                        },
+                    }
+                }
+            });
+        }
+
+        // MCP 工具 → McpClientPool (mcp__server__tool)
+        if name.starts_with("mcp__") {
+            let mcp_pool = self.mcp_pool.clone();
+            let call = ToolCall {
+                tool_name: name,
+                input,
+                validated: tool_call.validated,
+                validation_id: tool_call.validation_id.clone(),
+            };
+            return Box::pin(async move {
+                if let Some(pool) = mcp_pool {
+                    pool.execute(&call).await
+                } else {
+                    ToolExecutionResult {
+                        tool_name: call.tool_name,
+                        output: "MCP 系统未初始化".to_string(),
+                        is_error: true,
+                        duration_ms: 0,
+                    }
                 }
             });
         }
