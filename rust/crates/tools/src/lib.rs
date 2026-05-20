@@ -729,7 +729,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
-        "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
+        "Skill" => Err("Skill tool is handled by RealToolExecutor directly".to_string()),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
@@ -901,10 +901,6 @@ fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
     to_pretty_json(execute_todo_write(input)?)
 }
 
-fn run_skill(input: SkillInput) -> Result<String, String> {
-    to_pretty_json(execute_skill(input)?)
-}
-
 fn run_agent(input: AgentInput) -> Result<String, String> {
     to_pretty_json(execute_agent(input)?)
 }
@@ -1017,12 +1013,6 @@ enum TodoStatus {
     Pending,
     InProgress,
     Completed,
-}
-
-#[derive(Debug, Deserialize)]
-struct SkillInput {
-    skill: String,
-    args: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1211,15 +1201,6 @@ struct TodoWriteOutput {
     new_todos: Vec<TodoItem>,
     #[serde(rename = "verificationNudgeNeeded")]
     verification_nudge_needed: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SkillOutput {
-    skill: String,
-    path: String,
-    args: Option<String>,
-    description: Option<String>,
-    prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1810,20 +1791,6 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
     })
 }
 
-fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
-    let skill_path = resolve_skill_path(&input.skill)?;
-    let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
-    let description = parse_skill_description(&prompt);
-
-    Ok(SkillOutput {
-        skill: input.skill,
-        path: skill_path.display().to_string(),
-        args: input.args,
-        description,
-        prompt,
-    })
-}
-
 fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
     if todos.is_empty() {
         return Err(String::from("todos must not be empty"));
@@ -1844,50 +1811,6 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     Ok(cwd.join(".clawd-todos.json"))
-}
-
-fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
-    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
-    if requested.is_empty() {
-        return Err(String::from("skill must not be empty"));
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
-        candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".config").join("opencode").join("skills"));
-        candidates.push(home.join(".codex").join("skills"));
-    }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
-
-    for root in candidates {
-        let direct = root.join(requested).join("SKILL.md");
-        if direct.exists() {
-            return Ok(direct);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.exists() {
-                    continue;
-                }
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(requested)
-                {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    Err(format!("unknown skill: {requested}"))
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
@@ -3916,18 +3839,6 @@ fn format_notebook_edit_mode(mode: NotebookEditMode) -> String {
 
 fn make_cell_id(index: usize) -> String {
     format!("cell-{}", index + 1)
-}
-
-fn parse_skill_description(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        if let Some(value) = line.strip_prefix("description:") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
