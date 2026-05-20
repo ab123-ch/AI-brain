@@ -35,6 +35,7 @@ dependencies = [
  "brain-master",
  "brain-memory",
  "brain-motor",
+ "brain-plugin",
  "brain-reasoning",
  "brain-sensory",
  "brain-validation",
@@ -428,6 +429,18 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "brain-plugin"
+version = "0.1.0"
+dependencies = [
+ "brain-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "tracing",
 ]
 
