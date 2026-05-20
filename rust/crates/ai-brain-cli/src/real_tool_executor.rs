@@ -262,7 +262,7 @@ impl ToolExecutor for RealToolExecutor {
                     .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
                     match result {
                         Ok(output) => ToolExecutionResult {
-                            tool_name: n,
+                            tool_name: n.clone(),
                             output,
                             is_error: false,
                             duration_ms: 0,
