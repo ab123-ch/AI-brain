@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use brain_core::types::{EvalRequirement, EvolutionRule, PitfallCategory, PitfallRecord, UserProfile};
+use brain_core::types::{EvalRequirement, EvolutionRule, PitfallCategory, PitfallRecord, TurnRecord, TurnRole, UserProfile};
 use chrono::{Datelike, Utc};
 
 use crate::extractor::{FileChange, FileChangeType};
@@ -65,7 +65,7 @@ pub fn build_evaluation_system_prompt(
     let mut prompt = String::new();
 
     // 第一段：角色定义
-    prompt.push_str(r#"# 角色定义
+    prompt.push_str(r"# 角色定义
 
 你是 AI Brain 系统的质量审核员，负责在主脑产生输出后评估其质量和安全性。
 
@@ -75,23 +75,23 @@ pub fn build_evaluation_system_prompt(
 - **事实正确性校验**：验证日期、技术细节是否准确（以环境信息为准）
 - **偏好合规检查**：确认输出遵守用户的偏好和禁忌（只在直接相关时）
 
-"#);
+");
 
     // 如果有工具能力，添加工作方式说明
     if with_tools {
-        prompt.push_str(r#"## 工作方式
+        prompt.push_str(r"## 工作方式
 - 你可以调用 Skill 工具加载具体的审查规则
 - 你可以使用只读工具（read_file、grep、bash）验证代码
 - 只报告确实存在的问题，宁可漏报不误报
 - 不确定的事实不要标记为错误
 
-"#);
+");
     } else {
-        prompt.push_str(r#"## 工作方式
+        prompt.push_str(r"## 工作方式
 - 只报告确实存在的问题，宁可漏报不误报
 - 不确定的事实不要标记为错误
 
-"#);
+");
     }
 
     // 第二段：环境信息
@@ -106,10 +106,8 @@ pub fn build_evaluation_system_prompt(
         prompt.push_str(r#"# Skill 工具
 
 你可以调用 Skill 工具加载具体审查规则：
-- `Skill("code-review")` — 代码审查规则
-- `Skill("fact-check")` — 事实校验规则
-- `Skill("task-completion")` — 任务完成度规则
-- `Skill("writing-quality")` — 写作质量规则
+- `Skill("code-verification")` — 代码变更验证（编译、测试、空实现、日志、需求匹配）
+- `Skill("conclusion-verification")` — 结论真实性验证（证据验证、逻辑链检查）
 
 加载后你将看到完整的检查维度和铁律。
 
@@ -127,7 +125,7 @@ pub fn build_evaluation_system_prompt(
     }
 
     // 输出格式
-    prompt.push_str(r#"# 输出格式
+    prompt.push_str(r"# 输出格式
 
 没有问题时，严格输出（不要附加其他文字）：
 评估结果-正常
@@ -135,7 +133,7 @@ pub fn build_evaluation_system_prompt(
 有问题时，严格输出（不要附加其他文字）：
 评估结果-存在问题。具体问题：1.问题描述及修正建议 2.问题描述及修正建议 ...
 
-注意：不要输出 JSON，不要使用代码块，只输出纯文本。"#);
+注意：不要输出 JSON，不要使用代码块，只输出纯文本。");
 
     prompt
 }
@@ -257,11 +255,11 @@ pub fn format_file_changes(changes: &[FileChange]) -> String {
                 let _ = writeln!(s, "{}. 编辑 `{}`", i + 1, c.file_path);
                 if let Some(ref old) = c.old_content {
                     let truncated: String = old.chars().take(500).collect();
-                    let _ = writeln!(s, "   替换前: {}", truncated);
+                    let _ = writeln!(s, "   替换前: {truncated}");
                 }
                 if let Some(ref new) = c.new_content {
                     let truncated: String = new.chars().take(500).collect();
-                    let _ = writeln!(s, "   替换后: {}", truncated);
+                    let _ = writeln!(s, "   替换后: {truncated}");
                 }
             }
             FileChangeType::Write => {
@@ -269,6 +267,70 @@ pub fn format_file_changes(changes: &[FileChange]) -> String {
             }
         }
     }
+    s.push('\n');
+    s
+}
+
+/// 将主脑所有工具调用格式化为摘要文本，注入评估脑 prompt
+///
+/// 只处理 `TurnRole::ToolCall` 且 `tool_call` 为 Some 的记录，
+/// 格式化为：序号 + 工具名 + 成功/失败 + 耗时(ms) + 输入/输出摘要
+pub fn format_tool_trace(turns: &[TurnRecord]) -> String {
+    let tool_calls: Vec<_> = turns
+        .iter()
+        .filter(|t| matches!(t.role, TurnRole::ToolCall) && t.tool_call.is_some())
+        .collect();
+
+    if tool_calls.is_empty() {
+        return String::new();
+    }
+
+    let mut s = String::from("## 主脑操作轨迹\n\n");
+    for (i, turn) in tool_calls.iter().enumerate() {
+        let tc = turn.tool_call.as_ref().unwrap();
+        let status = if tc.is_error { "失败" } else { "成功" };
+
+        let _ = writeln!(s, "{}. [{}] → {}({}ms)", i + 1, tc.tool_name, status, tc.duration_ms);
+
+        // 输入 JSON
+        let input_json = serde_json::to_string(&tc.input).unwrap_or_else(|_| tc.input.to_string());
+        let _ = writeln!(s, "   输入: {input_json}");
+
+        if tc.is_error {
+            // 失败：完整错误信息
+            let _ = writeln!(s, "   错误: {}", tc.output);
+        } else {
+            // 成功：根据工具类型差异化展示
+            match tc.tool_name.as_str() {
+                "edit_file" => {
+                    if let Some(old) = tc.input.get("old_string").and_then(|v| v.as_str()) {
+                        let truncated: String = old.chars().take(500).collect();
+                        let _ = writeln!(s, "   替换前: {truncated}");
+                    }
+                    if let Some(new) = tc.input.get("new_string").and_then(|v| v.as_str()) {
+                        let truncated: String = new.chars().take(500).collect();
+                        let _ = writeln!(s, "   替换后: {truncated}");
+                    }
+                }
+                "write_file" => {
+                    if let Some(content) = tc.input.get("content").and_then(|v| v.as_str()) {
+                        let truncated: String = content.chars().take(500).collect();
+                        let _ = writeln!(s, "   内容: {truncated}");
+                    }
+                }
+                _ => {
+                    // 其他工具：输出摘要前 300 字符
+                    let truncated: String = tc.output.chars().take(300).collect();
+                    if tc.output.chars().count() > 300 {
+                        let _ = writeln!(s, "   输出摘要: {truncated}...");
+                    } else {
+                        let _ = writeln!(s, "   输出摘要: {truncated}");
+                    }
+                }
+            }
+        }
+    }
+
     s.push('\n');
     s
 }
@@ -453,8 +515,8 @@ mod tests {
         let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), true);
         // 新版本的系统提示词使用 Skill 工具说明替代验证工具
         assert!(prompt.contains("Skill 工具"));
-        assert!(prompt.contains("code-review"));
-        assert!(prompt.contains("fact-check"));
+        assert!(prompt.contains("code-verification"));
+        assert!(prompt.contains("conclusion-verification"));
     }
 
     #[test]
@@ -487,5 +549,132 @@ mod tests {
             "闲聊", "你好", &[], &UserProfile::default(), &[], &[],
         );
         assert!(!prompt.contains("文件修改记录"));
+    }
+
+    // ─── format_tool_trace 测试 ──────────────────────────────────
+
+    use brain_core::types::{ToolCallRecord, TurnRecord, TurnRole};
+
+    fn make_tool_call(
+        tool_name: &str,
+        input: serde_json::Value,
+        output: &str,
+        duration_ms: u64,
+        is_error: bool,
+    ) -> TurnRecord {
+        TurnRecord {
+            role: TurnRole::ToolCall,
+            content: String::new(),
+            tool_call: Some(ToolCallRecord {
+                tool_name: tool_name.into(),
+                input,
+                output: output.into(),
+                duration_ms,
+                is_error,
+            }),
+            timestamp: "2026-05-20T00:00:00Z".into(),
+        }
+    }
+
+    fn make_assistant(content: &str) -> TurnRecord {
+        TurnRecord {
+            role: TurnRole::Assistant,
+            content: content.into(),
+            tool_call: None,
+            timestamp: "2026-05-20T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn format_tool_trace_shows_all_tool_types() {
+        let turns = vec![
+            make_assistant("正在查询天气..."),
+            make_tool_call(
+                "bash",
+                serde_json::json!({"command": "curl -s wttr.in/Ningbo"}),
+                "Weather report: Ningbo...Partly Cloudy +24°C",
+                1249,
+                false,
+            ),
+            make_tool_call(
+                "bash",
+                serde_json::json!({"command": "curl -s \"wttr.in/Ningbo?format=...\""}),
+                "安全拒绝: Bash command contains potentially destructive pattern: \"format\"",
+                0,
+                true,
+            ),
+        ];
+
+        let trace = format_tool_trace(&turns);
+
+        // 标题存在
+        assert!(trace.contains("主脑操作轨迹"));
+        // bash 成功
+        assert!(trace.contains("[bash] → 成功(1249ms)"));
+        assert!(trace.contains("Weather report"));
+        // bash 失败
+        assert!(trace.contains("[bash] → 失败(0ms)"));
+        assert!(trace.contains("安全拒绝"));
+        // Assistant 角色不应出现
+        assert!(!trace.contains("正在查询天气"));
+    }
+
+    #[test]
+    fn format_tool_trace_empty_returns_empty() {
+        let trace = format_tool_trace(&[]);
+        assert!(trace.is_empty());
+    }
+
+    #[test]
+    fn format_tool_trace_only_assistant_returns_empty() {
+        let turns = vec![
+            make_assistant("hello"),
+            make_assistant("world"),
+        ];
+        let trace = format_tool_trace(&turns);
+        assert!(trace.is_empty());
+    }
+
+    #[test]
+    fn format_tool_trace_output_truncated() {
+        let long_output: String = "X".repeat(500);
+        let turns = vec![make_tool_call(
+            "grep",
+            serde_json::json!({"pattern": "TODO"}),
+            &long_output,
+            100,
+            false,
+        )];
+
+        let trace = format_tool_trace(&turns);
+
+        // 输出摘要应被截断到 300 字符 + "..."
+        assert!(trace.contains("输出摘要:"));
+        assert!(trace.contains("..."));
+        // 不应包含完整的 500 字符输出
+        assert!(!trace.contains(&long_output));
+    }
+
+    #[test]
+    fn format_tool_trace_edit_file_shows_old_new() {
+        let turns = vec![make_tool_call(
+            "edit_file",
+            serde_json::json!({
+                "file_path": "src/main.rs",
+                "old_string": "fn old()",
+                "new_string": "fn new() {}"
+            }),
+            "File edited successfully",
+            10,
+            false,
+        )];
+
+        let trace = format_tool_trace(&turns);
+
+        assert!(trace.contains("[edit_file] → 成功(10ms)"));
+        assert!(trace.contains("替换前: fn old()"));
+        assert!(trace.contains("替换后: fn new() {}"));
+        // 不应出现"输出摘要"
+        assert!(!trace.contains("输出摘要"));
     }
 }
