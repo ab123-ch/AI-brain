@@ -3,6 +3,7 @@ use std::sync::Arc;
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{EvalRequirement, EvolutionRule, PitfallRecord, ProgressEvent, ToolCall, TurnRecord, UserProfile};
 use brain_llm::{ChatMessage, ChatRequest, ContentBlock, LlmProvider, ToolChoice, ToolDefinition};
+use brain_plugin::SkillCatalog;
 use serde::{Deserialize, Serialize};
 
 use crate::checker;
@@ -248,6 +249,7 @@ async fn eval_tool_loop(
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
     skill_registry: &SkillRegistry,
+    external_catalog: Option<Arc<SkillCatalog>>,
     max_rounds: usize,
     progress_tx: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
 ) -> Result<String> {
@@ -293,14 +295,27 @@ async fn eval_tool_loop(
                     continue;
                 }
 
-                // Skill tool 特殊处理：从 registry 获取内容
+                // Skill tool 特殊处理：优先查统一 SkillCatalog，回退到内置 registry
                 if name == "Skill" {
                     let skill_name = input.get("command")
+                        .or_else(|| input.get("skill"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let content = skill_registry
-                        .get_skill_content(skill_name)
-                        .map_or_else(|| format!("Skill '{skill_name}' 不存在"), ToString::to_string);
+
+                    let content = if let Some(ref catalog) = external_catalog {
+                        match catalog.resolve(skill_name) {
+                            Some(meta) => catalog.load_content(meta)
+                                .unwrap_or_else(|_| format!("Skill '{}' 加载失败", skill_name)),
+                            None => {
+                                skill_registry.get_skill_content(skill_name)
+                                    .map_or_else(|| format!("Skill '{}' 不存在", skill_name), ToString::to_string)
+                            }
+                        }
+                    } else {
+                        skill_registry.get_skill_content(skill_name)
+                            .map_or_else(|| format!("Skill '{}' 不存在", skill_name), ToString::to_string)
+                    };
+
                     messages.push(ChatMessage::tool_result(&id, content, false));
                     continue;
                 }
@@ -389,6 +404,8 @@ pub struct EvalBrain {
     tool_executor: Option<Arc<dyn ToolExecutor>>,
     /// Skill 注册表（管理可用审查技能）
     skill_registry: SkillRegistry,
+    /// 统一 SkillCatalog（优先于 skill_registry）
+    skill_catalog: Option<Arc<SkillCatalog>>,
     progress_tx: Option<tokio::sync::mpsc::Sender<brain_core::types::ProgressEvent>>,
 }
 
@@ -400,6 +417,7 @@ impl EvalBrain {
             llm,
             tool_executor: None,
             skill_registry,
+            skill_catalog: None,
             progress_tx: None,
         }
     }
@@ -414,6 +432,7 @@ impl EvalBrain {
             llm,
             tool_executor: Some(tool_executor),
             skill_registry,
+            skill_catalog: None,
             progress_tx: None,
         }
     }
@@ -429,6 +448,11 @@ impl EvalBrain {
     /// 设置 skills 目录并加载
     pub fn load_skills_from_dir(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
         self.skill_registry.load_from_dir(dir)
+    }
+
+    /// 设置统一 SkillCatalog（优先于内置 skill_registry）
+    pub fn set_skill_catalog(&mut self, catalog: Arc<SkillCatalog>) {
+        self.skill_catalog = Some(catalog);
     }
 
     /// 获取 SkillRegistry 引用
@@ -492,6 +516,7 @@ impl EvalBrain {
                     messages,
                     tools,
                     &self.skill_registry,
+                    self.skill_catalog.clone(),
                     10,
                     self.progress_tx.as_ref(),
                 ).await?
@@ -1016,6 +1041,7 @@ mod tests {
             ],
             build_read_only_tool_definitions(),
             &SkillRegistry::new(),
+            None, // 无 external_catalog
             3, // 只测试 3 轮
             None, // 无 progress_tx
         )

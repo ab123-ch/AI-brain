@@ -280,6 +280,7 @@ version = "0.1.0"
 dependencies = [
  "brain-core",
  "brain-llm",
+ "brain-plugin",
  "chrono",
  "serde",
  "serde_json",

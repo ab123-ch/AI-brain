@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 brain-core = { path = "../brain-core" }
 brain-llm = { path = "../brain-llm" }
+brain-plugin = { path = "../brain-plugin" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
