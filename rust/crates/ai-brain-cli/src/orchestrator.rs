@@ -38,7 +38,10 @@ use brain_main::main_brain::MainBrain;
 use brain_master::MasterBrain;
 use brain_memory::analyzer::{AnalysisLlm, FourStepAnalyzer};
 use brain_memory::memory_brain::{MemoryBrain, MemoryBrainConfig};
+use brain_mcp::config::load_mcp_servers;
+use brain_mcp::McpClientPool;
 use brain_motor::motor_brain::{MotorBrain, MotorConfig};
+use brain_plugin::{PluginManager, SkillCatalog};
 use brain_reasoning::reasoning_brain::{ReasoningBrain, ReasoningConfig};
 use brain_sensory::llm::LlmProvider as SensoryLlmProvider;
 use brain_sensory::SensoryBrain;
@@ -236,6 +239,7 @@ impl Orchestrator {
         };
         // 加载评估脑内置 skills
         if let Some(ref mut eb) = eval_brain {
+            // TODO: Task 9 - EvalBrain.set_skill_catalog(skill_catalog.clone())
             let skills_dir = std::path::Path::new("rust/crates/brain-eval/skills");
             if let Err(e) = eb.load_skills_from_dir(skills_dir) {
                 tracing::warn!("加载评估脑 skills 失败: {e}");
@@ -1661,8 +1665,62 @@ fn create_v2_main_brain(
         }
     };
 
+    // === 插件系统初始化 ===
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let ai_brain_dir = std::path::PathBuf::from(&home).join(".ai-brain");
+
+    // 1. 加载插件管理器
+    let plugin_mgr = PluginManager::load(&ai_brain_dir.join("plugins"))
+        .map_err(|e| {
+            tracing::warn!("加载插件管理器失败: {e}");
+            e
+        })
+        .ok();
+
+    // 2. 扫描 Skill 目录
+    let mut skill_roots: Vec<std::path::PathBuf> = vec![];
+    skill_roots.push(
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(".ai-brain")
+            .join("skills"),
+    );
+    if let Some(ref mgr) = plugin_mgr {
+        skill_roots.extend(mgr.skill_roots());
+    }
+    skill_roots.push(ai_brain_dir.join("skills"));
+    skill_roots.push(
+        std::path::PathBuf::from(&home)
+            .join(".claude")
+            .join("skills"),
+    );
+    skill_roots.push(
+        std::path::PathBuf::from(&home)
+            .join(".codex")
+            .join("skills"),
+    );
+
+    let skill_catalog = SkillCatalog::scan_all(&skill_roots).unwrap_or_else(|e| {
+        tracing::warn!("扫描技能失败: {e}");
+        SkillCatalog { skills: vec![] }
+    });
+    let skill_catalog = Arc::new(skill_catalog);
+    tracing::info!("扫描到 {} 个技能", skill_catalog.skills.len());
+
+    // 3. 加载 MCP 配置
+    let mcp_config_path = ai_brain_dir.join("mcp").join("mcp-servers.json");
+    let mut mcp_configs = load_mcp_servers(&mcp_config_path).unwrap_or_default();
+    if let Some(ref mgr) = plugin_mgr {
+        for path in mgr.mcp_configs() {
+            mcp_configs.extend(load_mcp_servers(&path).unwrap_or_default());
+        }
+    }
+    tracing::info!("加载 {} 个 MCP 服务器配置", mcp_configs.len());
+
     let tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
-        crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch),
+        crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch)
+            .with_skill_catalog(skill_catalog.clone())
+            .with_mcp_pool(Arc::new(McpClientPool::new())),
     );
 
     let brain_config = BrainConfig::default();
