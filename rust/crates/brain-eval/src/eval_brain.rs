@@ -221,7 +221,7 @@ pub struct EvalIssue {
     pub suggestion: String,
 }
 
-/// 评估结果 — LLM 返回自然语言反馈，直接喂给主脑
+/// 评估结果 -- LLM 返回自然语言反馈，直接喂给主脑
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalResult {
     /// 是否通过（LLM 回复中包含"存在问题"则为 false）
@@ -240,7 +240,123 @@ impl EvalResult {
     }
 }
 
-/// v2 评估脑 — Skill 化版本
+/// 评估脑专用 tool_loop -- 与主脑架构一致，但只允许只读工具
+///
+/// LLM 自主决定调多少轮工具，直到不再调用工具或达到最大轮次。
+async fn eval_tool_loop(
+    llm: &dyn LlmProvider,
+    tool_executor: &dyn ToolExecutor,
+    messages: Vec<ChatMessage>,
+    tools: Vec<ToolDefinition>,
+    skill_registry: &SkillRegistry,
+    max_rounds: usize,
+) -> Result<String> {
+    let mut messages = messages;
+    for round in 0..max_rounds {
+        let request = ChatRequest {
+            model: None,
+            messages: messages.clone(),
+            max_tokens: Some(2048),
+            temperature: Some(0.1),
+            tools: Some(tools.clone()),
+            tool_choice: Some(ToolChoice::Auto),
+        };
+
+        let response = llm
+            .complete(request)
+            .await
+            .map_err(|e| EvalError::LlmError(e.to_string()))?;
+
+        // LLM 没有调用工具 -> 返回最终评估文本
+        if !response.has_tool_calls() {
+            return Ok(response.text());
+        }
+
+        tracing::info!("评估脑 tool_loop 第{round}轮: LLM 调用了 {} 个工具", response.tool_calls().len());
+        messages.push(ChatMessage::assistant_blocks(response.content.clone()));
+
+        // 执行工具调用
+        for tool_block in response.tool_calls() {
+            if let ContentBlock::ToolUse { id, name, input } = tool_block {
+                let id = id.clone();
+                let name = name.clone();
+                let input = input.clone();
+
+                // 安全校验：只允许只读工具
+                if !is_read_only_tool(&name) {
+                    tracing::warn!("评估脑工具安全拒绝: {name}");
+                    messages.push(ChatMessage::tool_result(
+                        &id,
+                        format!("工具 {name} 不可用：评估脑只允许只读工具"),
+                        true,
+                    ));
+                    continue;
+                }
+
+                // Skill tool 特殊处理：从 registry 获取内容
+                if name == "Skill" {
+                    let skill_name = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let content = skill_registry
+                        .get_skill_content(skill_name)
+                        .map_or_else(|| format!("Skill '{skill_name}' 不存在"), ToString::to_string);
+                    messages.push(ChatMessage::tool_result(&id, content, false));
+                    continue;
+                }
+
+                // bash 命令白名单检查
+                if name == "bash" {
+                    let cmd = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !is_read_only_bash_command(cmd) {
+                        tracing::warn!("评估脑 bash 命令安全拒绝: {cmd}");
+                        messages.push(ChatMessage::tool_result(
+                            &id,
+                            format!("命令 '{cmd}' 不在只读白名单中"),
+                            true,
+                        ));
+                        continue;
+                    }
+                }
+
+                // 通用工具执行
+                let tool_call = ToolCall {
+                    tool_name: name.clone(),
+                    input: input.clone(),
+                    validated: false,
+                    validation_id: None,
+                };
+
+                tracing::info!("评估脑验证工具: {name}");
+                let result = tool_executor.execute(&tool_call).await;
+
+                // 截断工具输出
+                let output = truncate_verification_output(&result.output, 5000);
+                messages.push(ChatMessage::tool_result(&id, output, result.is_error));
+            }
+        }
+    }
+
+    // 超过最大轮次 -> 强制无工具出结果
+    tracing::warn!("评估脑 tool_loop 达到最大轮次 {max_rounds}，强制出结果");
+    let request = ChatRequest {
+        model: None,
+        messages,
+        max_tokens: Some(2048),
+        temperature: Some(0.1),
+        tools: None,
+        tool_choice: None,
+    };
+    let response = llm
+        .complete(request)
+        .await
+        .map_err(|e| EvalError::LlmError(e.to_string()))?;
+    Ok(response.text())
+}
+
+/// v2 评估脑 -- Skill 化版本
 ///
 /// 主脑每次产生输出后自动触发评估。基于记忆脑的踩坑库 + 用户画像 + 自进化规则，
 /// 由 LLM 对主脑输出进行自然语言评估，结果直接作为反馈文本返回给主脑。
@@ -298,12 +414,10 @@ impl EvalBrain {
 
     /// 评估主脑输出（统一入口）
     ///
-    /// 流程：
-    /// 1. 无 tool_executor 或无文件变更 → 降级到纯文本评估
-    /// 2. Round 1: LLM 分析，可选调用只读工具
-    /// 3. 执行工具（只允许 read_only 白名单 + Skill/bash 特殊处理）
-    /// 4. Round 2: LLM 基于工具证据出最终评估
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    /// 统一架构：不再区分有/无文件变更两条路径。
+    /// - 有 tool_executor -> eval_tool_loop（LLM 可自主调工具，最多 max_rounds 轮）
+    /// - 无 tool_executor -> 单次 LLM 调用（降级）
+    #[allow(clippy::too_many_arguments)]
     pub async fn evaluate(
         &self,
         user_input: &str,
@@ -314,20 +428,6 @@ impl EvalBrain {
         rules: &[EvolutionRule],
         eval_requirements: &[EvalRequirement],
     ) -> Result<EvalResult> {
-        // 降级条件：无 tool_executor 或无文件变更
-        let file_changes = extractor::extract_file_changes(turns);
-        if self.tool_executor.is_none() || file_changes.is_empty() {
-            // 降级为纯文本评估时，直接构建消息并调用 LLM
-            return self.llm_evaluate_fallback(
-                user_input,
-                ai_output,
-                pitfalls,
-                user_profile,
-                rules,
-                eval_requirements,
-            ).await;
-        }
-
         if user_input.trim().is_empty() || ai_output.trim().is_empty() {
             return Err(EvalError::InvalidInput(
                 "user_input and ai_output must not be empty".into(),
@@ -337,22 +437,13 @@ impl EvalBrain {
         // 发送评估开始事件
         if let Some(tx) = &self.progress_tx {
             let _ = tx.try_send(ProgressEvent::EvaluationStart);
-            // 发送评估上下文事件
-            let ai_output_preview: String = ai_output.chars().take(200).collect();
-            let _ = tx.try_send(ProgressEvent::EvaluationContext {
-                user_input: user_input.to_string(),
-                ai_output_preview,
-                pitfalls_count: pitfalls.len(),
-                rules_count: rules.len(),
-                file_changes_count: file_changes.len(),
-            });
         }
 
-        let has_tools = self.tool_executor.is_some() && !file_changes.is_empty();
+        // 统一使用 with_tools=true 构建系统提示词
         let system_prompt = prompts::build_evaluation_system_prompt(
             eval_requirements,
             &self.skill_registry,
-            has_tools,
+            true,
         );
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
@@ -363,142 +454,49 @@ impl EvalBrain {
             turns,
         );
 
-        // ── Round 1: 带工具定义，LLM 可选调用工具 ──
-        let read_only_tools = build_read_only_tool_definitions();
         let messages = vec![
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&user_prompt),
         ];
-        let request = ChatRequest {
-            model: None,
-            messages,
-            max_tokens: Some(2048),
-            temperature: Some(0.1),
-            tools: Some(read_only_tools),
-            tool_choice: Some(ToolChoice::Auto),
-        };
 
-        let response = self
-            .llm
-            .complete(request)
-            .await
-            .map_err(|e| EvalError::LlmError(e.to_string()))?;
-
-        // LLM 没有调用工具 → 直接解析为评估结果
-        if !response.has_tool_calls() {
-            let feedback = response.text();
-            let passed = !feedback.contains("存在问题");
-            self.emit_result(passed, &feedback);
-            return Ok(EvalResult {
-                passed,
-                feedback: feedback.trim().to_string(),
-            });
-        }
-
-        // ── 执行验证工具 ──
-        let tool_executor = self.tool_executor.as_ref().unwrap();
-        let mut messages = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&user_prompt),
-            ChatMessage::assistant_blocks(response.content.clone()),
-        ];
-
-        for tool_block in response.tool_calls() {
-            if let ContentBlock::ToolUse {
-                id,
-                name,
-                input,
-            } = tool_block
-            {
-                // 安全校验：只允许只读工具
-                if !is_read_only_tool(name) {
-                    tracing::warn!("评估脑工具安全拒绝: {name}");
-                    messages.push(ChatMessage::tool_result(
-                        id,
-                        format!("工具 {name} 不可用：评估脑只允许只读工具"),
-                        true,
-                    ));
-                    continue;
-                }
-
-                // Skill tool 特殊处理：从 registry 获取内容
-                if name == "Skill" {
-                    let skill_name = input.get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    // 发送 Skill 调用事件
-                    if let Some(tx) = &self.progress_tx {
-                        let _ = tx.try_send(ProgressEvent::EvaluationSkillCalled {
-                            skill_name: skill_name.to_string(),
-                        });
-                    }
-                    let content = self.skill_registry
-                        .get_skill_content(skill_name)
-                        .map_or_else(|| format!("Skill '{skill_name}' 不存在"), std::string::ToString::to_string);
-                    messages.push(ChatMessage::tool_result(id, content, false));
-                    continue;
-                }
-
-                // bash 命令白名单检查
-                if name == "bash" {
-                    let cmd = input.get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !is_read_only_bash_command(cmd) {
-                        tracing::warn!("评估脑 bash 命令安全拒绝: {cmd}");
-                        messages.push(ChatMessage::tool_result(
-                            id,
-                            format!("命令 '{cmd}' 不在只读白名单中"),
-                            true,
-                        ));
-                        continue;
-                    }
-                }
-
-                let tool_call = ToolCall {
-                    tool_name: name.clone(),
-                    input: input.clone(),
-                    validated: false,
-                    validation_id: None,
-                };
-
-                tracing::info!("评估脑验证工具: {name}");
-                let result = tool_executor.execute(&tool_call).await;
-
-                // 截断工具输出（评估脑不需要超大输出）
-                let output = truncate_verification_output(&result.output, 5000);
-
-                messages.push(ChatMessage::tool_result(id, output, result.is_error));
+        let final_text = match &self.tool_executor {
+            Some(executor) => {
+                let tools = build_read_only_tool_definitions();
+                eval_tool_loop(
+                    self.llm.as_ref(),
+                    executor.as_ref(),
+                    messages,
+                    tools,
+                    &self.skill_registry,
+                    10,
+                ).await?
             }
-        }
-
-        // ── Round 2: 带工具证据，无工具定义，出最终评估 ──
-        let request = ChatRequest {
-            model: None,
-            messages,
-            max_tokens: Some(2048),
-            temperature: Some(0.1),
-            tools: None,
-            tool_choice: None,
+            None => {
+                // 无 tool_executor -> 单次 LLM 调用（降级）
+                let request = ChatRequest {
+                    model: None,
+                    messages,
+                    max_tokens: Some(2048),
+                    temperature: Some(0.1),
+                    tools: None,
+                    tool_choice: None,
+                };
+                let response = self.llm.complete(request).await
+                    .map_err(|e| EvalError::LlmError(e.to_string()))?;
+                response.text()
+            }
         };
 
-        let response = self
-            .llm
-            .complete(request)
-            .await
-            .map_err(|e| EvalError::LlmError(e.to_string()))?;
-
-        let feedback = response.text();
-        if feedback.trim().is_empty() {
+        if final_text.trim().is_empty() {
             self.emit_result(true, "评估结果-正常");
             return Ok(EvalResult::passed());
         }
 
-        let passed = !feedback.contains("存在问题");
-        self.emit_result(passed, &feedback);
+        let passed = !final_text.contains("存在问题");
+        self.emit_result(passed, &final_text);
         Ok(EvalResult {
             passed,
-            feedback: feedback.trim().to_string(),
+            feedback: final_text.trim().to_string(),
         })
     }
 
@@ -537,80 +535,6 @@ impl EvalBrain {
 
         issues
     }
-
-    /// 纯文本评估降级路径（无工具能力）
-    ///
-    /// 当无 tool_executor 或无文件变更时使用此方法
-    async fn llm_evaluate_fallback(
-        &self,
-        user_input: &str,
-        ai_output: &str,
-        pitfalls: &[PitfallRecord],
-        user_profile: &UserProfile,
-        rules: &[EvolutionRule],
-        eval_requirements: &[EvalRequirement],
-    ) -> Result<EvalResult> {
-        if user_input.trim().is_empty() || ai_output.trim().is_empty() {
-            return Err(EvalError::InvalidInput(
-                "user_input and ai_output must not be empty".into(),
-            ));
-        }
-
-        // 发送评估开始事件
-        if let Some(tx) = &self.progress_tx {
-            let _ = tx.try_send(ProgressEvent::EvaluationStart);
-            // 发送评估上下文事件（fallback 路径无文件变更）
-            let ai_output_preview: String = ai_output.chars().take(200).collect();
-            let _ = tx.try_send(ProgressEvent::EvaluationContext {
-                user_input: user_input.to_string(),
-                ai_output_preview,
-                pitfalls_count: pitfalls.len(),
-                rules_count: rules.len(),
-                file_changes_count: 0,
-            });
-        }
-
-        let system_prompt = prompts::build_evaluation_system_prompt(eval_requirements, &self.skill_registry, false);
-        let user_prompt = prompts::build_evaluation_user_prompt(
-            user_input,
-            ai_output,
-            pitfalls,
-            user_profile,
-            rules,
-            &[],
-        );
-
-        let request = ChatRequest {
-            model: None,
-            messages: vec![
-                ChatMessage::system(&system_prompt),
-                ChatMessage::user(&user_prompt),
-            ],
-            max_tokens: Some(2048),
-            temperature: Some(0.1),
-            tools: None,
-            tool_choice: None,
-        };
-
-        let response = self
-            .llm
-            .complete(request)
-            .await
-            .map_err(|e| EvalError::LlmError(e.to_string()))?;
-
-        let feedback = response.text();
-        if feedback.trim().is_empty() {
-            self.emit_result(true, "评估结果-正常");
-            return Ok(EvalResult::passed());
-        }
-
-        let passed = !feedback.contains("存在问题");
-        self.emit_result(passed, &feedback);
-        Ok(EvalResult {
-            passed,
-            feedback: feedback.trim().to_string(),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -641,7 +565,7 @@ mod tests {
         assert_eq!(format!("{}", IssueCategory::FactError), "FactError");
     }
 
-    // ── Mock LLM Provider for async integration tests ──
+    // -- Mock LLM Provider for async integration tests --
 
     struct MockLlmProvider {
         response: String,
@@ -676,7 +600,7 @@ mod tests {
         }
     }
 
-    // ── Async integration tests ──
+    // -- Async integration tests --
 
     #[tokio::test]
     async fn evaluate_normal_response_passes() {
@@ -807,7 +731,7 @@ mod tests {
         assert!(names.contains(&"bash"));
     }
 
-    // ── evaluate_with_verification tests ──
+    // -- evaluate_with_verification tests --
 
     use brain_core::types::{ToolCallRecord, TurnRole};
 
@@ -831,8 +755,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_no_changes_falls_back() {
-        // 无文件变更时降级到纯文本评估
+    async fn evaluate_with_no_file_changes_still_works() {
+        // 无文件变更时，统一路径也能正常工作
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let executor = Arc::new(brain_core::tool_executor::StubToolExecutor::new());
         let brain = EvalBrain::with_verification(llm, executor);
@@ -853,30 +777,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_skips_tools_when_no_changes() {
-        // 有 tool_executor 但 turns 为空 → 降级
-        let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
-        let executor = Arc::new(brain_core::tool_executor::StubToolExecutor::new());
-        let brain = EvalBrain::with_verification(llm, executor);
-
-        let result = brain
-            .evaluate(
-                "闲聊",
-                "你好",
-                &[], // turns 为空
-                &[], // pitfalls
-                &UserProfile::default(),
-                &[], // rules
-                &[], // eval_requirements
-            )
-            .await
-            .unwrap();
-        assert!(result.passed);
-    }
-
-    #[tokio::test]
-    async fn evaluate_calls_tools_two_rounds() {
-        // LLM Round 1 调用 read_file → Round 2 出评估
+    async fn evaluate_tool_loop_multiple_rounds() {
+        // LLM 第1轮调用 read_file -> 第2轮出评估（tool_loop 多轮）
         use std::sync::atomic::{AtomicUsize, Ordering};
         let call_count = Arc::new(AtomicUsize::new(0));
         let count_clone = call_count.clone();
@@ -899,7 +801,7 @@ mod tests {
                 Box::pin(async move {
                     let n = count.fetch_add(1, Ordering::SeqCst);
                     if n == 0 {
-                        // Round 1: 返回工具调用
+                        // 第1轮: 返回工具调用
                         Ok(ChatResponse {
                             content: vec![
                                 ContentBlock::text("需要验证文件内容"),
@@ -914,7 +816,7 @@ mod tests {
                             finish_reason: Some(brain_llm::FinishReason::ToolUse),
                         })
                     } else {
-                        // Round 2: 返回评估结果
+                        // 第2轮: 返回评估结果
                         Ok(ChatResponse {
                             content: vec![ContentBlock::text("评估结果-正常")],
                             model: "mock".into(),
@@ -953,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_rejects_write_tools() {
-        // LLM 尝试调用 write_file → 安全拒绝 → Round 2 仍能出评估
+        // LLM 尝试调用 write_file -> 安全拒绝 -> 下一轮仍能出评估
         use std::sync::atomic::{AtomicUsize, Ordering};
         let call_count = Arc::new(AtomicUsize::new(0));
         let count_clone = call_count.clone();
@@ -1020,6 +922,83 @@ mod tests {
             .await
             .unwrap();
         assert!(result.passed);
+    }
+
+    #[tokio::test]
+    async fn eval_tool_loop_max_rounds_forced_result() {
+        // LLM 每轮都调工具，达到最大轮次后强制出结果
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = call_count.clone();
+
+        struct AlwaysToolLlm {
+            call_count: Arc<AtomicUsize>,
+        }
+
+        impl LlmProvider for AlwaysToolLlm {
+            fn model(&self) -> &'static str {
+                "mock"
+            }
+
+            fn complete(
+                &self,
+                request: ChatRequest,
+            ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+                let count = self.call_count.clone();
+                let has_tools = request.tools.is_some();
+                Box::pin(async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    if has_tools {
+                        // 有工具时总是调用工具
+                        Ok(ChatResponse {
+                            content: vec![
+                                ContentBlock::text(format!("第{n}轮验证")),
+                                ContentBlock::ToolUse {
+                                    id: format!("tu_{n}"),
+                                    name: "read_file".into(),
+                                    input: serde_json::json!({"file_path": format!("/tmp/file_{n}.rs")}),
+                                },
+                            ],
+                            model: "mock".into(),
+                            usage: brain_llm::TokenUsage::default(),
+                            finish_reason: Some(brain_llm::FinishReason::ToolUse),
+                        })
+                    } else {
+                        // 无工具时返回最终评估
+                        Ok(ChatResponse {
+                            content: vec![ContentBlock::text("评估结果-正常")],
+                            model: "mock".into(),
+                            usage: brain_llm::TokenUsage::default(),
+                            finish_reason: Some(brain_llm::FinishReason::EndTurn),
+                        })
+                    }
+                })
+            }
+        }
+
+        // 直接调用 eval_tool_loop 测试最大轮次
+        let llm = Arc::new(AlwaysToolLlm {
+            call_count: count_clone,
+        });
+        let executor = Arc::new(brain_core::tool_executor::StubToolExecutor::new());
+
+        let result = eval_tool_loop(
+            llm.as_ref(),
+            executor.as_ref(),
+            vec![
+                ChatMessage::system("test"),
+                ChatMessage::user("test"),
+            ],
+            build_read_only_tool_definitions(),
+            &SkillRegistry::new(),
+            3, // 只测试 3 轮
+        )
+        .await
+        .unwrap();
+
+        assert!(result.contains("评估结果-正常"));
+        // 3轮工具 + 1轮强制 = 4次 LLM 调用
+        assert_eq!(call_count.load(Ordering::SeqCst), 4);
     }
 
     #[test]
