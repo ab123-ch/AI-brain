@@ -107,6 +107,26 @@ impl SessionLogger {
                 let ts = Self::timestamp();
                 self.log_raw(&format!("[{ts}] CONNECT | {name} | {model}\n"));
             }
+            ProgressEvent::EvaluationStart => {
+                let ts = Self::timestamp();
+                self.log_raw(&format!("[{ts}] EVAL_START | 评估脑\n"));
+            }
+            ProgressEvent::EvaluationResult { passed, feedback } => {
+                let ts = Self::timestamp();
+                let status = if *passed { "PASS" } else { "FAIL" };
+                let preview: String = feedback.chars().take(500).collect();
+                self.log_raw(&format!(
+                    "[{ts}] EVAL_RESULT | {status}\n  反馈: {preview}\n"
+                ));
+            }
+            ProgressEvent::Evaluating => {
+                let ts = Self::timestamp();
+                self.log_raw(&format!("[{ts}] EVALUATING | 评估脑处理中...\n"));
+            }
+            ProgressEvent::AskUser { question, .. } => {
+                let ts = Self::timestamp();
+                self.log_raw(&format!("[{ts}] ASK_USER | {question}\n"));
+            }
             _ => {}
         }
     }

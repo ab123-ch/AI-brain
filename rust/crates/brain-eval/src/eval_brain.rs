@@ -249,6 +249,7 @@ async fn eval_tool_loop(
     tools: Vec<ToolDefinition>,
     skill_registry: &SkillRegistry,
     max_rounds: usize,
+    progress_tx: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
 ) -> Result<String> {
     let mut messages = messages;
     for round in 0..max_rounds {
@@ -329,11 +330,35 @@ async fn eval_tool_loop(
                 };
 
                 tracing::info!("评估脑验证工具: {name}");
+
+                // 发送 ToolStart 事件
+                let input_str = serde_json::to_string(&input).unwrap_or_default();
+                if let Some(tx) = progress_tx {
+                    let _ = tx.try_send(ProgressEvent::ToolStart {
+                        brain: "eval".into(),
+                        tool_name: name.clone(),
+                        input: input_str,
+                    });
+                }
+
+                let start = std::time::Instant::now();
                 let result = tool_executor.execute(&tool_call).await;
+                let duration_ms = start.elapsed().as_millis() as u64;
 
                 // 截断工具输出
                 let output = truncate_verification_output(&result.output, 5000);
-                messages.push(ChatMessage::tool_result(&id, output, result.is_error));
+                messages.push(ChatMessage::tool_result(&id, output.clone(), result.is_error));
+
+                // 发送 ToolDone 事件
+                if let Some(tx) = progress_tx {
+                    let _ = tx.try_send(ProgressEvent::ToolDone {
+                        brain: "eval".into(),
+                        tool_name: name.clone(),
+                        duration_ms,
+                        output_preview: result.output.chars().take(500).collect(),
+                        is_error: result.is_error,
+                    });
+                }
             }
         }
     }
@@ -468,6 +493,7 @@ impl EvalBrain {
                     tools,
                     &self.skill_registry,
                     10,
+                    self.progress_tx.as_ref(),
                 ).await?
             }
             None => {
@@ -991,6 +1017,7 @@ mod tests {
             build_read_only_tool_definitions(),
             &SkillRegistry::new(),
             3, // 只测试 3 轮
+            None, // 无 progress_tx
         )
         .await
         .unwrap();
