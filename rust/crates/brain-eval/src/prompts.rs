@@ -3,7 +3,6 @@ use std::fmt::Write;
 use brain_core::types::{EvalRequirement, EvolutionRule, PitfallCategory, PitfallRecord, TurnRecord, TurnRole, UserProfile};
 use chrono::{Datelike, Utc};
 
-use crate::extractor::{FileChange, FileChangeType};
 use crate::skills::SkillRegistry;
 
 /// 构建运行环境信息段（注入 system prompt）
@@ -240,36 +239,6 @@ pub fn build_evaluation_user_prompt(
     prompt.push_str("请根据以上信息评估主脑输出。没有问题输出「评估结果-正常」，有问题输出「评估结果-存在问题。具体问题：...」");
 
     prompt
-}
-
-/// 将文件变更列表格式化为 prompt 文本
-#[allow(dead_code)] // Task 4 将清理
-pub fn format_file_changes(changes: &[FileChange]) -> String {
-    if changes.is_empty() {
-        return String::new();
-    }
-
-    let mut s = String::from("## 文件修改记录（主脑本轮操作）\n\n");
-    for (i, c) in changes.iter().enumerate() {
-        match c.change_type {
-            FileChangeType::Edit => {
-                let _ = writeln!(s, "{}. 编辑 `{}`", i + 1, c.file_path);
-                if let Some(ref old) = c.old_content {
-                    let truncated: String = old.chars().take(500).collect();
-                    let _ = writeln!(s, "   替换前: {truncated}");
-                }
-                if let Some(ref new) = c.new_content {
-                    let truncated: String = new.chars().take(500).collect();
-                    let _ = writeln!(s, "   替换后: {truncated}");
-                }
-            }
-            FileChangeType::Write => {
-                let _ = writeln!(s, "{}. 写入 `{}`（新建或覆盖）", i + 1, c.file_path);
-            }
-        }
-    }
-    s.push('\n');
-    s
 }
 
 /// 将主脑所有工具调用格式化为摘要文本，注入评估脑 prompt

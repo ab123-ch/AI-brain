@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::checker;
 use crate::error::{EvalError, Result};
-use crate::extractor;
 use crate::prompts;
 use crate::skills::SkillRegistry;
 
