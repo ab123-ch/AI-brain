@@ -494,6 +494,11 @@ async fn execute_tool_calls(
                             .filter_map(|v| v.as_str().map(String::from))
                             .collect()
                     });
+                let multi_select = input
+                    .get("multiSelect")
+                    .or_else(|| input.get("multi_select"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
@@ -502,6 +507,7 @@ async fn execute_tool_calls(
                     ProgressEvent::AskUser {
                         question: question.clone(),
                         options: options.clone(),
+                        multi_select,
                         response_tx: UserResponseSender(response_tx),
                     },
                 )

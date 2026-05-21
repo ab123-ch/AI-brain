@@ -6,6 +6,7 @@
 //! - `e` 键只在无文本输入时生效（通过 Ctrl+E 触发展开）
 //! - finish_query 不阻塞事件循环
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,14 +29,18 @@ use super::completion::EvolutionCompleter;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⼾", "⼿", "⾀", "⾁", "⾂", "⾃"];
 const COLLAPSE_MAX_CHARS: usize = 80;
 
-/// AskUserQuestion 的选择弹框状态
+/// AskUserQuestion 的选择状态（底部内联面板）
 struct SelectionState {
     /// 问题文本
     question: String,
     /// 选项列表
     options: Vec<String>,
-    /// 当前选中的索引
-    selected_index: usize,
+    /// 光标位置（当前高亮的索引）
+    cursor_index: usize,
+    /// 多选模式下已选中的索引集合
+    selected_indices: HashSet<usize>,
+    /// 是否允许多选
+    multi_select: bool,
 }
 
 pub struct App {
@@ -238,11 +243,16 @@ impl App {
         self.render_output(f, chunks[0]);
         self.status.render(f, chunks[1]);
 
-        // 选择弹框激活时，隐藏输入区，显示提示
-        if self.selection_state.is_some() {
+        // 选择面板激活时，隐藏输入区，显示提示
+        if let Some(ref sel) = self.selection_state {
             // 在输入区位置渲染提示
+            let hint_text = if sel.multi_select {
+                "  ↑↓ 移动 · 空格选择/取消 · Enter 确认 · Esc 取消 · 直接输入自定义回答"
+            } else {
+                "  ↑↓ 选择 · Enter 确认 · Esc 取消 · 直接输入自定义回答"
+            };
             let hint = Paragraph::new(Line::from(Span::styled(
-                "  ↑↓ 选择 · Enter 确认 · Esc 取消 · 直接输入自定义回答",
+                hint_text,
                 Style::default().fg(Color::Cyan),
             )));
             f.render_widget(hint, chunks[2]);
@@ -250,8 +260,8 @@ impl App {
             f.render_widget(&self.input.textarea, chunks[2]);
         }
 
-        // 渲染选择弹框 overlay（在输出区域上方）
-        self.render_selection_popup(f, chunks[0]);
+        // 渲染选择面板（输出区域底部的内联面板，非浮动弹框）
+        self.render_selection_block(f, chunks[0]);
     }
 
 
@@ -420,21 +430,28 @@ impl App {
         }
     }
 
-    /// 渲染 AskUserQuestion 选择弹框 overlay
-    fn render_selection_popup(&self, f: &mut ratatui::Frame, area: Rect) {
+    /// 渲染 AskUserQuestion 选择面板（输出区域底部的内联面板，非浮动弹框）
+    fn render_selection_block(&self, f: &mut ratatui::Frame, area: Rect) {
         let sel = match self.selection_state {
             Some(ref s) => s,
             None => return,
         };
 
-        // 弹框尺寸：宽度 60%，高度 = 选项数 + 标题行 + 提示行 + 边框
-        let inner_height = sel.options.len() as u16 + 4; // 4 = 标题(1) + 提示(1) + 边框上下(2)
-        let popup_area = centered_rect(60, inner_height, area);
+        // 面板高度：标题(1) + 选项(N) + 提示(1) + 边框(2)
+        let inner_height = sel.options.len() as u16 + 4;
+        // 面板锚定在输出区域底部
+        let block_height = inner_height.min(area.height);
+        let block_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(block_height),
+            width: area.width,
+            height: block_height,
+        };
 
-        // 清除弹框区域底层内容
-        f.render_widget(ratatui::widgets::Clear, popup_area);
+        // 清除面板区域底层内容
+        f.render_widget(ratatui::widgets::Clear, block_area);
 
-        // 弹框边框（问题作为标题）
+        // 边框（问题作为标题）
         let block = ratatui::widgets::Block::default()
             .title(ratatui::text::Span::styled(
                 format!(" {} ", &sel.question),
@@ -447,24 +464,37 @@ impl App {
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan));
 
-        // 选项列表
+        // 构建选项列表
         let items: Vec<ratatui::widgets::ListItem> = sel
             .options
             .iter()
             .enumerate()
             .map(|(i, opt)| {
-                let style = if i == sel.selected_index {
+                let is_cursor = i == sel.cursor_index;
+                let is_selected = sel.selected_indices.contains(&i);
+                // 样式：光标行高亮，已选项标记
+                let style = if is_cursor {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
+                } else if is_selected {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
-                let prefix = if i == sel.selected_index {
-                    "▶ "
+                // 前缀：光标用 ▶，已选用 ✓，多选框用 ◻/◼
+                let prefix = if sel.multi_select {
+                    let check = if is_selected { "◼" } else { "◻" };
+                    if is_cursor {
+                        format!("▶ {check} ")
+                    } else {
+                        format!("  {check} ")
+                    }
+                } else if is_cursor {
+                    "▶ ".to_string()
                 } else {
-                    "  "
+                    "  ".to_string()
                 };
                 ratatui::widgets::ListItem::new(Line::from(Span::styled(
                     format!("{prefix}{opt}"),
@@ -474,23 +504,7 @@ impl App {
             .collect();
 
         let list = ratatui::widgets::List::new(items).block(block);
-        f.render_widget(list, popup_area);
-
-        // 底部提示（弹框下方）
-        let hint_y = popup_area.y + popup_area.height;
-        if hint_y < area.y + area.height {
-            let hint_area = Rect {
-                x: popup_area.x,
-                y: hint_y,
-                width: popup_area.width,
-                height: 1,
-            };
-            let hint = Paragraph::new(Line::from(Span::styled(
-                " ↑↓ 选择 · Enter 确认 · Esc 取消 · 输入自定义回答 ",
-                Style::default().fg(Color::DarkGray),
-            )));
-            f.render_widget(hint, hint_area);
-        }
+        f.render_widget(list, block_area);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -735,36 +749,79 @@ impl App {
         let now = Instant::now();
         self.last_event_time = now;
 
-        // ── 选择弹框优先拦截 ──
+        // ── 选择面板优先拦截 ──
         if self.selection_state.is_some() {
             match (key.modifiers, key.code) {
-                // 方向键上：选择前一项
+                // 方向键上：移动光标到前一项
                 (KeyModifiers::NONE, KeyCode::Up) => {
                     if let Some(ref mut sel) = self.selection_state {
-                        sel.selected_index = sel.selected_index.saturating_sub(1);
+                        sel.cursor_index = sel.cursor_index.saturating_sub(1);
                     }
                     return true;
                 }
-                // 方向键下：选择后一项
+                // 方向键下：移动光标到后一项
                 (KeyModifiers::NONE, KeyCode::Down) => {
                     if let Some(ref mut sel) = self.selection_state {
-                        sel.selected_index =
-                            (sel.selected_index + 1).min(sel.options.len().saturating_sub(1));
+                        sel.cursor_index =
+                            (sel.cursor_index + 1).min(sel.options.len().saturating_sub(1));
+                    }
+                    return true;
+                }
+                // 空格：多选模式下切换选中/取消；单选模式下等同 Enter
+                (KeyModifiers::NONE, KeyCode::Char(' ')) => {
+                    if let Some(ref mut sel) = self.selection_state {
+                        if sel.multi_select {
+                            if sel.selected_indices.contains(&sel.cursor_index) {
+                                sel.selected_indices.remove(&sel.cursor_index);
+                            } else {
+                                sel.selected_indices.insert(sel.cursor_index);
+                            }
+                        } else {
+                            // 单选模式下，空格等同 Enter
+                            let sel_state = self.selection_state.take().unwrap();
+                            let answer =
+                                sel_state.options[sel_state.cursor_index].clone();
+                            self.output
+                                .push_system(&format!("   ✓ 已选择: {answer}"));
+                            if let Some(tx) = self.pending_ask_response.take() {
+                                let _ = tx.send(answer);
+                            }
+                        }
                     }
                     return true;
                 }
                 // Enter：确认选择
                 (KeyModifiers::NONE, KeyCode::Enter) => {
                     if let Some(sel) = self.selection_state.take() {
-                        let answer = sel.options[sel.selected_index].clone();
-                        self.output.push_system(&format!("   ✓ 已选择: {answer}"));
-                        if let Some(tx) = self.pending_ask_response.take() {
-                            let _ = tx.send(answer);
+                        if sel.multi_select {
+                            // 多选模式：如果没选任何项，自动选中光标所在项
+                            let indices = if sel.selected_indices.is_empty() {
+                                std::iter::once(sel.cursor_index).collect()
+                            } else {
+                                sel.selected_indices
+                            };
+                            let answers: Vec<String> = indices
+                                .iter()
+                                .filter_map(|&i| sel.options.get(i).cloned())
+                                .collect();
+                            let answer = answers.join(", ");
+                            self.output
+                                .push_system(&format!("   ✓ 已选择: {answer}"));
+                            if let Some(tx) = self.pending_ask_response.take() {
+                                let _ = tx.send(answer);
+                            }
+                        } else {
+                            let answer = sel.options[sel.cursor_index].clone();
+                            self.output
+                                .push_system(&format!("   ✓ 已选择: {answer}"));
+                            if let Some(tx) = self.pending_ask_response.take() {
+                                let _ = tx.send(answer);
+                            }
                         }
                     }
                     return true;
                 }
-                // Esc：取消选择弹框，降级为自由输入
+                // Esc：取消选择面板，降级为自由输入
                 (_, KeyCode::Esc) => {
                     self.selection_state = None;
                     self.output.push_system("   选择已取消，请直接输入回答:");
@@ -923,6 +980,7 @@ impl App {
                         if let ProgressEvent::AskUser {
                             question,
                             options,
+                            multi_select,
                             response_tx,
                         } = event
                         {
@@ -934,6 +992,7 @@ impl App {
                                 input: serde_json::to_string(&serde_json::json!({
                                     "question": &question,
                                     "options": &options,
+                                    "multi_select": multi_select,
                                 })).unwrap_or_default(),
                             });
                             // 显示问题文本
@@ -941,11 +1000,13 @@ impl App {
 
                             if let Some(opts) = options {
                                 if !opts.is_empty() {
-                                    // 有选项时激活选择弹框
+                                    // 有选项时激活选择面板
                                     self.selection_state = Some(SelectionState {
                                         question,
                                         options: opts,
-                                        selected_index: 0,
+                                        cursor_index: 0,
+                                        selected_indices: HashSet::new(),
+                                        multi_select,
                                     });
                                 } else {
                                     // 空选项列表，等用户自由输入
@@ -1709,19 +1770,6 @@ fn collect_link(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String
             _ => {}
         }
     }
-}
-
-/// 计算居中弹框的区域
-fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
-    let popup_width = r.width * percent_x / 100;
-    let x = r.x + r.width.saturating_sub(popup_width) / 2;
-    let y = r.y + r.height.saturating_sub(height) / 2;
-    Rect::new(
-        x,
-        y,
-        popup_width.min(r.width),
-        height.min(r.height),
-    )
 }
 
 #[cfg(test)]

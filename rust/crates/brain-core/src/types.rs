@@ -782,6 +782,8 @@ pub enum ProgressEvent {
     AskUser {
         question: String,
         options: Option<Vec<String>>,
+        /// 是否允许多选
+        multi_select: bool,
         response_tx: UserResponseSender,
     },
     Done,
