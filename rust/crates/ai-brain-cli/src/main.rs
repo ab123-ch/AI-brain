@@ -189,7 +189,7 @@ async fn run_command(cli: Cli) {
                 println!("\n=== 第 {} 轮 ===", i + 1);
                 println!("输入: {query}");
 
-                let (rx, handle) = Arc::clone(&orch).query_streaming(query);
+                let (rx, handle, _cancel) = Arc::clone(&orch).query_streaming(query);
                 let mut rx = rx;
 
                 // 在后台收集进度事件

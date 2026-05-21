@@ -49,6 +49,8 @@ pub struct App {
     progress_rx: Option<tokio::sync::mpsc::Receiver<ProgressEvent>>,
     query_handle:
         Option<tokio::task::JoinHandle<Result<brain_core::types::MainBrainOutput, String>>>,
+    /// 协作取消令牌：调用 cancel() 让 tool_loop 优雅退出，已执行的工具调用结果不丢失
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// Done 事件已收到，等待 query_handle 完成
     done_received: bool,
     /// 待发送消息队列（busy 时 Enter 提交的消息排队等处理）
@@ -101,6 +103,7 @@ impl App {
             orch,
             progress_rx: None,
             query_handle: None,
+            cancel_token: None,
             done_received: false,
             pending_queue: Vec::new(),
             last_event_time: Instant::now(),
@@ -889,9 +892,10 @@ impl App {
 
     /// 发起一次查询
     fn start_query(&mut self, text: &str) {
-        let (rx, handle) = Arc::clone(&self.orch).query_streaming(text);
+        let (rx, handle, cancel) = Arc::clone(&self.orch).query_streaming(text);
         self.progress_rx = Some(rx);
         self.query_handle = Some(handle);
+        self.cancel_token = Some(cancel);
         self.is_busy = true;
         let status = self.orch.status_structured();
         self.status.busy = true;
@@ -1100,15 +1104,22 @@ impl App {
     }
 
     fn cancel_query(&mut self) {
-        if let Some(handle) = self.query_handle.take() {
-            handle.abort();
+        // 协作取消：通知 tool_loop 停止（而非直接 abort）
+        // tool_loop 检测到取消信号后会返回已执行的部分结果，
+        // process_input 会将已执行的工具调用写入历史，避免信息丢失。
+        if let Some(cancel) = self.cancel_token.take() {
+            cancel.cancel();
+            tracing::info!("已发送协作取消信号，tool_loop 将在下一轮 LLM 调用前退出");
         }
+        // 不 abort task — 让它自然完成，process_input 内部会写回已执行结果
+        // JoinHandle drop 时自动 detach
+        self.query_handle = None;
         self.progress_rx = None;
         self.done_received = false;
         self.is_busy = false;
         self.status.busy = false;
         self.pending_queue.clear();
-        self.output.push_system("查询已取消");
+        self.output.push_system("查询已取消（已执行的工具调用已保存）");
     }
 
     fn handle_ctrl_c(&mut self) {

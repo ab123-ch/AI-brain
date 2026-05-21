@@ -27,6 +27,7 @@ brain-hooks = { path = "../brain-hooks" }
 brain-dispatch = { path = "../brain-dispatch" }
 
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-std", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 crossterm = { version = "0.28", features = ["event-stream"] }

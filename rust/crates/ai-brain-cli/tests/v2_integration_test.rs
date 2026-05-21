@@ -31,7 +31,7 @@ async fn main() {
         println!("=== 第 {} 轮 [{}] ===", i + 1, label);
         println!("输入: {query}");
 
-        let (mut rx, handle) = Arc::clone(&orch).query_streaming(query);
+        let (mut rx, handle, _cancel) = Arc::clone(&orch).query_streaming(query);
 
         // 收集进度事件
         let mut events = Vec::new();

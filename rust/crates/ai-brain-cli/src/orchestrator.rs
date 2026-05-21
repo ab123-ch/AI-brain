@@ -646,12 +646,14 @@ impl Orchestrator {
     /// 流式查询（TUI 用）
     ///
     /// 优先走 v2 MainBrain（带 tool_loop + 工具），不可用时回退 v1。
+    /// 返回值中包含 CancellationToken，调用者可通过 cancel() 协作取消 tool_loop。
     pub fn query_streaming(
         self: &Arc<Self>,
         input: &str,
     ) -> (
         tokio::sync::mpsc::Receiver<ProgressEvent>,
         tokio::task::JoinHandle<Result<MainBrainOutput, String>>,
+        tokio_util::sync::CancellationToken,
     ) {
         self.query_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -659,6 +661,8 @@ impl Orchestrator {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let input_owned = input.to_string();
         let this = Arc::clone(self);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
             // 尝试 v2 路径
@@ -669,7 +673,7 @@ impl Orchestrator {
 
                     // --- 1. 主脑首次处理 ---
                     let mut result = brain
-                        .process_input(&input_owned, Some(&tx))
+                        .process_input(&input_owned, Some(&tx), Some(cancel_clone.clone()))
                         .await
                         .map_err(|e| format!("{e}"));
 
@@ -802,7 +806,7 @@ impl Orchestrator {
                                         // 主脑根据反馈重新生成
                                         let revision_prompt =
                                             "请根据以上评估反馈修正你的回答，直接输出修正后的完整内容。";
-                                        match brain.process_input(revision_prompt, Some(&tx)).await
+                                        match brain.process_input(revision_prompt, Some(&tx), None).await
                                         {
                                             Ok(retry_output) => {
                                                 tracing::info!(
@@ -905,7 +909,7 @@ impl Orchestrator {
             }
         });
 
-        (rx, handle)
+        (rx, handle, cancel)
     }
 
     /// 系统状态（文本）

@@ -109,11 +109,15 @@ pub async fn run_tool_loop(
         hook_runner,
         4096,
         0.7,
+        None,
     )
     .await
 }
 
 /// 带配置参数的 tool_loop
+///
+/// `cancel` — 可选的取消令牌，调用 `cancel()` 后 tool_loop 会在下一轮 LLM 调用前退出，
+/// 返回已执行的部分结果（已完成的工具调用和 LLM 回复不会丢失）。
 pub async fn run_tool_loop_with_config(
     llm: &dyn LlmProvider,
     tool_executor: &dyn ToolExecutor,
@@ -123,14 +127,39 @@ pub async fn run_tool_loop_with_config(
     hook_runner: Option<&HookRunner>,
     max_tokens: u32,
     temperature: f64,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<ToolLoopResult> {
     let mut llm_calls = 0u32;
     let mut turns: Vec<TurnRecord> = Vec::new();
     let mut total_prompt_tokens = 0u64;
-    let mut last_prompt_tokens; // 在循环内赋值
+    let mut last_prompt_tokens = 0u64; // 在循环内赋值
     let mut usage_records: Vec<brain_llm::types::TokenUsage> = Vec::new();
+    // 记录最后一次 LLM 响应，用于取消时构建结果
+    let mut last_response: Option<ChatResponse> = None;
 
     loop {
+        // ── 协作取消检测：在 LLM 调用前检查，避免浪费 API 调用 ──
+        if let Some(ref cancel) = cancel {
+            if cancel.is_cancelled() {
+                tracing::info!(
+                    "tool_loop 收到取消信号，返回已执行结果（{} 轮 LLM 调用）",
+                    llm_calls
+                );
+                // 如果已有部分 LLM 响应，构建结果返回
+                if let Some(response) = last_response.take() {
+                    return Ok(ToolLoopResult {
+                        response,
+                        llm_calls,
+                        turns,
+                        total_prompt_tokens,
+                        last_prompt_tokens,
+                        usage_records,
+                    });
+                }
+                // 还没有任何 LLM 响应，返回错误
+                return Err(MainBrainError::LlmError("查询被用户取消".into()));
+            }
+        }
         llm_calls += 1;
         // 不设硬限制，由上下文窗口和 LLM 自身决定何时停止
         // （Claude Code 同样无硬限制）
@@ -266,6 +295,9 @@ pub async fn run_tool_loop_with_config(
         // === 日志：LLM 响应 ===
         let resp_text = response.text();
         let tool_calls = response.tool_calls();
+
+        // 保存最后一次 LLM 响应，用于取消时构建部分结果
+        last_response = Some(response.clone());
 
         // 将 LLM 的文本推理通过 TextDelta 发送到 TUI（让用户看到思考过程）
         // 遍历所有 content blocks，Text 和 Thinking 都发送

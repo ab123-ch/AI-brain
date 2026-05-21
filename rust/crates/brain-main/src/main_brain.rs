@@ -106,6 +106,7 @@ impl MainBrain {
         &mut self,
         input: &str,
         progress_tx: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<MainBrainOutput> {
         let start = std::time::Instant::now();
 
@@ -169,6 +170,7 @@ impl MainBrain {
             None,
             self.llm_max_tokens,
             self.llm_temperature,
+            cancel,
         )
         .await
         {
@@ -379,6 +381,7 @@ impl MainBrain {
     pub fn process_input_streaming(
         &mut self,
         input: &str,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(
         tokio::sync::mpsc::Receiver<ProgressEvent>,
         tokio::sync::oneshot::Receiver<String>,
@@ -416,6 +419,7 @@ impl MainBrain {
                 None,
                 max_tokens,
                 temperature,
+                cancel,
             )
             .await;
 
@@ -596,7 +600,7 @@ mod tests {
         let config = BrainConfig::default();
 
         let mut brain = MainBrain::new(llm, executor, config);
-        let output = brain.process_input("你好", None).await.unwrap();
+        let output = brain.process_input("你好", None, None).await.unwrap();
 
         assert_eq!(output.answer, "测试回复");
         assert!(!output.answer.is_empty());
@@ -626,7 +630,7 @@ mod tests {
         let mut brain = MainBrain::new(llm, executor, config);
         assert_eq!(brain.history_len(), 0);
 
-        brain.process_input("你好", None).await.unwrap();
+        brain.process_input("你好", None, None).await.unwrap();
         // 应该有 user + assistant = 2 条
         assert_eq!(brain.history_len(), 2);
     }
@@ -640,7 +644,7 @@ mod tests {
         let mut brain = MainBrain::new(llm, executor, config);
         brain.history.push_user("hello");
 
-        let (rx, result_rx) = brain.process_input_streaming("hello").unwrap();
+        let (rx, result_rx) = brain.process_input_streaming("hello", None).unwrap();
         drop(rx); // 不读取进度事件
 
         if let Ok(answer) = result_rx.await {
