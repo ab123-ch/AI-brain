@@ -49,7 +49,7 @@ impl ConversationHistory {
     pub fn push_system(&mut self, content: impl Into<String>) {
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
-            content: content.into(),
+            content: vec![brain_core::types::ContentBlock::text(content)],
             timestamp: chrono::Utc::now(),
         });
     }
@@ -72,7 +72,7 @@ impl ConversationHistory {
         self.messages
             .iter()
             .map(|m| {
-                let chars = m.content.chars().count();
+                let chars = m.text_content().chars().count();
                 // 对中文友好的估算：每字符约 0.75 token
                 chars * 3 / 4
             })
@@ -210,7 +210,7 @@ impl ConversationHistory {
                 };
                 ChatMessage {
                     role,
-                    content: vec![brain_llm::ContentBlock::text(&m.content)],
+                    content: vec![brain_llm::ContentBlock::text(&m.text_content())],
                 }
             })
             .collect()

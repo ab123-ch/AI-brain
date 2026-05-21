@@ -245,7 +245,7 @@ impl MainBrain {
         // 确保最终回答也写入历史
         let has_final_answer =
             self.history.messages().iter().rev().take(3).any(|m| {
-                m.role == brain_core::types::MessageRole::Assistant && m.content == answer
+                m.role == brain_core::types::MessageRole::Assistant && m.text_content() == answer
             });
         if !has_final_answer {
             self.history.push_assistant(&answer);
@@ -661,6 +661,6 @@ mod tests {
         let messages = brain.history();
         assert_eq!(messages[0].role, brain_core::types::MessageRole::User);
         assert_eq!(messages[1].role, brain_core::types::MessageRole::System);
-        assert!(messages[1].content.contains("测试大佬"));
+        assert!(messages[1].text_content().contains("测试大佬"));
     }
 }

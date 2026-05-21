@@ -520,11 +520,80 @@ pub enum MessageRole {
     Evaluator,
 }
 
+// ─── Serde 兼容函数：content 字段 String ↔ Vec<ContentBlock> ─────────
+
+/// 序列化：单个纯 Text 块 → 字符串（向后兼容），否则 → 数组
+fn serialize_content_blocks<S: serde::Serializer>(
+    blocks: &Vec<ContentBlock>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+
+    // 快速路径：只有一个 Text 块 → 序列化为纯字符串
+    if blocks.len() == 1 {
+        if let ContentBlock::Text { text } = &blocks[0] {
+            return s.serialize_str(text);
+        }
+    }
+    // 其他情况：序列化为数组
+    let mut seq = s.serialize_seq(Some(blocks.len()))?;
+    for block in blocks {
+        seq.serialize_element(block)?;
+    }
+    seq.end()
+}
+
+/// 反序列化：字符串 → vec![Text(s)]，数组 → Vec<ContentBlock>
+fn deserialize_content_blocks<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<ContentBlock>, D::Error> {
+    use serde::de::{self, Visitor};
+
+    struct ContentVisitor;
+
+    impl<'de> Visitor<'de> for ContentVisitor {
+        type Value = Vec<ContentBlock>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a string or an array of content blocks")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![ContentBlock::text(v)])
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(vec![ContentBlock::text(v)])
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            let blocks: Vec<ContentBlock> =
+                serde::de::Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+            Ok(blocks)
+        }
+    }
+
+    d.deserialize_any(ContentVisitor)
+}
+
 /// 对话消息（主脑内部历史记录）
+///
+/// `content` 字段使用 `Vec<ContentBlock>` 存储结构化数据：
+/// - 纯文本消息：`vec![ContentBlock::Text { text }]`
+/// - 助手消息含工具调用：`vec![Text, ToolUse, ...]`
+/// - 工具结果：`vec![ContentBlock::ToolResult { ... }]`
+///
+/// Serde 向后兼容：旧 JSON 中 content 为字符串时自动转为 `vec![Text(s)]`；
+/// 序列化时若只有一个 Text 块，输出为字符串（节省空间）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub role: MessageRole,
-    pub content: String,
+    #[serde(
+        serialize_with = "serialize_content_blocks",
+        deserialize_with = "deserialize_content_blocks",
+        default,
+    )]
+    pub content: Vec<ContentBlock>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
@@ -532,7 +601,7 @@ impl ConversationMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::User,
-            content: content.into(),
+            content: vec![ContentBlock::text(content)],
             timestamp: chrono::Utc::now(),
         }
     }
@@ -540,15 +609,38 @@ impl ConversationMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::Assistant,
-            content: content.into(),
+            content: vec![ContentBlock::text(content)],
             timestamp: chrono::Utc::now(),
         }
     }
 
+    /// 助手消息：结构化内容块（文本 + 工具调用）
+    pub fn assistant_blocks(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: blocks,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// 工具结果消息（带 tool_use_id）
+    pub fn tool_result(tool_use_id: String, content: String, is_error: bool) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            }],
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// 旧版工具消息（纯文本，向后兼容）
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::Tool,
-            content: content.into(),
+            content: vec![ContentBlock::text(content)],
             timestamp: chrono::Utc::now(),
         }
     }
@@ -556,9 +648,18 @@ impl ConversationMessage {
     pub fn evaluator(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::Evaluator,
-            content: content.into(),
+            content: vec![ContentBlock::text(content)],
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    /// 提取纯文本内容（仅 Text 块，拼接）
+    pub fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<Vec<_>>()
+            .join("")
     }
 }
 
@@ -884,5 +985,99 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let de: BroadcastMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(de.raw_input, "这个月有节假日吗？");
+    }
+
+    // ─── ConversationMessage 新增测试 ─────────────────────────────
+
+    #[test]
+    fn conversation_message_stores_tool_use() {
+        let msg = ConversationMessage::assistant_blocks(vec![
+            ContentBlock::text("我来搜索"),
+            ContentBlock::ToolUse {
+                id: "toolu_01".into(),
+                name: "WebFetch".into(),
+                input: serde_json::json!({"url":"https://example.com"}),
+            },
+        ]);
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.content.len(), 2);
+        assert!(msg.content[1].is_tool_use());
+    }
+
+    #[test]
+    fn conversation_message_backward_compat_string() {
+        // 旧格式：content 是纯字符串
+        let json = r#"{"role":"User","content":"hello","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let msg: ConversationMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content.len(), 1);
+        assert_eq!(msg.text_content(), "hello");
+    }
+
+    #[test]
+    fn conversation_message_backward_compat_serialize_string() {
+        // 序列化单个 Text 块时应输出为字符串（向后兼容）
+        let msg = ConversationMessage::user("hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        // content 应该是字符串而不是数组
+        assert!(json.contains("\"content\":\"hello\""));
+    }
+
+    #[test]
+    fn conversation_message_new_format_roundtrip() {
+        let msg = ConversationMessage::assistant_blocks(vec![
+            ContentBlock::text("搜索中"),
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"cmd":"ls"}),
+            },
+        ]);
+        let json = serde_json::to_string(&msg).unwrap();
+        let de: ConversationMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.content.len(), 2);
+        assert!(de.content[1].is_tool_use());
+    }
+
+    #[test]
+    fn conversation_message_tool_result() {
+        let msg = ConversationMessage::tool_result("toolu_01".into(), "file contents".into(), false);
+        assert_eq!(msg.role, MessageRole::Tool);
+        assert!(msg.content[0].is_tool_result());
+    }
+
+    #[test]
+    fn conversation_message_text_content_joins() {
+        let msg = ConversationMessage::assistant_blocks(vec![
+            ContentBlock::text("Hello "),
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::text("World"),
+        ]);
+        // text_content() 应只提取 Text 块并拼接
+        assert_eq!(msg.text_content(), "Hello World");
+    }
+
+    #[test]
+    fn conversation_message_content_eq_string() {
+        let msg = ConversationMessage::user("hello");
+        // text_content() 提取文本进行比较
+        assert_eq!(msg.text_content(), "hello");
+        // 多块时拼接
+        let msg2 = ConversationMessage::assistant_blocks(vec![
+            ContentBlock::text("a"),
+            ContentBlock::text("b"),
+        ]);
+        assert_eq!(msg2.text_content(), "ab");
+    }
+
+    #[test]
+    fn conversation_message_default_empty_content() {
+        // 缺少 content 字段时，反序列化应为空 Vec
+        let json = r#"{"role":"User","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let msg: ConversationMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.content.is_empty());
     }
 }

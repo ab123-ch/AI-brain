@@ -76,7 +76,7 @@ fn split_turn_blocks(messages: &[ConversationMessage]) -> Vec<TurnBlock> {
             current_start = Some(i);
         } else if msg.role == MessageRole::Tool {
             tool_indices.push(i);
-            tool_chars += msg.content.chars().count();
+            tool_chars += msg.text_content().chars().count();
         }
     }
 
@@ -199,14 +199,14 @@ pub async fn compress_single_turn(
     let user_message: String = block
         .iter()
         .find(|m| m.role == MessageRole::User)
-        .map(|m| m.content.clone())
+        .map(|m| m.text_content())
         .unwrap_or_default();
 
     // 2. 提取工具结果（完整内容）
     let tool_results: String = block
         .iter()
         .filter(|m| m.role == MessageRole::Tool)
-        .map(|m| m.content.as_str())
+        .map(|m| m.text_content())
         .collect::<Vec<_>>()
         .join("\n---\n");
 
@@ -215,7 +215,7 @@ pub async fn compress_single_turn(
         .iter()
         .rev()
         .find(|m| m.role == MessageRole::Assistant)
-        .map(|m| m.content.clone())
+        .map(|m| m.text_content())
         .unwrap_or_default();
 
     if tool_results.is_empty() {
@@ -289,12 +289,12 @@ pub fn apply_pending(
         if msg.role != MessageRole::Tool {
             continue;
         }
-        let old_len = msg.content.chars().count();
+        let old_len = msg.text_content().chars().count();
         let new_len = compressed.chars().count();
         if new_len < old_len {
             chars_saved += old_len - new_len;
             compacted_groups += 1;
-            msg.content.clone_from(compressed);
+            msg.content = vec![brain_core::types::ContentBlock::text(compressed)];
         }
     }
 
@@ -319,7 +319,7 @@ pub fn last_turn_tool_chars(messages: &[ConversationMessage]) -> usize {
     messages[start..]
         .iter()
         .filter(|m| m.role == MessageRole::Tool)
-        .map(|m| m.content.chars().count())
+        .map(|m| m.text_content().chars().count())
         .sum()
 }
 
@@ -405,7 +405,7 @@ mod tests {
         let result = apply_pending(&mut messages, &pending);
         assert_eq!(result.compacted_groups, 1);
         assert!(result.chars_saved > 0);
-        assert!(messages[1].content.starts_with("[工具调用结果已压缩]"));
+        assert!(messages[1].text_content().starts_with("[工具调用结果已压缩]"));
     }
 
     #[test]
