@@ -19,8 +19,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
+use crate::command::{self, CommandHandler, CommandRegistry};
 use crate::orchestrator::Orchestrator;
 
+use super::command_panel::CommandPanel;
 use super::input::{InputArea, InputResult};
 use super::output::{OutputArea, OutputLine};
 use super::status::StatusBar;
@@ -81,6 +83,10 @@ pub struct App {
     selection_extend_mode: bool,
     /// 渲染后的纯文本行（用于复制）
     rendered_text: Vec<String>,
+    /// 命令注册表（所有命令的中央仓库）
+    command_registry: CommandRegistry,
+    /// 命令面板（下拉选择 UI）
+    command_panel: CommandPanel,
 }
 
 impl App {
@@ -97,6 +103,9 @@ impl App {
             let (template_names, pattern_keywords) = orch.completion_data();
             EvolutionCompleter::new(template_names, pattern_keywords)
         };
+
+        let command_registry = command::build_full_registry();
+        let command_panel = CommandPanel::new();
 
         Self {
             output,
@@ -121,6 +130,8 @@ impl App {
             selection_end: None,
             selection_extend_mode: false,
             rendered_text: Vec::new(),
+            command_registry,
+            command_panel,
         }
     }
 
@@ -262,6 +273,9 @@ impl App {
 
         // 渲染选择面板（输出区域底部的内联面板，非浮动弹框）
         self.render_selection_block(f, chunks[0]);
+
+        // 渲染命令面板（浮动在输入区上方）
+        self.command_panel.render(f, chunks[2]);
     }
 
 
@@ -836,6 +850,41 @@ impl App {
             }
         }
 
+        // ── 命令面板导航（可见时优先拦截方向键/Enter/Tab/Esc）──
+        if self.command_panel.visible {
+            match key.code {
+                KeyCode::Down => {
+                    self.command_panel.move_down();
+                    return true;
+                }
+                KeyCode::Up => {
+                    self.command_panel.move_up();
+                    return true;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    if let Some(item) = self.command_panel.confirm() {
+                        let mut replacement = item.display.clone();
+                        let has_subcommands = self.command_registry.find_command(&item.command_name)
+                            .map_or(false, |c| !c.subcommands.is_empty());
+                        if has_subcommands && item.subcommand_name.is_none() {
+                            replacement.push(' ');
+                        } else if item.subcommand_name.is_some() {
+                            replacement.push(' ');
+                        }
+                        self.input.set_text(replacement);
+                        // 重新触发面板过滤
+                        self.command_panel.update_filter(&self.command_registry, &self.input.input_text());
+                    }
+                    return true;
+                }
+                KeyCode::Esc => {
+                    self.command_panel.clear();
+                    return true;
+                }
+                _ => {} // 其他按键穿透到正常处理
+            }
+        }
+
         // ── App 层独占按键 ──
         match (key.modifiers, key.code) {
             // Ctrl+C / Esc — 清除选择、取消查询或退出
@@ -902,7 +951,15 @@ impl App {
         // ── 委托给 InputArea ──
         match self.input.apply_key(key) {
             InputResult::Submit => self.submit_input(),
-            InputResult::Consumed => {}
+            InputResult::Consumed => {
+                // 输入变化时更新命令面板
+                let text = self.input.input_text();
+                if text.starts_with(':') {
+                    self.command_panel.update_filter(&self.command_registry, &text);
+                } else if self.command_panel.visible {
+                    self.command_panel.clear();
+                }
+            }
             InputResult::Ignored => {
                 // 未识别的按键：静默忽略（不写入 textarea，避免与 original 不同步）
             }
@@ -925,12 +982,12 @@ impl App {
 
         // 内置命令始终立即处理
         match self.handle_builtin_command_sync(&text) {
-            CommandResult::Handled => return,
-            CommandResult::Exit => {
+            HandleResult::Handled => return,
+            HandleResult::Exit => {
                 self.should_quit = true;
                 return;
             }
-            CommandResult::Unknown => {}
+            HandleResult::Unknown => {}
         }
 
         self.output.push_user_input(&text);
@@ -1422,77 +1479,75 @@ impl App {
         }
     }
 
-    /// 处理内置命令（同步版本，不 await 编排器的异步方法）
-    fn handle_builtin_command_sync(&mut self, input: &str) -> CommandResult {
-        match input {
-            ":help" | "help" => {
-                for line in [
-                    "=== AI Brain v2 命令 ===",
-                    "  :help           — 显示帮助",
-                    "  :status         — 系统状态",
-                    "  :memory         — 记忆统计",
-                    "  :evo <目标>     — 启动进化任务",
-                    "  :evo-status     — 查看进化状态",
-                    "  :evo-approve    — 确认合并进化结果",
-                    "  :evo-reject     — 拒绝并回滚进化",
-                    "  :evo-diff       — 查看进化变更",
-                    "  :quit / Ctrl+C  — 退出并保存",
-                    "  Enter           — 提交消息",
-                    "  Shift+Enter     — 插入换行",
-                    "  Ctrl+E          — 显示/隐藏详情（思考+记忆+评估）",
-                    "  Shift+↑/↓       — 上下滚动输出",
-                    "  ↑/↓             — 翻阅输入历史",
-                    "  Ctrl+W/Backspace— 删除前一词",
-                    "  Ctrl+Delete     — 删除后一词",
-                    "  Ctrl+U/K        — 删到行首/行尾",
-                    "  Ctrl+←/→        — 词间跳转",
-                    "  Ctrl+P          — 展开/折叠长粘贴",
-                    "  Ctrl+A/E        — 跳到行首/行尾",
-                    "  鼠标滚轮        — 上下滚动输出",
-                    "  文本选择        — 单击拖选 / Ctrl+F切换扩展模式",
-                    "  Esc             — 清除选择",
-                ] {
+    /// 处理内置命令（通过 CommandRegistry 查找并执行）
+    fn handle_builtin_command_sync(&mut self, input: &str) -> HandleResult {
+        let trimmed = input.trim();
+
+        // 快速排除非命令输入
+        if !trimmed.starts_with(':') && trimmed != "help" && trimmed != "exit" && trimmed != "quit" {
+            return HandleResult::Unknown;
+        }
+
+        // 去掉冒号前缀，"help"/"exit"/"quit" 无冒号也支持
+        let cmd_input = if trimmed.starts_with(':') {
+            trimmed.trim_start_matches(':')
+        } else {
+            trimmed
+        };
+        let parts: Vec<&str> = cmd_input.split_whitespace().collect();
+        if parts.is_empty() {
+            return HandleResult::Unknown;
+        }
+
+        let cmd_name = parts[0];
+        let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+        // 特殊: status 命令需要 Orchestrator 实时状态
+        if cmd_name == "status" {
+            self.output.push_system(&self.orch.status());
+            return HandleResult::Handled;
+        }
+
+        // 特殊: exit/quit 无冒号前缀也支持
+        if cmd_name == "exit" || cmd_name == "quit" {
+            return HandleResult::Exit;
+        }
+
+        // 在注册表中查找命令
+        let Some(cmd) = self.command_registry.find_command(cmd_name) else {
+            return HandleResult::Unknown;
+        };
+
+        // 执行处理器
+        match &cmd.handler {
+            CommandHandler::Sync(f) => {
+                let result = f(&args);
+                if result.output == "__QUIT__" {
+                    return HandleResult::Exit;
+                }
+                if result.output == "__CLEAR__" {
+                    self.output.lines.clear();
+                    return HandleResult::Handled;
+                }
+                for line in result.output.lines() {
                     self.output.push_system(line);
                 }
-                CommandResult::Handled
+                HandleResult::Handled
             }
-            ":status" | "status" => {
-                self.output.push_system(&self.orch.status());
-                CommandResult::Handled
+            CommandHandler::Async(_) => {
+                // 异步命令：显示占位提示
+                self.output.push_system(&format!(
+                    "命令 :{} 异步执行中...（待完善）",
+                    cmd_name
+                ));
+                HandleResult::Handled
             }
-            cmd if cmd == ":evo"
-                || cmd.starts_with(":evo ")
-                || matches!(
-                    cmd,
-                    ":evo-status" | ":evo-approve" | ":evo-reject" | ":evo-diff"
-                ) =>
-            {
-                // 进化命令需要异步调用，TUI 同步方法中暂为占位提示
-                let msg = match input {
-                    c if c == ":evo" || c.starts_with(":evo ") => {
-                        let goal = c.strip_prefix(":evo").unwrap_or("").trim();
-                        if goal.is_empty() {
-                            "用法: :evo <目标描述>".to_string()
-                        } else {
-                            format!("进化任务已排队: {goal}（TUI 模式异步执行待完善）")
-                        }
-                    }
-                    ":evo-status" => "进化状态查询（TUI 模式异步执行待完善）".to_string(),
-                    ":evo-approve" => "确认合并（TUI 模式异步执行待完善）".to_string(),
-                    ":evo-reject" => "拒绝回滚（TUI 模式异步执行待完善）".to_string(),
-                    ":evo-diff" => "进化变更查询（TUI 模式异步执行待完善）".to_string(),
-                    _ => unreachable!(),
-                };
-                self.output.push_system(&msg);
-                CommandResult::Handled
-            }
-            ":quit" | ":exit" | "exit" | "quit" => CommandResult::Exit,
-            _ => CommandResult::Unknown,
         }
     }
 }
 
-enum CommandResult {
+/// 命令处理结果（App 内部使用，与 command::CommandResult 区分）
+enum HandleResult {
     Handled,
     Exit,
     Unknown,

@@ -118,6 +118,16 @@ impl InputArea {
         self.original.clone()
     }
 
+    /// 设置输入内容（用于命令面板确认后替换文本）
+    pub(crate) fn set_text(&mut self, text: String) {
+        self.original = text;
+        self.cursor_byte = self.original.len();
+        self.paste_collapsed = false;
+        self.paste_end_byte = 0;
+        self.popup.clear();
+        self.sync_display();
+    }
+
     /// 更新折行宽度（终端 resize 时调用）
     pub fn set_wrap_width(&mut self, terminal_width: u16) {
         let new_width = ((terminal_width.saturating_sub(6)) / 2) as usize;
