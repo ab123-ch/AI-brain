@@ -191,9 +191,17 @@ impl MainBrain {
                         }
                         brain_llm::MessageRole::User => {
                             for block in &msg.content {
-                                if let brain_llm::ContentBlock::ToolResult { content, .. } = block
+                                if let brain_llm::ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    is_error,
+                                } = block
                                 {
-                                    self.history.push_tool_result(content);
+                                    self.history.push_tool_result(
+                                        tool_use_id.clone(),
+                                        content.clone(),
+                                        *is_error,
+                                    );
                                 }
                             }
                         }
@@ -233,8 +241,17 @@ impl MainBrain {
                 }
                 brain_llm::MessageRole::User => {
                     for block in &msg.content {
-                        if let brain_llm::ContentBlock::ToolResult { content, .. } = block {
-                            self.history.push_tool_result(content);
+                        if let brain_llm::ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } = block
+                        {
+                            self.history.push_tool_result(
+                                tool_use_id.clone(),
+                                content.clone(),
+                                *is_error,
+                            );
                         }
                     }
                 }

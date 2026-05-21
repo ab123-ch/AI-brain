@@ -35,9 +35,15 @@ impl ConversationHistory {
         self.messages.push(ConversationMessage::assistant(content));
     }
 
-    /// 追加工具结果消息
-    pub fn push_tool_result(&mut self, content: impl Into<String>) {
-        self.messages.push(ConversationMessage::tool(content));
+    /// 追加助手消息（含工具调用）
+    pub fn push_assistant_blocks(&mut self, blocks: Vec<brain_core::types::ContentBlock>) {
+        self.messages.push(ConversationMessage::assistant_blocks(blocks));
+    }
+
+    /// 追加工具结果消息（完整版，保留 tool_use_id）
+    pub fn push_tool_result(&mut self, tool_use_id: String, content: String, is_error: bool) {
+        self.messages
+            .push(ConversationMessage::tool_result(tool_use_id, content, is_error));
     }
 
     /// 追加评估脑反馈消息
@@ -191,18 +197,17 @@ impl ConversationHistory {
     }
 
     /// 转换为 LLM ChatMessage 格式
+    ///
+    /// 直接 clone 原始 ContentBlock，保留 ToolUse/ToolResult 的结构信息。
+    /// ToolResult 块以 User 角色发送（OpenAI API 规范）。
     pub fn to_chat_messages(&self) -> Vec<ChatMessage> {
         self.messages
             .iter()
             .map(|m| {
                 let role = match m.role {
                     MessageRole::Assistant => LlmRole::Assistant,
-                    // R-P2-1: Tool/System/Evaluator 均映射为 User
-                    // 原因: ConversationMessage 不携带 tool_call_id，不能映射为 LlmRole::Tool（否则 API 400）
-                    // System 消息（如记忆注入）和 Evaluator 消息也映射为 User，
-                    // 因为 API 通常只接受 System/User/Assistant 三种角色，
-                    // 且 System 只允许出现在第一条消息中。
-                    // 长期方案: S4 升级 ContentBlock 模型后，Tool 消息可正确映射。
+                    // ToolResult 在 API 中以 User 角色发送
+                    // System/Evaluator 也映射为 User（API 只接受 System/User/Assistant）
                     MessageRole::Tool
                     | MessageRole::System
                     | MessageRole::User
@@ -210,7 +215,7 @@ impl ConversationHistory {
                 };
                 ChatMessage {
                     role,
-                    content: vec![brain_llm::ContentBlock::text(&m.text_content())],
+                    content: m.content.clone(),
                 }
             })
             .collect()
@@ -281,5 +286,88 @@ mod tests {
         assert_eq!(chat.len(), 2);
         assert_eq!(chat[0].role, LlmRole::User);
         assert_eq!(chat[1].role, LlmRole::Assistant);
+    }
+
+    #[test]
+    fn to_chat_messages_preserves_tool_use() {
+        let mut history = ConversationHistory::new(100_000);
+        history.push_user("搜索 firecrawl");
+        history.push_assistant_blocks(vec![
+            brain_core::types::ContentBlock::text("我来搜索"),
+            brain_core::types::ContentBlock::ToolUse {
+                id: "toolu_01".into(),
+                name: "WebFetch".into(),
+                input: serde_json::json!({"url": "https://github.com/firecrawl"}),
+            },
+        ]);
+        history.push_tool_result("toolu_01".into(), "firecrawl 数据".into(), false);
+        history.push_assistant("搜索结果如下...");
+
+        let chat = history.to_chat_messages();
+        assert_eq!(chat.len(), 4);
+        // msg[0] = user (搜索 firecrawl)
+        assert_eq!(chat[0].role, LlmRole::User);
+        // msg[1] = assistant (含 ToolUse)
+        assert_eq!(chat[1].role, LlmRole::Assistant);
+        assert!(chat[1].content.iter().any(|b| b.is_tool_use()));
+        // msg[2] = user (ToolResult → User role)
+        assert_eq!(chat[2].role, LlmRole::User);
+        assert!(chat[2].content.iter().any(|b| b.is_tool_result()));
+        // msg[3] = assistant (搜索结果如下...)
+        assert_eq!(chat[3].role, LlmRole::Assistant);
+    }
+
+    #[test]
+    fn push_tool_result_stores_structured_data() {
+        let mut history = ConversationHistory::new(100_000);
+        history.push_tool_result("toolu_42".into(), "error: not found".into(), true);
+
+        let chat = history.to_chat_messages();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].role, LlmRole::User);
+        assert!(chat[0].content.iter().any(|b| b.is_tool_result()));
+
+        // 验证结构化字段保留
+        if let brain_core::types::ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } = &chat[0].content[0]
+        {
+            assert_eq!(tool_use_id, "toolu_42");
+            assert_eq!(content, "error: not found");
+            assert!(*is_error);
+        } else {
+            panic!("expected ToolResult block");
+        }
+    }
+
+    #[test]
+    fn push_assistant_blocks_preserves_multiple_blocks() {
+        let mut history = ConversationHistory::new(100_000);
+        history.push_assistant_blocks(vec![
+            brain_core::types::ContentBlock::text("分析中..."),
+            brain_core::types::ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            brain_core::types::ContentBlock::text("继续执行"),
+            brain_core::types::ContentBlock::ToolUse {
+                id: "call_2".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/tmp/test.txt"}),
+            },
+        ]);
+
+        let chat = history.to_chat_messages();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].role, LlmRole::Assistant);
+        assert_eq!(chat[0].content.len(), 4);
+        // 2 个 text + 2 个 tool_use
+        let tool_uses: Vec<_> = chat[0].content.iter().filter(|b| b.is_tool_use()).collect();
+        assert_eq!(tool_uses.len(), 2);
+        let texts: Vec<_> = chat[0].content.iter().filter_map(|b| b.as_text()).collect();
+        assert_eq!(texts.len(), 2);
     }
 }
