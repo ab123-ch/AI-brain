@@ -538,3 +538,127 @@ mod tests {
         assert_eq!(panel.items[0].command_name, "help");
     }
 }
+
+/// Integration tests using the full command registry from build_full_registry().
+/// These verify end-to-end interaction between the command panel and all registered commands.
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::command;
+
+    fn full_registry() -> CommandRegistry {
+        command::build_full_registry()
+    }
+
+    #[test]
+    fn test_full_registry_has_all_commands() {
+        let reg = full_registry();
+        // Verify all 10 commands are registered
+        assert!(reg.find_command("help").is_some(), "missing help");
+        assert!(reg.find_command("status").is_some(), "missing status");
+        assert!(reg.find_command("quit").is_some(), "missing quit");
+        assert!(reg.find_command("clear").is_some(), "missing clear");
+        assert!(reg.find_command("config").is_some(), "missing config");
+        assert!(reg.find_command("plugin").is_some(), "missing plugin");
+        assert!(reg.find_command("skill").is_some(), "missing skill");
+        assert!(reg.find_command("mcp").is_some(), "missing mcp");
+        assert!(reg.find_command("memory").is_some(), "missing memory");
+        assert!(reg.find_command("evo").is_some(), "missing evo");
+    }
+
+    #[test]
+    fn test_panel_filter_plugin() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "pl");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.command_name == "plugin"));
+        assert!(!panel.items.iter().any(|i| i.command_name == "help"));
+    }
+
+    #[test]
+    fn test_panel_subcommand_mode() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "plugin ");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("install")));
+    }
+
+    #[test]
+    fn test_panel_subcommand_filter() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "plugin ins");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("install")));
+        assert!(!panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
+    }
+
+    #[test]
+    fn test_panel_no_match() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "zzz");
+        assert!(!panel.visible);
+    }
+
+    #[test]
+    fn test_panel_memory_subcommands() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "memory ");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("stats")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("recall")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("save")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("daily")));
+    }
+
+    #[test]
+    fn test_panel_evo_filter() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "ev");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.command_name == "evo"));
+    }
+
+    #[test]
+    fn test_panel_config_subcommands() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "config ");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("get")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("set")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("brain-params")));
+    }
+
+    #[test]
+    fn test_panel_skill_subcommands() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "skill ");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("run")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("info")));
+    }
+
+    #[test]
+    fn test_panel_mcp_subcommands() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "mcp ");
+        assert!(panel.visible);
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("status")));
+        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("reconnect")));
+    }
+
+    #[test]
+    fn test_panel_navigation_and_confirm() {
+        let mut panel = CommandPanel::new();
+        panel.update_filter(&full_registry(), "pl");
+        assert!(panel.visible);
+        assert_eq!(panel.selected, 0);
+
+        panel.move_down();
+        // Only "plugin" matches "pl", so move_down wraps back to 0
+        let item = panel.confirm().expect("should have a selection");
+        assert_eq!(item.command_name, "plugin");
+    }
+}
