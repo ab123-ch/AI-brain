@@ -90,11 +90,13 @@ impl SensoryLlmProvider for LlmAdapter {
 struct AnalyzerLlm {
     client: Arc<dyn brain_llm::LlmProvider>,
     model: String,
+    max_tokens: u32,
+    temperature: f64,
 }
 
 impl AnalyzerLlm {
-    fn new(client: Arc<dyn brain_llm::LlmProvider>, model: String) -> Self {
-        Self { client, model }
+    fn new(client: Arc<dyn brain_llm::LlmProvider>, model: String, max_tokens: u32, temperature: f64) -> Self {
+        Self { client, model, max_tokens, temperature }
     }
 }
 
@@ -106,8 +108,8 @@ impl AnalysisLlm for AnalyzerLlm {
         let request = ChatRequest {
             model: Some(self.model.clone()),
             messages: vec![ChatMessage::user(prompt)],
-            max_tokens: Some(4096),
-            temperature: Some(0.3),
+            max_tokens: Some(self.max_tokens),
+            temperature: Some(self.temperature),
             tools: None,
             tool_choice: None,
         };
@@ -165,6 +167,15 @@ pub struct Orchestrator {
     dispatch: brain_dispatch::TokioDispatch,
     /// dispatch_loop 输出通道（主脑消费异步通知）
     dispatch_output_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<brain_dispatch::MainLoopMessage>>>,
+    /// 插件管理器
+    #[allow(dead_code)] // Task 8 会使用
+    plugin_mgr: Option<PluginManager>,
+    /// 技能目录
+    #[allow(dead_code)] // Task 8 会使用
+    skill_catalog: Arc<SkillCatalog>,
+    /// MCP 客户端池
+    #[allow(dead_code)] // Task 8 会使用
+    mcp_pool: Arc<McpClientPool>,
 }
 
 /// 系统状态结构体（TUI 状态栏用）
@@ -209,9 +220,11 @@ impl Orchestrator {
             }
             // 记忆脑单独用 memory brain 的 LLM（语义召回用）
             if let Ok(client) = config.create_brain_client("memory") {
+                let (mt, temp) = config.params_for_brain("memory");
                 let analyzer_llm = AnalyzerLlm::new(
                     Arc::from(client),
                     config.model_for_brain("memory").to_string(),
+                    mt, temp,
                 );
                 memory.set_llm(Box::new(analyzer_llm));
                 tracing::info!("记忆脑已注入 LLM（语义召回）");
@@ -380,7 +393,8 @@ impl Orchestrator {
         }
 
         // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册 + dispatch）
-        let v2_brain = create_v2_main_brain(Some(Arc::clone(&memory)), dispatch.clone());
+        let (v2_brain, plugin_mgr, skill_catalog, mcp_pool) =
+            create_v2_main_brain(Some(Arc::clone(&memory)), dispatch.clone());
 
         // 12.1 启动守护线程（L2→L1 归档）
         {
@@ -391,9 +405,11 @@ impl Orchestrator {
             let guardian_llm: Option<Box<dyn AnalysisLlm>> =
                 if let Ok(config) = LlmConfig::load_default() {
                     if let Ok(client) = config.create_brain_client("memory") {
+                        let (mt, temp) = config.params_for_brain("memory");
                         Some(Box::new(AnalyzerLlm::new(
                             Arc::from(client),
                             config.model_for_brain("memory").to_string(),
+                            mt, temp,
                         )))
                     } else {
                         None
@@ -524,6 +540,9 @@ impl Orchestrator {
             v2_brain,
             dispatch,
             dispatch_output_rx: Arc::new(Mutex::new(dispatch_output_rx)),
+            plugin_mgr,
+            skill_catalog,
+            mcp_pool,
         })
     }
 
@@ -596,6 +615,21 @@ impl Orchestrator {
     #[cfg(test)]
     pub fn task_count(&self) -> usize {
         self.tasks.len()
+    }
+
+    /// 获取插件管理器引用
+    pub fn plugin_mgr(&self) -> Option<&PluginManager> {
+        self.plugin_mgr.as_ref()
+    }
+
+    /// 获取技能目录引用
+    pub fn skill_catalog(&self) -> &SkillCatalog {
+        &self.skill_catalog
+    }
+
+    /// 获取 MCP 客户端池引用
+    pub fn mcp_pool(&self) -> &McpClientPool {
+        &self.mcp_pool
     }
 
     /// 系统状态结构体（TUI 用）
@@ -1397,7 +1431,8 @@ impl Orchestrator {
         let config = LlmConfig::load_default().ok()?;
         let client: Box<dyn brain_llm::LlmProvider> = config.create_brain_client("memory").ok()?;
         let model = config.model_for_brain("memory").to_string();
-        Some(AnalyzerLlm::new(Arc::from(client), model))
+        let (mt, temp) = config.params_for_brain("memory");
+        Some(AnalyzerLlm::new(Arc::from(client), model, mt, temp))
     }
 
     /// 创建四步分析用的 LLM 客户端
@@ -1405,7 +1440,8 @@ impl Orchestrator {
         let config = LlmConfig::load_default().ok()?;
         let client: Box<dyn brain_llm::LlmProvider> = config.create_brain_client("memory").ok()?;
         let model = config.model_for_brain("memory").to_string();
-        Some(AnalyzerLlm::new(Arc::from(client), model))
+        let (mt, temp) = config.params_for_brain("memory");
+        Some(AnalyzerLlm::new(Arc::from(client), model, mt, temp))
     }
 }
 
@@ -1660,12 +1696,17 @@ fn try_create_llm_client(brain_name: &str) -> Option<Arc<dyn brain_llm::LlmProvi
 fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<MemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
-) -> Arc<Mutex<Option<MainBrain>>> {
+) -> (Arc<Mutex<Option<MainBrain>>>, Option<PluginManager>, Arc<SkillCatalog>, Arc<McpClientPool>) {
     let client = match try_create_llm_client("sensory") {
         Some(c) => c,
         None => {
             tracing::warn!("v2 MainBrain: LLM 不可用，跳过创建（回声模式）");
-            return Arc::new(Mutex::new(None));
+            return (
+                Arc::new(Mutex::new(None)),
+                None,
+                Arc::new(SkillCatalog { skills: vec![] }),
+                Arc::new(McpClientPool::new()),
+            );
         }
     };
 
@@ -1721,21 +1762,27 @@ fn create_v2_main_brain(
     }
     tracing::info!("加载 {} 个 MCP 服务器配置", mcp_configs.len());
 
+    // 创建 MCP 客户端池（Arc 共享给 tool_executor 和返回值）
+    let mcp_pool = Arc::new(McpClientPool::new());
+
     let tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
         crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch)
             .with_skill_catalog(skill_catalog.clone())
-            .with_mcp_pool(Arc::new(McpClientPool::new())),
+            .with_mcp_pool(mcp_pool.clone()),
     );
 
     let brain_config = BrainConfig::default();
-    let mut brain = MainBrain::new(client, tool_executor, brain_config);
+    let (main_mt, main_temp) = LlmConfig::load_default()
+        .map(|c| c.params_for_brain("main"))
+        .unwrap_or((32768, 0.7));
+    let mut brain = MainBrain::new(client, tool_executor, brain_config, main_mt, main_temp);
 
     // 注册所有 MVP 工具（bash、read_file、write_file、edit_file、glob、grep）
     let tool_defs = crate::real_tool_executor::mvp_tool_definitions();
     tracing::info!("v2 MainBrain: 注册 {} 个工具", tool_defs.len());
     brain.register_tools(tool_defs);
 
-    Arc::new(Mutex::new(Some(brain)))
+    (Arc::new(Mutex::new(Some(brain))), plugin_mgr, skill_catalog, mcp_pool)
 }
 
 /// 创建所有副脑
