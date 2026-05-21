@@ -114,6 +114,10 @@ impl InputContext {
 ///
 /// 集成 brain-evolution 的 SuggestionEngine 和 BrainRegistry，
 /// 提供上下文感知的补全建议。
+///
+/// 命令列表来源：
+/// - `from_registry()` 从 CommandRegistry 动态读取（推荐，生产使用）
+/// - `new()` / `lightweight()` 使用硬编码 default_commands()（测试用）
 pub struct EvolutionCompleter {
     /// 内置命令列表
     builtin_commands: Vec<BuiltinCommand>,
@@ -136,6 +140,33 @@ impl EvolutionCompleter {
     pub fn new(template_names: Vec<String>, pattern_keywords: Vec<String>) -> Self {
         Self {
             builtin_commands: Self::default_commands(),
+            template_names,
+            pattern_keywords,
+        }
+    }
+
+    /// 从 CommandRegistry 构建补全器（动态读取命令列表）
+    pub fn from_registry(
+        registry: &crate::command::CommandRegistry,
+        template_names: Vec<String>,
+        pattern_keywords: Vec<String>,
+    ) -> Self {
+        let builtin_commands: Vec<BuiltinCommand> = registry
+            .all_commands()
+            .iter()
+            .map(|cmd| BuiltinCommand {
+                name: cmd.name.to_string(),
+                args_hint: if cmd.subcommands.is_empty() {
+                    None
+                } else {
+                    Some("<子命令>".to_string())
+                },
+                description: cmd.description.to_string(),
+            })
+            .collect();
+
+        Self {
+            builtin_commands,
             template_names,
             pattern_keywords,
         }

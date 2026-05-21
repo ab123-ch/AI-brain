@@ -98,13 +98,15 @@ impl App {
         output.push_system("输入查询 | :help 命令 | Enter 提交 | Tab 补全 | ↑↓ 历史 | Shift+Enter 换行");
         output.push_system("文本选择: 单击拖选 | 单击→Ctrl+F→单击扩展 → Ctrl+Y 复制 | Esc 清除");
 
-        // 从 orchestrator 获取 brain-evolution 数据
+        // 构建 CommandRegistry，同时用于补全器和命令面板
+        let command_registry = command::build_full_registry();
+
+        // 从 orchestrator 获取 brain-evolution 数据，从 registry 动态读取命令列表
         let completer = {
             let (template_names, pattern_keywords) = orch.completion_data();
-            EvolutionCompleter::new(template_names, pattern_keywords)
+            EvolutionCompleter::from_registry(&command_registry, template_names, pattern_keywords)
         };
 
-        let command_registry = command::build_full_registry();
         let command_panel = CommandPanel::new();
 
         Self {
