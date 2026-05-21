@@ -1,4 +1,5 @@
 mod api_server;
+mod command;
 mod init;
 mod llm_usage_logger;
 mod orchestrator;
