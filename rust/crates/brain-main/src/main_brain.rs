@@ -184,9 +184,17 @@ impl MainBrain {
                     }
                     match msg.role {
                         brain_llm::MessageRole::Assistant => {
-                            let text = msg.text_content();
-                            if !text.is_empty() {
-                                self.history.push_assistant(&text);
+                            let has_tool_use =
+                                msg.content.iter().any(|b| b.is_tool_use());
+                            if has_tool_use {
+                                // Assistant message with tool calls → save entire blocks
+                                self.history.push_assistant_blocks(msg.content.clone());
+                            } else {
+                                // Pure text response → simplified storage
+                                let text = msg.text_content();
+                                if !text.is_empty() {
+                                    self.history.push_assistant(&text);
+                                }
                             }
                         }
                         brain_llm::MessageRole::User => {
@@ -234,9 +242,16 @@ impl MainBrain {
             }
             match msg.role {
                 brain_llm::MessageRole::Assistant => {
-                    let text = msg.text_content();
-                    if !text.is_empty() {
-                        self.history.push_assistant(&text);
+                    let has_tool_use = msg.content.iter().any(|b| b.is_tool_use());
+                    if has_tool_use {
+                        // Assistant message with tool calls → save entire blocks
+                        self.history.push_assistant_blocks(msg.content.clone());
+                    } else {
+                        // Pure text response → simplified storage
+                        let text = msg.text_content();
+                        if !text.is_empty() {
+                            self.history.push_assistant(&text);
+                        }
                     }
                 }
                 brain_llm::MessageRole::User => {
@@ -262,7 +277,8 @@ impl MainBrain {
         // 确保最终回答也写入历史
         let has_final_answer =
             self.history.messages().iter().rev().take(3).any(|m| {
-                m.role == brain_core::types::MessageRole::Assistant && m.text_content() == answer
+                m.role == brain_core::types::MessageRole::Assistant
+                    && m.text_content() == answer
             });
         if !has_final_answer {
             self.history.push_assistant(&answer);
