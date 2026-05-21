@@ -11,9 +11,7 @@ fn handle_skill(args: &[String]) -> CommandResult {
     };
 
     match sub {
-        "list" => {
-            CommandResult::ok("[placeholder] 已注册技能列表（暂无数据）")
-        }
+        "list" => CommandResult::ok("[placeholder] 已注册技能列表（暂无数据）"),
         "run" => {
             let name = args.get(1);
             match name {
@@ -78,7 +76,9 @@ mod tests {
     #[test]
     fn test_skill_registration() {
         let registry = register_skill();
-        let cmd = registry.find_command("skill").expect("skill command should exist");
+        let cmd = registry
+            .find_command("skill")
+            .expect("skill command should exist");
         assert_eq!(cmd.name, "skill");
         assert_eq!(cmd.group, CommandGroup::Skill);
         assert_eq!(cmd.subcommands.len(), 3);

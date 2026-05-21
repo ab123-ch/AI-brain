@@ -11,9 +11,7 @@ fn handle_plugin(args: &[String]) -> CommandResult {
     };
 
     match sub {
-        "list" => {
-            CommandResult::ok("[placeholder] 已安装插件列表（暂无数据）")
-        }
+        "list" => CommandResult::ok("[placeholder] 已安装插件列表（暂无数据）"),
         "install" => {
             let path = args.get(1);
             match path {
@@ -28,10 +26,10 @@ fn handle_plugin(args: &[String]) -> CommandResult {
                 None => CommandResult::err("用法: /plugin uninstall <name>"),
             }
         }
-        "reload" => {
-            CommandResult::ok("[placeholder] 重新加载所有插件")
-        }
-        other => CommandResult::err(format!("未知子命令: {other}。可用: list, install, uninstall, reload")),
+        "reload" => CommandResult::ok("[placeholder] 重新加载所有插件"),
+        other => CommandResult::err(format!(
+            "未知子命令: {other}。可用: list, install, uninstall, reload"
+        )),
     }
 }
 
@@ -86,7 +84,9 @@ mod tests {
     #[test]
     fn test_plugin_registration() {
         let registry = register_plugin();
-        let cmd = registry.find_command("plugin").expect("plugin command should exist");
+        let cmd = registry
+            .find_command("plugin")
+            .expect("plugin command should exist");
         assert_eq!(cmd.name, "plugin");
         assert_eq!(cmd.group, CommandGroup::Plugin);
         assert_eq!(cmd.subcommands.len(), 4);

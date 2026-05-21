@@ -36,10 +36,10 @@ use brain_hooks::types::{HookEvent, HookInput};
 use brain_llm::{ChatMessage, ChatRequest, LlmConfig};
 use brain_main::main_brain::MainBrain;
 use brain_master::MasterBrain;
-use brain_memory::analyzer::{AnalysisLlm, FourStepAnalyzer};
-use brain_memory::memory_brain::{MemoryBrain, MemoryBrainConfig};
 use brain_mcp::config::load_mcp_servers;
 use brain_mcp::McpClientPool;
+use brain_memory::analyzer::{AnalysisLlm, FourStepAnalyzer};
+use brain_memory::memory_brain::{MemoryBrain, MemoryBrainConfig};
 use brain_motor::motor_brain::{MotorBrain, MotorConfig};
 use brain_plugin::{PluginManager, SkillCatalog};
 use brain_reasoning::reasoning_brain::{ReasoningBrain, ReasoningConfig};
@@ -95,8 +95,18 @@ struct AnalyzerLlm {
 }
 
 impl AnalyzerLlm {
-    fn new(client: Arc<dyn brain_llm::LlmProvider>, model: String, max_tokens: u32, temperature: f64) -> Self {
-        Self { client, model, max_tokens, temperature }
+    fn new(
+        client: Arc<dyn brain_llm::LlmProvider>,
+        model: String,
+        max_tokens: u32,
+        temperature: f64,
+    ) -> Self {
+        Self {
+            client,
+            model,
+            max_tokens,
+            temperature,
+        }
     }
 }
 
@@ -224,7 +234,8 @@ impl Orchestrator {
                 let analyzer_llm = AnalyzerLlm::new(
                     Arc::from(client),
                     config.model_for_brain("memory").to_string(),
-                    mt, temp,
+                    mt,
+                    temp,
                 );
                 memory.set_llm(Box::new(analyzer_llm));
                 tracing::info!("记忆脑已注入 LLM（语义召回）");
@@ -409,7 +420,8 @@ impl Orchestrator {
                         Some(Box::new(AnalyzerLlm::new(
                             Arc::from(client),
                             config.model_for_brain("memory").to_string(),
-                            mt, temp,
+                            mt,
+                            temp,
                         )))
                     } else {
                         None
@@ -485,7 +497,9 @@ impl Orchestrator {
             };
             mem.base_dir().to_path_buf()
         };
-        if let Some(pending) = brain_memory::pending_analysis::PendingAnalysis::load(&pending_base_dir) {
+        if let Some(pending) =
+            brain_memory::pending_analysis::PendingAnalysis::load(&pending_base_dir)
+        {
             let injection_text = pending.format_for_injection();
             let convs_for_analysis = pending.conversations.clone();
             let sess_id = pending.session_id.clone();
@@ -495,10 +509,7 @@ impl Orchestrator {
             if let Ok(mut v2_guard) = v2_brain.try_lock() {
                 if let Some(ref mut brain) = *v2_guard {
                     brain.push_memory_context(&injection_text);
-                    tracing::info!(
-                        "已注入上次会话记忆 ({}条对话)",
-                        convs_for_analysis.len()
-                    );
+                    tracing::info!("已注入上次会话记忆 ({}条对话)", convs_for_analysis.len());
                 }
             }
 
@@ -634,7 +645,14 @@ impl Orchestrator {
 
     /// 系统状态结构体（TUI 用）
     pub fn status_structured(&self) -> SystemStatus {
-        let (context_usage, cumulative_prompt, cumulative_completion, cumulative_cache_read, compaction_count, chars_saved) = self
+        let (
+            context_usage,
+            cumulative_prompt,
+            cumulative_completion,
+            cumulative_cache_read,
+            compaction_count,
+            chars_saved,
+        ) = self
             .v2_brain
             .try_lock()
             .ok()
@@ -667,11 +685,19 @@ impl Orchestrator {
     /// 获取补全数据（模板名 + 模式关键词），供 TUI 补全使用
     pub fn completion_data(&self) -> (Vec<String>, Vec<String>) {
         let template_names = match self.registry.try_lock() {
-            Ok(guard) => guard.list_templates().iter().map(|t| t.name.clone()).collect(),
+            Ok(guard) => guard
+                .list_templates()
+                .iter()
+                .map(|t| t.name.clone())
+                .collect(),
             Err(_) => Vec::new(),
         };
         let pattern_keywords = match self.suggestion_engine.try_lock() {
-            Ok(guard) => guard.patterns().iter().flat_map(|p| p.keywords.clone()).collect(),
+            Ok(guard) => guard
+                .patterns()
+                .iter()
+                .flat_map(|p| p.keywords.clone())
+                .collect(),
             Err(_) => Vec::new(),
         };
         (template_names, pattern_keywords)
@@ -758,12 +784,14 @@ impl Orchestrator {
                                 brain_memory::user_profile::UserProfileStore::new(storage.clone())
                                     .load()
                                     .unwrap_or_default();
-                            let rules = brain_memory::evolution::EvolutionStore::new(storage.clone())
-                                .load_active()
-                                .unwrap_or_default();
-                            let eval_requirements = brain_memory::eval_requirement::EvalRequirementStore::new(storage)
-                                .load_active()
-                                .unwrap_or_default();
+                            let rules =
+                                brain_memory::evolution::EvolutionStore::new(storage.clone())
+                                    .load_active()
+                                    .unwrap_or_default();
+                            let eval_requirements =
+                                brain_memory::eval_requirement::EvalRequirementStore::new(storage)
+                                    .load_active()
+                                    .unwrap_or_default();
 
                             tracing::info!(
                                 "v2 评估脑开始评估 (踩坑={} 画像偏好={} 进化规则={} 用户评估要求={})",
@@ -840,7 +868,9 @@ impl Orchestrator {
                                         // 主脑根据反馈重新生成
                                         let revision_prompt =
                                             "请根据以上评估反馈修正你的回答，直接输出修正后的完整内容。";
-                                        match brain.process_input(revision_prompt, Some(&tx), None).await
+                                        match brain
+                                            .process_input(revision_prompt, Some(&tx), None)
+                                            .await
                                         {
                                             Ok(retry_output) => {
                                                 tracing::info!(
@@ -897,7 +927,7 @@ impl Orchestrator {
                             cache_read_input_tokens: 0,     // MainBrainOutput 不包含此字段
                         },
                     );
-                    
+
                     // 触发四步分析（非阻塞，后台执行）
                     this.maybe_trigger_analysis();
 
@@ -911,19 +941,27 @@ impl Orchestrator {
                                         "\n📡 异步子代理完成: {} ({:?})\n",
                                         result.agent_id, result.status
                                     );
-                                    let _ = tx.send(ProgressEvent::TextDelta {
-                                        text: notification,
-                                    }).await;
-                                    tracing::info!("异步子代理通知: {} status={:?}", result.agent_id, result.status);
-                                }
-                                brain_dispatch::MainLoopMessage::BrainTaskNotification { brain_id, result } => {
-                                    let notification = format!(
-                                        "\n📡 副脑任务完成: {brain_id}\n",
+                                    let _ = tx
+                                        .send(ProgressEvent::TextDelta { text: notification })
+                                        .await;
+                                    tracing::info!(
+                                        "异步子代理通知: {} status={:?}",
+                                        result.agent_id,
+                                        result.status
                                     );
-                                    let _ = tx.send(ProgressEvent::TextDelta {
-                                        text: notification,
-                                    }).await;
-                                    tracing::info!("副脑任务通知: {brain_id} status={:?}", result.status);
+                                }
+                                brain_dispatch::MainLoopMessage::BrainTaskNotification {
+                                    brain_id,
+                                    result,
+                                } => {
+                                    let notification = format!("\n📡 副脑任务完成: {brain_id}\n",);
+                                    let _ = tx
+                                        .send(ProgressEvent::TextDelta { text: notification })
+                                        .await;
+                                    tracing::info!(
+                                        "副脑任务通知: {brain_id} status={:?}",
+                                        result.status
+                                    );
                                 }
                             }
                         }
@@ -1308,10 +1346,10 @@ impl Orchestrator {
     /// 关闭时快速保存对话数据（替代 run_analysis_force，毫秒级）
     pub async fn shutdown_with_analysis(&self) {
         self.save_pending_analysis();
-        
+
         // 记录会话结束时的 LLM 使用统计
         llm_usage_logger::log_session_summary();
-        
+
         self.shutdown();
     }
 
@@ -1671,11 +1709,7 @@ fn create_sensory_llm() -> Result<LlmResult, String> {
     })?;
     let client = config
         .create_brain_client("sensory")
-        .map_err(|e| {
-            format!(
-                "LLM 客户端创建失败: {e}\n请检查 ZHIPU_API_KEY 是否已设置"
-            )
-        })?;
+        .map_err(|e| format!("LLM 客户端创建失败: {e}\n请检查 ZHIPU_API_KEY 是否已设置"))?;
     let model = config.model_for_brain("sensory").to_string();
     tracing::info!("LLM 已加载，感知脑模型: {model}");
     Ok(LlmResult {
@@ -1696,7 +1730,12 @@ fn try_create_llm_client(brain_name: &str) -> Option<Arc<dyn brain_llm::LlmProvi
 fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<MemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
-) -> (Arc<Mutex<Option<MainBrain>>>, Option<PluginManager>, Arc<SkillCatalog>, Arc<McpClientPool>) {
+) -> (
+    Arc<Mutex<Option<MainBrain>>>,
+    Option<PluginManager>,
+    Arc<SkillCatalog>,
+    Arc<McpClientPool>,
+) {
     let client = match try_create_llm_client("sensory") {
         Some(c) => c,
         None => {
@@ -1782,7 +1821,12 @@ fn create_v2_main_brain(
     tracing::info!("v2 MainBrain: 注册 {} 个工具", tool_defs.len());
     brain.register_tools(tool_defs);
 
-    (Arc::new(Mutex::new(Some(brain))), plugin_mgr, skill_catalog, mcp_pool)
+    (
+        Arc::new(Mutex::new(Some(brain))),
+        plugin_mgr,
+        skill_catalog,
+        mcp_pool,
+    )
 }
 
 /// 创建所有副脑

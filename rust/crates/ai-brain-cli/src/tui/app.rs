@@ -23,10 +23,10 @@ use crate::command::{self, CommandHandler, CommandRegistry};
 use crate::orchestrator::Orchestrator;
 
 use super::command_panel::CommandPanel;
+use super::completion::EvolutionCompleter;
 use super::input::{InputArea, InputResult};
 use super::output::{OutputArea, OutputLine};
 use super::status::StatusBar;
-use super::completion::EvolutionCompleter;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⼾", "⼿", "⾀", "⾁", "⾂", "⾃"];
 const COLLAPSE_MAX_CHARS: usize = 80;
@@ -95,7 +95,9 @@ impl App {
         let status_structured = orch.status_structured();
         let mut output = OutputArea::new();
         output.push_system("AI Brain v2 一主二从系统");
-        output.push_system("输入查询 | :help 命令 | Enter 提交 | Tab 补全 | ↑↓ 历史 | Shift+Enter 换行");
+        output.push_system(
+            "输入查询 | :help 命令 | Enter 提交 | Tab 补全 | ↑↓ 历史 | Shift+Enter 换行",
+        );
         output.push_system("文本选择: 单击拖选 | 单击→Ctrl+F→单击扩展 → Ctrl+Y 复制 | Esc 清除");
 
         // 构建 CommandRegistry，同时用于补全器和命令面板
@@ -280,8 +282,6 @@ impl App {
         self.command_panel.render(f, chunks[2]);
     }
 
-
-
     fn render_output(&mut self, f: &mut ratatui::Frame, area: Rect) {
         let mut ratatui_lines: Vec<Line> = Vec::new();
 
@@ -314,7 +314,9 @@ impl App {
         if let Some(latest) = self.output.streaming_thinking_latest_line() {
             ratatui_lines.push(Line::from(Span::styled(
                 format!("  💭 {latest}"),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
             )));
         }
 
@@ -342,23 +344,21 @@ impl App {
                 self.rendered_text.extend(segments);
             } else {
                 // 需要换行：检测前缀样式（如 "> "、"✓ "）
-                let content_style =
-                    line.iter().last().map(|s| s.style).unwrap_or_default();
-                let (prefix_style, prefix_end_col) =
-                    if let Some(first) = line.iter().next() {
-                        let w: usize = first
-                            .content
-                            .chars()
-                            .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
-                            .sum();
-                        if w > 0 && w <= 4 {
-                            (first.style, w)
-                        } else {
-                            (Style::default(), 0)
-                        }
+                let content_style = line.iter().last().map(|s| s.style).unwrap_or_default();
+                let (prefix_style, prefix_end_col) = if let Some(first) = line.iter().next() {
+                    let w: usize = first
+                        .content
+                        .chars()
+                        .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+                        .sum();
+                    if w > 0 && w <= 4 {
+                        (first.style, w)
                     } else {
                         (Style::default(), 0)
-                    };
+                    }
+                } else {
+                    (Style::default(), 0)
+                };
 
                 for (i, seg) in segments.iter().enumerate() {
                     if i == 0 && prefix_end_col > 0 {
@@ -380,8 +380,7 @@ impl App {
                         ]));
                     } else {
                         // 续行或无前缀行：使用内容样式
-                        final_lines
-                            .push(Line::from(Span::styled(seg.clone(), content_style)));
+                        final_lines.push(Line::from(Span::styled(seg.clone(), content_style)));
                     }
                     self.rendered_text.push(seg.clone());
                 }
@@ -495,7 +494,9 @@ impl App {
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -589,7 +590,9 @@ impl App {
                                     .fg(Color::DarkGray)
                                     .add_modifier(Modifier::DIM),
                             )));
-                            if let Some(last) = all_lines.iter().rev().find(|l| !l.trim().is_empty()) {
+                            if let Some(last) =
+                                all_lines.iter().rev().find(|l| !l.trim().is_empty())
+                            {
                                 lines.push(Line::from(Span::styled(
                                     format!("  💭 {last}"),
                                     Style::default()
@@ -795,10 +798,8 @@ impl App {
                         } else {
                             // 单选模式下，空格等同 Enter
                             let sel_state = self.selection_state.take().unwrap();
-                            let answer =
-                                sel_state.options[sel_state.cursor_index].clone();
-                            self.output
-                                .push_system(&format!("   ✓ 已选择: {answer}"));
+                            let answer = sel_state.options[sel_state.cursor_index].clone();
+                            self.output.push_system(&format!("   ✓ 已选择: {answer}"));
                             if let Some(tx) = self.pending_ask_response.take() {
                                 let _ = tx.send(answer);
                             }
@@ -821,15 +822,13 @@ impl App {
                                 .filter_map(|&i| sel.options.get(i).cloned())
                                 .collect();
                             let answer = answers.join(", ");
-                            self.output
-                                .push_system(&format!("   ✓ 已选择: {answer}"));
+                            self.output.push_system(&format!("   ✓ 已选择: {answer}"));
                             if let Some(tx) = self.pending_ask_response.take() {
                                 let _ = tx.send(answer);
                             }
                         } else {
                             let answer = sel.options[sel.cursor_index].clone();
-                            self.output
-                                .push_system(&format!("   ✓ 已选择: {answer}"));
+                            self.output.push_system(&format!("   ✓ 已选择: {answer}"));
                             if let Some(tx) = self.pending_ask_response.take() {
                                 let _ = tx.send(answer);
                             }
@@ -866,7 +865,9 @@ impl App {
                 KeyCode::Tab | KeyCode::Enter => {
                     if let Some(item) = self.command_panel.confirm() {
                         let mut replacement = item.display.clone();
-                        let has_subcommands = self.command_registry.find_command(&item.command_name)
+                        let has_subcommands = self
+                            .command_registry
+                            .find_command(&item.command_name)
                             .map_or(false, |c| !c.subcommands.is_empty());
                         if has_subcommands && item.subcommand_name.is_none() {
                             replacement.push(' ');
@@ -875,7 +876,8 @@ impl App {
                         }
                         self.input.set_text(replacement);
                         // 重新触发面板过滤
-                        self.command_panel.update_filter(&self.command_registry, &self.input.input_text());
+                        self.command_panel
+                            .update_filter(&self.command_registry, &self.input.input_text());
                     }
                     return true;
                 }
@@ -892,7 +894,8 @@ impl App {
             // Ctrl+C / Esc — 清除选择、取消查询或退出
             (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Esc) => {
                 // 清除选择、光标和扩展模式
-                if self.selection_anchor.is_some() || self.cursor_pos.is_some()
+                if self.selection_anchor.is_some()
+                    || self.cursor_pos.is_some()
                     || self.selection_extend_mode
                 {
                     self.selection_anchor = None;
@@ -923,9 +926,8 @@ impl App {
                 if self.selection_anchor.is_some() && self.selection_end.is_none() {
                     self.selection_extend_mode = !self.selection_extend_mode;
                     if self.selection_extend_mode {
-                        self.output.push_system(
-                            "  选择扩展模式: 点击或拖拽设终点 (Esc取消)",
-                        );
+                        self.output
+                            .push_system("  选择扩展模式: 点击或拖拽设终点 (Esc取消)");
                     }
                 } else {
                     self.selection_extend_mode = false;
@@ -957,7 +959,8 @@ impl App {
                 // 输入变化时更新命令面板
                 let text = self.input.input_text();
                 if text.starts_with(':') {
-                    self.command_panel.update_filter(&self.command_registry, &text);
+                    self.command_panel
+                        .update_filter(&self.command_registry, &text);
                 } else if self.command_panel.visible {
                     self.command_panel.clear();
                 }
@@ -1052,7 +1055,8 @@ impl App {
                                     "question": &question,
                                     "options": &options,
                                     "multi_select": multi_select,
-                                })).unwrap_or_default(),
+                                }))
+                                .unwrap_or_default(),
                             });
                             // 显示问题文本
                             self.output.push_system(&format!("❓ {question}"));
@@ -1159,8 +1163,11 @@ impl App {
                     // 单行选择：提取 start_col..=end_col
                     let ci_s = Self::screen_col_to_char_idx(line_text, start_col);
                     let ci_e = Self::screen_col_to_char_idx(line_text, end_col + 1);
-                    let selected: String =
-                        line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+                    let selected: String = line_text
+                        .chars()
+                        .skip(ci_s)
+                        .take(ci_e.saturating_sub(ci_s))
+                        .collect();
                     parts.push(selected);
                 } else if i == start_line {
                     // 首行：从 start_col 到行尾
@@ -1181,8 +1188,16 @@ impl App {
             let text = parts.join("\n");
 
             let text_preview: String = text.chars().take(60).collect();
-            let start_preview: String = self.rendered_text.get(start_line).map(|s| s.chars().take(30).collect()).unwrap_or_default();
-            let end_preview: String = self.rendered_text.get(end_line).map(|s| s.chars().take(30).collect()).unwrap_or_default();
+            let start_preview: String = self
+                .rendered_text
+                .get(start_line)
+                .map(|s| s.chars().take(30).collect())
+                .unwrap_or_default();
+            let end_preview: String = self
+                .rendered_text
+                .get(end_line)
+                .map(|s| s.chars().take(30).collect())
+                .unwrap_or_default();
             Self::dbg_log(&format!(
                 "COPY: anchor={:?} end={:?} -> start=({},{}) end=({},{}) | text={:?} | line[{}]={:?} | line[{}]={:?}",
                 self.selection_anchor, self.selection_end,
@@ -1219,7 +1234,8 @@ impl App {
             self.selection_anchor = None;
             self.selection_end = None;
         } else {
-            self.output.push_system("未选择文本（单击拖选 / 单击后右键扩展）");
+            self.output
+                .push_system("未选择文本（单击拖选 / 单击后右键扩展）");
         }
     }
 
@@ -1239,7 +1255,8 @@ impl App {
         self.is_busy = false;
         self.status.busy = false;
         self.pending_queue.clear();
-        self.output.push_system("查询已取消（已执行的工具调用已保存）");
+        self.output
+            .push_system("查询已取消（已执行的工具调用已保存）");
     }
 
     fn handle_ctrl_c(&mut self) {
@@ -1486,7 +1503,8 @@ impl App {
         let trimmed = input.trim();
 
         // 快速排除非命令输入
-        if !trimmed.starts_with(':') && trimmed != "help" && trimmed != "exit" && trimmed != "quit" {
+        if !trimmed.starts_with(':') && trimmed != "help" && trimmed != "exit" && trimmed != "quit"
+        {
             return HandleResult::Unknown;
         }
 
@@ -1538,10 +1556,8 @@ impl App {
             }
             CommandHandler::Async(_) => {
                 // 异步命令：显示占位提示
-                self.output.push_system(&format!(
-                    "命令 :{} 异步执行中...（待完善）",
-                    cmd_name
-                ));
+                self.output
+                    .push_system(&format!("命令 :{} 异步执行中...（待完善）", cmd_name));
                 HandleResult::Handled
             }
         }
@@ -1929,7 +1945,11 @@ mod tests {
         let line_text = &rendered[0];
         let ci_s = App::screen_col_to_char_idx(line_text, start_col);
         let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
-        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+        let selected: String = line_text
+            .chars()
+            .skip(ci_s)
+            .take(ci_e.saturating_sub(ci_s))
+            .collect();
 
         assert_eq!(selected, "llo Wor");
     }
@@ -1946,7 +1966,11 @@ mod tests {
         let line_text = &rendered[0];
         let ci_s = App::screen_col_to_char_idx(line_text, start_col);
         let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
-        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+        let selected: String = line_text
+            .chars()
+            .skip(ci_s)
+            .take(ci_e.saturating_sub(ci_s))
+            .collect();
 
         assert_eq!(ci_s, 6, "start char index should be 6 (W)");
         assert_eq!(ci_e, 11, "end char index should be 11 (past 'd')");
@@ -1964,7 +1988,11 @@ mod tests {
         let line_text = &rendered[0];
         let ci_s = App::screen_col_to_char_idx(line_text, start_col);
         let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
-        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+        let selected: String = line_text
+            .chars()
+            .skip(ci_s)
+            .take(ci_e.saturating_sub(ci_s))
+            .collect();
 
         assert_eq!(selected, "Hello World");
     }
@@ -1992,7 +2020,11 @@ mod tests {
             if start_line == end_line {
                 let ci_s = App::screen_col_to_char_idx(line_text, start_col);
                 let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1);
-                let sel: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+                let sel: String = line_text
+                    .chars()
+                    .skip(ci_s)
+                    .take(ci_e.saturating_sub(ci_s))
+                    .collect();
                 parts.push(sel);
             } else if i == start_line {
                 let ci = App::screen_col_to_char_idx(line_text, start_col);
@@ -2017,12 +2049,16 @@ mod tests {
         // 选中最后4个字符 "试文本"
         // "这"(0-1) "是"(2-3) "一"(4-5) "段"(6-7) "中"(8-9) "文"(10-11) "测"(12-13) "试"(14-15) "文"(16-17) "本"(18-19)
         let start_col = 12; // '测'
-        let end_col = 18;   // '本' 的起始列
+        let end_col = 18; // '本' 的起始列
         let line_text = &rendered[0];
 
         let ci_s = App::screen_col_to_char_idx(line_text, start_col);
         let ci_e = App::screen_col_to_char_idx(line_text, end_col + 1); // past '本'
-        let selected: String = line_text.chars().skip(ci_s).take(ci_e.saturating_sub(ci_s)).collect();
+        let selected: String = line_text
+            .chars()
+            .skip(ci_s)
+            .take(ci_e.saturating_sub(ci_s))
+            .collect();
 
         // 每个屏幕列=2单位, 所以 col 12 → char idx 6 ('测')
         assert_eq!(ci_s, 6, "start at char 6 (测)");
@@ -2033,19 +2069,28 @@ mod tests {
 
     #[test]
     fn display_width_ascii() {
-        let w: usize = "Hello".chars().map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)).sum();
+        let w: usize = "Hello"
+            .chars()
+            .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+            .sum();
         assert_eq!(w, 5);
     }
 
     #[test]
     fn display_width_cjk() {
-        let w: usize = "你好世界".chars().map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)).sum();
+        let w: usize = "你好世界"
+            .chars()
+            .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+            .sum();
         assert_eq!(w, 8); // 4 chars × 2 width
     }
 
     #[test]
     fn display_width_mixed() {
-        let w: usize = "> 你好".chars().map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)).sum();
+        let w: usize = "> 你好"
+            .chars()
+            .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+            .sum();
         assert_eq!(w, 6); // "> " = 2, "你好" = 4
     }
 }

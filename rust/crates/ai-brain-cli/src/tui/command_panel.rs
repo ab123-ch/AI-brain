@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_confirm_invisible() {
-        let mut panel = CommandPanel::new();
+        let panel = CommandPanel::new();
         assert!(panel.confirm().is_none());
     }
 
@@ -580,8 +580,14 @@ mod integration_tests {
         let mut panel = CommandPanel::new();
         panel.update_filter(&full_registry(), "plugin ");
         assert!(panel.visible);
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("install")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("list")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("install")));
     }
 
     #[test]
@@ -589,8 +595,14 @@ mod integration_tests {
         let mut panel = CommandPanel::new();
         panel.update_filter(&full_registry(), "plugin ins");
         assert!(panel.visible);
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("install")));
-        assert!(!panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("install")));
+        assert!(!panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("list")));
     }
 
     #[test]
@@ -605,10 +617,22 @@ mod integration_tests {
         let mut panel = CommandPanel::new();
         panel.update_filter(&full_registry(), "memory ");
         assert!(panel.visible);
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("stats")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("recall")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("save")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("daily")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("stats")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("recall")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("save")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("daily")));
     }
 
     #[test]
@@ -624,9 +648,18 @@ mod integration_tests {
         let mut panel = CommandPanel::new();
         panel.update_filter(&full_registry(), "config ");
         assert!(panel.visible);
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("get")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("set")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("brain-params")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("get")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("set")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("brain-params")));
     }
 
     #[test]
@@ -634,9 +667,18 @@ mod integration_tests {
         let mut panel = CommandPanel::new();
         panel.update_filter(&full_registry(), "skill ");
         assert!(panel.visible);
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("run")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("info")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("list")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("run")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("info")));
     }
 
     #[test]
@@ -644,9 +686,18 @@ mod integration_tests {
         let mut panel = CommandPanel::new();
         panel.update_filter(&full_registry(), "mcp ");
         assert!(panel.visible);
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("list")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("status")));
-        assert!(panel.items.iter().any(|i| i.subcommand_name.as_deref() == Some("reconnect")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("list")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("status")));
+        assert!(panel
+            .items
+            .iter()
+            .any(|i| i.subcommand_name.as_deref() == Some("reconnect")));
     }
 
     #[test]

@@ -35,6 +35,36 @@ validation = "glm-5-turbo"
 [llm.defaults]
 max_tokens = 4096
 temperature = 0.7
+
+# 每个脑的独立生成参数（未配置的脑走 defaults）
+# max_tokens = 单次输出的 token 上限（推理模型的 thinking 也算在内，要留够余量）
+[llm.brain_params.main]
+max_tokens = 32768
+temperature = 0.7
+
+[llm.brain_params.memory]
+max_tokens = 32768
+temperature = 0.3
+
+[llm.brain_params.eval]
+max_tokens = 16384
+temperature = 0.3
+
+[llm.brain_params.evolver]
+max_tokens = 16384
+temperature = 0.3
+
+[llm.brain_params.sensory]
+max_tokens = 8192
+temperature = 0.3
+
+[llm.brain_params.reasoning]
+max_tokens = 8192
+temperature = 0.5
+
+[llm.brain_params.compact]
+max_tokens = 4096
+temperature = 0.3
 "#;
 
 /// 初始化 AI Brain 运行环境

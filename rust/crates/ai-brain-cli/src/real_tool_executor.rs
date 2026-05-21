@@ -226,10 +226,7 @@ impl ToolExecutor for RealToolExecutor {
             let inp = input;
             return Box::pin(async move {
                 if let Some(ref catalog) = catalog {
-                    let skill_name = inp
-                        .get("skill")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let skill_name = inp.get("skill").and_then(|v| v.as_str()).unwrap_or("");
                     match catalog.resolve(skill_name) {
                         Some(meta) => match catalog.load_content(meta) {
                             Ok(content) => ToolExecutionResult {
@@ -255,11 +252,10 @@ impl ToolExecutor for RealToolExecutor {
                 } else {
                     // 没有 SkillCatalog 时走旧的 tools::execute_tool 路径
                     let n_clone = n.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        tools::execute_tool(&n_clone, &inp)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
+                    let result =
+                        tokio::task::spawn_blocking(move || tools::execute_tool(&n_clone, &inp))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
                     match result {
                         Ok(output) => ToolExecutionResult {
                             tool_name: n.clone(),

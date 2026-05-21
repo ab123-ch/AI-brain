@@ -107,7 +107,8 @@ async fn main() {
 fn dump_system_prompt_to_desktop() {
     use brain_main::prompts;
     let prompt = prompts::build_full_system_prompt(None);
-    let desktop = dirs::desktop_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let desktop =
+        dirs::desktop_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let path = desktop.join("系统提示词.txt");
     match std::fs::write(&path, &prompt) {
         Ok(()) => tracing::info!(
@@ -148,12 +149,10 @@ async fn run_command(cli: Cli) {
                 Err(e) => eprintln!("查询失败: {e}"),
             }
         }
-        Some(Commands::Status) => {
-            match Orchestrator::new().await {
-                Ok(orch) => println!("{}", orch.status()),
-                Err(e) => println!("=== AI Brain 系统状态 ===\n  LLM 不可用: {e}"),
-            }
-        }
+        Some(Commands::Status) => match Orchestrator::new().await {
+            Ok(orch) => println!("{}", orch.status()),
+            Err(e) => println!("=== AI Brain 系统状态 ===\n  LLM 不可用: {e}"),
+        },
         Some(Commands::Weights) => {
             let orch = init_or_die().await;
             println!("{}", orch.weights().await);
@@ -264,8 +263,12 @@ async fn run_command(cli: Cli) {
         }
         Some(Commands::DumpSystemPrompt) => {
             dump_system_prompt_to_desktop();
-            let desktop = dirs::desktop_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            println!("系统提示词已导出到: {}", desktop.join("系统提示词.txt").display());
+            let desktop =
+                dirs::desktop_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            println!(
+                "系统提示词已导出到: {}",
+                desktop.join("系统提示词.txt").display()
+            );
         }
     }
 }

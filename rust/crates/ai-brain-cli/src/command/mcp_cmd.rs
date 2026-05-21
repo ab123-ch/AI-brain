@@ -11,9 +11,7 @@ fn handle_mcp(args: &[String]) -> CommandResult {
     };
 
     match sub {
-        "list" => {
-            CommandResult::ok("[placeholder] MCP 服务列表（暂无数据）")
-        }
+        "list" => CommandResult::ok("[placeholder] MCP 服务列表（暂无数据）"),
         "status" => {
             let server = args.get(1);
             match server {
@@ -28,7 +26,9 @@ fn handle_mcp(args: &[String]) -> CommandResult {
                 None => CommandResult::err("用法: /mcp reconnect <server>"),
             }
         }
-        other => CommandResult::err(format!("未知子命令: {other}。可用: list, status, reconnect")),
+        other => CommandResult::err(format!(
+            "未知子命令: {other}。可用: list, status, reconnect"
+        )),
     }
 }
 
@@ -78,7 +78,9 @@ mod tests {
     #[test]
     fn test_mcp_registration() {
         let registry = register_mcp();
-        let cmd = registry.find_command("mcp").expect("mcp command should exist");
+        let cmd = registry
+            .find_command("mcp")
+            .expect("mcp command should exist");
         assert_eq!(cmd.name, "mcp");
         assert_eq!(cmd.group, CommandGroup::Mcp);
         assert_eq!(cmd.subcommands.len(), 3);

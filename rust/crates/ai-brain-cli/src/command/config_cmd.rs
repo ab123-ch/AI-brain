@@ -85,7 +85,9 @@ mod tests {
         let registry = register_config();
 
         // Verify top-level command registered
-        let cmd = registry.find_command("config").expect("config command should exist");
+        let cmd = registry
+            .find_command("config")
+            .expect("config command should exist");
         assert_eq!(cmd.name, "config");
         assert_eq!(cmd.group, CommandGroup::Config);
 
@@ -93,13 +95,17 @@ mod tests {
         assert_eq!(cmd.subcommands.len(), 3);
 
         // get subcommand
-        let get = registry.find_subcommand("config", "get").expect("get subcommand");
+        let get = registry
+            .find_subcommand("config", "get")
+            .expect("get subcommand");
         assert_eq!(get.args.len(), 1);
         assert_eq!(get.args[0].name, "key");
         assert!(get.args[0].required);
 
         // set subcommand
-        let set = registry.find_subcommand("config", "set").expect("set subcommand");
+        let set = registry
+            .find_subcommand("config", "set")
+            .expect("set subcommand");
         assert_eq!(set.args.len(), 2);
         assert_eq!(set.args[0].name, "key");
         assert!(set.args[0].required);
@@ -107,7 +113,9 @@ mod tests {
         assert!(set.args[1].required);
 
         // brain-params subcommand
-        let bp = registry.find_subcommand("config", "brain-params").expect("brain-params subcommand");
+        let bp = registry
+            .find_subcommand("config", "brain-params")
+            .expect("brain-params subcommand");
         assert!(bp.args.is_empty());
     }
 
@@ -158,13 +166,19 @@ mod tests {
     fn test_config_unknown_subcommand() {
         let result = handle_config(&["unknown".into()]);
         assert!(!result.success);
-        assert_eq!(result.output, "用法: :config get <key> | set <key> <value> | brain-params");
+        assert_eq!(
+            result.output,
+            "用法: :config get <key> | set <key> <value> | brain-params"
+        );
     }
 
     #[test]
     fn test_config_no_args() {
         let result = handle_config(&[]);
         assert!(!result.success);
-        assert_eq!(result.output, "用法: :config get <key> | set <key> <value> | brain-params");
+        assert_eq!(
+            result.output,
+            "用法: :config get <key> | set <key> <value> | brain-params"
+        );
     }
 }

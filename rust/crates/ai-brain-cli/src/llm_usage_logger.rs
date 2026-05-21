@@ -27,7 +27,7 @@ impl ModelPricing {
     /// 根据模型名称获取定价
     pub fn for_model(model: &str) -> Option<Self> {
         let normalized = model.to_ascii_lowercase();
-        
+
         // Anthropic Claude 模型
         if normalized.contains("claude") {
             if normalized.contains("haiku") {
@@ -54,27 +54,27 @@ impl ModelPricing {
                 cache_read_cost_per_million: 1.5,
             });
         }
-        
+
         // DeepSeek 模型
         if normalized.contains("deepseek") {
             return Some(Self {
-                input_cost_per_million: 0.27,  // DeepSeek-V3 价格
+                input_cost_per_million: 0.27, // DeepSeek-V3 价格
                 output_cost_per_million: 1.10,
                 cache_creation_cost_per_million: 0.27,
                 cache_read_cost_per_million: 0.07,
             });
         }
-        
+
         // GLM 模型（智谱）
         if normalized.contains("glm") {
             return Some(Self {
-                input_cost_per_million: 1.0,    // GLM-4 价格估算
+                input_cost_per_million: 1.0, // GLM-4 价格估算
                 output_cost_per_million: 1.0,
                 cache_creation_cost_per_million: 1.0,
                 cache_read_cost_per_million: 0.1,
             });
         }
-        
+
         None
     }
 }
@@ -102,10 +102,10 @@ impl LlmUsageRecord {
     /// 从 TokenUsage 创建记录
     pub fn new(model: String, call_index: u32, usage: TokenUsage) -> Self {
         let cache_hit_rate = usage.cache_hit_rate().unwrap_or(0.0);
-        
+
         let pricing = ModelPricing::for_model(&model);
         let has_model_pricing = pricing.is_some();
-        
+
         let estimated_cost_usd = if let Some(pricing) = pricing {
             Self::calculate_cost(&usage, pricing)
         } else {
@@ -118,9 +118,11 @@ impl LlmUsageRecord {
             };
             Self::calculate_cost(&usage, default_pricing)
         };
-        
+
         Self {
-            timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+            timestamp: chrono::Local::now()
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
             model,
             call_index,
             usage,
@@ -129,13 +131,16 @@ impl LlmUsageRecord {
             has_model_pricing,
         }
     }
-    
+
     fn calculate_cost(usage: &TokenUsage, pricing: ModelPricing) -> f64 {
         let input_cost = usage.prompt_tokens as f64 / 1_000_000.0 * pricing.input_cost_per_million;
-        let output_cost = usage.completion_tokens as f64 / 1_000_000.0 * pricing.output_cost_per_million;
-        let cache_creation_cost = usage.cache_creation_input_tokens as f64 / 1_000_000.0 * pricing.cache_creation_cost_per_million;
-        let cache_read_cost = usage.cache_read_input_tokens as f64 / 1_000_000.0 * pricing.cache_read_cost_per_million;
-        
+        let output_cost =
+            usage.completion_tokens as f64 / 1_000_000.0 * pricing.output_cost_per_million;
+        let cache_creation_cost = usage.cache_creation_input_tokens as f64 / 1_000_000.0
+            * pricing.cache_creation_cost_per_million;
+        let cache_read_cost = usage.cache_read_input_tokens as f64 / 1_000_000.0
+            * pricing.cache_read_cost_per_million;
+
         input_cost + output_cost + cache_creation_cost + cache_read_cost
     }
 }
@@ -160,9 +165,9 @@ impl LlmUsageLogger {
     pub fn new() -> Self {
         let base = crate::init::base_dir();
         let _ = fs::create_dir_all(&base);
-        
+
         let path = base.join("llm_usage.log");
-        
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -171,14 +176,14 @@ impl LlmUsageLogger {
                 eprintln!("无法创建 LLM 使用日志 {}: {e}", path.display());
                 std::process::exit(1);
             });
-        
+
         let sl = Self {
             path,
             writer: Mutex::new(file),
             cumulative_usage: Mutex::new(TokenUsage::default()),
             call_counter: Mutex::new(0),
         };
-        
+
         // 写入会话头
         sl.log_raw(&format!(
             "\n═══════════════════════════════════════════════════════════════════════════════\n\
@@ -186,10 +191,10 @@ impl LlmUsageLogger {
              ═══════════════════════════════════════════════════════════════════════════════\n",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         ));
-        
+
         sl
     }
-    
+
     /// 记录一次 LLM 调用的使用情况
     pub fn log_usage(&self, model: &str, usage: &TokenUsage) {
         // 更新调用计数
@@ -198,7 +203,7 @@ impl LlmUsageLogger {
             *counter += 1;
             *counter
         };
-        
+
         // 更新累计使用量
         {
             let mut cumulative = self.cumulative_usage.lock().unwrap();
@@ -208,30 +213,30 @@ impl LlmUsageLogger {
             cumulative.cache_creation_input_tokens += usage.cache_creation_input_tokens;
             cumulative.cache_read_input_tokens += usage.cache_read_input_tokens;
         }
-        
+
         // 创建本次记录
         let record = LlmUsageRecord::new(model.to_string(), call_index, usage.clone());
-        
+
         // 格式化并写入日志
         let log_entry = self.format_record(&record);
         self.log_raw(&log_entry);
     }
-    
+
     /// 记录会话结束时的累计统计
     pub fn log_session_summary(&self) {
         let cumulative = self.cumulative_usage.lock().unwrap();
         let call_count = *self.call_counter.lock().unwrap();
-        
+
         if call_count == 0 {
             return;
         }
-        
+
         let cache_hit_rate = if cumulative.total_input_tokens() > 0 {
             cumulative.cache_read_input_tokens as f64 / cumulative.total_input_tokens() as f64
         } else {
             0.0
         };
-        
+
         let summary = format!(
             "\n\
              ─────────────────────────────────────────────────────────────────────────────\n\
@@ -252,10 +257,10 @@ impl LlmUsageLogger {
             cache_hit_rate * 100.0,
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         );
-        
+
         self.log_raw(&summary);
     }
-    
+
     fn format_record(&self, record: &LlmUsageRecord) -> String {
         format!(
             "\n\
@@ -292,7 +297,7 @@ impl LlmUsageLogger {
             }
         )
     }
-    
+
     fn log_raw(&self, text: &str) {
         if let Ok(mut file) = self.writer.lock() {
             let _ = file.write_all(text.as_bytes());

@@ -9,25 +9,15 @@ fn handle_evolver(args: &[String]) -> CommandResult {
     let sub = args.first().map(|s| s.as_str());
 
     match sub {
-        Some("status") => {
-            CommandResult::ok("[placeholder] 进化任务状态（暂无进行中的任务）")
-        }
-        Some("approve") => {
-            CommandResult::ok("[placeholder] 批准进化变更")
-        }
-        Some("reject") => {
-            CommandResult::ok("[placeholder] 拒绝进化变更")
-        }
-        Some("diff") => {
-            CommandResult::ok("[placeholder] 进化变更差异（暂无数据）")
-        }
+        Some("status") => CommandResult::ok("[placeholder] 进化任务状态（暂无进行中的任务）"),
+        Some("approve") => CommandResult::ok("[placeholder] 批准进化变更"),
+        Some("reject") => CommandResult::ok("[placeholder] 拒绝进化变更"),
+        Some("diff") => CommandResult::ok("[placeholder] 进化变更差异（暂无数据）"),
         Some(goal) => {
             // Treat as "start evolution with goal"
             CommandResult::ok(format!("[placeholder] 启动进化任务，目标: {goal}"))
         }
-        None => {
-            CommandResult::err("用法: /evo <goal> 或 /evo <status|approve|reject|diff>")
-        }
+        None => CommandResult::err("用法: /evo <goal> 或 /evo <status|approve|reject|diff>"),
     }
 }
 
@@ -74,7 +64,9 @@ mod tests {
     #[test]
     fn test_evolver_registration() {
         let registry = register_evolver();
-        let cmd = registry.find_command("evo").expect("evo command should exist");
+        let cmd = registry
+            .find_command("evo")
+            .expect("evo command should exist");
         assert_eq!(cmd.name, "evo");
         assert_eq!(cmd.group, CommandGroup::Evolver);
         assert_eq!(cmd.subcommands.len(), 4);

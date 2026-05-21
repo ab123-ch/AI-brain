@@ -7,7 +7,9 @@ mod session_logger;
 mod status;
 
 pub use app::App;
-pub use completion::{CompletionCategory, CompletionItem, CompletionPopup, EvolutionCompleter, InputContext};
+pub use completion::{
+    CompletionCategory, CompletionItem, CompletionPopup, EvolutionCompleter, InputContext,
+};
 
 use crate::orchestrator::Orchestrator;
 
@@ -20,19 +22,12 @@ pub async fn run(orch: Orchestrator) {
 
     // 2. 启用 bracketed paste & 进入 alternate screen（一并 flush）
     use std::io::Write as _;
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-    )
-    .expect("无法进入 alternate screen");
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen,)
+        .expect("无法进入 alternate screen");
     // 手动启用鼠标捕获：只用 normal tracking (?1000h) + SGR 模式 (?1006h)
     // 不启用 button-event (?1002h) 和 any-event (?1003h)，
     // 这样左键拖拽不被捕获，终端原生文本选择可以正常工作。
-    write!(
-        std::io::stdout(),
-        "\x1b[?1000h\x1b[?1006h"
-    )
-    .ok();
+    write!(std::io::stdout(), "\x1b[?1000h\x1b[?1006h").ok();
     // bracketed paste
     write!(std::io::stdout(), "\x1b[?2004h").ok();
     std::io::stdout().flush().ok();
@@ -51,11 +46,7 @@ pub async fn run(orch: Orchestrator) {
     // 禁用 bracketed paste
     write!(std::io::stdout(), "\x1b[?2004l").ok();
     std::io::stdout().flush().ok();
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen
-    )
-    .ok();
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
     crossterm::terminal::disable_raw_mode().ok();
 

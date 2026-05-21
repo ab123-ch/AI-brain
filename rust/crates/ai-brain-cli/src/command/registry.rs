@@ -114,7 +114,11 @@ impl CommandRegistry {
 
     /// Find a subcommand under a given top-level command.
     /// Returns `None` if the top-level command or the subcommand is not found.
-    pub fn find_subcommand(&self, command_name: &str, subcommand_name: &str) -> Option<&SubCommand> {
+    pub fn find_subcommand(
+        &self,
+        command_name: &str,
+        subcommand_name: &str,
+    ) -> Option<&SubCommand> {
         self.find_command(command_name)?
             .subcommands
             .iter()

@@ -11,9 +11,7 @@ fn handle_memory(args: &[String]) -> CommandResult {
     };
 
     match sub {
-        "stats" => {
-            CommandResult::ok("[placeholder] 记忆统计（暂无数据）")
-        }
+        "stats" => CommandResult::ok("[placeholder] 记忆统计（暂无数据）"),
         "recall" => {
             let query = args.get(1);
             match query {
@@ -32,7 +30,9 @@ fn handle_memory(args: &[String]) -> CommandResult {
             let date = args.get(1).map(|s| s.as_str()).unwrap_or("今天");
             CommandResult::ok(format!("[placeholder] 每日摘要: {date}"))
         }
-        other => CommandResult::err(format!("未知子命令: {other}。可用: stats, recall, save, daily")),
+        other => CommandResult::err(format!(
+            "未知子命令: {other}。可用: stats, recall, save, daily"
+        )),
     }
 }
 
@@ -91,7 +91,9 @@ mod tests {
     #[test]
     fn test_memory_registration() {
         let registry = register_memory();
-        let cmd = registry.find_command("memory").expect("memory command should exist");
+        let cmd = registry
+            .find_command("memory")
+            .expect("memory command should exist");
         assert_eq!(cmd.name, "memory");
         assert_eq!(cmd.group, CommandGroup::Memory);
         assert_eq!(cmd.subcommands.len(), 4);

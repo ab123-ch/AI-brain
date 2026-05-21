@@ -84,10 +84,16 @@ impl StatusBar {
 
         // Token 计数 + 缓存命中率 + 费用估算
         let total_input = self.cumulative_prompt_tokens + self.cumulative_cache_read_tokens;
-        let tok_display = if self.cumulative_prompt_tokens > 0 || self.cumulative_completion_tokens > 0 {
+        let tok_display = if self.cumulative_prompt_tokens > 0
+            || self.cumulative_completion_tokens > 0
+        {
             let in_tok = short_tokens(self.cumulative_prompt_tokens);
             let out_tok = short_tokens(self.cumulative_completion_tokens);
-            let cost = estimate_cost(&self.model, self.cumulative_prompt_tokens, self.cumulative_completion_tokens);
+            let cost = estimate_cost(
+                &self.model,
+                self.cumulative_prompt_tokens,
+                self.cumulative_completion_tokens,
+            );
 
             // 缓存命中率
             let cache_str = if self.cumulative_cache_read_tokens > 0 && total_input > 0 {
@@ -115,8 +121,16 @@ impl StatusBar {
             " {} | 上下文 {}%{}{} | 第{}轮 | {}{} ",
             self.model,
             ctx_display,
-            if tok_display.is_empty() { String::new() } else { format!(" | {tok_display}") },
-            if compaction_str.is_empty() { String::new() } else { format!(" | {compaction_str}") },
+            if tok_display.is_empty() {
+                String::new()
+            } else {
+                format!(" | {tok_display}")
+            },
+            if compaction_str.is_empty() {
+                String::new()
+            } else {
+                format!(" | {compaction_str}")
+            },
             self.round,
             eval_str,
             busy_indicator

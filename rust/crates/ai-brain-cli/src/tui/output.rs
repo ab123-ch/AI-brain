@@ -224,9 +224,8 @@ impl OutputArea {
                 self.lines.push(OutputLine::ToolStart {
                     name: "AskUserQuestion".into(),
                 });
-                self.lines.push(OutputLine::System(format!(
-                    "等待用户回答: {question}"
-                )));
+                self.lines
+                    .push(OutputLine::System(format!("等待用户回答: {question}")));
                 self.spinner_label = Some("等待用户回答...".into());
             }
             ProgressEvent::Done => {
@@ -264,7 +263,10 @@ impl OutputArea {
         // 注意：Done 事件会在 flush_streaming 之后追加 ToolSummary/Blank，
         // 所以不能只看 lines.last()，需要倒序查找最近的 AssistantReply
         for line in self.lines.iter().rev().take(5) {
-            if let OutputLine::AssistantReply { text: prev_text, .. } = line {
+            if let OutputLine::AssistantReply {
+                text: prev_text, ..
+            } = line
+            {
                 // 完全匹配 或 包含关系（streaming 可能只推送了部分）
                 if prev_text.trim() == text.trim()
                     || text.len() > 100 && prev_text.contains(&text.trim())
@@ -281,9 +283,7 @@ impl OutputArea {
             thinking: None, // thinking 已通过 ThinkingDelta 通道单独处理
             thinking_visible: false,
         });
-
     }
-
 
     pub fn push_system(&mut self, text: &str) {
         self.lines.push(OutputLine::System(text.to_string()));

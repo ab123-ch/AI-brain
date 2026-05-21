@@ -96,10 +96,22 @@ mod tests {
     #[test]
     fn test_register_all() {
         let registry = register_builtin();
-        assert!(registry.find_command("help").is_some(), "help should be registered");
-        assert!(registry.find_command("status").is_some(), "status should be registered");
-        assert!(registry.find_command("quit").is_some(), "quit should be registered");
-        assert!(registry.find_command("clear").is_some(), "clear should be registered");
+        assert!(
+            registry.find_command("help").is_some(),
+            "help should be registered"
+        );
+        assert!(
+            registry.find_command("status").is_some(),
+            "status should be registered"
+        );
+        assert!(
+            registry.find_command("quit").is_some(),
+            "quit should be registered"
+        );
+        assert!(
+            registry.find_command("clear").is_some(),
+            "clear should be registered"
+        );
     }
 
     #[test]
@@ -121,7 +133,9 @@ mod tests {
     #[test]
     fn test_status_output() {
         let registry = register_builtin();
-        let cmd = registry.find_command("status").expect("status command exists");
+        let cmd = registry
+            .find_command("status")
+            .expect("status command exists");
         let result = match &cmd.handler {
             CommandHandler::Sync(handler) => handler(&[]),
             CommandHandler::Async(handler) => handler(&[]),
@@ -145,7 +159,9 @@ mod tests {
     #[test]
     fn test_clear_sentinel() {
         let registry = register_builtin();
-        let cmd = registry.find_command("clear").expect("clear command exists");
+        let cmd = registry
+            .find_command("clear")
+            .expect("clear command exists");
         let result = match &cmd.handler {
             CommandHandler::Sync(handler) => handler(&[]),
             CommandHandler::Async(handler) => handler(&[]),

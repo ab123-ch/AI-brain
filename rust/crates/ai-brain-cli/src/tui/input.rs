@@ -18,9 +18,7 @@ use ratatui::widgets::Block;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
 
-use super::completion::{
-    CompletionPopup, EvolutionCompleter, InputContext,
-};
+use super::completion::{CompletionPopup, EvolutionCompleter, InputContext};
 
 const INPUT_MIN_HEIGHT: u16 = 3;
 const INPUT_MAX_HEIGHT: u16 = 10;
@@ -242,7 +240,8 @@ impl InputArea {
                 self.exit_history();
                 // 折叠状态下，光标在占位符区域或紧邻占位符末尾 → 整块删除粘贴内容
                 if self.paste_collapsed && self.cursor_byte <= self.paste_end_byte {
-                    let after = self.original[self.paste_end_byte.min(self.original.len())..].to_string();
+                    let after =
+                        self.original[self.paste_end_byte.min(self.original.len())..].to_string();
                     self.original = after;
                     self.cursor_byte = 0;
                     self.paste_collapsed = false;
@@ -268,7 +267,8 @@ impl InputArea {
                 self.exit_history();
                 // 折叠状态下，光标在占位符区域内 → 整块删除粘贴内容
                 if self.paste_collapsed && self.cursor_byte < self.paste_end_byte {
-                    let after = self.original[self.paste_end_byte.min(self.original.len())..].to_string();
+                    let after =
+                        self.original[self.paste_end_byte.min(self.original.len())..].to_string();
                     self.original = after;
                     self.cursor_byte = 0;
                     self.paste_collapsed = false;
@@ -294,8 +294,7 @@ impl InputArea {
                 self.delete_range(start, self.cursor_byte);
                 InputResult::Consumed
             }
-            (KeyModifiers::CONTROL, KeyCode::Delete)
-            | (KeyModifiers::ALT, KeyCode::Delete) => {
+            (KeyModifiers::CONTROL, KeyCode::Delete) | (KeyModifiers::ALT, KeyCode::Delete) => {
                 self.exit_history();
                 let end = self.find_next_word_end(self.cursor_byte);
                 self.delete_range(self.cursor_byte, end);
@@ -317,8 +316,7 @@ impl InputArea {
             }
 
             // ── 词级跳转（Ctrl+Left / Ctrl+Right / Alt+Left / Alt+Right） ──
-            (KeyModifiers::CONTROL, KeyCode::Left)
-            | (KeyModifiers::ALT, KeyCode::Left) => {
+            (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Left) => {
                 self.exit_history();
                 self.popup.clear();
                 let target = self.find_prev_word_start(self.cursor_byte);
@@ -326,8 +324,7 @@ impl InputArea {
                 self.sync_cursor_only();
                 InputResult::Consumed
             }
-            (KeyModifiers::CONTROL, KeyCode::Right)
-            | (KeyModifiers::ALT, KeyCode::Right) => {
+            (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Right) => {
                 self.exit_history();
                 self.popup.clear();
                 let end = self.find_next_word_end(self.cursor_byte);
@@ -742,10 +739,7 @@ impl InputArea {
         if pos == 0 {
             return 0;
         }
-        self.original[..pos]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0)
+        self.original[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0)
     }
 
     /// 找到光标所在行的行尾位置（用于 Ctrl+K 删到行尾）
@@ -888,9 +882,13 @@ impl InputArea {
                 let after_offset = self.cursor_byte - self.paste_end_byte;
                 let full_line = format!("{}{}", placeholder, after_paste);
                 // 计算 placeholder 后 after_offset 字符对应的视觉位置
-                let (vrow, vcol) =
-                    Self::map_byte_to_visual(&full_line, placeholder.len() + after_offset, self.wrap_width);
-                self.textarea.move_cursor(CursorMove::Jump(vrow as u16, vcol as u16));
+                let (vrow, vcol) = Self::map_byte_to_visual(
+                    &full_line,
+                    placeholder.len() + after_offset,
+                    self.wrap_width,
+                );
+                self.textarea
+                    .move_cursor(CursorMove::Jump(vrow as u16, vcol as u16));
             }
             return;
         }
@@ -931,9 +929,13 @@ impl InputArea {
             } else {
                 let after_offset = self.cursor_byte - self.paste_end_byte;
                 let full_line = format!("{}{}", placeholder, after_paste);
-                let (vrow, vcol) =
-                    Self::map_byte_to_visual(&full_line, placeholder.len() + after_offset, self.wrap_width);
-                self.textarea.move_cursor(CursorMove::Jump(vrow as u16, vcol as u16));
+                let (vrow, vcol) = Self::map_byte_to_visual(
+                    &full_line,
+                    placeholder.len() + after_offset,
+                    self.wrap_width,
+                );
+                self.textarea
+                    .move_cursor(CursorMove::Jump(vrow as u16, vcol as u16));
             }
             return;
         }
@@ -1034,9 +1036,12 @@ mod tests {
     #[test]
     fn test_history_navigation() {
         let mut area = InputArea::new(EvolutionCompleter::lightweight());
-        area.original = "first".into(); area.submit();
-        area.original = "second".into(); area.submit();
-        area.original = "third".into(); area.submit();
+        area.original = "first".into();
+        area.submit();
+        area.original = "second".into();
+        area.submit();
+        area.original = "third".into();
+        area.submit();
 
         // 当前在编辑新输入
         area.original = "editing".into();
@@ -1191,7 +1196,7 @@ mod tests {
     fn test_ctrl_u_delete_to_line_start() {
         let mut area = setup_area("hello world", 10);
         area.apply_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(area.original, "d");  // "hello wor" deleted, "d" remains
+        assert_eq!(area.original, "d"); // "hello wor" deleted, "d" remains
         assert_eq!(area.cursor_byte, 0);
     }
 
