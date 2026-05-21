@@ -6,90 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Content Blocks (multi-modal message content)
-// ---------------------------------------------------------------------------
-
-/// A single content block within a chat message.
-///
-/// Messages may contain multiple blocks: text, tool-use requests,
-/// and tool-execution results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    /// Plain text content.
-    Text { text: String },
-    /// Model's internal reasoning/thinking process (e.g. `<thinking>` tags from MiniMax/DeepSeek).
-    /// Not shown to users by default — filtered out by `as_text()` / `text()`.
-    Thinking { content: String },
-    /// A tool-use request from the assistant.
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        /// Unique ID for this tool call (e.g. "toolu_01abc").
-        id: String,
-        /// Name of the tool to invoke.
-        name: String,
-        /// JSON input for the tool.
-        input: serde_json::Value,
-    },
-    /// The result of executing a tool call, sent back to the LLM.
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        /// The ID of the tool call this result is for.
-        tool_use_id: String,
-        /// The output content (or error message).
-        content: String,
-        /// Whether the tool execution failed.
-        is_error: bool,
-    },
-}
-
-impl ContentBlock {
-    /// Convenience: create a text block.
-    pub fn text(content: impl Into<String>) -> Self {
-        Self::Text {
-            text: content.into(),
-        }
-    }
-
-    /// Extract text if this is a Text block, otherwise None.
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text { text } => Some(text),
-            _ => None,
-        }
-    }
-
-    /// Check if this is a ToolUse block.
-    pub fn is_tool_use(&self) -> bool {
-        matches!(self, Self::ToolUse { .. })
-    }
-
-    /// Check if this is a ToolResult block.
-    pub fn is_tool_result(&self) -> bool {
-        matches!(self, Self::ToolResult { .. })
-    }
-
-    /// Convenience: create a thinking block.
-    pub fn thinking(content: impl Into<String>) -> Self {
-        Self::Thinking {
-            content: content.into(),
-        }
-    }
-
-    /// Check if this is a Thinking block.
-    pub fn is_thinking(&self) -> bool {
-        matches!(self, Self::Thinking { .. })
-    }
-
-    /// Extract thinking content if this is a Thinking block, otherwise None.
-    pub fn as_thinking(&self) -> Option<&str> {
-        match self {
-            Self::Thinking { content } => Some(content),
-            _ => None,
-        }
-    }
-}
+// ContentBlock is defined in brain-core; re-export here for convenience.
+pub use brain_core::types::ContentBlock;
 
 // ---------------------------------------------------------------------------
 // Tool Definitions (sent to the LLM so it knows what tools are available)
@@ -202,49 +120,6 @@ impl TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn content_block_text_roundtrip() {
-        let block = ContentBlock::text("hello world");
-        let json = serde_json::to_string(&block).unwrap();
-        let de: ContentBlock = serde_json::from_str(&json).unwrap();
-        assert_eq!(de.as_text(), Some("hello world"));
-    }
-
-    #[test]
-    fn content_block_tool_use_roundtrip() {
-        let block = ContentBlock::ToolUse {
-            id: "toolu_01".into(),
-            name: "read_file".into(),
-            input: serde_json::json!({"path": "/tmp/test.rs"}),
-        };
-        let json = serde_json::to_string(&block).unwrap();
-        let de: ContentBlock = serde_json::from_str(&json).unwrap();
-        assert!(de.is_tool_use());
-    }
-
-    #[test]
-    fn content_block_tool_result_roundtrip() {
-        let block = ContentBlock::ToolResult {
-            tool_use_id: "toolu_01".into(),
-            content: "file contents here".into(),
-            is_error: false,
-        };
-        let json = serde_json::to_string(&block).unwrap();
-        let de: ContentBlock = serde_json::from_str(&json).unwrap();
-        assert!(de.is_tool_result());
-    }
-
-    #[test]
-    fn content_block_thinking_roundtrip() {
-        let block = ContentBlock::thinking("internal reasoning here");
-        let json = serde_json::to_string(&block).unwrap();
-        let de: ContentBlock = serde_json::from_str(&json).unwrap();
-        assert!(de.is_thinking());
-        assert_eq!(de.as_thinking(), Some("internal reasoning here"));
-        // as_text() returns None for Thinking blocks
-        assert!(de.as_text().is_none());
-    }
 
     #[test]
     fn finish_reason_from_api_str() {
