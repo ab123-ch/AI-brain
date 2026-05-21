@@ -1,4 +1,5 @@
 mod app;
+mod command_panel;
 mod completion;
 mod input;
 mod output;
