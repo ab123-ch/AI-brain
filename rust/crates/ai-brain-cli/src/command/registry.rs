@@ -129,6 +129,16 @@ impl CommandRegistry {
             .collect()
     }
 
+    /// Merge another registry into this one, consuming the other registry.
+    pub fn merge(&mut self, other: CommandRegistry) {
+        self.commands.extend(other.commands);
+    }
+
+    /// Return a slice of all registered commands.
+    pub fn all_commands(&self) -> &[Command] {
+        &self.commands
+    }
+
     /// Filter subcommands under a given top-level command by name prefix.
     /// Returns an empty vector if the top-level command is not found.
     pub fn filter_subcommands(&self, command_name: &str, prefix: &str) -> Vec<&SubCommand> {
@@ -253,5 +263,44 @@ mod tests {
 
         assert!(registry.find_subcommand("plugin", "remove").is_none());
         assert!(registry.find_subcommand("nonexistent", "list").is_none());
+    }
+
+    #[test]
+    fn test_merge_registries() {
+        let mut r1 = CommandRegistry::new();
+        r1.register(Command {
+            name: "help",
+            description: "h",
+            group: CommandGroup::BuiltIn,
+            subcommands: vec![],
+            handler: CommandHandler::Sync(noop_handler),
+        });
+        let mut r2 = CommandRegistry::new();
+        r2.register(Command {
+            name: "plugin",
+            description: "p",
+            group: CommandGroup::Plugin,
+            subcommands: vec![],
+            handler: CommandHandler::Sync(noop_handler),
+        });
+        r1.merge(r2);
+        assert_eq!(r1.commands.len(), 2);
+        assert_eq!(r1.find_command("help").unwrap().name, "help");
+        assert_eq!(r1.find_command("plugin").unwrap().name, "plugin");
+    }
+
+    #[test]
+    fn test_all_commands() {
+        let mut reg = CommandRegistry::new();
+        assert!(reg.all_commands().is_empty());
+        reg.register(Command {
+            name: "a",
+            description: "a",
+            group: CommandGroup::BuiltIn,
+            subcommands: vec![],
+            handler: CommandHandler::Sync(noop_handler),
+        });
+        assert_eq!(reg.all_commands().len(), 1);
+        assert_eq!(reg.all_commands()[0].name, "a");
     }
 }
