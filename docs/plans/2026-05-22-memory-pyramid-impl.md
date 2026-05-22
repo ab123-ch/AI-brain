@@ -999,13 +999,114 @@ fn persona_list(orch: &Orchestrator) -> HandleResult {
 }
 
 fn persona_switch(orch: &Orchestrator, id: &str) -> HandleResult {
+    // 1. 命令系统拦截，不经过 LLM
+    // 2. 获取当前记忆脑锁
     let mut mem = orch.memory_brain().lock().await;
+    // 3. 记忆脑内部执行切换（flush旧人格 → 加载新人格 → 重建Storage）
     mem.switch_persona(id)?;
+    // 4. 通知主脑重置上下文
+    let main_brain = orch.main_brain().lock().await;
+    main_brain.reset_for_persona_switch();
+    // 5. 注入新人格上下文
+    let inject = mem.auto_inject()?;
+    main_brain.inject_persona_context(&inject);
     // 输出切换成功信息
 }
 ```
 
-**提交:** `feat(cli): 原生人格管理命令`
+---
+
+### Task 12.5: 人格切换时序与上下文隔离保障
+
+**本节为设计约束，约束 Task 12/13/14 的实现。**
+
+#### 命令拦截机制
+
+人格切换命令 (`:persona switch`) 是 CLI 命令，在命令系统层面拦截，**不经过 LLM**：
+
+```
+用户输入
+  │
+  ├─ 以 ":" 开头 → 命令系统拦截 → 代码直接执行，不调 LLM
+  │   ":persona switch B"  → 代码切人格（零 LLM 调用）
+  │   ":persona list"      → 代码列人格
+  │
+  └─ 其他 → 发给主脑 → 主脑调 LLM
+      "帮我写个函数"  → LLM 处理
+```
+
+#### 启动时序（默认注入上次人格）
+
+```
+进程启动
+  ├─ 1. 加载 registry.json → 读取 active_persona_id（假设为 A）
+  ├─ 2. 创建 PyramidStorage(base_dir, "A")
+  ├─ 3. 加载 A/pending.json → 注入上下文（如果有未分析数据）
+  ├─ 4. auto_inject(): 加载 A 的 L4 + profile + injectable 经验
+  ├─ 5. 构建主脑 system prompt = 基础prompt + A的prompt片段 + A的画像 + A的潜意识
+  └─ 此时还没调过 LLM，A 的上下文只在内存中
+```
+
+#### 场景：启动后第一条消息就切人格
+
+```
+进程启动 → 加载 A 的上下文（内存中，未调 LLM）
+
+用户输入: ":persona switch B"
+  │
+  ├─ 命令系统拦截，不调 LLM
+  ├─ 代码执行:
+  │   a. flush 当前 pending 到 A/pending.json（如果有未写入数据）
+  │   b. 清空内存中 A 的所有注入内容（A 的上下文从未离开过本地进程）
+  │   c. registry.json → active_persona_id = "B"
+  │   d. 重建 PyramidStorage(base_dir, "B")
+  │   e. auto_inject(): 加载 B 的 L4 + profile + injectable 经验
+  │   f. 主脑 system prompt 重建 = 基础prompt + B的prompt片段 + B的画像 + B的潜意识
+  │   g. 主脑 conversation history 清空
+  │   h. 返回 "已切换到人格 B"
+  │
+  └─ A 的上下文从未发送给任何 LLM，零 token 浪费，零信息泄露
+
+用户输入: "帮我写个函数"
+  └─ 这时才构建完整消息 → 用 B 的上下文 → 发给 LLM
+      LLM 从头到尾只见过 B 的内容
+```
+
+#### 场景：对话中途切人格
+
+```
+A 人格活跃，已进行 5 轮对话
+  → turns 1-5 存入 A/l1-raw/sess-001.jsonl
+  → LLM 已处理过 5 轮（用的是 A 的上下文）
+
+用户: ":persona switch B"
+  │
+  ├─ 命令拦截
+  ├─ a. 将未分析轮次刷到 A/pending.json
+  ├─ b. 清空主脑中所有 A 的注入内容:
+  │     - 删 system prompt 中 A 的 prompt 片段
+  │     - 删 A 的画像、潜意识、经验
+  │     - 清空 conversation history
+  ├─ c. 加载 B 的完整上下文
+  ├─ d. 主脑就像一个全新启动的进程，只知道 B 的人格和记忆
+  └─ 返回 "已切换到人格 B"
+
+继续对话... turns 存入 B/l1-raw/sess-001.jsonl
+  → 四步浓缩只读 B/l1-raw/ → 只写 B 的 L2/L3/L4
+  → 不会碰 A/ 目录
+```
+
+#### 隔离保障总结
+
+| 场景 | 隔离机制 |
+|------|---------|
+| 启动即切换（未调 LLM） | A 的上下文只在内存，从未发送，直接替换 |
+| 中途切换（已调 LLM） | 清空 conversation history + 重置 system prompt + 重建 Storage |
+| 多进程并发 | 写入路径完全不同（不同目录），registry.json 文件锁保护 |
+| 会话恢复 | pending.json 按人格存储（A/pending.json），恢复时只加载对应人格 |
+| 记忆分析 | 浓缩引擎只操作 active_storage，不跨目录 |
+
+**核心原则：切换 = 完全重置上下文。删掉旧的全部，换成新的。主脑 conversation history 也清空，等效于新进程。**
 
 ---
 
