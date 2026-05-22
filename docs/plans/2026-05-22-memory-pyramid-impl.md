@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** 将 brain-memory crate 从追加式存储重构为四人隔离的金字塔提炼式记忆系统。
+**Goal:** 将 brain-memory crate 从追加式存储重构为原生多人格+金字塔提炼式记忆系统。
 
-**Architecture:** 四层金字塔(L1全量基座→L2任务摘要池→L3经验抽象层→L4潜意识触发词)，每层全量重生成而非追加。多人格完全隔离，每人格独立目录。渐进式召回(LLM驱动，自顶向下)。
+**Architecture:** 原生人格系统(注册表+CRUD+配置+prompt注入) + 四层金字塔(L1全量基座→L2任务摘要池→L3经验抽象层→L4潜意识触发词)，每层全量重生成而非追加。多人格完全隔离，每人格独立目录。渐进式召回(LLM驱动，自顶向下)。人格系统不依赖任何外部 MCP。
 
 **Tech Stack:** Rust, serde_json, chrono, tokio(async), brain-llm(LLM trait)
 
@@ -15,32 +15,397 @@
 ## 依赖关系图
 
 ```
-Task 1 (类型定义)
-  ├─→ Task 2 (per-persona 存储)
-  │     ├─→ Task 3 (L1 Raw Pool)
-  │     ├─→ Task 4 (L2 Summary Pool)
-  │     ├─→ Task 5 (L3 Abstraction Layer)
-  │     ├─→ Task 6 (L4 Subconscious)
-  │     └─→ Task 7 (Profile + EvalInfo)
-  ├─→ Task 8 (Prompt 重写)
-  │     └─→ Task 9 (四步浓缩引擎)
-  ├─→ Task 10 (渐进式召回引擎)
-  └─→ Task 11 (MemoryBrain 重构)
-        └─→ Task 12 (Orchestrator 集成)
-              └─→ Task 13 (旧数据迁移)
+Task 1 (类型定义 + 人格类型)
+  ├─→ Task 2 (原生人格系统)
+  │     ├─→ Task 3 (per-persona 存储层)
+  │     │     ├─→ Task 4 (L1 Raw Pool)
+  │     │     ├─→ Task 5 (L2 Summary Pool)
+  │     │     ├─→ Task 6 (L3 Abstraction Layer)
+  │     │     ├─→ Task 7 (L4 Subconscious)
+  │     │     └─→ Task 8 (Profile + EvalInfo)
+  │     └─→ Task 12 (人格命令集成)
+  ├─→ Task 9 (Prompt 重写)
+  │     └─→ Task 10 (四步浓缩引擎)
+  ├─→ Task 11 (渐进式召回引擎)
+  └─→ Task 13 (MemoryBrain 重构)
+        └─→ Task 14 (Orchestrator 集成)
+              └─→ Task 15 (旧数据迁移)
+                    └─→ Task 16 (清理旧代码)
 ```
 
 ---
 
-### Task 1: 核心类型定义
+### Task 1: 核心类型定义（含人格类型）
 
 **Files:**
 - Create: `rust/crates/brain-memory/src/pyramid_types.rs`
-- Test: `rust/crates/brain-memory/src/pyramid_types.rs` (inline tests)
+- Create: `rust/crates/brain-memory/src/persona_types.rs`
+- Modify: `rust/crates/brain-memory/src/lib.rs`
 
-**设计要点:** 定义金字塔所有层级的数据结构，这些类型是整个重构的基础。
+**设计要点:** 定义金字塔所有层级的数据结构和人格系统类型，这些类型是整个重构的基础。
 
-**Step 1: 定义金字塔层级枚举和核心类型**
+**Step 1: 定义人格系统类型**
+
+```rust
+// persona_types.rs
+
+use serde::{Deserialize, Serialize};
+
+/// 人格定义
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Persona {
+    /// 唯一标识符（英文，如 "cyber-brain", "writer"）
+    pub id: String,
+    /// 显示名称
+    pub name: String,
+    /// 人格描述（一段话说明该人格的角色定位）
+    pub description: String,
+    /// 人格专属 system prompt 片段（注入主脑 prompt）
+    pub system_prompt: String,
+    /// 人格专属配置
+    pub config: PersonaConfig,
+    /// 创建时间
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// 最后激活时间
+    pub last_active_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// 人格配置（影响主脑和评估脑行为）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaConfig {
+    /// 默认使用的语言（如 "zh-CN", "en"）
+    pub language: String,
+    /// 输出风格偏好（如 "concise", "detailed", "academic"）
+    pub output_style: String,
+    /// 额外的模型参数覆盖（可选）
+    pub model_override: Option<String>,
+    /// 评估脑敏感度（0.0-1.0，越高越严格）
+    pub eval_sensitivity: f64,
+    /// 四步分析间隔（轮次）
+    pub analysis_interval: u32,
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self {
+            language: "zh-CN".into(),
+            output_style: "concise".into(),
+            model_override: None,
+            eval_sensitivity: 0.7,
+            analysis_interval: 5,
+        }
+    }
+}
+
+/// 人格注册表（存储在 ~/.ai-brain/personas/registry.json）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaRegistry {
+    /// 所有注册的人格
+    pub personas: Vec<Persona>,
+    /// 当前激活的人格 ID（空字符串 = 默认）
+    pub active_persona_id: String,
+    /// 更新时间
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for PersonaRegistry {
+    fn default() -> Self {
+        Self {
+            personas: vec![Persona::default_persona()],
+            active_persona_id: "default".into(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl Persona {
+    /// 创建默认人格
+    pub fn default_persona() -> Self {
+        Self {
+            id: "default".into(),
+            name: "智脑".into(),
+            description: "默认人格，通用AI助手".into(),
+            system_prompt: String::new(),
+            config: PersonaConfig::default(),
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        }
+    }
+}
+```
+
+**Step 2: 定义金字塔层级类型（与原 Task 1 相同）**
+
+`pyramid_types.rs` 内容不变，包含 `PyramidLayer`, `TaskSummary`, `L1Ref`, `TaskType`,
+`SummaryIndex`, `Experience`, `TypeExperience`, `SubconsciousTrigger`, `SubconsciousData`,
+`PersonaProfile`, `EvalInfo` 等所有类型。
+
+**Step 3: 写测试**
+
+```rust
+// persona_types.rs tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_registry_has_default_persona() {
+        let reg = PersonaRegistry::default();
+        assert_eq!(reg.personas.len(), 1);
+        assert_eq!(reg.active_persona_id, "default");
+        assert_eq!(reg.personas[0].id, "default");
+    }
+
+    #[test]
+    fn persona_config_default_values() {
+        let config = PersonaConfig::default();
+        assert_eq!(config.language, "zh-CN");
+        assert_eq!(config.analysis_interval, 5);
+        assert!(config.model_override.is_none());
+    }
+
+    #[test]
+    fn persona_serde_roundtrip() {
+        let p = Persona {
+            id: "writer".into(),
+            name: "滚开作家".into(),
+            description: "网文创作".into(),
+            system_prompt: "你是一个网文写作助手...".into(),
+            config: PersonaConfig {
+                output_style: "literary".into(),
+                eval_sensitivity: 0.5,
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Persona = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "writer");
+        assert_eq!(back.config.eval_sensitivity, 0.5);
+    }
+}
+```
+
+**Step 4: 运行测试并提交**
+
+```bash
+cargo test -p brain-memory persona_types
+cargo test -p brain-memory pyramid_types
+git commit -m "feat(memory): 核心类型定义 — 人格系统 + 金字塔层级"
+```
+
+---
+
+### Task 2: 原生人格系统
+
+**Files:**
+- Create: `rust/crates/brain-memory/src/persona_manager.rs`
+- Test: `rust/crates/brain-memory/src/persona_manager.rs` (inline tests)
+
+**设计要点:** 人格注册表的 CRUD 操作，人格切换，人格 prompt 生成。不依赖任何外部 MCP。
+
+**核心结构:**
+
+```rust
+// persona_manager.rs
+
+pub struct PersonaManager {
+    base_dir: PathBuf,
+    registry: PersonaRegistry,
+}
+
+impl PersonaManager {
+    /// 从磁盘加载或创建默认注册表
+    pub fn load_or_create(base_dir: &Path) -> Result<Self, MemoryError> {
+        let registry_path = base_dir.join("personas").join("registry.json");
+        let registry = if registry_path.exists() {
+            let data = std::fs::read_to_string(&registry_path)?;
+            serde_json::from_str(&data)?
+        } else {
+            PersonaRegistry::default()
+        };
+        Ok(Self { base_dir: base_dir.to_path_buf(), registry })
+    }
+
+    /// 列出所有人格
+    pub fn list(&self) -> &[Persona] { &self.registry.personas }
+
+    /// 获取当前激活人格
+    pub fn active(&self) -> &Persona {
+        self.registry.personas.iter()
+            .find(|p| p.id == self.registry.active_persona_id)
+            .unwrap_or(&self.registry.personas[0])
+    }
+
+    /// 获取当前激活人格 ID
+    pub fn active_id(&self) -> &str { &self.registry.active_persona_id }
+
+    /// 切换人格
+    pub fn switch(&mut self, persona_id: &str) -> Result<&Persona, MemoryError> {
+        let persona = self.registry.personas.iter()
+            .find(|p| p.id == persona_id)
+            .ok_or_else(|| MemoryError::NotFound(format!("人格不存在: {persona_id}")))?;
+        self.registry.active_persona_id = persona_id.to_string();
+        // 更新最后激活时间
+        // 持久化到磁盘
+        self.persist()?;
+        Ok(self.active())
+    }
+
+    /// 创建新人格
+    pub fn create(&mut self, id: String, name: String, description: String,
+                  system_prompt: String, config: PersonaConfig) -> Result<&Persona, MemoryError> {
+        // 检查 ID 唯一性
+        if self.registry.personas.iter().any(|p| p.id == id) {
+            return Err(MemoryError::Conflict(format!("人格ID已存在: {id}")));
+        }
+        let persona = Persona {
+            id, name, description, system_prompt, config,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+        };
+        self.registry.personas.push(persona);
+        self.persist()?;
+        Ok(self.registry.personas.last().unwrap())
+    }
+
+    /// 删除人格（不能删除 default 和当前激活的）
+    pub fn delete(&mut self, persona_id: &str) -> Result<(), MemoryError> {
+        if persona_id == "default" {
+            return Err(MemoryError::Conflict("不能删除默认人格".into()));
+        }
+        if persona_id == self.registry.active_persona_id {
+            return Err(MemoryError::Conflict("不能删除当前激活的人格".into()));
+        }
+        let idx = self.registry.personas.iter().position(|p| p.id == persona_id)
+            .ok_or_else(|| MemoryError::NotFound(format!("人格不存在: {persona_id}")))?;
+        self.registry.personas.remove(idx);
+        // 删除该人格的记忆目录
+        let persona_dir = self.base_dir.join("personas").join(persona_id);
+        if persona_dir.exists() { std::fs::remove_dir_all(&persona_dir)?; }
+        self.persist()?;
+        Ok(())
+    }
+
+    /// 生成人格的 prompt 注入内容
+    pub fn build_persona_prompt(&self) -> String {
+        let persona = self.active();
+        if persona.system_prompt.is_empty() {
+            return String::new();
+        }
+        format!(
+            "[人格: {}]\n{}\n[语言: {}, 风格: {}]",
+            persona.name, persona.system_prompt,
+            persona.config.language, persona.config.output_style
+        )
+    }
+
+    /// 获取当前人格的分析间隔配置
+    pub fn analysis_interval(&self) -> u32 {
+        self.active().config.analysis_interval
+    }
+
+    /// 获取当前人格的评估敏感度
+    pub fn eval_sensitivity(&self) -> f64 {
+        self.active().config.eval_sensitivity
+    }
+
+    fn persist(&self) -> Result<(), MemoryError> {
+        let dir = self.base_dir.join("personas");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("registry.json");
+        let json = serde_json::to_string_pretty(&self.registry)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+}
+```
+
+**测试:**
+
+```rust
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn create_and_switch_persona() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = PersonaManager::load_or_create(tmp.path()).unwrap();
+        assert_eq!(mgr.active_id(), "default");
+
+        mgr.create("writer".into(), "作家".into(), "网文".into(),
+                   "你是网文助手".into(), PersonaConfig::default()).unwrap();
+        assert_eq!(mgr.list().len(), 2);
+
+        mgr.switch("writer").unwrap();
+        assert_eq!(mgr.active_id(), "writer");
+        assert_eq!(mgr.active().name, "作家");
+    }
+
+    #[test]
+    fn cannot_delete_default_or_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = PersonaManager::load_or_create(tmp.path()).unwrap();
+        assert!(mgr.delete("default").is_err());
+
+        mgr.create("writer".into(), "作家".into(), "网文".into(),
+                   "".into(), PersonaConfig::default()).unwrap();
+        mgr.switch("writer").unwrap();
+        assert!(mgr.delete("writer").is_err()); // 当前激活的不能删
+    }
+
+    #[test]
+    fn persona_prompt_includes_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = PersonaManager::load_or_create(tmp.path()).unwrap();
+        mgr.create("writer".into(), "作家".into(), "网文".into(),
+                   "模仿滚开风格".into(), PersonaConfig {
+                       language: "zh-CN".into(),
+                       output_style: "literary".into(),
+                       ..Default::default()
+                   }).unwrap();
+        mgr.switch("writer").unwrap();
+        let prompt = mgr.build_persona_prompt();
+        assert!(prompt.contains("滚开风格"));
+        assert!(prompt.contains("literary"));
+    }
+
+    #[test]
+    fn persist_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = PersonaManager::load_or_create(tmp.path()).unwrap();
+        mgr.create("writer".into(), "作家".into(), "网文".into(),
+                   "".into(), PersonaConfig::default()).unwrap();
+        mgr.switch("writer").unwrap();
+
+        // 重新加载
+        let mgr2 = PersonaManager::load_or_create(tmp.path()).unwrap();
+        assert_eq!(mgr2.active_id(), "writer");
+        assert_eq!(mgr2.list().len(), 2);
+    }
+
+    #[test]
+    fn analysis_interval_per_persona() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = PersonaManager::load_or_create(tmp.path()).unwrap();
+        assert_eq!(mgr.analysis_interval(), 5); // default
+
+        mgr.create("writer".into(), "作家".into(), "网文".into(),
+                   "".into(), PersonaConfig {
+                       analysis_interval: 20,
+                       ..Default::default()
+                   }).unwrap();
+        mgr.switch("writer").unwrap();
+        assert_eq!(mgr.analysis_interval(), 20);
+    }
+}
+```
+
+**提交:** `feat(memory): 原生人格系统 — 注册表 + CRUD + 配置 + prompt 注入`
+
+---
+
+### Task 3: Per-Persona 存储层
 
 ```rust
 // pyramid_types.rs
@@ -265,146 +630,7 @@ git commit -m "feat(memory): 金字塔核心类型定义"
 
 ---
 
-### Task 2: Per-Persona 存储层
-
-**Files:**
-- Create: `rust/crates/brain-memory/src/pyramid_storage.rs`
-- Modify: `rust/crates/brain-memory/src/lib.rs`
-
-**设计要点:** 封装 per-persona 目录结构的创建和文件读写。所有人格数据存储在 `~/.ai-brain/personas/{persona_id}/pyramid/` 下。
-
-**Step 1: 写测试**
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pyramid_dirs_created() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = PyramidStorage::new(tmp.path().to_path_buf(), "cyber-brain");
-        store.ensure_dirs().unwrap();
-        assert!(store.l1_dir().exists());
-        assert!(store.l2_dir().exists());
-        assert!(store.l3_dir().exists());
-        assert!(store.l4_path().parent().unwrap().exists());
-    }
-
-    #[test]
-    fn default_persona_uses_base_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = PyramidStorage::new(tmp.path().to_path_buf(), "");
-        assert_eq!(store.pyramid_dir(), tmp.path().join("pyramid"));
-    }
-
-    #[test]
-    fn named_persona_creates_subdir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = PyramidStorage::new(tmp.path().to_path_buf(), "writer");
-        assert_eq!(
-            store.pyramid_dir(),
-            tmp.path().join("personas").join("writer").join("pyramid")
-        );
-    }
-}
-```
-
-**Step 2: 实现 PyramidStorage**
-
-```rust
-// pyramid_storage.rs
-
-use crate::error::MemoryError;
-use serde::de::DeserializeOwned;
-use std::path::PathBuf;
-
-pub struct PyramidStorage {
-    base_dir: PathBuf,
-    persona_id: String,
-}
-
-impl PyramidStorage {
-    pub fn new(base_dir: PathBuf, persona_id: &str) -> Self {
-        Self {
-            base_dir,
-            persona_id: persona_id.to_string(),
-        }
-    }
-
-    /// 金字塔根目录（per-persona）
-    pub fn pyramid_dir(&self) -> PathBuf {
-        if self.persona_id.is_empty() {
-            self.base_dir.join("pyramid")
-        } else {
-            self.base_dir.join("personas").join(&self.persona_id).join("pyramid")
-        }
-    }
-
-    pub fn l1_dir(&self) -> PathBuf { self.pyramid_dir().join("l1-raw") }
-    pub fn l2_dir(&self) -> PathBuf { self.pyramid_dir().join("l2-summary") }
-    pub fn l3_dir(&self) -> PathBuf { self.pyramid_dir().join("l3-abstract") }
-    pub fn l4_path(&self) -> PathBuf { self.pyramid_dir().join("l4-subconscious.json") }
-    pub fn profile_path(&self) -> PathBuf {
-        if self.persona_id.is_empty() {
-            self.base_dir.join("pyramid").join("profile.json")
-        } else {
-            self.base_dir.join("personas").join(&self.persona_id).join("profile.json")
-        }
-    }
-    pub fn eval_info_path(&self) -> PathBuf {
-        if self.persona_id.is_empty() {
-            self.base_dir.join("pyramid").join("eval-info.json")
-        } else {
-            self.base_dir.join("personas").join(&self.persona_id).join("eval-info.json")
-        }
-    }
-
-    pub fn ensure_dirs(&self) -> Result<(), MemoryError> {
-        for dir in &[self.l1_dir(), self.l2_dir(), self.l3_dir()] {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| MemoryError::Io(e))?;
-        }
-        if let Some(parent) = self.l4_path().parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MemoryError::Io(e))?;
-        }
-        Ok(())
-    }
-
-    pub fn read_json<T: DeserializeOwned>(&self, path: &PathBuf) -> Result<Option<T>, MemoryError> {
-        if !path.exists() { return Ok(None); }
-        let data = std::fs::read_to_string(path)
-            .map_err(MemoryError::Io)?;
-        let val: T = serde_json::from_str(&data)
-            .map_err(MemoryError::Serde)?;
-        Ok(Some(val))
-    }
-
-    pub fn write_json<T: Serialize>(&self, path: &PathBuf, data: &T) -> Result<(), MemoryError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MemoryError::Io(e))?;
-        }
-        let json = serde_json::to_string_pretty(data)
-            .map_err(MemoryError::Serde)?;
-        std::fs::write(path, json)
-            .map_err(MemoryError::Io)?;
-        Ok(())
-    }
-}
-```
-
-**Step 3: 运行测试并提交**
-
-```bash
-cargo test -p brain-memory pyramid_storage
-git add -A && git commit -m "feat(memory): per-persona 金字塔存储层"
-```
-
----
-
-### Task 3: L1 Raw Pool（适配现有 raw_layer.rs）
+### Task 4: L1 Raw Pool（适配现有 raw_layer.rs）
 
 **Files:**
 - Modify: `rust/crates/brain-memory/src/raw_layer.rs`
@@ -438,7 +664,7 @@ git commit -m "refactor(memory): L1 Raw Pool 适配 per-persona 路径"
 
 ---
 
-### Task 4: L2 Summary Pool（任务分类摘要）
+### Task 5: L2 Summary Pool（任务分类摘要）
 
 **Files:**
 - Create: `rust/crates/brain-memory/src/summary_pool.rs`
@@ -533,7 +759,7 @@ git commit -m "feat(memory): L2 Summary Pool 任务分类摘要"
 
 ---
 
-### Task 5: L3 Abstraction Layer（经验抽象层）
+### Task 6: L3 Abstraction Layer（经验抽象层）
 
 **Files:**
 - Create: `rust/crates/brain-memory/src/abstract_layer.rs`
@@ -555,7 +781,7 @@ git commit -m "feat(memory): L2 Summary Pool 任务分类摘要"
 
 ---
 
-### Task 6: L4 Subconscious（增强版潜意识层）
+### Task 7: L4 Subconscious（增强版潜意识层）
 
 **Files:**
 - Modify: `rust/crates/brain-memory/src/subconscious.rs`
@@ -574,7 +800,7 @@ git commit -m "feat(memory): L2 Summary Pool 任务分类摘要"
 
 ---
 
-### Task 7: Profile + EvalInfo（融合知识层）
+### Task 8: Profile + EvalInfo（融合知识层）
 
 **Files:**
 - Modify: `rust/crates/brain-memory/src/user_profile.rs` → 重构为 `PersonaProfile`
@@ -595,7 +821,7 @@ git commit -m "feat(memory): L2 Summary Pool 任务分类摘要"
 
 ---
 
-### Task 8: Prompt 重写
+### Task 9: Prompt 重写
 
 **Files:**
 - Modify: `rust/crates/brain-memory/src/prompts.rs`
@@ -626,7 +852,7 @@ git commit -m "feat(memory): L2 Summary Pool 任务分类摘要"
 
 ---
 
-### Task 9: 四步浓缩引擎
+### Task 10: 四步浓缩引擎
 
 **Files:**
 - Create: `rust/crates/brain-memory/src/concentration.rs`
@@ -674,7 +900,7 @@ impl ConcentrationEngine {
 
 ---
 
-### Task 10: 渐进式召回引擎
+### Task 11: 渐进式召回引擎
 
 **Files:**
 - Create: `rust/crates/brain-memory/src/progressive_recall.rs`
@@ -728,41 +954,99 @@ impl ProgressiveRecall {
 
 ---
 
-### Task 11: MemoryBrain 重构
+### Task 12: 人格命令集成
+
+**Files:**
+- Create: `rust/crates/ai-brain-cli/src/command/persona_cmd.rs`
+- Modify: `rust/crates/ai-brain-cli/src/command/mod.rs`
+- Modify: `rust/crates/ai-brain-cli/src/command/registry.rs`
+
+**设计要点:** 将人格 CRUD 操作注册为智脑原生命令，替代外部 MCP 依赖。
+
+**命令列表:**
+
+| 命令 | 功能 |
+|------|------|
+| `:persona list` | 列出所有人格及当前激活状态 |
+| `:persona switch <id>` | 切换到指定人格 |
+| `:persona create` | 交互式创建新人格（输入 id/name/description/prompt） |
+| `:persona delete <id>` | 删除指定人格（不可删 default 和当前激活） |
+| `:persona info` | 显示当前人格详情（配置、记忆统计） |
+
+**实现方式:**
+
+```rust
+// persona_cmd.rs
+
+pub fn build_persona_commands() -> Vec<Command> {
+    vec![
+        Command::new("persona")
+            .description("人格管理")
+            .sub_commands(vec![
+                SubCommand::new("list", "列出所有人格", persona_list),
+                SubCommand::new("switch", "切换人格", persona_switch),
+                SubCommand::new("create", "创建人格", persona_create),
+                SubCommand::new("delete", "删除人格", persona_delete),
+                SubCommand::new("info", "当前人格详情", persona_info),
+            ])
+    ]
+}
+
+fn persona_list(orch: &Orchestrator) -> HandleResult {
+    let mem = orch.memory_brain().lock().await;
+    let personas = mem.persona_manager().list();
+    // 格式化输出：名称 | ID | 激活状态
+}
+
+fn persona_switch(orch: &Orchestrator, id: &str) -> HandleResult {
+    let mut mem = orch.memory_brain().lock().await;
+    mem.switch_persona(id)?;
+    // 输出切换成功信息
+}
+```
+
+**提交:** `feat(cli): 原生人格管理命令`
+
+---
+
+### Task 13: MemoryBrain 重构
 
 **Files:**
 - Modify: `rust/crates/brain-memory/src/memory_brain.rs`
 
-**设计要点:** 用新的金字塔组件替代旧的扁平存储。保持对外接口不变（`store_turns`, `recall_for_context` 等），内部路由到金字塔。
+**设计要点:** 用新的金字塔组件替代旧的扁平存储。保持对外接口不变（`store_turns`, `recall_for_context` 等），内部路由到金字塔。通过 `PersonaManager` 获取当前人格，路由到对应的金字塔。
 
 **关键改动:**
 
 1. `MemoryBrainConfig` 新增 `persona_id: String` 和 `analysis_interval: u32`
-2. 内部持有 `PyramidStorage` 而非多个独立 `Storage`
+2. 内部持有 `PersonaManager` + `PyramidStorage`（根据 active persona 动态）
 3. `store_turns` → 写入 L1（不再写 L2 短期记忆）
-4. `tick_and_should_analyze` → 触发 `ConcentrationEngine::run`
+4. `tick_and_should_analyze` → 触发 `ConcentrationEngine::run`，interval 从 PersonaConfig 读取
 5. `recall_for_context` → 委托 `ProgressiveRecall::recall`
-6. `load_subconscious_summary` → 从 L4 读取
-7. 删除旧的 `gather_all_candidates` 逻辑
+6. `load_subconscious_summary` → 从 L4 读取 + 人格 prompt 注入
+7. 新增 `switch_persona(&mut self, id: &str)` → 切换人格（路由到新金字塔）
+8. 新增 `active_persona(&self) -> &Persona` → 暴露当前人格信息给 Orchestrator
+9. 删除旧的 `gather_all_candidates` 逻辑
 
 **兼容性:** `base_dir()` 和 `stats()` 方法保留，适配新结构。
 
-**提交:** `refactor(memory): MemoryBrain 重构为金字塔架构`
+**提交:** `refactor(memory): MemoryBrain 重构为金字塔+人格架构`
 
 ---
 
-### Task 12: Orchestrator 集成
+### Task 14: Orchestrator 集成
 
 **Files:**
 - Modify: `rust/crates/ai-brain-cli/src/orchestrator.rs`
 
 **改动点:**
 
-1. **创建 MemoryBrain 时传入 persona_id**: 从配置或环境变量读取当前人格
-2. **启动注入**: `inject_memory_context` 改为调用 `auto_inject()`
-3. **评估脑接口适配**: 评估信息从 `eval-info.json` 加载，而非从旧 Store 加载
-4. **配置支持**: `analysis_interval` 从 `config.toml` 读取
+1. **创建 MemoryBrain 时传入 PersonaManager**: 不再硬编码 persona_id，由 PersonaManager 管理
+2. **启动注入**: `inject_memory_context` 改为调用 `auto_inject()` + 人格 prompt 注入
+3. **评估脑接口适配**: 评估信息从 `eval-info.json` 加载，敏感度从 PersonaConfig 读取
+4. **人格切换**: 新增 `switch_persona` 方法，通知主脑更新 prompt，通知记忆脑切换金字塔
 5. **pending_analysis 路径**: 适配 per-persona 目录
+6. **配置支持**: analysis_interval 从 PersonaConfig 读取（替代硬编码 5）
 
 **行号参考:**
 - 行 1830: `create_sub_brains()` → 传入 persona_id
@@ -771,11 +1055,11 @@ impl ProgressiveRecall {
 - 行 1340: `tick_and_should_analyze` → interval 可配
 - 行 779: 评估信息加载 → 改用 `eval-info.json`
 
-**提交:** `feat(orchestrator): 集成金字塔记忆脑`
+**提交:** `feat(orchestrator): 集成金字塔记忆脑 + 人格系统`
 
 ---
 
-### Task 13: 旧数据迁移
+### Task 15: 旧数据迁移
 
 **Files:**
 - Create: `rust/crates/brain-migration/src/main.rs`
@@ -794,7 +1078,7 @@ impl ProgressiveRecall {
 
 ---
 
-### Task 14: 清理旧代码
+### Task 16: 清理旧代码
 
 **Files:**
 - Delete: `brain-memory/src/short_term.rs`
@@ -806,7 +1090,7 @@ impl ProgressiveRecall {
 - Delete: `brain-memory/src/memory_iteration.rs`
 - Modify: `brain-memory/src/lib.rs` — 移除旧模块导出
 
-**前提:** Task 11 完成且所有测试通过后执行。
+**前提:** Task 13 完成且所有测试通过后执行。
 
 **提交:** `chore(memory): 清理旧记忆系统代码`
 
