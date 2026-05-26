@@ -8,11 +8,10 @@ use brain_core::types::{
 };
 use brain_hooks::runner::HookRunner;
 use brain_hooks::types::{HookDecision, HookEvent, HookInput};
-use brain_llm::{
-    ChatMessage, ChatRequest, ChatResponse, ContentBlock, FinishReason, LlmProvider,
-    ToolDefinition,
-};
 use brain_llm::types::TokenUsage;
+use brain_llm::{
+    ChatMessage, ChatRequest, ChatResponse, ContentBlock, FinishReason, LlmProvider, ToolDefinition,
+};
 
 use crate::error::{MainBrainError, Result};
 
@@ -236,18 +235,15 @@ pub async fn run_tool_loop_with_config(
         // 处理 usage 信息：如果 API 不返回（如小米 mimo），使用估算值
         let estimated_input = estimate_input_tokens(&messages);
         let estimated_output = estimate_output_tokens(&response);
-        
+
         // 如果 API 返回的 prompt_tokens 为 0，使用估算值
         let prompt_tokens = if response.usage.prompt_tokens > 0 {
             response.usage.prompt_tokens
         } else {
-            tracing::info!(
-                "API 未返回 prompt_tokens，使用估算值: {}",
-                estimated_input
-            );
+            tracing::info!("API 未返回 prompt_tokens，使用估算值: {}", estimated_input);
             estimated_input
         };
-        
+
         // 如果 API 返回的 completion_tokens 为 0，使用估算值
         let completion_tokens = if response.usage.completion_tokens > 0 {
             response.usage.completion_tokens
@@ -258,7 +254,7 @@ pub async fn run_tool_loop_with_config(
             );
             estimated_output
         };
-        
+
         // 构建修正后的 usage（用于计费和显示）
         let corrected_usage = TokenUsage {
             prompt_tokens,
@@ -271,7 +267,7 @@ pub async fn run_tool_loop_with_config(
         // 累计 prompt_tokens
         last_prompt_tokens = prompt_tokens;
         total_prompt_tokens += last_prompt_tokens;
-        
+
         // 记录本次 LLM 调用的 usage 信息（使用修正后的值）
         usage_records.push(corrected_usage.clone());
 
@@ -304,17 +300,16 @@ pub async fn run_tool_loop_with_config(
         for block in &response.content {
             match block {
                 ContentBlock::Text { text } if !text.is_empty() => {
-                    send_progress(
-                        progress_tx,
-                        ProgressEvent::TextDelta { text: text.clone() },
-                    )
-                    .await;
+                    send_progress(progress_tx, ProgressEvent::TextDelta { text: text.clone() })
+                        .await;
                 }
                 ContentBlock::Thinking { content } if !content.is_empty() => {
                     // 走专用 ThinkingDelta 通道，TUI 默认不显示，Ctrl+E 切换
                     send_progress(
                         progress_tx,
-                        ProgressEvent::ThinkingDelta { content: content.clone() },
+                        ProgressEvent::ThinkingDelta {
+                            content: content.clone(),
+                        },
                     )
                     .await;
                 }
@@ -486,10 +481,8 @@ async fn execute_tool_calls(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let options: Option<Vec<String>> = input
-                    .get("options")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
+                let options: Option<Vec<String>> =
+                    input.get("options").and_then(|v| v.as_array()).map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str().map(String::from))
                             .collect()

@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 /// Unique identifier for an agent.
 pub type AgentId = String;
@@ -53,9 +53,7 @@ pub enum DispatchEvent {
         result: AgentResult,
     },
     /// User input that needs to be routed.
-    UserInput {
-        content: String,
-    },
+    UserInput { content: String },
 }
 
 /// Priority level for dispatch events.

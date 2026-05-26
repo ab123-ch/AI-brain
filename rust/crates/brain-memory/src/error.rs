@@ -20,6 +20,12 @@ pub enum MemoryError {
 
     #[error("巩固失败: {0}")]
     ConsolidationFailed(String),
+
+    #[error("未找到: {0}")]
+    NotFound(String),
+
+    #[error("冲突: {0}")]
+    Conflict(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

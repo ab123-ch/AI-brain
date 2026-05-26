@@ -591,7 +591,7 @@ pub struct ConversationMessage {
     #[serde(
         serialize_with = "serialize_content_blocks",
         deserialize_with = "deserialize_content_blocks",
-        default,
+        default
     )]
     pub content: Vec<ContentBlock>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -1042,7 +1042,8 @@ mod tests {
 
     #[test]
     fn conversation_message_tool_result() {
-        let msg = ConversationMessage::tool_result("toolu_01".into(), "file contents".into(), false);
+        let msg =
+            ConversationMessage::tool_result("toolu_01".into(), "file contents".into(), false);
         assert_eq!(msg.role, MessageRole::Tool);
         assert!(msg.content[0].is_tool_result());
     }

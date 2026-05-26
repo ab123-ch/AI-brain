@@ -725,4 +725,272 @@ mod tests {
         assert!(!prompt.contains("{evolution_text}"));
         assert!(!prompt.contains("{existing_narrative}"));
     }
+
+    // ── 金字塔浓缩 prompt 测试 ──
+
+    #[test]
+    fn concentration_step1_prompt_substitutes() {
+        let prompt = build_concentration_step1_prompt(
+            "[{\"role\":\"user\",\"content\":\"修复TUI鼠标\"}]",
+            "[{\"task_id\":\"t-old\",\"summary\":\"旧任务\"}]",
+        );
+        assert!(prompt.contains("TUI鼠标"));
+        assert!(prompt.contains("旧任务"));
+        assert!(!prompt.contains("{conversation_json}"));
+        assert!(!prompt.contains("{existing_l2_index}"));
+    }
+
+    #[test]
+    fn concentration_step2_prompt_substitutes() {
+        let prompt = build_concentration_step2_prompt(
+            "[{\"task_id\":\"t-1\",\"summary\":\"编码\"}]",
+            "[{\"task_type\":\"Coding\",\"experiences\":[]}]",
+        );
+        assert!(prompt.contains("编码"));
+        assert!(prompt.contains("Coding"));
+        assert!(!prompt.contains("{l2_data}"));
+        assert!(!prompt.contains("{existing_l3}"));
+    }
+
+    #[test]
+    fn concentration_step3_prompt_substitutes() {
+        let prompt = build_concentration_step3_prompt(
+            "[{\"task_type\":\"Coding\",\"experiences\":[]}]",
+            "{\"triggers\":[],\"narrative\":\"旧叙事\"}",
+        );
+        assert!(prompt.contains("旧叙事"));
+        assert!(!prompt.contains("{l3_data}"));
+        assert!(!prompt.contains("{existing_l4}"));
+    }
+
+    #[test]
+    fn concentration_step4_prompt_substitutes() {
+        let prompt = build_concentration_step4_prompt(
+            "[{\"role\":\"user\"}]",
+            "Rust开发者",
+            "要测试\n别忘判空",
+        );
+        assert!(prompt.contains("Rust开发者"));
+        assert!(prompt.contains("要测试"));
+        assert!(!prompt.contains("{conversation_json}"));
+        assert!(!prompt.contains("{existing_profile}"));
+        assert!(!prompt.contains("{existing_eval_info}"));
+    }
+}
+
+// ===========================================================================
+// 金字塔四步浓缩 Prompt（新增，替代旧的 8 步分析）
+// ===========================================================================
+
+/// 第一步：L1→L2 任务拆分（全量重生成）
+///
+/// 将原始对话拆分为独立任务摘要，跨会话合并同类任务。
+pub const CONCENTRATION_STEP1_PROMPT: &str = "\
+# 身份
+你是一个对话分析引擎。你将原始对话内容拆分为独立的任务，跨会话合并同类任务。
+
+# 输入
+新会话原始对话（JSON 数组）：
+{conversation_json}
+
+现有 L2 任务索引：
+{existing_l2_index}
+
+# 规则
+1. 将对话拆分为独立任务（一个会话可拆出多个任务，多个会话的任务可合并）
+2. 每个任务需分类到以下类型之一：Coding, Writing, Troubleshooting, Research, Multimedia, Configuration, Other
+3. 合并：新对话中的内容如果与已有任务属于同类工作，合并到同一任务中（更新 summary）
+4. 每个任务提供：
+   - task_id: 唯一标识（已有任务保留原 ID，新任务用 new-1, new-2...）
+   - task_type: 任务类型
+   - task_name: 简短名称（10字以内）
+   - summary: 2-3 句话概括（200字以内）
+   - l1_refs: 关联的会话段落索引
+   - tags: 3-5 个关键词
+   - importance: 0.0-1.0
+5. 最多保留 50 个任务，超过请合并相关任务
+6. 用中文输出
+
+# 输出格式（严格 JSON 数组）
+[
+  {
+    \"task_id\": \"task-001\",
+    \"task_type\": \"Coding\",
+    \"task_name\": \"TUI鼠标修复\",
+    \"summary\": \"修复EnableMouseCapture拦截导致终端原生选择失效...\",
+    \"l1_refs\": [{\"session\": \"sess-xxx\", \"paragraphs\": [3, 4]}],
+    \"tags\": [\"TUI\", \"鼠标\", \"crossterm\"],
+    \"importance\": 0.85
+  }
+]\
+";
+
+/// 第二步：L2→L3 经验抽象（全量重生成）
+///
+/// 从任务摘要中提炼按类型汇总的经验。
+pub const CONCENTRATION_STEP2_PROMPT: &str = "\
+# 身份
+你是一个经验提炼引擎。你从任务摘要中提炼出按类型汇总的可复用经验。
+
+# 输入
+L2 任务摘要数据：
+{l2_data}
+
+现有 L3 经验数据：
+{existing_l3}
+
+# 规则
+1. 按任务类型（Coding/Writing/Troubleshooting/Research/等）分组提炼经验
+2. 每条经验包括：
+   - pattern: 经验模式名称（如「工具调用失败时的替代方案」）
+   - description: 具体描述（100字以内）
+   - source_tasks: 来源任务 ID 列表
+   - frequency: 出现频率
+   - injectable: 是否在启动时注入上下文（只有高频且通用的经验设为 true）
+3. 每个类型最多保留 10 条经验，超过请合并浓缩
+4. 为每个类型生成关键词索引（keyword → 关联的 L2 任务 ID）
+5. 合并：新经验与已有经验重合时，融合为更精炼的一条
+6. 用中文输出
+
+# 输出格式（严格 JSON 数组，每个类型一个对象）
+[
+  {
+    \"task_type\": \"Coding\",
+    \"experiences\": [
+      {
+        \"pattern\": \"工具调用失败时的替代方案\",
+        \"description\": \"WebSearch工具调用失败时，可用bash+curl替代获取网页内容\",
+        \"source_tasks\": [\"task-001\", \"task-007\"],
+        \"frequency\": 3,
+        \"injectable\": true
+      }
+    ],
+    \"l2_refs\": [\"task-001\", \"task-007\"],
+    \"index\": [{\"keyword\": \"工具替代\", \"l2_task_ids\": [\"task-001\"]}]
+  }
+]\
+";
+
+/// 第三步：L3→L4 触发词提取（全量重生成）
+///
+/// 从 L3 经验中提取触发词和叙事文本。
+pub const CONCENTRATION_STEP3_PROMPT: &str = "\
+# 身份
+你是一个触发词提取引擎。你从 L3 经验中提取关键触发词和一段关于用户的流动叙事。
+
+# 输入
+L3 经验数据：
+{l3_data}
+
+现有 L4 潜意识数据：
+{existing_l4}
+
+# 规则
+1. 从 L3 经验中提取触发词（关键词短语，能触发相关记忆的召回）
+2. 每个触发词指向一个 L3 类型和 L2 任务
+3. 叙事文本：用最少的文字描述用户做过什么、擅长什么、踩过什么坑
+4. 容量限制：
+   - 触发词最多 50 个（超过请合并或删除低价值项）
+   - 叙事文本最多 500 字
+5. 叙事编辑原则：
+   - 合并：相关领域经验融合为一句
+   - 覆盖：新信息推翻旧结论时自然替换
+   - 精炼：用逗号/顿号连接短语，追求最少文字×最大覆盖
+6. 只有真正有价值的经验才值得设为触发词
+7. 用中文输出
+
+# 输出格式（严格 JSON）
+{
+  \"triggers\": [
+    {\"keyword\": \"红冲逻辑变更\", \"l3_type\": \"Coding\", \"l2_task\": \"task-033\"},
+    {\"keyword\": \"TUI鼠标选择\", \"l3_type\": \"Coding\", \"l2_task\": \"task-001\"}
+  ],
+  \"narrative\": \"用户是Rust全栈开发者，偏好极简指令。完成过Nexus红冲逻辑、消消乐游戏。\"
+}\
+";
+
+/// 第四步：Profile + EvalInfo（全量重生成）
+///
+/// 生成 100 字画像和评估信息。
+pub const CONCENTRATION_STEP4_PROMPT: &str = "\
+# 身份
+你是一个用户画像和评估信息生成引擎。你从对话中提炼精炼的用户画像和评估信息。
+
+# 输入
+对话记录：
+{conversation_json}
+
+现有用户画像：
+{existing_profile}
+
+现有评估信息：
+{existing_eval_info}
+
+# 规则
+
+## 用户画像
+1. 用 100 字以内的自然语言描述用户：身份、擅长、偏好、工作模式
+2. 不是罗列特征，而是一段连贯的描述文本
+3. 融合已有画像和新对话中的信息
+
+## 评估信息
+为评估脑提供三个列表：
+1. requirements（评估要求）：用户对输出质量的要求（最多 5 条）
+   - 合并语义重复的要求
+   - 只保留最重要、最高频的要求
+2. pitfalls（已知踩坑）：系统犯过的典型错误（最多 5 条）
+   - 每条简洁描述错误和正确做法
+3. rules（进化规则）：可执行的改进规则（最多 3 条）
+   - 格式：\"当 [条件] 时，[行为]\"
+   - 来自具体踩坑记录
+
+4. 用中文输出
+
+# 输出格式（严格 JSON）
+{
+  \"profile\": \"用户是Rust全栈开发者，偏好简洁指令式交互，零容忍偏离指令的行为\",
+  \"requirements\": [\"回答必须包含具体代码示例\"],
+  \"pitfalls\": [\"修改配置文件前未确认正确路径\"],
+  \"rules\": [\"当修改配置文件时，先向用户确认正确的文件路径\"]
+}\
+";
+
+// ---------------------------------------------------------------------------
+// 金字塔浓缩 Prompt Builder
+// ---------------------------------------------------------------------------
+
+/// 构建第一步：L1→L2 任务拆分 prompt
+pub fn build_concentration_step1_prompt(
+    conversation_json: &str,
+    existing_l2_index: &str,
+) -> String {
+    CONCENTRATION_STEP1_PROMPT
+        .replace("{conversation_json}", conversation_json)
+        .replace("{existing_l2_index}", existing_l2_index)
+}
+
+/// 构建第二步：L2→L3 经验抽象 prompt
+pub fn build_concentration_step2_prompt(l2_data: &str, existing_l3: &str) -> String {
+    CONCENTRATION_STEP2_PROMPT
+        .replace("{l2_data}", l2_data)
+        .replace("{existing_l3}", existing_l3)
+}
+
+/// 构建第三步：L3→L4 触发词提取 prompt
+pub fn build_concentration_step3_prompt(l3_data: &str, existing_l4: &str) -> String {
+    CONCENTRATION_STEP3_PROMPT
+        .replace("{l3_data}", l3_data)
+        .replace("{existing_l4}", existing_l4)
+}
+
+/// 构建第四步：Profile + EvalInfo prompt
+pub fn build_concentration_step4_prompt(
+    conversation_json: &str,
+    existing_profile: &str,
+    existing_eval_info: &str,
+) -> String {
+    CONCENTRATION_STEP4_PROMPT
+        .replace("{conversation_json}", conversation_json)
+        .replace("{existing_profile}", existing_profile)
+        .replace("{existing_eval_info}", existing_eval_info)
 }

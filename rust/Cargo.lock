@@ -447,6 +447,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain-migration"
+version = "0.1.0"
+dependencies = [
+ "brain-core",
+ "brain-memory",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "brain-motor"
 version = "0.1.0"
 dependencies = [

@@ -21,6 +21,7 @@ use ratatui::Terminal;
 
 use crate::command::{self, CommandHandler, CommandRegistry};
 use crate::orchestrator::Orchestrator;
+use brain_mcp::client_pool::ServerStatus;
 
 use super::command_panel::CommandPanel;
 use super::completion::EvolutionCompleter;
@@ -978,6 +979,9 @@ impl App {
             return;
         }
 
+        // 重置命令面板状态，避免 phase 残留导致下次输入 : 无法弹出下拉
+        self.command_panel.clear();
+
         // 如果有等待中的 AskUserQuestion，直接发送响应
         if let Some(tx) = self.pending_ask_response.take() {
             self.output.push_user_input(&text);
@@ -1528,6 +1532,120 @@ impl App {
             return HandleResult::Handled;
         }
 
+        // 特殊: skill list 需要从 Orchestrator 获取 SkillCatalog
+        if cmd_name == "skill" && args.first().map(|s| s.as_str()) == Some("list") {
+            let catalog = self.orch.skill_catalog();
+            if catalog.skills.is_empty() {
+                self.output.push_system("暂无已注册技能");
+            } else {
+                self.output.push_system(&format!("已注册技能 ({}个):", catalog.skills.len()));
+                self.output.push_system("\x1b[33m  \x1b[0m\x1b[33m[兼容 Claude Code]\x1b[0m 也扫描 ~/.claude/skills 目录");
+                for skill in &catalog.skills {
+                    let display = match &skill.namespace {
+                        Some(ns) => format!("{}:{}", ns, skill.name),
+                        None => skill.name.clone(),
+                    };
+                    // 判断来源
+                    let source_tag = if skill.source_path.to_string_lossy().contains(".claude/skills") {
+                        "\x1b[33m[Claude]\x1b[0m "
+                    } else if skill.source_path.to_string_lossy().contains(".codex/skills") {
+                        "\x1b[33m[Codex]\x1b[0m "
+                    } else {
+                        ""
+                    };
+                    let when = skill
+                        .when_to_use
+                        .as_deref()
+                        .map(|w| format!(" [触发: {w}]"))
+                        .unwrap_or_default();
+                    self.output
+                        .push_system(&format!("  {}{} - {}{}", source_tag, display, skill.description, when));
+                }
+            }
+            return HandleResult::Handled;
+        }
+
+        // 特殊: skill info 需要从 SkillCatalog 查询详情
+        if cmd_name == "skill" && args.first().map(|s| s.as_str()) == Some("info") {
+            if let Some(name) = args.get(1) {
+                let catalog = self.orch.skill_catalog();
+                match catalog.resolve(name) {
+                    Some(meta) => {
+                        let display = match &meta.namespace {
+                            Some(ns) => format!("{}:{}", ns, meta.name),
+                            None => meta.name.clone(),
+                        };
+                        self.output.push_system(&format!("技能: {display}"));
+                        self.output.push_system(&format!("  描述: {}", meta.description));
+                        if let Some(ref when) = meta.when_to_use {
+                            self.output.push_system(&format!("  触发条件: {when}"));
+                        }
+                        self.output
+                            .push_system(&format!("  来源: {}", meta.source_path.display()));
+                        match catalog.load_content(meta) {
+                            Ok(body) => {
+                                self.output.push_system("  ─── 内容 ───");
+                                for line in body.lines() {
+                                    self.output.push_system(line);
+                                }
+                            }
+                            Err(e) => self.output.push_system(&format!("  (读取内容失败: {e})")),
+                        }
+                    }
+                    None => self.output.push_system(&format!("未找到技能: {name}")),
+                }
+            } else {
+                self.output.push_system("用法: :skill info <name>");
+            }
+            return HandleResult::Handled;
+        }
+
+        // 特殊: plugin list 需要从 Orchestrator 获取 PluginManager
+        if cmd_name == "plugin" && args.first().map(|s| s.as_str()) == Some("list") {
+            match self.orch.plugin_mgr() {
+                Some(mgr) => {
+                    let plugins = mgr.list();
+                    if plugins.is_empty() {
+                        self.output.push_system("暂无已安装插件");
+                    } else {
+                        self.output.push_system(&format!("已安装插件 ({}个):", plugins.len()));
+                        for p in plugins {
+                            self.output.push_system(&format!(
+                                "  {} ({}/{}) v{} - {}",
+                                p.name,
+                                p.publisher,
+                                p.source,
+                                p.version,
+                                p.installed_at
+                            ));
+                        }
+                    }
+                }
+                None => self.output.push_system("插件管理器未初始化"),
+            }
+            return HandleResult::Handled;
+        }
+
+        // 特殊: persona 命令需要记忆脑的 PersonaManager
+        if cmd_name == "persona" {
+            return self.handle_persona_command(&args);
+        }
+
+        // 特殊: memory 命令需要记忆脑
+        if cmd_name == "memory" {
+            return self.handle_memory_command(&args);
+        }
+
+        // 特殊: evo 命令需要 Orchestrator 异步方法
+        if cmd_name == "evo" {
+            return self.handle_evo_command(&args);
+        }
+
+        // 特殊: mcp list 需要从 McpClientPool 获取数据
+        if cmd_name == "mcp" {
+            return self.handle_mcp_command(&args);
+        }
+
         // 特殊: exit/quit 无冒号前缀也支持
         if cmd_name == "exit" || cmd_name == "quit" {
             return HandleResult::Exit;
@@ -1561,6 +1679,364 @@ impl App {
                 HandleResult::Handled
             }
         }
+    }
+}
+
+// ─── 命令拦截实现 ──────────────────────────────────────────────────
+
+impl App {
+    /// 人格管理命令拦截
+    fn handle_persona_command(&mut self, args: &[String]) -> HandleResult {
+        let sub = match args.first() {
+            Some(s) => s.as_str(),
+            None => {
+                self.output.push_system("用法: :persona <list|switch|info|delete> [参数]");
+                return HandleResult::Handled;
+            }
+        };
+
+        let mem_arc = self.orch.memory_brain();
+        let mut mem = match mem_arc.try_lock() {
+            Ok(m) => m,
+            Err(_) => {
+                self.output.push_system("记忆脑正忙，请稍后重试");
+                return HandleResult::Handled;
+            }
+        };
+
+        match sub {
+            "list" => {
+                let personas = mem.persona_manager().list();
+                let active_id = mem.persona_manager().active_id().to_string();
+                self.output.push_system(&format!("已注册人格 ({}个):", personas.len()));
+                for p in personas {
+                    let marker = if p.id == active_id {
+                        "\x1b[33m ← 当前\x1b[0m"
+                    } else {
+                        ""
+                    };
+                    self.output.push_system(&format!(
+                        "  \x1b[36m{}\x1b[0m ({}) — {}{}",
+                        p.name, p.id, p.description, marker
+                    ));
+                }
+            }
+            "switch" => {
+                let id = match args.get(1) {
+                    Some(id) => id.clone(),
+                    None => {
+                        self.output.push_system("用法: :persona switch <id>");
+                        return HandleResult::Handled;
+                    }
+                };
+                let new_name = mem.persona_manager().list()
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone());
+                match mem.switch_persona(&id) {
+                    Ok(()) => {
+                        let name = new_name.unwrap_or_else(|| id.clone());
+                        drop(mem);
+                        self.output.push_system(&format!(
+                            "\x1b[32m已切换到人格: {}\x1b[0m",
+                            name
+                        ));
+                        self.output.push_system("  (主脑上下文将在下次对话时刷新)");
+                    }
+                    Err(e) => {
+                        self.output.push_system(&format!("切换失败: {e}"));
+                    }
+                }
+            }
+            "info" => {
+                let p = mem.active_persona();
+                self.output.push_system(&format!("\x1b[36m当前人格: {}\x1b[0m ({})", p.name, p.id));
+                self.output.push_system(&format!("  描述: {}", p.description));
+                self.output.push_system(&format!(
+                    "  语言: {} | 风格: {} | 评估敏感度: {}",
+                    p.config.language, p.config.output_style, p.config.eval_sensitivity
+                ));
+                self.output.push_system(&format!(
+                    "  分析间隔: {} 轮",
+                    p.config.analysis_interval
+                ));
+                if !p.system_prompt.is_empty() {
+                    self.output.push_system(&format!("  Prompt: {}...", &p.system_prompt[..p.system_prompt.len().min(80)]));
+                }
+                let stats = mem.stats();
+                if let Ok(s) = stats {
+                    self.output.push_system(&format!(
+                        "  记忆: L1={} L2={} L3={} L4={}",
+                        s.l1_count, s.l2_count, s.l3_count, s.l4_exists
+                    ));
+                }
+            }
+            "delete" => {
+                let id = match args.get(1) {
+                    Some(id) => id.clone(),
+                    None => {
+                        self.output.push_system("用法: :persona delete <id>");
+                        return HandleResult::Handled;
+                    }
+                };
+                match mem.persona_manager_mut().delete(&id) {
+                    Ok(()) => {
+                        self.output.push_system(&format!("已删除人格: {id}"));
+                    }
+                    Err(e) => {
+                        self.output.push_system(&format!("删除失败: {e}"));
+                    }
+                }
+            }
+            "create" => {
+                self.output.push_system("交互式创建暂未实现，请直接编辑:");
+                self.output.push_system("  ~/.ai-brain/personas/registry.json");
+                self.output.push_system("  然后重启生效");
+            }
+            other => {
+                self.output.push_system(&format!(
+                    "未知子命令: {other}。可用: list, switch, info, create, delete"
+                ));
+            }
+        }
+        HandleResult::Handled
+    }
+
+    /// 记忆管理命令拦截
+    fn handle_memory_command(&mut self, args: &[String]) -> HandleResult {
+        let sub = match args.first() {
+            Some(s) => s.as_str(),
+            None => {
+                self.output.push_system("用法: :memory <stats|recall|save|daily> [参数]");
+                return HandleResult::Handled;
+            }
+        };
+
+        let mem_arc = self.orch.memory_brain();
+        let mem = match mem_arc.try_lock() {
+            Ok(m) => m,
+            Err(_) => {
+                self.output.push_system("记忆脑正忙，请稍后重试");
+                return HandleResult::Handled;
+            }
+        };
+
+        match sub {
+            "stats" => {
+                match mem.stats() {
+                    Ok(s) => {
+                        self.output.push_system("=== 金字塔记忆统计 ===");
+                        self.output.push_system(&format!("  L1 全量基座: {} 条", s.l1_count));
+                        self.output.push_system(&format!("  L2 任务摘要: {} 条", s.l2_count));
+                        self.output.push_system(&format!("  L3 经验条目: {} 条", s.l3_count));
+                        self.output.push_system(&format!("  L4 潜意识: {}", if s.l4_exists { "已生成" } else { "未生成" }));
+                        self.output.push_system(&format!("  活跃人格: {}", s.active_persona));
+                        self.output.push_system(&format!("  会话ID: {}", s.session_id));
+                    }
+                    Err(e) => self.output.push_system(&format!("统计读取失败: {e}")),
+                }
+            }
+            "recall" => {
+                let query = match args.get(1) {
+                    Some(q) => q,
+                    None => {
+                        self.output.push_system("用法: :memory recall <query>");
+                        return HandleResult::Handled;
+                    }
+                };
+                let results = mem.recall_for_context(query, 5);
+                if results.is_empty() {
+                    self.output.push_system(&format!("未找到与 '{}' 相关的记忆", query));
+                } else {
+                    self.output.push_system(&format!("找到 {} 条相关记忆:", results.len()));
+                    for (i, entry) in results.iter().enumerate() {
+                        let preview = if entry.content.len() > 120 {
+                            format!("{}...", &entry.content[..120])
+                        } else {
+                            entry.content.clone()
+                        };
+                        self.output.push_system(&format!("  {}. {}", i + 1, preview));
+                    }
+                }
+            }
+            "save" => {
+                let text = match args.get(1) {
+                    Some(t) => t,
+                    None => {
+                        self.output.push_system("用法: :memory save <text>");
+                        return HandleResult::Handled;
+                    }
+                };
+                match mem.store_turn("User", &format!("[手动保存] {text}"), None) {
+                    Ok(()) => self.output.push_system("已保存到 L1 基座"),
+                    Err(e) => self.output.push_system(&format!("保存失败: {e}")),
+                }
+            }
+            "daily" => {
+                // 从 L2 读取最近摘要
+                let summaries = mem.list_recent_summaries(5);
+                if summaries.is_empty() {
+                    self.output.push_system("暂无任务摘要");
+                } else {
+                    self.output.push_system(&format!("最近 {} 条任务摘要:", summaries.len()));
+                    for s in &summaries {
+                        let preview = if s.summary_preview.len() > 100 {
+                            format!("{}...", &s.summary_preview[..100])
+                        } else {
+                            s.summary_preview.clone()
+                        };
+                        self.output.push_system(&format!("  [{}] {}", s.session_start, preview));
+                    }
+                }
+            }
+            other => {
+                self.output.push_system(&format!(
+                    "未知子命令: {other}。可用: stats, recall, save, daily"
+                ));
+            }
+        }
+        HandleResult::Handled
+    }
+
+    /// 进化脑命令拦截
+    fn handle_evo_command(&mut self, args: &[String]) -> HandleResult {
+        let sub = args.first().map(|s| s.as_str());
+
+        match sub {
+            Some("status") | None => {
+                // 使用 tokio::task::block_in_place 在同步上下文中调用 async 方法
+                let status = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.orch.evolution_status())
+                });
+                for line in status.lines() {
+                    self.output.push_system(line);
+                }
+            }
+            Some("approve") => {
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.orch.approve_evolution())
+                });
+                match result {
+                    Ok(()) => self.output.push_system("\x1b[32m进化变更已批准\x1b[0m"),
+                    Err(e) => self.output.push_system(&format!("批准失败: {e}")),
+                }
+            }
+            Some("reject") => {
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.orch.reject_evolution())
+                });
+                match result {
+                    Ok(()) => self.output.push_system("进化变更已拒绝"),
+                    Err(e) => self.output.push_system(&format!("拒绝失败: {e}")),
+                }
+            }
+            Some("diff") => {
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.orch.evolution_diff())
+                });
+                match result {
+                    Ok(diff) => {
+                        for line in diff.lines() {
+                            self.output.push_system(line);
+                        }
+                    }
+                    Err(e) => self.output.push_system(&format!("获取差异失败: {e}")),
+                }
+            }
+            Some(goal) => {
+                let goal = goal.to_string();
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(self.orch.start_evolution(goal))
+                });
+                match result {
+                    Ok(msg) => self.output.push_system(&format!("进化任务已启动: {msg}")),
+                    Err(e) => self.output.push_system(&format!("启动失败: {e}")),
+                }
+            }
+        }
+        HandleResult::Handled
+    }
+
+    /// MCP 命令拦截
+    fn handle_mcp_command(&mut self, args: &[String]) -> HandleResult {
+        let sub = match args.first() {
+            Some(s) => s.as_str(),
+            None => {
+                self.output.push_system("用法: :mcp <list|status|reconnect> [参数]");
+                return HandleResult::Handled;
+            }
+        };
+
+        let pool = self.orch.mcp_pool();
+        match sub {
+            "list" => {
+                let servers = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(pool.list_servers())
+                });
+                if servers.is_empty() {
+                    self.output.push_system("暂无已配置的 MCP 服务");
+                    self.output.push_system("  配置文件: ~/.ai-brain/mcp_servers.json");
+                } else {
+                    self.output.push_system(&format!("MCP 服务 ({}个):", servers.len()));
+                    for (name, status) in &servers {
+                        let status_str = match status {
+                            ServerStatus::Connected => "\x1b[32m已连接\x1b[0m",
+                            ServerStatus::Disconnected => "\x1b[33m未连接\x1b[0m",
+                            ServerStatus::Error(e) => &format!("\x1b[31m错误: {e}\x1b[0m"),
+                        };
+                        self.output.push_system(&format!(
+                            "  \x1b[36m{}\x1b[0m — {}",
+                            name, status_str
+                        ));
+                    }
+                }
+            }
+            "status" => {
+                let name = match args.get(1) {
+                    Some(n) => n.clone(),
+                    None => {
+                        self.output.push_system("用法: :mcp status <server>");
+                        return HandleResult::Handled;
+                    }
+                };
+                let status = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(pool.server_status(&name))
+                });
+                match status {
+                    Some(s) => {
+                        let status_str = match &s {
+                            ServerStatus::Connected => "已连接",
+                            ServerStatus::Disconnected => "未连接",
+                            ServerStatus::Error(e) => &format!("错误: {e}"),
+                        };
+                        self.output.push_system(&format!(
+                            "MCP 服务 \x1b[36m{}\x1b[0m: {}",
+                            name, status_str
+                        ));
+                    }
+                    None => {
+                        self.output.push_system(&format!("未找到 MCP 服务: {name}"));
+                    }
+                }
+            }
+            "reconnect" => {
+                let name = match args.get(1) {
+                    Some(n) => n,
+                    None => {
+                        self.output.push_system("用法: :mcp reconnect <server>");
+                        return HandleResult::Handled;
+                    }
+                };
+                self.output.push_system(&format!("MCP 重连功能暂未实现: {name}"));
+            }
+            other => {
+                self.output.push_system(&format!(
+                    "未知子命令: {other}。可用: list, status, reconnect"
+                ));
+            }
+        }
+        HandleResult::Handled
     }
 }
 

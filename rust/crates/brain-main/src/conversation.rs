@@ -37,13 +37,17 @@ impl ConversationHistory {
 
     /// 追加助手消息（含工具调用）
     pub fn push_assistant_blocks(&mut self, blocks: Vec<brain_core::types::ContentBlock>) {
-        self.messages.push(ConversationMessage::assistant_blocks(blocks));
+        self.messages
+            .push(ConversationMessage::assistant_blocks(blocks));
     }
 
     /// 追加工具结果消息（完整版，保留 tool_use_id）
     pub fn push_tool_result(&mut self, tool_use_id: String, content: String, is_error: bool) {
-        self.messages
-            .push(ConversationMessage::tool_result(tool_use_id, content, is_error));
+        self.messages.push(ConversationMessage::tool_result(
+            tool_use_id,
+            content,
+            is_error,
+        ));
     }
 
     /// 追加评估脑反馈消息

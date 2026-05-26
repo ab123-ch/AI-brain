@@ -34,10 +34,9 @@ pub fn load_mcp_servers(path: &Path) -> Result<Vec<(String, McpServerConfig)>, S
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("读取 MCP 配置失败: {e}"))?;
-    let file: McpServersFile = serde_json::from_str(&content)
-        .map_err(|e| format!("解析 MCP 配置失败: {e}"))?;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("读取 MCP 配置失败: {e}"))?;
+    let file: McpServersFile =
+        serde_json::from_str(&content).map_err(|e| format!("解析 MCP 配置失败: {e}"))?;
     Ok(file.mcp_servers.into_iter().collect())
 }
 
@@ -65,7 +64,8 @@ mod tests {
     fn load_mcp_servers_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("mcp-servers.json");
-        let content = r#"{"mcpServers": {"context7": {"command": "npx", "args": ["-y", "context7"]}}}"#;
+        let content =
+            r#"{"mcpServers": {"context7": {"command": "npx", "args": ["-y", "context7"]}}}"#;
         std::fs::write(&config_path, content).unwrap();
 
         let servers = load_mcp_servers(&config_path).unwrap();

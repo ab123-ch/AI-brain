@@ -18,6 +18,8 @@ pub struct CompactionConfig {
     pub preserve_recent_turns: usize,
     /// 单轮工具结果字符数 > 此值触发预压缩，默认 10000
     pub tool_result_compress_threshold: usize,
+    /// 压缩时 LLM 输出的 max_tokens，默认 2048
+    pub max_tokens: u32,
 }
 
 impl Default for CompactionConfig {
@@ -25,6 +27,7 @@ impl Default for CompactionConfig {
         Self {
             preserve_recent_turns: 4,
             tool_result_compress_threshold: 10_000,
+            max_tokens: 2048,
         }
     }
 }
@@ -192,6 +195,7 @@ pub async fn compress_single_turn(
     turn_start: usize,
     turn_end: usize,
     llm: &dyn LlmProvider,
+    max_tokens: u32,
 ) -> HashMap<usize, String> {
     let block = &messages[turn_start..turn_end];
 
@@ -227,7 +231,7 @@ pub async fn compress_single_turn(
     let request = ChatRequest {
         model: None,
         messages: vec![ChatMessage::user(prompt)],
-        max_tokens: Some(2048),
+        max_tokens: Some(max_tokens),
         temperature: Some(0.3),
         tools: None,
         tool_choice: None,
@@ -405,7 +409,9 @@ mod tests {
         let result = apply_pending(&mut messages, &pending);
         assert_eq!(result.compacted_groups, 1);
         assert!(result.chars_saved > 0);
-        assert!(messages[1].text_content().starts_with("[工具调用结果已压缩]"));
+        assert!(messages[1]
+            .text_content()
+            .starts_with("[工具调用结果已压缩]"));
     }
 
     #[test]

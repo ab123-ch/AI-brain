@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex, watch};
+use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::types::{DispatchEvent, MainLoopMessage, PrioritizedEvent, Priority};
 
@@ -59,10 +59,7 @@ impl TokioDispatch {
 
     /// Launch the main dispatch loop — consumes the priority queue and routes
     /// events to `output_tx`.
-    pub async fn run_dispatch_loop(
-        &self,
-        output_tx: mpsc::Sender<MainLoopMessage>,
-    ) {
+    pub async fn run_dispatch_loop(&self, output_tx: mpsc::Sender<MainLoopMessage>) {
         let mut rx = self.queue_rx.lock().await;
 
         loop {
@@ -85,16 +82,10 @@ impl TokioDispatch {
         }
     }
 
-    async fn handle_event(
-        &self,
-        event: DispatchEvent,
-        output_tx: &mpsc::Sender<MainLoopMessage>,
-    ) {
+    async fn handle_event(&self, event: DispatchEvent, output_tx: &mpsc::Sender<MainLoopMessage>) {
         match event {
             DispatchEvent::SyncAgentRequest {
-                agent_id,
-                reply_tx,
-                ..
+                agent_id, reply_tx, ..
             } => {
                 // Sync requests are handled by spawn_agent_job in a separate
                 // thread; the reply is sent from that thread.
@@ -110,9 +101,7 @@ impl TokioDispatch {
                 tracing::info!("dispatch_loop: AsyncAgentCompleted {name} status={status:?}");
                 let msg = MainLoopMessage::AgentNotification(agent_result);
                 if let Err(e) = output_tx.send(msg).await {
-                    tracing::error!(
-                        "dispatch_loop: failed to forward agent notification: {e}"
-                    );
+                    tracing::error!("dispatch_loop: failed to forward agent notification: {e}");
                 }
             }
             DispatchEvent::BrainTaskCompleted { brain_id, result } => {
@@ -120,9 +109,7 @@ impl TokioDispatch {
                 tracing::info!("dispatch_loop: BrainTaskCompleted {brain_id} {task_type}");
                 let msg = MainLoopMessage::BrainTaskNotification { brain_id, result };
                 if let Err(e) = output_tx.send(msg).await {
-                    tracing::error!(
-                        "dispatch_loop: failed to forward brain notification: {e}"
-                    );
+                    tracing::error!("dispatch_loop: failed to forward brain notification: {e}");
                 }
             }
             DispatchEvent::UserInput { content } => {

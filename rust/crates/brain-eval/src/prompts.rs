@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use brain_core::types::{EvalRequirement, EvolutionRule, PitfallCategory, PitfallRecord, TurnRecord, TurnRole, UserProfile};
+use brain_core::types::{EvalRequirement, TurnRecord, TurnRole};
 use chrono::{Datelike, Utc};
 
 use crate::skills::SkillRegistry;
@@ -15,8 +15,8 @@ pub fn build_environment_info() -> String {
         "windows" => "Windows",
         other => other,
     };
-    let cwd = std::env::current_dir()
-        .map_or_else(|_| "unknown".into(), |p| p.display().to_string());
+    let cwd =
+        std::env::current_dir().map_or_else(|_| "unknown".into(), |p| p.display().to_string());
     let now = Utc::now();
     let date_str = now.format("%Y年%m月%d日").to_string();
     let weekday = match now.weekday().num_days_from_monday() {
@@ -53,9 +53,10 @@ pub fn build_available_skills(registry: &SkillRegistry) -> String {
     s
 }
 
-/// 构建评估系统提示词（Skill 化版本）
+/// 构建评估系统提示词（需求驱动版本）
 ///
-/// 四段式结构：角色定义 + 环境信息 + available_skills + 用户评估要求 + 输出格式
+/// 核心理念：评估脑聚焦当前用户需求，而非历史记忆。
+/// 三步评估逻辑：理解需求 → 对照输出 → 二次校验
 pub fn build_evaluation_system_prompt(
     eval_requirements: &[EvalRequirement],
     registry: &SkillRegistry,
@@ -63,34 +64,61 @@ pub fn build_evaluation_system_prompt(
 ) -> String {
     let mut prompt = String::new();
 
-    // 第一段：角色定义
-    prompt.push_str(r"# 角色定义
+    // 第一段：角色定义 + 评估方法论
+    prompt.push_str(
+        r"# 角色定义
 
-你是 AI Brain 系统的质量审核员，负责在主脑产生输出后评估其质量和安全性。
+你是 AI Brain 系统的质量审核员。你的唯一职责是验证主脑的输出是否真正满足了用户的当前需求。
 
-## 核心能力
-- **任务完成度审查**：判断主脑是否真正完成了用户要求的任务
-- **安全风险识别**：检测代码中的危险操作和安全隐患
-- **事实正确性校验**：验证日期、技术细节是否准确（以环境信息为准）
-- **偏好合规检查**：确认输出遵守用户的偏好和禁忌（只在直接相关时）
+## 评估方法论（三步法）
 
-");
+你必须严格按以下三步进行评估，不得跳步：
 
-    // 如果有工具能力，添加工作方式说明
+### 第一步：理解用户需求
+仔细分析用户的原始输入，拆解出：
+- 核心意图：用户到底想要什么
+- 具体要求：有哪些明确的约束、条件、格式要求
+- 隐含期望：从需求上下文可以合理推断的期望（必须与当前需求直接相关）
+
+### 第二步：对照主脑输出
+将主脑的输出与第一步理解的需求逐条对照：
+- 是否完成了用户要求的核心任务？
+- 是否满足所有明确约束？
+- 代码/结论中是否存在安全风险或事实性错误？
+- 是否存在偷懒行为（TODO占位、省略实现等）？
+
+### 第三步：二次校验（关键）
+如果第二步发现问题，**必须进行二次校验**：
+- 重新审视用户原始需求，确认自己的理解是否正确
+- 如果是自己理解有误 → 输出「评估结果-正常」
+- 如果确认主脑确实有问题 → 输出具体问题和修正建议
+
+## 评估原则
+- **只关注当前需求**：不参考任何用户的历史偏好、习惯、画像
+- **宁漏勿报**：只报告确实存在的问题，不确定的不报
+- **不吹毛求疵**：风格、措辞、称呼等不涉及任务正确性的细节不评估
+- **不重复劳动**：主脑已完成的任务不要要求换一种方式重做
+
+",
+    );
+
+    // 工具说明
     if with_tools {
-        prompt.push_str(r"## 工作方式
+        prompt.push_str(
+            r"## 工具使用
 - 你可以调用 Skill 工具加载具体的审查规则
 - 你可以使用只读工具（read_file、grep、bash）验证代码
-- 只报告确实存在的问题，宁可漏报不误报
-- 不确定的事实不要标记为错误
+- 不确定的事实不要标记为错误，可以用工具验证后再判断
 
-");
+",
+        );
     } else {
-        prompt.push_str(r"## 工作方式
-- 只报告确实存在的问题，宁可漏报不误报
+        prompt.push_str(
+            r"## 注意事项
 - 不确定的事实不要标记为错误
 
-");
+",
+        );
     }
 
     // 第二段：环境信息
@@ -102,7 +130,8 @@ pub fn build_evaluation_system_prompt(
 
     // Skill tool 说明
     if with_tools {
-        prompt.push_str(r#"# Skill 工具
+        prompt.push_str(
+            r#"# Skill 工具
 
 你可以调用 Skill 工具加载具体审查规则：
 - `Skill("code-verification")` — 代码变更验证（编译、测试、空实现、日志、需求匹配）
@@ -110,7 +139,8 @@ pub fn build_evaluation_system_prompt(
 
 加载后你将看到完整的检查维度和铁律。
 
-"#);
+"#,
+        );
     }
 
     // 第四段：用户评估要求
@@ -124,7 +154,8 @@ pub fn build_evaluation_system_prompt(
     }
 
     // 输出格式
-    prompt.push_str(r"# 输出格式
+    prompt.push_str(
+        r"# 输出格式
 
 没有问题时，严格输出（不要附加其他文字）：
 评估结果-正常
@@ -132,21 +163,19 @@ pub fn build_evaluation_system_prompt(
 有问题时，严格输出（不要附加其他文字）：
 评估结果-存在问题。具体问题：1.问题描述及修正建议 2.问题描述及修正建议 ...
 
-注意：不要输出 JSON，不要使用代码块，只输出纯文本。");
+注意：不要输出 JSON，不要使用代码块，只输出纯文本。",
+    );
 
     prompt
 }
 
 /// 构建评估用户提示词
 ///
-/// 将踩坑库 + 用户画像 + 自进化规则 + 主脑输入输出注入上下文
-#[allow(clippy::cognitive_complexity)]
+/// 聚焦当前需求：用户输入 + 主脑输出 + 操作轨迹
+/// 不再注入用户画像、踩坑库、进化规则等历史记忆数据
 pub fn build_evaluation_user_prompt(
     user_input: &str,
     ai_output: &str,
-    pitfalls: &[PitfallRecord],
-    user_profile: &UserProfile,
-    rules: &[EvolutionRule],
     turns: &[TurnRecord],
 ) -> String {
     let mut prompt = String::new();
@@ -167,76 +196,7 @@ pub fn build_evaluation_user_prompt(
         prompt.push_str(&trace_text);
     }
 
-    // 踩坑库
-    if !pitfalls.is_empty() {
-        prompt.push_str("## 踩坑库（已知错误模式）\n");
-        for (i, p) in pitfalls.iter().enumerate() {
-            let _ = writeln!(
-                prompt,
-                "{}. [{}] {} (出现{}次)",
-                i + 1,
-                category_label(p.category),
-                p.description,
-                p.occurrence_count
-            );
-            if let Some(ref correction) = p.user_correction {
-                let _ = write!(prompt, " — 用户纠正: {correction}");
-            }
-            prompt.push('\n');
-        }
-        prompt.push('\n');
-    }
-
-    // 用户画像
-    let has_profile = !user_profile.explicit_preferences.is_empty()
-        || !user_profile.implicit_preferences.is_empty()
-        || !user_profile.taboos.is_empty()
-        || !user_profile.habits.is_empty();
-
-    if has_profile {
-        prompt.push_str("## 用户画像\n");
-
-        if !user_profile.explicit_preferences.is_empty() {
-            prompt.push_str("### 显性偏好\n");
-            for pref in &user_profile.explicit_preferences {
-                let _ = writeln!(prompt, "- {pref}");
-            }
-        }
-
-        if !user_profile.implicit_preferences.is_empty() {
-            prompt.push_str("### 隐性偏好\n");
-            for pref in &user_profile.implicit_preferences {
-                let _ = writeln!(prompt, "- {pref}");
-            }
-        }
-
-        if !user_profile.taboos.is_empty() {
-            prompt.push_str("### 禁忌（绝对不能做的事）\n");
-            for taboo in &user_profile.taboos {
-                let _ = writeln!(prompt, "- {taboo}");
-            }
-        }
-
-        if !user_profile.habits.is_empty() {
-            prompt.push_str("### 习惯\n");
-            for habit in &user_profile.habits {
-                let _ = writeln!(prompt, "- {habit}");
-            }
-        }
-
-        prompt.push('\n');
-    }
-
-    // 自进化规则
-    if !rules.is_empty() {
-        prompt.push_str("## 自进化规则（避坑指南）\n");
-        for (i, r) in rules.iter().enumerate() {
-            let _ = writeln!(prompt, "{}. [优先级{}] {}", i + 1, r.priority, r.rule);
-        }
-        prompt.push('\n');
-    }
-
-    prompt.push_str("请根据以上信息评估主脑输出。没有问题输出「评估结果-正常」，有问题输出「评估结果-存在问题。具体问题：...」");
+    prompt.push_str("请按照三步法评估：1)理解用户需求 → 2)对照主脑输出 → 3)二次校验。没有问题输出「评估结果-正常」，有问题输出「评估结果-存在问题。具体问题：...」");
 
     prompt
 }
@@ -260,7 +220,14 @@ pub fn format_tool_trace(turns: &[TurnRecord]) -> String {
         let tc = turn.tool_call.as_ref().unwrap();
         let status = if tc.is_error { "失败" } else { "成功" };
 
-        let _ = writeln!(s, "{}. [{}] → {}({}ms)", i + 1, tc.tool_name, status, tc.duration_ms);
+        let _ = writeln!(
+            s,
+            "{}. [{}] → {}({}ms)",
+            i + 1,
+            tc.tool_name,
+            status,
+            tc.duration_ms
+        );
 
         // 输入 JSON
         let input_json = serde_json::to_string(&tc.input).unwrap_or_else(|_| tc.input.to_string());
@@ -305,20 +272,9 @@ pub fn format_tool_trace(turns: &[TurnRecord]) -> String {
     s
 }
 
-fn category_label(category: PitfallCategory) -> &'static str {
-    match category {
-        PitfallCategory::ToolFailure => "工具失败",
-        PitfallCategory::WrongAnswer => "答案错误",
-        PitfallCategory::FormatIssue => "格式问题",
-        PitfallCategory::LazyBehavior => "偷懒行为",
-        PitfallCategory::Other => "其他",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::types::PitfallCategory;
     use chrono::Utc;
 
     #[test]
@@ -326,17 +282,23 @@ mod tests {
         let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
         assert!(prompt.contains("角色定义"));
         assert!(prompt.contains("质量审核员"));
-        assert!(prompt.contains("核心能力"));
+        assert!(prompt.contains("三步法"));
     }
 
     #[test]
-    fn system_prompt_has_fixed_dimensions() {
+    fn system_prompt_has_evaluation_dimensions() {
         let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        // 新版本的系统提示词使用"核心能力"替代"评估维度"
-        assert!(prompt.contains("任务完成度审查"));
-        assert!(prompt.contains("安全风险识别"));
-        assert!(prompt.contains("事实正确性校验"));
-        assert!(prompt.contains("偏好合规检查"));
+        // 需求驱动版本不再有"偏好合规检查"，改为三步法
+        assert!(prompt.contains("理解用户需求"));
+        assert!(prompt.contains("对照主脑输出"));
+        assert!(prompt.contains("二次校验"));
+    }
+
+    #[test]
+    fn system_prompt_no_preference_check() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
+        // 确保不再包含"偏好合规检查"
+        assert!(!prompt.contains("偏好合规检查"));
     }
 
     #[test]
@@ -350,8 +312,8 @@ mod tests {
     #[test]
     fn system_prompt_has_judgment_principles() {
         let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        // 新版本的系统提示词在"工作方式"中包含判定原则
-        assert!(prompt.contains("宁可漏报不误报"));
+        assert!(prompt.contains("宁漏勿报"));
+        assert!(prompt.contains("不吹毛求疵"));
     }
 
     #[test]
@@ -391,99 +353,39 @@ mod tests {
             "帮我写一个函数",
             "fn add(a: i32, b: i32) -> i32 { a + b }",
             &[],
-            &UserProfile::default(),
-            &[],
-            &[],
         );
         assert!(prompt.contains("帮我写一个函数"));
         assert!(prompt.contains("fn add"));
-        assert!(prompt.contains("请根据以上信息评估"));
+        assert!(prompt.contains("三步法"));
     }
 
     #[test]
-    fn user_prompt_with_pitfalls() {
-        let pitfall = PitfallRecord {
-            id: "p1".into(),
-            category: PitfallCategory::LazyBehavior,
-            description: "使用了 unwrap()".into(),
-            user_correction: Some("应该用 ok_or".into()),
-            occurred_at: Utc::now(),
-            occurrence_count: 3,
-            superseded: false,
-        };
-        let prompt = build_evaluation_user_prompt(
-            "写代码",
-            "some code",
-            &[pitfall],
-            &UserProfile::default(),
-            &[],
-            &[],
-        );
-        assert!(prompt.contains("踩坑库"));
-        assert!(prompt.contains("unwrap"));
-        assert!(prompt.contains("用户纠正"));
-        assert!(prompt.contains("出现3次"));
-    }
-
-    #[test]
-    fn user_prompt_with_user_profile() {
-        let mut profile = UserProfile::default();
-        profile
-            .explicit_preferences
-            .push("使用 Rust 惯用写法".into());
-        profile.taboos.push("禁止使用 unsafe".into());
-
-        let prompt = build_evaluation_user_prompt("写代码", "some code", &[], &profile, &[], &[]);
-        assert!(prompt.contains("用户画像"));
-        assert!(prompt.contains("显性偏好"));
-        assert!(prompt.contains("Rust 惯用写法"));
-        assert!(prompt.contains("禁忌"));
-        assert!(prompt.contains("unsafe"));
-    }
-
-    #[test]
-    fn user_prompt_with_evolution_rules() {
-        let rule = EvolutionRule {
-            id: "r1".into(),
-            rule: "永远不要在循环里分配内存".into(),
-            source_pitfall_ids: vec!["p1".into()],
-            priority: 5,
-            created_at: Utc::now(),
-            superseded: false,
-        };
-        let prompt = build_evaluation_user_prompt(
-            "写代码",
-            "some code",
-            &[],
-            &UserProfile::default(),
-            &[rule],
-            &[],
-        );
-        assert!(prompt.contains("自进化规则"));
-        assert!(prompt.contains("优先级5"));
-        assert!(prompt.contains("循环里分配内存"));
-    }
-
-    #[test]
-    fn user_prompt_no_profile_section_when_empty() {
-        let prompt =
-            build_evaluation_user_prompt("input", "output", &[], &UserProfile::default(), &[], &[]);
+    fn user_prompt_no_user_profile() {
+        // 确保不再包含用户画像相关内容
+        let prompt = build_evaluation_user_prompt("写代码", "some code", &[]);
         assert!(!prompt.contains("用户画像"));
+        assert!(!prompt.contains("显性偏好"));
+        assert!(!prompt.contains("隐性偏好"));
+        assert!(!prompt.contains("禁忌"));
     }
 
     #[test]
-    fn category_label_matches() {
-        assert_eq!(category_label(PitfallCategory::ToolFailure), "工具失败");
-        assert_eq!(category_label(PitfallCategory::WrongAnswer), "答案错误");
-        assert_eq!(category_label(PitfallCategory::FormatIssue), "格式问题");
-        assert_eq!(category_label(PitfallCategory::LazyBehavior), "偷懒行为");
-        assert_eq!(category_label(PitfallCategory::Other), "其他");
+    fn user_prompt_no_pitfalls() {
+        // 确保不再包含踩坑库
+        let prompt = build_evaluation_user_prompt("写代码", "some code", &[]);
+        assert!(!prompt.contains("踩坑库"));
+    }
+
+    #[test]
+    fn user_prompt_no_evolution_rules() {
+        // 确保不再包含自进化规则
+        let prompt = build_evaluation_user_prompt("写代码", "some code", &[]);
+        assert!(!prompt.contains("自进化规则"));
     }
 
     #[test]
     fn system_prompt_with_tools_has_verification_section() {
         let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), true);
-        // 新版本的系统提示词使用 Skill 工具说明替代验证工具
         assert!(prompt.contains("Skill 工具"));
         assert!(prompt.contains("code-verification"));
         assert!(prompt.contains("conclusion-verification"));
@@ -497,6 +399,7 @@ mod tests {
 
     #[test]
     fn user_prompt_with_file_changes_shows_trace() {
+        use brain_core::types::{ToolCallRecord, TurnRole};
         let turns = vec![TurnRecord {
             role: TurnRole::ToolCall,
             content: String::new(),
@@ -514,7 +417,9 @@ mod tests {
             timestamp: String::new(),
         }];
         let prompt = build_evaluation_user_prompt(
-            "改代码", "已修改", &[], &UserProfile::default(), &[], &turns,
+            "改代码",
+            "已修改",
+            &turns,
         );
         assert!(prompt.contains("主脑操作轨迹"));
         assert!(prompt.contains("src/main.rs"));
@@ -523,9 +428,8 @@ mod tests {
 
     #[test]
     fn user_prompt_without_file_changes_no_section() {
-        let prompt = build_evaluation_user_prompt(
-            "闲聊", "你好", &[], &UserProfile::default(), &[], &[],
-        );
+        let prompt =
+            build_evaluation_user_prompt("闲聊", "你好", &[]);
         assert!(!prompt.contains("主脑操作轨迹"));
     }
 
@@ -605,10 +509,7 @@ mod tests {
 
     #[test]
     fn format_tool_trace_only_assistant_returns_empty() {
-        let turns = vec![
-            make_assistant("hello"),
-            make_assistant("world"),
-        ];
+        let turns = vec![make_assistant("hello"), make_assistant("world")];
         let trace = format_tool_trace(&turns);
         assert!(trace.is_empty());
     }

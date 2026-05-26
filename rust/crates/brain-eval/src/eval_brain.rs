@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use brain_core::tool_executor::ToolExecutor;
-use brain_core::types::{EvalRequirement, EvolutionRule, PitfallRecord, ProgressEvent, ToolCall, TurnRecord, UserProfile};
+use brain_core::types::{
+    EvalRequirement, PitfallRecord, ProgressEvent, ToolCall, TurnRecord,
+};
 use brain_llm::{ChatMessage, ChatRequest, ContentBlock, LlmProvider, ToolChoice, ToolDefinition};
 use brain_plugin::SkillCatalog;
 use serde::{Deserialize, Serialize};
@@ -36,9 +38,9 @@ const READ_ONLY_BASH_COMMANDS: &[&str] = &[
 /// 检查 bash 命令是否在只读白名单中
 pub(crate) fn is_read_only_bash_command(cmd: &str) -> bool {
     let cmd_lower = cmd.trim().to_lowercase();
-    READ_ONLY_BASH_COMMANDS.iter().any(|allowed| {
-        cmd_lower.starts_with(&allowed.to_lowercase())
-    })
+    READ_ONLY_BASH_COMMANDS
+        .iter()
+        .any(|allowed| cmd_lower.starts_with(&allowed.to_lowercase()))
 }
 
 /// 构建评估脑专用的只读工具定义
@@ -274,7 +276,10 @@ async fn eval_tool_loop(
             return Ok(response.text());
         }
 
-        tracing::info!("评估脑 tool_loop 第{round}轮: LLM 调用了 {} 个工具", response.tool_calls().len());
+        tracing::info!(
+            "评估脑 tool_loop 第{round}轮: LLM 调用了 {} 个工具",
+            response.tool_calls().len()
+        );
         messages.push(ChatMessage::assistant_blocks(response.content.clone()));
 
         // 执行工具调用
@@ -297,23 +302,27 @@ async fn eval_tool_loop(
 
                 // Skill tool 特殊处理：优先查统一 SkillCatalog，回退到内置 registry
                 if name == "Skill" {
-                    let skill_name = input.get("command")
+                    let skill_name = input
+                        .get("command")
                         .or_else(|| input.get("skill"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
                     let content = if let Some(ref catalog) = external_catalog {
                         match catalog.resolve(skill_name) {
-                            Some(meta) => catalog.load_content(meta)
+                            Some(meta) => catalog
+                                .load_content(meta)
                                 .unwrap_or_else(|_| format!("Skill '{}' 加载失败", skill_name)),
-                            None => {
-                                skill_registry.get_skill_content(skill_name)
-                                    .map_or_else(|| format!("Skill '{}' 不存在", skill_name), ToString::to_string)
-                            }
+                            None => skill_registry.get_skill_content(skill_name).map_or_else(
+                                || format!("Skill '{}' 不存在", skill_name),
+                                ToString::to_string,
+                            ),
                         }
                     } else {
-                        skill_registry.get_skill_content(skill_name)
-                            .map_or_else(|| format!("Skill '{}' 不存在", skill_name), ToString::to_string)
+                        skill_registry.get_skill_content(skill_name).map_or_else(
+                            || format!("Skill '{}' 不存在", skill_name),
+                            ToString::to_string,
+                        )
                     };
 
                     messages.push(ChatMessage::tool_result(&id, content, false));
@@ -322,9 +331,7 @@ async fn eval_tool_loop(
 
                 // bash 命令白名单检查
                 if name == "bash" {
-                    let cmd = input.get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
                     if !is_read_only_bash_command(cmd) {
                         tracing::warn!("评估脑 bash 命令安全拒绝: {cmd}");
                         messages.push(ChatMessage::tool_result(
@@ -362,7 +369,11 @@ async fn eval_tool_loop(
 
                 // 截断工具输出
                 let output = truncate_verification_output(&result.output, 5000);
-                messages.push(ChatMessage::tool_result(&id, output.clone(), result.is_error));
+                messages.push(ChatMessage::tool_result(
+                    &id,
+                    output.clone(),
+                    result.is_error,
+                ));
 
                 // 发送 ToolDone 事件
                 if let Some(tx) = progress_tx {
@@ -460,20 +471,15 @@ impl EvalBrain {
         &self.skill_registry
     }
 
-    /// 评估主脑输出（统一入口）
+    /// 评估主脑输出（需求驱动版本）
     ///
-    /// 统一架构：不再区分有/无文件变更两条路径。
-    /// - 有 tool_executor -> eval_tool_loop（LLM 可自主调工具，最多 max_rounds 轮）
-    /// - 无 tool_executor -> 单次 LLM 调用（降级）
-    #[allow(clippy::too_many_arguments)]
+    /// 聚焦当前用户需求，不再依赖历史记忆（用户画像/踩坑库/进化规则）。
+    /// 三步法：理解需求 → 对照输出 → 二次校验
     pub async fn evaluate(
         &self,
         user_input: &str,
         ai_output: &str,
         turns: &[TurnRecord],
-        pitfalls: &[PitfallRecord],
-        user_profile: &UserProfile,
-        rules: &[EvolutionRule],
         eval_requirements: &[EvalRequirement],
     ) -> Result<EvalResult> {
         if user_input.trim().is_empty() || ai_output.trim().is_empty() {
@@ -488,17 +494,11 @@ impl EvalBrain {
         }
 
         // 统一使用 with_tools=true 构建系统提示词
-        let system_prompt = prompts::build_evaluation_system_prompt(
-            eval_requirements,
-            &self.skill_registry,
-            true,
-        );
+        let system_prompt =
+            prompts::build_evaluation_system_prompt(eval_requirements, &self.skill_registry, true);
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
-            pitfalls,
-            user_profile,
-            rules,
             turns,
         );
 
@@ -519,7 +519,8 @@ impl EvalBrain {
                     self.skill_catalog.clone(),
                     10,
                     self.progress_tx.as_ref(),
-                ).await?
+                )
+                .await?
             }
             None => {
                 // 无 tool_executor -> 单次 LLM 调用（降级）
@@ -531,7 +532,10 @@ impl EvalBrain {
                     tools: None,
                     tool_choice: None,
                 };
-                let response = self.llm.complete(request).await
+                let response = self
+                    .llm
+                    .complete(request)
+                    .await
                     .map_err(|e| EvalError::LlmError(e.to_string()))?;
                 response.text()
             }
@@ -661,9 +665,6 @@ mod tests {
                 "写一个函数",
                 "fn add(a: i32, b: i32) -> i32 { a + b }",
                 &[], // turns
-                &[], // pitfalls
-                &UserProfile::default(),
-                &[], // rules
                 &[], // eval_requirements
             )
             .await
@@ -682,9 +683,6 @@ mod tests {
                 "写代码",
                 "fn process() {\n    // TODO: implement this\n}",
                 &[], // turns
-                &[], // pitfalls
-                &UserProfile::default(),
-                &[], // rules
                 &[], // eval_requirements
             )
             .await
@@ -698,7 +696,12 @@ mod tests {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
         let result = brain
-            .evaluate("", "some output", &[], &[], &UserProfile::default(), &[], &[])
+            .evaluate(
+                "",
+                "some output",
+                &[],
+                &[],
+            )
             .await;
         assert!(result.is_err());
     }
@@ -708,7 +711,12 @@ mod tests {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
         let result = brain
-            .evaluate("some input", "", &[], &[], &UserProfile::default(), &[], &[])
+            .evaluate(
+                "some input",
+                "",
+                &[],
+                &[],
+            )
             .await;
         assert!(result.is_err());
     }
@@ -722,9 +730,6 @@ mod tests {
                 "写代码",
                 "fn add(a: i32, b: i32) -> i32 { a + b }",
                 &[], // turns
-                &[], // pitfalls
-                &UserProfile::default(),
-                &[], // rules
                 &[], // eval_requirements
             )
             .await
@@ -816,9 +821,6 @@ mod tests {
                 "写代码",
                 "fn add() {}",
                 &[], // turns 为空，无文件变更
-                &[], // pitfalls
-                &UserProfile::default(),
-                &[], // rules
                 &[], // eval_requirements
             )
             .await
@@ -891,9 +893,6 @@ mod tests {
                 "改代码",
                 "已修改",
                 &turns,
-                &[], // pitfalls
-                &UserProfile::default(),
-                &[], // rules
                 &[], // eval_requirements
             )
             .await
@@ -922,7 +921,8 @@ mod tests {
             fn complete(
                 &self,
                 _request: ChatRequest,
-            ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>>
+            {
                 let count = self.call_count.clone();
                 Box::pin(async move {
                     let n = count.fetch_add(1, Ordering::SeqCst);
@@ -964,9 +964,6 @@ mod tests {
                 "改代码",
                 "已修改",
                 &turns,
-                &[], // pitfalls
-                &UserProfile::default(),
-                &[], // rules
                 &[], // eval_requirements
             )
             .await
@@ -993,7 +990,8 @@ mod tests {
             fn complete(
                 &self,
                 request: ChatRequest,
-            ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>>
+            {
                 let count = self.call_count.clone();
                 let has_tools = request.tools.is_some();
                 Box::pin(async move {
@@ -1035,14 +1033,11 @@ mod tests {
         let result = eval_tool_loop(
             llm.as_ref(),
             executor.as_ref(),
-            vec![
-                ChatMessage::system("test"),
-                ChatMessage::user("test"),
-            ],
+            vec![ChatMessage::system("test"), ChatMessage::user("test")],
             build_read_only_tool_definitions(),
             &SkillRegistry::new(),
             None, // 无 external_catalog
-            3, // 只测试 3 轮
+            3,    // 只测试 3 轮
             None, // 无 progress_tx
         )
         .await

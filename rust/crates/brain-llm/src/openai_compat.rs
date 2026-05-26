@@ -535,8 +535,14 @@ impl LlmProvider for OpenAiCompatClient {
             let parsed = Self::parse_response(api_resp, fallback_model);
 
             // 检测异常：空内容 + 非工具调用
-            let has_text = parsed.content.iter().any(|b| matches!(b, ContentBlock::Text { .. }));
-            let has_tool = parsed.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+            let has_text = parsed
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. }));
+            let has_tool = parsed
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
             if !has_text && !has_tool {
                 tracing::warn!(
                     "LLM 返回空响应（无文本无工具调用）: finish_reason={:?}, model={}",
@@ -546,7 +552,7 @@ impl LlmProvider for OpenAiCompatClient {
             }
             if matches!(parsed.finish_reason, Some(FinishReason::MaxTokens)) {
                 tracing::warn!(
-                    "LLM 因上下文长度限制截断: prompt_tokens={}, completion_tokens={}, model={}",
+                    "LLM 达到 max_tokens 限制（输出被截断）: prompt_tokens={}, completion_tokens={}, model={}",
                     parsed.usage.prompt_tokens,
                     parsed.usage.completion_tokens,
                     parsed.model

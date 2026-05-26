@@ -26,8 +26,20 @@ pub struct LlmSection {
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub brain_models: HashMap<String, String>,
+    /// 每个脑独立的生成参数（max_tokens / temperature），未配置的脑走 defaults
+    #[serde(default)]
+    pub brain_params: HashMap<String, BrainParams>,
     #[serde(default)]
     pub defaults: LlmDefaults,
+}
+
+/// 单个脑的生成参数
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrainParams {
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +115,17 @@ impl LlmConfig {
             .map_or(&self.llm.default_model, |s| s.as_str())
     }
 
+    /// 获取某个脑的生成参数（max_tokens, temperature）
+    ///
+    /// 优先查 brain_params 中该脑的独立配置，未配置则走 defaults
+    pub fn params_for_brain(&self, brain_name: &str) -> (u32, f64) {
+        if let Some(params) = self.llm.brain_params.get(brain_name) {
+            (params.max_tokens, params.temperature)
+        } else {
+            (self.llm.defaults.max_tokens, self.llm.defaults.temperature)
+        }
+    }
+
     /// 解析 API Key（优先环境变量，其次直接配置）
     pub fn resolve_api_key(&self, provider_name: &str) -> Result<String> {
         let provider = self
@@ -139,6 +162,7 @@ impl LlmConfig {
         let model = self.model_for_brain(brain_name);
         let provider_name = &self.llm.default_provider;
         let api_key = self.resolve_api_key(provider_name)?;
+        let (max_tokens, temperature) = self.params_for_brain(brain_name);
 
         let provider_config = self
             .llm
@@ -150,8 +174,8 @@ impl LlmConfig {
             provider_config.api_base.clone(),
             api_key,
             model.to_string(),
-            self.llm.defaults.max_tokens,
-            self.llm.defaults.temperature,
+            max_tokens,
+            temperature,
         );
 
         Ok(Box::new(client))
@@ -176,12 +200,64 @@ impl LlmConfig {
         brain_models.insert("motor".into(), "glm-5.1".into());
         brain_models.insert("validation".into(), "glm-5-turbo".into());
 
+        let mut brain_params = HashMap::new();
+        brain_params.insert(
+            "main".into(),
+            BrainParams {
+                max_tokens: 32768,
+                temperature: 0.7,
+            },
+        );
+        brain_params.insert(
+            "memory".into(),
+            BrainParams {
+                max_tokens: 32768,
+                temperature: 0.3,
+            },
+        );
+        brain_params.insert(
+            "eval".into(),
+            BrainParams {
+                max_tokens: 16384,
+                temperature: 0.3,
+            },
+        );
+        brain_params.insert(
+            "evolver".into(),
+            BrainParams {
+                max_tokens: 16384,
+                temperature: 0.3,
+            },
+        );
+        brain_params.insert(
+            "sensory".into(),
+            BrainParams {
+                max_tokens: 8192,
+                temperature: 0.3,
+            },
+        );
+        brain_params.insert(
+            "reasoning".into(),
+            BrainParams {
+                max_tokens: 8192,
+                temperature: 0.5,
+            },
+        );
+        brain_params.insert(
+            "compact".into(),
+            BrainParams {
+                max_tokens: 4096,
+                temperature: 0.3,
+            },
+        );
+
         Self {
             llm: LlmSection {
                 default_provider: "zhipu".into(),
                 default_model: "glm-4.7".into(),
                 providers,
                 brain_models,
+                brain_params,
                 defaults: LlmDefaults::default(),
             },
             brain: BrainSection::default(),

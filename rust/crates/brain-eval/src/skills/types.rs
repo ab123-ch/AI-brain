@@ -58,7 +58,9 @@ impl SkillRegistry {
     fn parse_skill_content(&self, content: &str) -> Option<SkillMeta> {
         // 提取 YAML frontmatter
         let frontmatter_end = content.find("---\n").and_then(|start| {
-            content[start + 4..].find("---\n").map(|end| start + 4 + end + 4)
+            content[start + 4..]
+                .find("---\n")
+                .map(|end| start + 4 + end + 4)
         })?;
 
         let frontmatter = &content[..frontmatter_end];
@@ -115,9 +117,7 @@ mod tests {
     fn create_skill_file(dir: &Path, name: &str, description: &str, content: &str) {
         let skill_dir = dir.join(name);
         fs::create_dir_all(&skill_dir).unwrap();
-        let skill_md = format!(
-            "---\nname: {name}\ndescription: {description}\n---\n\n{content}"
-        );
+        let skill_md = format!("---\nname: {name}\ndescription: {description}\n---\n\n{content}");
         fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
     }
 
@@ -135,7 +135,8 @@ mod tests {
     #[test]
     fn parse_skill_content_handles_quoted_values() {
         let registry = SkillRegistry::new();
-        let content = "---\nname: \"quoted-name\"\ndescription: \"quoted description\"\n---\n\nContent";
+        let content =
+            "---\nname: \"quoted-name\"\ndescription: \"quoted description\"\n---\n\nContent";
         let meta = registry.parse_skill_content(content).unwrap();
 
         assert_eq!(meta.name, "quoted-name");
@@ -152,8 +153,18 @@ mod tests {
     #[test]
     fn load_from_dir_loads_all_skills() {
         let tmp_dir = TempDir::new().unwrap();
-        create_skill_file(tmp_dir.path(), "skill-a", "Skill A desc", "# Skill A\n\nContent A");
-        create_skill_file(tmp_dir.path(), "skill-b", "Skill B desc", "# Skill B\n\nContent B");
+        create_skill_file(
+            tmp_dir.path(),
+            "skill-a",
+            "Skill A desc",
+            "# Skill A\n\nContent A",
+        );
+        create_skill_file(
+            tmp_dir.path(),
+            "skill-b",
+            "Skill B desc",
+            "# Skill B\n\nContent B",
+        );
 
         let mut registry = SkillRegistry::new();
         registry.load_from_dir(tmp_dir.path()).unwrap();
@@ -183,7 +194,12 @@ mod tests {
     #[test]
     fn get_skill_content_returns_correct_content() {
         let tmp_dir = TempDir::new().unwrap();
-        create_skill_file(tmp_dir.path(), "my-skill", "My skill", "# Instructions\n\nDo this.");
+        create_skill_file(
+            tmp_dir.path(),
+            "my-skill",
+            "My skill",
+            "# Instructions\n\nDo this.",
+        );
 
         let mut registry = SkillRegistry::new();
         registry.load_from_dir(tmp_dir.path()).unwrap();

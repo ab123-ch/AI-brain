@@ -400,7 +400,9 @@ impl StreamState {
                 self.reasoning_buffer.push_str(&reasoning);
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
-                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: reasoning,
+                    },
                 }));
             }
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
@@ -738,7 +740,9 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
-                    InputContentBlock::Thinking { thinking } => reasoning_content.push_str(thinking),
+                    InputContentBlock::Thinking { thinking } => {
+                        reasoning_content.push_str(thinking)
+                    }
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",

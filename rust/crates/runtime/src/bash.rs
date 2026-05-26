@@ -106,7 +106,10 @@ async fn execute_bash_async(
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
+    // 默认超时 120 秒，防止命令无限挂起
+    const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+    let timeout_ms = input.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let output_result = {
         match timeout(Duration::from_millis(timeout_ms), command.output()).await {
             Ok(result) => (result?, false),
             Err(_) => {
@@ -129,8 +132,6 @@ async fn execute_bash_async(
                 });
             }
         }
-    } else {
-        (command.output().await?, false)
     };
 
     let (output, interrupted) = output_result;
@@ -199,7 +200,9 @@ fn prepare_command(
 
     let mut prepared = Command::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
+    // HOME 重写仅在 namespace 隔离真正生效时启用（Linux + unshare）
+    // macOS 上没有真正的沙箱隔离，HOME 重写只会导致工具安装到错误路径
+    if sandbox_status.filesystem_active && sandbox_status.namespace_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
@@ -226,7 +229,9 @@ fn prepare_tokio_command(
 
     let mut prepared = TokioCommand::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
+    // HOME 重写仅在 namespace 隔离真正生效时启用（Linux + unshare）
+    // macOS 上没有真正的沙箱隔离，HOME 重写只会导致工具安装到错误路径
+    if sandbox_status.filesystem_active && sandbox_status.namespace_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }

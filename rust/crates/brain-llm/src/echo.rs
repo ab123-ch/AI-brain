@@ -104,9 +104,8 @@ impl LlmProvider for EchoLlmProvider {
         request: ChatRequest,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = crate::Result<tokio::sync::mpsc::Receiver<StreamEvent>>,
-                > + Send
+            dyn Future<Output = crate::Result<tokio::sync::mpsc::Receiver<StreamEvent>>>
+                + Send
                 + '_,
         >,
     > {

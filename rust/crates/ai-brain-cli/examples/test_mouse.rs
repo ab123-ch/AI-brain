@@ -46,7 +46,11 @@ fn main() {
 
     writeln!(log, "=== Mouse test mode: {mode} ===").ok();
     writeln!(log, "Enable sequence: {:?}", enable_seq).ok();
-    writeln!(log, "Instructions: scroll wheel, click, drag, press Esc to quit").ok();
+    writeln!(
+        log,
+        "Instructions: scroll wheel, click, drag, press Esc to quit"
+    )
+    .ok();
     writeln!(log, "---").ok();
 
     write!(io::stdout(), "{enable_seq}").ok();
@@ -77,8 +81,13 @@ fn main() {
                         m.modifiers
                     )
                     .ok();
-                    write!(io::stdout(), "\r[#{event_count}] {kind_str} ({},{})  ", m.row, m.column)
-                        .ok();
+                    write!(
+                        io::stdout(),
+                        "\r[#{event_count}] {kind_str} ({},{})  ",
+                        m.row,
+                        m.column
+                    )
+                    .ok();
                     io::stdout().flush().ok();
                 }
                 crossterm::event::Event::Key(k) => {
@@ -95,15 +104,29 @@ fn main() {
                         break;
                     }
                     // 检查是否收到滚轮被转成的方向键
-                    if matches!(k.code, crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down)
-                        && !k.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                    if matches!(
+                        k.code,
+                        crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down
+                    ) && !k.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
                     {
-                        write!(io::stdout(), "\r[#{event_count}] KEY({:?}) - 可能是滚轮!  ", k.code).ok();
+                        write!(
+                            io::stdout(),
+                            "\r[#{event_count}] KEY({:?}) - 可能是滚轮!  ",
+                            k.code
+                        )
+                        .ok();
                         io::stdout().flush().ok();
                     }
                 }
                 crossterm::event::Event::Resize(w, h) => {
-                    writeln!(log, "[{:.3}s] RESIZE {}x{}", start.elapsed().as_secs_f64(), w, h).ok();
+                    writeln!(
+                        log,
+                        "[{:.3}s] RESIZE {}x{}",
+                        start.elapsed().as_secs_f64(),
+                        w,
+                        h
+                    )
+                    .ok();
                 }
                 _ => {}
             }

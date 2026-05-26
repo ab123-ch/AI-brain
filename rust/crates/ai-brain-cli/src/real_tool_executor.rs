@@ -9,16 +9,16 @@ use std::sync::Arc;
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
-use brain_memory::memory_brain::MemoryBrain;
+use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
 use brain_plugin::SkillCatalog;
 
 /// Production tool executor that delegates to `tools::execute_tool` for built-in tools
-/// and handles `search_memory` directly via MemoryBrain.
+/// and handles `search_memory` directly via PyramidMemoryBrain.
 pub struct RealToolExecutor {
     /// Tool descriptors (name → descriptor) for list_tools()
     tool_descriptors: HashMap<String, ToolDescriptor>,
-    /// MemoryBrain for search_memory tool
-    memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>,
+    /// PyramidMemoryBrain for search_memory tool
+    memory_brain: Option<Arc<tokio::sync::Mutex<PyramidMemoryBrain>>>,
     /// Dispatch bus for async agent completion notifications
     dispatch: Option<brain_dispatch::TokioDispatch>,
     /// Skill catalog for skill-based tool routing
@@ -53,16 +53,16 @@ impl RealToolExecutor {
         }
     }
 
-    /// Create with an optional MemoryBrain for search_memory support.
-    pub fn with_memory(memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>) -> Self {
+    /// Create with an optional PyramidMemoryBrain for search_memory support.
+    pub fn with_memory(memory_brain: Option<Arc<tokio::sync::Mutex<PyramidMemoryBrain>>>) -> Self {
         let mut exec = Self::new();
         exec.memory_brain = memory_brain;
         exec
     }
 
-    /// Create with MemoryBrain and dispatch bus for async agent notifications.
+    /// Create with PyramidMemoryBrain and dispatch bus for async agent notifications.
     pub fn with_dispatch(
-        memory_brain: Option<Arc<tokio::sync::Mutex<MemoryBrain>>>,
+        memory_brain: Option<Arc<tokio::sync::Mutex<PyramidMemoryBrain>>>,
         dispatch: brain_dispatch::TokioDispatch,
     ) -> Self {
         let mut exec = Self::with_memory(memory_brain);
@@ -98,17 +98,17 @@ impl ToolExecutor for RealToolExecutor {
         let input = tool_call.input.clone();
         let tool_name_owned = tool_call.tool_name.clone();
 
-        // special-case: search_memory 由 MemoryBrain 处理
+        // special-case: search_memory 由 PyramidMemoryBrain 处理
         if name == "search_memory" {
             let memory_brain = self.memory_brain.clone();
             return Box::pin(async move {
                 let start = std::time::Instant::now();
-                let mem: Arc<tokio::sync::Mutex<MemoryBrain>> = match memory_brain {
+                let mem: Arc<tokio::sync::Mutex<PyramidMemoryBrain>> = match memory_brain {
                     Some(m) => m,
                     None => {
                         return ToolExecutionResult {
                             tool_name: tool_name_owned,
-                            output: "search_memory: MemoryBrain not available".into(),
+                            output: "search_memory: PyramidMemoryBrain not available".into(),
                             is_error: true,
                             duration_ms: start.elapsed().as_millis() as u64,
                         };
@@ -160,17 +160,17 @@ impl ToolExecutor for RealToolExecutor {
             });
         }
 
-        // special-case: list_recent_memories 由 MemoryBrain 处理
+        // special-case: list_recent_memories 由 PyramidMemoryBrain 处理
         if name == "list_recent_memories" {
             let memory_brain = self.memory_brain.clone();
             return Box::pin(async move {
                 let start = std::time::Instant::now();
-                let mem: Arc<tokio::sync::Mutex<MemoryBrain>> = match memory_brain {
+                let mem: Arc<tokio::sync::Mutex<PyramidMemoryBrain>> = match memory_brain {
                     Some(m) => m,
                     None => {
                         return ToolExecutionResult {
                             tool_name: tool_name_owned,
-                            output: "list_recent_memories: MemoryBrain not available".into(),
+                            output: "list_recent_memories: PyramidMemoryBrain not available".into(),
                             is_error: true,
                             duration_ms: start.elapsed().as_millis() as u64,
                         };

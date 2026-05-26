@@ -576,7 +576,10 @@ impl ContentBlock {
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
             Self::Thinking { thinking } => {
-                object.insert("type".to_string(), JsonValue::String("thinking".to_string()));
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("thinking".to_string()),
+                );
                 object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
             }
             Self::ToolUse { id, name, input } => {

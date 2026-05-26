@@ -11,7 +11,7 @@ fn handle_skill(args: &[String]) -> CommandResult {
     };
 
     match sub {
-        "list" => CommandResult::ok("[placeholder] 已注册技能列表（暂无数据）"),
+        "list" => CommandResult::ok("[skill list 由 TUI app.rs 特殊处理，此处不应到达]"),
         "run" => {
             let name = args.get(1);
             match name {
@@ -22,7 +22,7 @@ fn handle_skill(args: &[String]) -> CommandResult {
         "info" => {
             let name = args.get(1);
             match name {
-                Some(n) => CommandResult::ok(format!("[placeholder] 技能详情: {n}")),
+                Some(n) => CommandResult::ok(format!("[skill info 由 TUI app.rs 特殊处理，此处不应到达: {n}]")),
                 None => CommandResult::err("用法: /skill info <name>"),
             }
         }
@@ -129,6 +129,7 @@ mod tests {
             CommandHandler::Async(h) => h,
         };
         let result = handler(&["run".to_string(), "my-skill".to_string()]);
+        // run 仍为 placeholder，在 TUI 中由 app.rs 处理
         assert!(result.success);
     }
 }

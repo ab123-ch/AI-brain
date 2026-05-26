@@ -31,6 +31,8 @@ pub struct MainBrain {
     llm_temperature: f64,
     /// 记忆脑启动时注入的上下文（追加到 system prompt 尾部）
     memory_context: Option<String>,
+    /// 可用技能摘要（追加到 system prompt）
+    skill_summary: Option<String>,
     /// 会话级 prompt_tokens 累计
     session_prompt_tokens: u64,
     /// 会话级 completion_tokens 累计
@@ -57,11 +59,11 @@ impl MainBrain {
         llm: Arc<dyn LlmProvider>,
         tool_executor: Arc<dyn ToolExecutor>,
         config: BrainConfig,
+        llm_max_tokens: u32,
+        llm_temperature: f64,
     ) -> Self {
         // 从 ThresholdConfig 取 max_context_tokens，默认 1M
         let max_context_tokens = config.brain.thresholds.max_context_tokens as usize;
-        let llm_max_tokens = 8192;
-        let llm_temperature = 0.7;
         Self {
             llm,
             tool_executor,
@@ -71,6 +73,7 @@ impl MainBrain {
             llm_max_tokens,
             llm_temperature,
             memory_context: None,
+            skill_summary: None,
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
             session_cache_read_tokens: 0,
@@ -186,8 +189,7 @@ impl MainBrain {
                     }
                     match msg.role {
                         brain_llm::MessageRole::Assistant => {
-                            let has_tool_use =
-                                msg.content.iter().any(|b| b.is_tool_use());
+                            let has_tool_use = msg.content.iter().any(|b| b.is_tool_use());
                             if has_tool_use {
                                 // Assistant message with tool calls → save entire blocks
                                 self.history.push_assistant_blocks(msg.content.clone());
@@ -226,7 +228,9 @@ impl MainBrain {
 
         let answer = loop_result.response.text();
         // 使用 usage_records 中的修正后 usage（如果 API 不返回则使用估算值）
-        let corrected_usage = loop_result.usage_records.last()
+        let corrected_usage = loop_result
+            .usage_records
+            .last()
             .cloned()
             .unwrap_or_default();
         let total_tokens = corrected_usage.total_tokens;
@@ -277,11 +281,9 @@ impl MainBrain {
         }
 
         // 确保最终回答也写入历史
-        let has_final_answer =
-            self.history.messages().iter().rev().take(3).any(|m| {
-                m.role == brain_core::types::MessageRole::Assistant
-                    && m.text_content() == answer
-            });
+        let has_final_answer = self.history.messages().iter().rev().take(3).any(|m| {
+            m.role == brain_core::types::MessageRole::Assistant && m.text_content() == answer
+        });
         if !has_final_answer {
             self.history.push_assistant(&answer);
         }
@@ -301,7 +303,7 @@ impl MainBrain {
         if turn_tool_chars > self.compaction_config.tool_result_compress_threshold {
             self.compaction_triggered = true;
         }
-        
+
         // 基于上下文占用率触发压缩：超过 60% 时开始压缩
         let context_usage_ratio = self.history.context_usage();
         if context_usage_ratio > 0.6 {
@@ -326,6 +328,7 @@ impl MainBrain {
                 let messages_snapshot: Vec<_> =
                     self.history.messages()[start_idx..end_idx].to_vec();
                 let llm = self.llm.clone();
+                let compact_max_tokens = self.compaction_config.max_tokens;
 
                 tokio::spawn(async move {
                     let compressed = compact::compress_single_turn(
@@ -333,6 +336,7 @@ impl MainBrain {
                         0,
                         messages_snapshot.len(),
                         llm.as_ref(),
+                        compact_max_tokens,
                     )
                     .await;
                     if !compressed.is_empty() {
@@ -486,6 +490,15 @@ impl MainBrain {
         );
     }
 
+    /// 注入可用技能摘要（追加到 system prompt）
+    pub fn inject_skill_summary(&mut self, summary: String) {
+        if summary.is_empty() {
+            return;
+        }
+        self.skill_summary = Some(summary);
+        tracing::info!("已注入技能摘要");
+    }
+
     /// 注入实时召回的记忆作为独立 system 消息
     pub fn push_memory_context(&mut self, memory_text: &str) {
         if memory_text.is_empty() {
@@ -553,9 +566,13 @@ impl MainBrain {
         // 1. 系统核心规则（永不变化）
         // 2. 环境信息（每天变化）
         // 3. 记忆上下文/潜意识（每次会话变化）
-        let full_prompt = match &self.memory_context {
-            Some(ctx) => format!("{system_prompt}\n{env_info}\n\n{ctx}"),
-            None => format!("{system_prompt}\n{env_info}"),
+        let full_prompt = match (&self.memory_context, &self.skill_summary) {
+            (Some(ctx), Some(skills)) => {
+                format!("{system_prompt}\n{env_info}\n{skills}\n\n{ctx}")
+            }
+            (Some(ctx), None) => format!("{system_prompt}\n{env_info}\n\n{ctx}"),
+            (None, Some(skills)) => format!("{system_prompt}\n{env_info}\n{skills}"),
+            (None, None) => format!("{system_prompt}\n{env_info}"),
         };
         let mut messages = vec![ChatMessage::system(full_prompt)];
         messages.extend(self.history.to_chat_messages());
@@ -599,7 +616,7 @@ mod tests {
         let executor = Arc::new(StubToolExecutor::new());
         let config = BrainConfig::default();
 
-        let mut brain = MainBrain::new(llm, executor, config);
+        let mut brain = MainBrain::new(llm, executor, config, 32768, 0.7);
         let output = brain.process_input("你好", None, None).await.unwrap();
 
         assert_eq!(output.answer, "测试回复");
@@ -612,7 +629,7 @@ mod tests {
         let executor = Arc::new(StubToolExecutor::new());
         let config = BrainConfig::default();
 
-        let mut brain = MainBrain::new(llm, executor, config);
+        let mut brain = MainBrain::new(llm, executor, config, 32768, 0.7);
         brain.history.push_user("测试");
 
         let messages = brain.build_messages();
@@ -627,7 +644,7 @@ mod tests {
         let executor = Arc::new(StubToolExecutor::new());
         let config = BrainConfig::default();
 
-        let mut brain = MainBrain::new(llm, executor, config);
+        let mut brain = MainBrain::new(llm, executor, config, 32768, 0.7);
         assert_eq!(brain.history_len(), 0);
 
         brain.process_input("你好", None, None).await.unwrap();
@@ -641,7 +658,7 @@ mod tests {
         let executor = Arc::new(StubToolExecutor::new());
         let config = BrainConfig::default();
 
-        let mut brain = MainBrain::new(llm, executor, config);
+        let mut brain = MainBrain::new(llm, executor, config, 32768, 0.7);
         brain.history.push_user("hello");
 
         let (rx, result_rx) = brain.process_input_streaming("hello", None).unwrap();
@@ -662,7 +679,7 @@ mod tests {
         let executor = Arc::new(StubToolExecutor::new());
         let config = BrainConfig::default();
 
-        let mut brain = MainBrain::new(llm, executor, config);
+        let mut brain = MainBrain::new(llm, executor, config, 32768, 0.7);
         brain.register_tools(vec![]);
 
         // 注入记忆上下文
@@ -688,7 +705,7 @@ mod tests {
         let executor = Arc::new(StubToolExecutor::new());
         let config = BrainConfig::default();
 
-        let mut brain = MainBrain::new(llm, executor, config);
+        let mut brain = MainBrain::new(llm, executor, config, 32768, 0.7);
 
         brain.history.push_user("你好");
         brain.push_memory_context("[相关记忆]\n- 用户希望被称为测试大佬");

@@ -1626,47 +1626,43 @@ pub fn handle_plugins_slash_command(
 /// 处理 /plugin 命令
 pub fn handle_plugin_command(args: Option<&str>) -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let plugins_dir = std::path::PathBuf::from(&home).join(".ai-brain").join("plugins");
+    let plugins_dir = std::path::PathBuf::from(&home)
+        .join(".ai-brain")
+        .join("plugins");
 
     match args.map(|a| a.trim()).unwrap_or("") {
-        "list" | "" => {
-            match brain_plugin::PluginManager::load(&plugins_dir) {
-                Ok(mgr) => {
-                    let plugins = mgr.list();
-                    if plugins.is_empty() {
-                        "没有已安装的插件。".to_string()
-                    } else {
-                        let mut out = String::from("已安装插件:\n");
-                        for p in plugins {
-                            out.push_str(&format!("  {} v{} ({})\n", p.name, p.version, p.publisher));
-                        }
-                        out
+        "list" | "" => match brain_plugin::PluginManager::load(&plugins_dir) {
+            Ok(mgr) => {
+                let plugins = mgr.list();
+                if plugins.is_empty() {
+                    "没有已安装的插件。".to_string()
+                } else {
+                    let mut out = String::from("已安装插件:\n");
+                    for p in plugins {
+                        out.push_str(&format!("  {} v{} ({})\n", p.name, p.version, p.publisher));
                     }
+                    out
                 }
-                Err(e) => format!("加载插件管理器失败: {e}"),
             }
-        }
+            Err(e) => format!("加载插件管理器失败: {e}"),
+        },
         install_args if install_args.starts_with("install ") => {
             let path = install_args["install ".len()..].trim();
             match brain_plugin::PluginManager::load(&plugins_dir) {
-                Ok(mut mgr) => {
-                    match mgr.install(std::path::Path::new(path), "local") {
-                        Ok(name) => format!("插件 '{}' 安装成功。", name),
-                        Err(e) => format!("安装失败: {e}"),
-                    }
-                }
+                Ok(mut mgr) => match mgr.install(std::path::Path::new(path), "local") {
+                    Ok(name) => format!("插件 '{}' 安装成功。", name),
+                    Err(e) => format!("安装失败: {e}"),
+                },
                 Err(e) => format!("加载插件管理器失败: {e}"),
             }
         }
         uninstall_args if uninstall_args.starts_with("uninstall ") => {
             let name = uninstall_args["uninstall ".len()..].trim();
             match brain_plugin::PluginManager::load(&plugins_dir) {
-                Ok(mut mgr) => {
-                    match mgr.uninstall(name) {
-                        Ok(()) => format!("插件 '{}' 已卸载。", name),
-                        Err(e) => format!("卸载失败: {e}"),
-                    }
-                }
+                Ok(mut mgr) => match mgr.uninstall(name) {
+                    Ok(()) => format!("插件 '{}' 已卸载。", name),
+                    Err(e) => format!("卸载失败: {e}"),
+                },
                 Err(e) => format!("加载插件管理器失败: {e}"),
             }
         }

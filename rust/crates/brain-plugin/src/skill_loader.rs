@@ -143,9 +143,7 @@ fn parse_skill_content(content: &str) -> Option<ParsedSkill> {
 
     let after_first = &trimmed[3..];
     let rest = after_first.trim_start_matches(|c: char| c == '\n' || c == '\r');
-    let end_pos = rest
-        .find("\n---")
-        .or_else(|| rest.find("\r\n---"))?;
+    let end_pos = rest.find("\n---").or_else(|| rest.find("\r\n---"))?;
 
     let frontmatter = &rest[..end_pos];
     let body_start = end_pos + 3;
@@ -176,11 +174,7 @@ fn extract_field(yaml: &str, field: &str) -> Option<String> {
             let value = value
                 .strip_prefix('"')
                 .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| {
-                    value
-                        .strip_prefix('\'')
-                        .and_then(|v| v.strip_suffix('\''))
-                })
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
                 .unwrap_or(value);
             if !value.is_empty() {
                 return Some(value.to_string());
@@ -197,9 +191,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_skill_md(name: &str, description: &str, body: &str) -> String {
-        format!(
-            "---\nname: {name}\ndescription: \"{description}\"\n---\n\n{body}"
-        )
+        format!("---\nname: {name}\ndescription: \"{description}\"\n---\n\n{body}")
     }
 
     #[test]
@@ -235,10 +227,7 @@ mod tests {
         let content = "---\nname: tdd\ndescription: \"TDD skill\"\nwhen_to_use: \"when writing code\"\n---\n# TDD";
         let result = parse_skill_content(&content).unwrap();
         assert_eq!(result.name, "tdd");
-        assert_eq!(
-            result.when_to_use,
-            Some("when writing code".to_string())
-        );
+        assert_eq!(result.when_to_use, Some("when writing code".to_string()));
     }
 
     #[test]
@@ -259,8 +248,7 @@ mod tests {
         )
         .unwrap();
 
-        let catalog =
-            SkillCatalog::scan_all(&[dir.path().to_path_buf()]).unwrap();
+        let catalog = SkillCatalog::scan_all(&[dir.path().to_path_buf()]).unwrap();
         assert_eq!(catalog.skills.len(), 1);
         assert_eq!(catalog.skills[0].name, "brainstorming");
     }
@@ -268,16 +256,13 @@ mod tests {
     #[test]
     fn scan_empty_dir_ok() {
         let dir = TempDir::new().unwrap();
-        let catalog =
-            SkillCatalog::scan_all(&[dir.path().to_path_buf()]).unwrap();
+        let catalog = SkillCatalog::scan_all(&[dir.path().to_path_buf()]).unwrap();
         assert!(catalog.skills.is_empty());
     }
 
     #[test]
     fn scan_nonexistent_dir_ok() {
-        let catalog =
-            SkillCatalog::scan_all(&[PathBuf::from("/tmp/does-not-exist-xyz")])
-                .unwrap();
+        let catalog = SkillCatalog::scan_all(&[PathBuf::from("/tmp/does-not-exist-xyz")]).unwrap();
         assert!(catalog.skills.is_empty());
     }
 
@@ -339,8 +324,7 @@ mod tests {
         )
         .unwrap();
 
-        let catalog =
-            SkillCatalog::scan_all(&[dir.path().to_path_buf()]).unwrap();
+        let catalog = SkillCatalog::scan_all(&[dir.path().to_path_buf()]).unwrap();
         let content = catalog.load_content(&catalog.skills[0]).unwrap();
         assert!(content.contains("# TDD Rules"));
         assert!(!content.contains("name: tdd"));

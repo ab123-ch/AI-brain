@@ -33,9 +33,7 @@ impl McpClientPool {
     }
 
     /// 连接所有 MCP 服务器（当前为 stub 框架）
-    pub async fn connect_all(
-        configs: &[(String, McpServerConfig)],
-    ) -> Result<Self, String> {
+    pub async fn connect_all(configs: &[(String, McpServerConfig)]) -> Result<Self, String> {
         let pool = Self::new();
         {
             let mut servers = pool.servers.lock().await;
@@ -45,15 +43,10 @@ impl McpClientPool {
                     McpServerEntry {
                         name: name.clone(),
                         tools: Vec::new(),
-                        status: ServerStatus::Error(
-                            "MCP client not yet implemented".to_string(),
-                        ),
+                        status: ServerStatus::Error("MCP client not yet implemented".to_string()),
                     },
                 );
-                tracing::warn!(
-                    "MCP 服务器 '{}' 注册为 stub（rmcp 连接待实现）",
-                    name
-                );
+                tracing::warn!("MCP 服务器 '{}' 注册为 stub（rmcp 连接待实现）", name);
             }
         }
 
@@ -118,6 +111,21 @@ impl McpClientPool {
         let mut servers = self.servers.lock().await;
         servers.clear();
         Ok(())
+    }
+
+    /// 列出所有已注册服务器名称和状态
+    pub async fn list_servers(&self) -> Vec<(String, ServerStatus)> {
+        let servers = self.servers.lock().await;
+        servers
+            .values()
+            .map(|s| (s.name.clone(), s.status.clone()))
+            .collect()
+    }
+
+    /// 查询单个服务器状态
+    pub async fn server_status(&self, name: &str) -> Option<ServerStatus> {
+        let servers = self.servers.lock().await;
+        servers.get(name).map(|s| s.status.clone())
     }
 }
 

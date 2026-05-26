@@ -38,8 +38,8 @@ use brain_main::main_brain::MainBrain;
 use brain_master::MasterBrain;
 use brain_mcp::config::load_mcp_servers;
 use brain_mcp::McpClientPool;
-use brain_memory::analyzer::{AnalysisLlm, FourStepAnalyzer};
-use brain_memory::memory_brain::{MemoryBrain, MemoryBrainConfig};
+// [Task 16] 旧 analyzer::AnalysisLlm 已随旧模块清理，使用新版 concentration::AnalysisLlm
+use brain_memory::pyramid_memory_brain::{PyramidMemoryBrain, PyramidMemoryBrainConfig};
 use brain_motor::motor_brain::{MotorBrain, MotorConfig};
 use brain_plugin::{PluginManager, SkillCatalog};
 use brain_reasoning::reasoning_brain::{ReasoningBrain, ReasoningConfig};
@@ -110,7 +110,9 @@ impl AnalyzerLlm {
     }
 }
 
-impl AnalysisLlm for AnalyzerLlm {
+// [Task 16] 旧 analyzer::AnalysisLlm trait impl 已禁用（analyzer.rs 依赖已删除模块）
+// complete() 方法作为固有方法保留（新版 concentration::AnalysisLlm 依赖）
+impl AnalyzerLlm {
     fn complete(
         &self,
         prompt: &str,
@@ -131,6 +133,16 @@ impl AnalysisLlm for AnalyzerLlm {
                 .map(|r| r.text())
                 .map_err(|e| e.to_string())
         })
+    }
+}
+
+// 同时实现新版浓缩引擎的 AnalysisLlm trait
+impl brain_memory::concentration::AnalysisLlm for AnalyzerLlm {
+    fn analyze(
+        &self,
+        prompt: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        self.complete(prompt)
     }
 }
 
@@ -155,7 +167,7 @@ pub struct Orchestrator {
     bus: Arc<BrainBus>,
     sensory: SensoryBrain,
     master_state: Arc<Mutex<MasterState>>,
-    memory_brain: Arc<Mutex<MemoryBrain>>,
+    memory_brain: Arc<Mutex<PyramidMemoryBrain>>,
     evaluation_brain: EvaluationBrain,
     /// v2 评估脑（LLM 深度评估），None 表示 LLM 不可用
     eval_brain: Option<EvalBrain>,
@@ -218,9 +230,9 @@ impl Orchestrator {
         let sensory = SensoryBrain::new("glm-4.7", bus.clone(), sensory_llm_result.provider);
 
         // 3. 创建各副脑
-        let (mut memory, mut reasoning, mut motor, validation, evaluation) = create_sub_brains()?;
+        let (memory, mut reasoning, mut motor, validation, evaluation) = create_sub_brains()?;
 
-        // 4. 注入 LLM 到需要慢思考的副脑 + 记忆脑（语义召回）
+        // 4. 注入 LLM 到需要慢思考的副脑
         if let Ok(config) = LlmConfig::load_default() {
             if let Ok(client) = config.create_brain_client("reasoning") {
                 let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
@@ -228,18 +240,7 @@ impl Orchestrator {
                 motor.set_llm(llm);
                 tracing::info!("推理脑+执行脑已注入 LLM");
             }
-            // 记忆脑单独用 memory brain 的 LLM（语义召回用）
-            if let Ok(client) = config.create_brain_client("memory") {
-                let (mt, temp) = config.params_for_brain("memory");
-                let analyzer_llm = AnalyzerLlm::new(
-                    Arc::from(client),
-                    config.model_for_brain("memory").to_string(),
-                    mt,
-                    temp,
-                );
-                memory.set_llm(Box::new(analyzer_llm));
-                tracing::info!("记忆脑已注入 LLM（语义召回）");
-            }
+            // 记忆脑不再需要 set_llm（浓缩引擎在需要时动态创建 LLM）
         }
 
         // 4.0 提前包装记忆脑 Arc<Mutex>（评估脑和后续都需要）
@@ -308,16 +309,7 @@ impl Orchestrator {
         // 9. 启动副脑异步任务
         let mut tasks = Vec::new();
 
-        let mem_id = memory.lock().await.id().clone();
-        tasks.push(spawn_agent_loop(
-            memory.clone(),
-            bus.subscribe_broadcast(),
-            bus.subscribe_collaboration(mem_id).await,
-            bus.clone(),
-            shutdown_rx.clone(),
-            memory.clone(),
-        ));
-
+        // 注意：记忆脑不再作为独立 BrainAgent 运行循环，只在其他副脑的 slow_think 中被调用
         let reas_id = reasoning.lock().await.id().clone();
         tasks.push(spawn_agent_loop(
             reasoning.clone(),
@@ -407,84 +399,118 @@ impl Orchestrator {
         let (v2_brain, plugin_mgr, skill_catalog, mcp_pool) =
             create_v2_main_brain(Some(Arc::clone(&memory)), dispatch.clone());
 
-        // 12.1 启动守护线程（L2→L1 归档）
-        {
-            let mem_base_dir = {
-                let mem_guard = memory.lock().await;
-                mem_guard.base_dir().to_path_buf()
+        // 12.1 [Task 16] 旧守护线程已禁用（guardian.rs 已删除，由金字塔浓缩引擎替代）
+        // {
+        //     let mem_base_dir = {
+        //         let mem_guard = memory.lock().await;
+        //         mem_guard.base_dir().to_path_buf()
+        //     };
+        //     let guardian_llm: Option<Box<dyn AnalysisLlm>> =
+        //         if let Ok(config) = LlmConfig::load_default() {
+        //             if let Ok(client) = config.create_brain_client("memory") {
+        //                 let (mt, temp) = config.params_for_brain("memory");
+        //                 Some(Box::new(AnalyzerLlm::new(
+        //                     Arc::from(client),
+        //                     config.model_for_brain("memory").to_string(),
+        //                     mt,
+        //                     temp,
+        //                 )))
+        //             } else {
+        //                 None
+        //             }
+        //         } else {
+        //             None
+        //         };
+        //
+        //     if let Some(llm) = guardian_llm {
+        //         let mut guardian_config = brain_memory::guardian::GuardianConfig::default();
+        //         guardian_config.check_interval_secs = 28800; // 8h
+        //         guardian_config.min_new_summaries = 10;
+        //         let engine =
+        //             brain_memory::guardian::GuardianEngine::new(mem_base_dir, guardian_config, llm);
+        //         let mut shutdown_rx_g = shutdown_rx.clone();
+        //         let interval = tokio::time::Duration::from_secs(28800);
+        //         let guardian_handle = tokio::spawn(async move {
+        //             loop {
+        //                 tokio::select! {
+        //                     _ = tokio::time::sleep(interval) => {
+        //                         match engine.should_run() {
+        //                             Ok(true) => {
+        //                                 match engine.run().await {
+        //                                     Ok(report) => {
+        //                                         if report.archived_count > 0 || report.new_topics > 0 {
+        //                                             tracing::info!(
+        //                                                 "守护线程: 归档{}条, 新建{}主题, 合并{}主题",
+        //                                                 report.archived_count,
+        //                                                 report.new_topics,
+        //                                                 report.merged_topics,
+        //                                             );
+        //                                         }
+        //                                     }
+        //                                     Err(e) => tracing::warn!("守护线程运行失败: {e}"),
+        //                                 }
+        //                             }
+        //                             Ok(false) => {} // 条件不满足，下次再检查
+        //                             Err(e) => tracing::warn!("守护线程检查失败: {e}"),
+        //                         }
+        //                     }
+        //                     _ = shutdown_rx_g.changed() => {
+        //                         tracing::info!("守护线程收到关机信号");
+        //                         break;
+        //                     }
+        //                 }
+        //             }
+        //         });
+        //         tasks.push(guardian_handle);
+        //         tracing::info!("守护线程已启动 (8h检查间隔)");
+        //     }
+        // }
+
+        // 12.5 启动时注入金字塔记忆上下文（潜意识 + 画像 + 可注入经验 + 人格 prompt）
+        let injection_text = if let Ok(mem_guard) = memory.try_lock() {
+
+            let pp = mem_guard.persona_manager().build_persona_prompt();
+            let inject_ctx = match mem_guard.auto_inject() {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    tracing::warn!("自动注入失败: {e}");
+                    drop(mem_guard);
+                    return Err(format!("记忆注入失败: {e}"));
+                }
             };
-            let guardian_llm: Option<Box<dyn AnalysisLlm>> =
-                if let Ok(config) = LlmConfig::load_default() {
-                    if let Ok(client) = config.create_brain_client("memory") {
-                        let (mt, temp) = config.params_for_brain("memory");
-                        Some(Box::new(AnalyzerLlm::new(
-                            Arc::from(client),
-                            config.model_for_brain("memory").to_string(),
-                            mt,
-                            temp,
-                        )))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
 
-            if let Some(llm) = guardian_llm {
-                let mut guardian_config = brain_memory::guardian::GuardianConfig::default();
-                guardian_config.check_interval_secs = 28800; // 8h
-                guardian_config.min_new_summaries = 10;
-                let engine =
-                    brain_memory::guardian::GuardianEngine::new(mem_base_dir, guardian_config, llm);
-                let mut shutdown_rx_g = shutdown_rx.clone();
-                let interval = tokio::time::Duration::from_secs(28800);
-                let guardian_handle = tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep(interval) => {
-                                match engine.should_run() {
-                                    Ok(true) => {
-                                        match engine.run().await {
-                                            Ok(report) => {
-                                                if report.archived_count > 0 || report.new_topics > 0 {
-                                                    tracing::info!(
-                                                        "守护线程: 归档{}条, 新建{}主题, 合并{}主题",
-                                                        report.archived_count,
-                                                        report.new_topics,
-                                                        report.merged_topics,
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => tracing::warn!("守护线程运行失败: {e}"),
-                                        }
-                                    }
-                                    Ok(false) => {} // 条件不满足，下次再检查
-                                    Err(e) => tracing::warn!("守护线程检查失败: {e}"),
-                                }
-                            }
-                            _ = shutdown_rx_g.changed() => {
-                                tracing::info!("守护线程收到关机信号");
-                                break;
-                            }
-                        }
-                    }
-                });
-                tasks.push(guardian_handle);
-                tracing::info!("守护线程已启动 (8h检查间隔)");
+            let mut parts = Vec::new();
+            if !pp.is_empty() {
+                parts.push(pp);
             }
-        }
-
-        // 12.5 启动时注入潜意识印象到 v2 MainBrain
-        if let Ok(mem_guard) = memory.try_lock() {
-            if let Some(summary) = mem_guard.load_subconscious_summary() {
-                drop(mem_guard);
-                if let Ok(mut v2_guard) = v2_brain.try_lock() {
-                    if let Some(ref mut brain) = *v2_guard {
-                        brain.inject_memory_context(&format!(
-                            "[潜意识印象 — 你曾经做过这些事，匹配到时再深入回忆]\n{summary}"
-                        ));
-                        tracing::info!("潜意识印象已注入主脑");
-                    }
+            if !inject_ctx.subconscious_text.is_empty() {
+                parts.push(format!(
+                    "[潜意识印象 — 你曾经做过这些事，匹配到时再深入回忆]\n{}",
+                    inject_ctx.subconscious_text
+                ));
+            }
+            if !inject_ctx.profile.is_empty() {
+                parts.push(format!("[用户画像] {}", inject_ctx.profile));
+            }
+            if !inject_ctx.injectable_experiences.is_empty() {
+                let exp_lines: Vec<String> = inject_ctx
+                    .injectable_experiences
+                    .iter()
+                    .map(|e| format!("- {}", e.description))
+                    .collect();
+                parts.push(format!("[经验规则]\n{}", exp_lines.join("\n")));
+            }
+            drop(mem_guard);
+            parts.join("\n\n")
+        } else {
+            tracing::warn!("记忆脑锁被占用，跳过启动注入");
+            String::new()
+        };
+        if !injection_text.is_empty() {
+            if let Ok(mut v2_guard) = v2_brain.try_lock() {
+                if let Some(ref mut brain) = *v2_guard {
+                    brain.inject_memory_context(&injection_text);
+                    tracing::info!("金字塔记忆上下文已注入主脑");
                 }
             }
         }
@@ -513,22 +539,22 @@ impl Orchestrator {
                 }
             }
 
-            // 2) 后台跑四步分析（更新持久化记忆，fire-and-forget）
+            // 2) 后台跑四步浓缩（更新金字塔记忆，fire-and-forget）
             let llm = Self::create_analyzer_llm_from_config();
             drop(tokio::spawn(async move {
                 if let Some(llm) = llm {
-                    let analyzer = FourStepAnalyzer::new(Box::new(llm), base_for_analysis, sess_id);
-                    let report = analyzer
-                        .run(&format!("[{}]", convs_for_analysis.join(",")))
-                        .await;
-                    tracing::info!(
-                        "后台四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识叙事更新={}",
-                        report.fact_summary.chars().count(),
-                        report.profile_entries_added,
-                        report.pitfalls_found,
-                        report.rules_created,
-                        report.subconscious_updated,
-                    );
+                    let config = PyramidMemoryBrainConfig {
+                        base_dir: base_for_analysis,
+                        session_id: sess_id,
+                    };
+                    if let Ok(brain) = PyramidMemoryBrain::new(config) {
+                        let report = brain.concentrate(&llm).await;
+                        tracing::info!(
+                            "后台四步浓缩完成: tasks={}, types={}, triggers={}, narrative={}字, profile_updated={}, errors={}",
+                            report.step1_tasks, report.step2_types, report.step3_triggers,
+                            report.step3_narrative_chars, report.step4_profile_updated, report.errors.len(),
+                        );
+                    }
                 }
             }));
         }
@@ -643,6 +669,11 @@ impl Orchestrator {
         &self.mcp_pool
     }
 
+    /// 获取记忆脑 Arc（供 TUI 命令系统使用）
+    pub fn memory_brain(&self) -> Arc<Mutex<PyramidMemoryBrain>> {
+        Arc::clone(&self.memory_brain)
+    }
+
     /// 系统状态结构体（TUI 用）
     pub fn status_structured(&self) -> SystemStatus {
         let (
@@ -737,9 +768,9 @@ impl Orchestrator {
                         .await
                         .map_err(|e| format!("{e}"));
 
-                    // 将本轮对话完整轨迹存入记忆脑（L3 原始 + L2 短期）
+                    // 将本轮对话完整轨迹存入记忆脑（L1 全量基座）
                     if let Ok(ref output) = result {
-                        let mut mem = this.memory_brain.lock().await;
+                        let mem = this.memory_brain.lock().await;
                         if let Err(e) = mem.store_turns(&output.turns) {
                             tracing::warn!("v2 对话存入记忆脑失败: {e}");
                         }
@@ -769,36 +800,12 @@ impl Orchestrator {
                     if should_eval && result.is_ok() {
                         tracing::info!("eval_gate 判定：需要评估");
                         if let Some(ref eb) = this.eval_brain {
-                            let mem_base_dir = {
-                                let mem_guard = this.memory_brain.lock().await;
-                                mem_guard.base_dir().to_path_buf()
-                            };
-                            let storage = brain_memory::storage::Storage::new_lazy(mem_base_dir);
-
-                            // 从记忆脑读取踩坑库、用户画像、进化规则
-                            let pitfalls =
-                                brain_memory::pitfall::PitfallStore::new(storage.clone())
-                                    .load_active()
-                                    .unwrap_or_default();
-                            let profile =
-                                brain_memory::user_profile::UserProfileStore::new(storage.clone())
-                                    .load()
-                                    .unwrap_or_default();
-                            let rules =
-                                brain_memory::evolution::EvolutionStore::new(storage.clone())
-                                    .load_active()
-                                    .unwrap_or_default();
-                            let eval_requirements =
-                                brain_memory::eval_requirement::EvalRequirementStore::new(storage)
-                                    .load_active()
-                                    .unwrap_or_default();
+                            // 金字塔模式下暂不加载旧 eval_requirements
+                            // TODO: 适配 EvalBrain 接口以使用 eval-info.json
+                            let eval_requirements: Vec<brain_core::types::EvalRequirement> = Vec::new();
 
                             tracing::info!(
-                                "v2 评估脑开始评估 (踩坑={} 画像偏好={} 进化规则={} 用户评估要求={})",
-                                pitfalls.len(),
-                                profile.explicit_preferences.len()
-                                    + profile.implicit_preferences.len(),
-                                rules.len(),
+                                "v2 评估脑开始评估 (用户评估要求={})",
                                 eval_requirements.len(),
                             );
 
@@ -822,9 +829,6 @@ impl Orchestrator {
                                         &input_owned,
                                         &answer,
                                         &result.as_ref().unwrap().turns,
-                                        &pitfalls,
-                                        &profile,
-                                        &rules,
                                         &eval_requirements,
                                     )
                                     .await
@@ -880,7 +884,7 @@ impl Orchestrator {
                                                 );
                                                 // 存入记忆脑
                                                 {
-                                                    let mut mem = this.memory_brain.lock().await;
+                                                    let mem = this.memory_brain.lock().await;
                                                     if let Err(e) =
                                                         mem.store_turns(&retry_output.turns)
                                                     {
@@ -1022,22 +1026,25 @@ impl Orchestrator {
         let brain = self.memory_brain.lock().await;
         match brain.stats() {
             Ok(s) => format!(
-                "=== 记忆统计 ===\n\
-                 \x20 L0 任务总结: {}\n\
-                 \x20 L1 事件索引: {}\n\
-                 \x20 L2 短期记忆: {}\n\
-                 \x20 L3 原始记录: {}\n\
-                 \x20 总大小: {} bytes\n",
-                s.l0_count, s.l1_count, s.l2_count, s.l3_count, s.total_size_bytes,
+                "=== 金字塔记忆统计 ===\n\
+                 \x20 L1 全量基座: {}\n\
+                 \x20 L2 任务摘要: {}\n\
+                 \x20 L3 经验抽象: {}\n\
+                 \x20 L4 潜意识: {}\n\
+                 \x20 活跃人格: {}\n\
+                 \x20 会话ID: {}\n",
+                s.l1_count, s.l2_count, s.l3_count,
+                if s.l4_exists { "有" } else { "无" },
+                s.active_persona, s.session_id,
             ),
             Err(e) => format!("获取记忆统计失败: {e}"),
         }
     }
 
-    /// 记忆统计（原始数据）
+    /// 记忆统计（原始数据，兼容旧 MemoryStats 格式）
     pub async fn memory_stats_raw(&self) -> Result<MemoryStats, String> {
         let brain = self.memory_brain.lock().await;
-        brain.stats().map_err(|e| format!("{e}"))
+        brain.stats_legacy().map_err(|e| format!("{e}"))
     }
 
     /// 评估脑 — 默认快照（文本）
@@ -1353,45 +1360,43 @@ impl Orchestrator {
         self.shutdown();
     }
 
-    /// 检查是否需要触发四步分析（每 N 轮），并在后台启动
+    /// 检查是否需要触发四步浓缩（每 N 轮），并在后台启动
     pub fn maybe_trigger_analysis(&self) {
-        let should = {
+        let (should, interval) = {
             let mem = match self.memory_brain.try_lock() {
                 Ok(m) => m,
-                Err(_) => return, // 锁被占用，跳过
+                Err(_) => return,
             };
-            mem.tick_and_should_analyze()
+            (mem.tick_and_should_analyze(), mem.persona_manager().analysis_interval())
         };
 
         if should {
-            tracing::info!("达到 {} 轮，触发四步分析", 5);
-            let (conversations, base_dir, session_id) = {
-                // 复制必要数据，避免持锁
+            tracing::info!("达到 {} 轮，触发四步浓缩", interval);
+            let (base_dir, session_id) = {
                 let mem = match self.memory_brain.try_lock() {
                     Ok(m) => m,
                     Err(_) => return,
                 };
-                let convs = mem.read_recent_conversations(20);
                 let dir = mem.base_dir().to_path_buf();
                 let sid = mem.session_id().to_string();
-                (convs, dir, sid)
+                (dir, sid)
             };
 
             let llm = self.create_analyzer_llm();
             let _ = tokio::spawn(async move {
                 if let Some(llm) = llm {
-                    let analyzer = FourStepAnalyzer::new(Box::new(llm), base_dir, session_id);
-                    let report = analyzer
-                        .run(&format!("[{}]", conversations.join(",")))
-                        .await;
-                    tracing::info!(
-                        "四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识叙事更新={}",
-                        report.fact_summary.chars().count(),
-                        report.profile_entries_added,
-                        report.pitfalls_found,
-                        report.rules_created,
-                        report.subconscious_updated,
-                    );
+                    let config = PyramidMemoryBrainConfig {
+                        base_dir,
+                        session_id,
+                    };
+                    if let Ok(brain) = PyramidMemoryBrain::new(config) {
+                        let report = brain.concentrate(&llm).await;
+                        tracing::info!(
+                            "四步浓缩完成: tasks={}, types={}, triggers={}, narrative={}字, profile_updated={}, errors={}",
+                            report.step1_tasks, report.step2_types, report.step3_triggers,
+                            report.step3_narrative_chars, report.step4_profile_updated, report.errors.len(),
+                        );
+                    }
                 }
             });
         }
@@ -1425,42 +1430,36 @@ impl Orchestrator {
         }
     }
 
-    /// 强制执行一次四步分析（保留供手动调用）
+/// 强制执行一次四步浓缩（保留供手动调用）
     #[allow(dead_code)]
     async fn run_analysis_force(&self) {
-        let (conversations, base_dir, session_id) = {
+        let (base_dir, session_id) = {
             let mem = match self.memory_brain.try_lock() {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let convs = mem.read_recent_conversations(50);
             let dir = mem.base_dir().to_path_buf();
             let sid = mem.session_id().to_string();
-            (convs, dir, sid)
+            (dir, sid)
         };
-
-        if conversations.is_empty() {
-            tracing::info!("无对话记录，跳过四步分析");
-            return;
-        }
 
         let llm = self.create_analyzer_llm();
         if let Some(llm) = llm {
-            tracing::info!("正在执行四步分析（关闭时强制触发）...");
-            let analyzer = FourStepAnalyzer::new(Box::new(llm), base_dir, session_id);
-            let report = analyzer
-                .run(&format!("[{}]", conversations.join(",")))
-                .await;
-            tracing::info!(
-                "四步分析完成: 事实总结={}字, 画像+={}, 踩坑={}, 规则={}, 潜意识叙事更新={}",
-                report.fact_summary.chars().count(),
-                report.profile_entries_added,
-                report.pitfalls_found,
-                report.rules_created,
-                report.subconscious_updated,
-            );
+            tracing::info!("正在执行四步浓缩（关闭时强制触发）...");
+            let config = PyramidMemoryBrainConfig {
+                base_dir,
+                session_id,
+            };
+            if let Ok(brain) = PyramidMemoryBrain::new(config) {
+                let report = brain.concentrate(&llm).await;
+                tracing::info!(
+                    "四步浓缩完成: tasks={}, types={}, triggers={}, narrative={}字, profile_updated={}, errors={}",
+                    report.step1_tasks, report.step2_types, report.step3_triggers,
+                    report.step3_narrative_chars, report.step4_profile_updated, report.errors.len(),
+                );
+            }
         } else {
-            tracing::warn!("无法创建记忆脑 LLM 客户端，跳过关闭时的四步分析");
+            tracing::warn!("无法创建记忆脑 LLM 客户端，跳过关闭时的四步浓缩");
         }
     }
 
@@ -1497,7 +1496,7 @@ fn spawn_agent_loop<A: BrainAgent + 'static>(
     mut collab_rx: brain_bus::CollaborationReceiver,
     bus: Arc<BrainBus>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    memory_brain: Arc<Mutex<MemoryBrain>>,
+    memory_brain: Arc<Mutex<PyramidMemoryBrain>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_broadcast: Option<BroadcastMessage> = None;
@@ -1553,7 +1552,7 @@ async fn handle_slow_think_dispatch<A: BrainAgent>(
     bus: &BrainBus,
     collab_msg: brain_core::types::CollaborationMessage,
     last_broadcast: Option<&BroadcastMessage>,
-    memory_brain: &Arc<Mutex<MemoryBrain>>,
+    memory_brain: &Arc<Mutex<PyramidMemoryBrain>>,
 ) {
     // Phase 0: 立刻发 Processing ack，告知主脑"我在想了"
     {
@@ -1728,7 +1727,7 @@ fn try_create_llm_client(brain_name: &str) -> Option<Arc<dyn brain_llm::LlmProvi
 ///
 /// LLM 不可用时返回 `Arc<Mutex<None>>`
 fn create_v2_main_brain(
-    memory_brain: Option<Arc<Mutex<MemoryBrain>>>,
+    memory_brain: Option<Arc<Mutex<PyramidMemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
 ) -> (
     Arc<Mutex<Option<MainBrain>>>,
@@ -1821,6 +1820,12 @@ fn create_v2_main_brain(
     tracing::info!("v2 MainBrain: 注册 {} 个工具", tool_defs.len());
     brain.register_tools(tool_defs);
 
+    // 注入技能摘要到 system prompt，让 LLM 感知可用技能
+    let skill_summary = skill_catalog.summary_for_prompt();
+    if !skill_summary.is_empty() {
+        brain.inject_skill_summary(skill_summary);
+    }
+
     (
         Arc::new(Mutex::new(Some(brain))),
         plugin_mgr,
@@ -1832,7 +1837,7 @@ fn create_v2_main_brain(
 /// 创建所有副脑
 fn create_sub_brains() -> Result<
     (
-        MemoryBrain,
+        PyramidMemoryBrain,
         ReasoningBrain,
         MotorBrain,
         ValidationBrain,
@@ -1840,7 +1845,7 @@ fn create_sub_brains() -> Result<
     ),
     String,
 > {
-    let memory = MemoryBrain::new(MemoryBrainConfig::default())
+    let memory = PyramidMemoryBrain::new(PyramidMemoryBrainConfig::default())
         .map_err(|e| format!("记忆脑初始化失败: {e}"))?;
     let reasoning = ReasoningBrain::new(ReasoningConfig::default())
         .map_err(|e| format!("推理脑初始化失败: {e}"))?;
@@ -1886,7 +1891,7 @@ mod tests {
         let orch = Orchestrator::new().await;
         assert!(orch.is_ok(), "Orchestrator 初始化应该成功");
         let orch = orch.unwrap();
-        assert_eq!(orch.task_count(), 5, "应该有 5 个任务（4副脑+1守护线程）");
+        assert_eq!(orch.task_count(), 5, "应该有 5 个任务（3副脑+1进化+1守护线程）");
     }
 
     #[tokio::test]

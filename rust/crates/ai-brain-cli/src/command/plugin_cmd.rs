@@ -11,7 +11,7 @@ fn handle_plugin(args: &[String]) -> CommandResult {
     };
 
     match sub {
-        "list" => CommandResult::ok("[placeholder] 已安装插件列表（暂无数据）"),
+        "list" => CommandResult::ok("[plugin list 由 TUI app.rs 特殊处理，此处不应到达]"),
         "install" => {
             let path = args.get(1);
             match path {
@@ -127,6 +127,7 @@ mod tests {
             CommandHandler::Async(h) => h,
         };
         let result = handler(&["list".to_string()]);
+        // list 在 TUI 中由 app.rs 特殊处理，此处返回 fallback 文本
         assert!(result.success);
     }
 

@@ -3,6 +3,7 @@ pub mod config_cmd;
 pub mod evolver_cmd;
 pub mod mcp_cmd;
 pub mod memory_cmd;
+pub mod persona_cmd;
 pub mod plugin_cmd;
 pub mod registry;
 pub mod skill_cmd;
@@ -19,5 +20,6 @@ pub fn build_full_registry() -> CommandRegistry {
     reg.merge(mcp_cmd::register_mcp());
     reg.merge(memory_cmd::register_memory());
     reg.merge(evolver_cmd::register_evolver());
+    reg.merge(persona_cmd::register_persona());
     reg
 }

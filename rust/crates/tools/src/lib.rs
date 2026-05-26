@@ -5,15 +5,15 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
+    edit_file, execute_bash, glob_search, grep_search, read_file, write_file, ApiClient,
+    ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
     PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
 };
@@ -1902,9 +1902,9 @@ where
     }
 
     // 同步模式：阻塞等待子代理完成
-    let agent_done = result_rx.recv().map_err(|_| {
-        String::from("sub-agent channel closed unexpectedly (thread panicked?)")
-    })?;
+    let agent_done = result_rx
+        .recv()
+        .map_err(|_| String::from("sub-agent channel closed unexpectedly (thread panicked?)"))?;
 
     // 构建最终 manifest
     let final_manifest = AgentOutput {
@@ -1933,7 +1933,9 @@ fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>
                     let final_text = std::fs::read_to_string(&job.manifest.output_file)
                         .ok()
                         .and_then(|content| {
-                            content.split("## Output\n").last()
+                            content
+                                .split("## Output\n")
+                                .last()
                                 .or_else(|| content.split("## Result\n").last())
                                 .map(|s| s.trim().to_string())
                         });
@@ -1945,8 +1947,12 @@ fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>
                     }
                 }
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.clone()));
+                    let _ = persist_agent_terminal_state(
+                        &job.manifest,
+                        "failed",
+                        None,
+                        Some(error.clone()),
+                    );
                     AgentDone {
                         status: "failed".into(),
                         final_text: None,
@@ -1977,11 +1983,17 @@ fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    tracing::debug!("[子代理] run_agent_job 开始: agent={}, model={:?}", job.manifest.agent_id, job.manifest.model);
-    let mut runtime = build_agent_runtime(job).map_err(|e| {
-        tracing::error!("[子代理] build_agent_runtime 失败: {e}");
-        e
-    })?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    tracing::debug!(
+        "[子代理] run_agent_job 开始: agent={}, model={:?}",
+        job.manifest.agent_id,
+        job.manifest.model
+    );
+    let mut runtime = build_agent_runtime(job)
+        .map_err(|e| {
+            tracing::error!("[子代理] build_agent_runtime 失败: {e}");
+            e
+        })?
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     tracing::debug!("[子代理] build_agent_runtime 成功，开始 run_turn");
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
@@ -2211,8 +2223,8 @@ impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(_model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
         // 1. 加载主脑 LLM 配置
-        let llm_config = LlmConfig::load_default()
-            .map_err(|e| format!("无法加载主脑 LLM 配置: {e}"))?;
+        let llm_config =
+            LlmConfig::load_default().map_err(|e| format!("无法加载主脑 LLM 配置: {e}"))?;
         let default_provider = &llm_config.llm.default_provider;
         tracing::debug!("[子代理] 主脑配置: provider={default_provider}");
 
@@ -2242,10 +2254,14 @@ impl ProviderRuntimeClient {
             .unwrap_or(default_provider);
         tracing::debug!("[子代理] 选择提供商: {provider_name}");
 
-        let provider_config = llm_config.llm.providers.get(provider_name)
+        let provider_config = llm_config
+            .llm
+            .providers
+            .get(provider_name)
             .ok_or_else(|| format!("提供商配置不存在: {provider_name}"))?;
 
-        let api_key = llm_config.resolve_api_key(provider_name)
+        let api_key = llm_config
+            .resolve_api_key(provider_name)
             .map_err(|e| format!("无法获取 API Key (provider={provider_name}): {e}"))?;
 
         // 5. 创建 OpenAI 兼容客户端
@@ -2260,8 +2276,8 @@ impl ProviderRuntimeClient {
         if let Some(base_url) = &subagent_config.base_url {
             api_base = base_url.clone();
         }
-        let openai_client = api::OpenAiCompatClient::new(api_key, openai_config)
-            .with_base_url(api_base.clone());
+        let openai_client =
+            api::OpenAiCompatClient::new(api_key, openai_config).with_base_url(api_base.clone());
         let client = api::ProviderClient::OpenAi(openai_client);
         tracing::debug!("[子代理] 客户端就绪: model={model}, api_base={api_base}");
 
@@ -2302,10 +2318,18 @@ impl ApiClient for ProviderRuntimeClient {
             message_request.max_tokens,
             message_request.messages.len(),
             message_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            message_request.system.as_ref().map(|s| s.len()).unwrap_or(0),
+            message_request
+                .system
+                .as_ref()
+                .map(|s| s.len())
+                .unwrap_or(0),
         );
         for (i, msg) in message_request.messages.iter().enumerate() {
-            tracing::info!("[子代理]   msg[{i}] role={}, blocks={}", msg.role, msg.content.len());
+            tracing::info!(
+                "[子代理]   msg[{i}] role={}, blocks={}",
+                msg.role,
+                msg.content.len()
+            );
         }
         // 诊断：多轮调用时打印详细消息结构（排查 400 错误）
         if message_request.messages.len() > 1 {
@@ -2313,15 +2337,25 @@ impl ApiClient for ProviderRuntimeClient {
                 for (j, block) in msg.content.iter().enumerate() {
                     match block {
                         InputContentBlock::Text { text } => {
-                            tracing::info!("[子代理]     msg[{i}].block[{j}] Text ({}chars)", text.len());
+                            tracing::info!(
+                                "[子代理]     msg[{i}].block[{j}] Text ({}chars)",
+                                text.len()
+                            );
                         }
                         InputContentBlock::Thinking { thinking } => {
-                            tracing::info!("[子代理]     msg[{i}].block[{j}] Thinking ({}chars)", thinking.len());
+                            tracing::info!(
+                                "[子代理]     msg[{i}].block[{j}] Thinking ({}chars)",
+                                thinking.len()
+                            );
                         }
                         InputContentBlock::ToolUse { id, name, input } => {
                             tracing::info!("[子代理]     msg[{i}].block[{j}] ToolUse id={}, name={}, input={}chars", id, name, input.to_string().len());
                         }
-                        InputContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        InputContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
                             tracing::info!("[子代理]     msg[{i}].block[{j}] ToolResult tool_use_id={}, content_items={}, is_error={}", tool_use_id, content.len(), is_error);
                         }
                     }
@@ -2467,8 +2501,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
-                    ContentBlock::Thinking { thinking } => Some(InputContentBlock::Thinking { thinking: thinking.clone() }),
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::Thinking { thinking } => Some(InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                    }),
                     ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -2614,7 +2652,13 @@ pub fn base_tool_specs() -> Vec<ToolSpec> {
         .filter(|spec| {
             matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search" | "Agent"
+                "bash"
+                    | "read_file"
+                    | "write_file"
+                    | "edit_file"
+                    | "glob_search"
+                    | "grep_search"
+                    | "Agent"
             )
         })
         .collect()
@@ -2628,7 +2672,13 @@ pub fn deferred_tool_specs() -> Vec<ToolSpec> {
         .filter(|spec| {
             !matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search" | "Agent"
+                "bash"
+                    | "read_file"
+                    | "write_file"
+                    | "edit_file"
+                    | "glob_search"
+                    | "grep_search"
+                    | "Agent"
             )
         })
         .collect()
@@ -3860,7 +3910,10 @@ mod tests {
         ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
-    use runtime::{ApiRequest, ApiClient, AssistantEvent, ConversationMessage, ConversationRuntime, RuntimeError, Session};
+    use runtime::{
+        ApiClient, ApiRequest, AssistantEvent, ConversationMessage, ConversationRuntime,
+        RuntimeError, Session,
+    };
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -4363,7 +4416,8 @@ mod tests {
                     final_text: None,
                     error: None,
                     duration_ms: 0,
-                }).expect("send AgentDone");
+                })
+                .expect("send AgentDone");
                 Ok(rx)
             },
         )
@@ -4449,7 +4503,8 @@ mod tests {
                     final_text: Some("Finished successfully".into()),
                     error: None,
                     duration_ms: 0,
-                }).expect("send AgentDone");
+                })
+                .expect("send AgentDone");
                 Ok(rx)
             },
         )
@@ -4484,7 +4539,8 @@ mod tests {
                     final_text: None,
                     error: Some("simulated failure".into()),
                     duration_ms: 0,
-                }).expect("send AgentDone");
+                })
+                .expect("send AgentDone");
                 Ok(rx)
             },
         )
@@ -5536,7 +5592,11 @@ printf 'pwsh:%s' "$1"
 
         // 直接构建 client，不走 ProviderRuntimeClient::new()（它会用 subagent 模型）
         let api_key = config.resolve_api_key(default_provider).expect("api key");
-        let provider_config = config.llm.providers.get(default_provider.as_str()).expect("provider");
+        let provider_config = config
+            .llm
+            .providers
+            .get(default_provider.as_str())
+            .expect("provider");
         let openai_config = api::OpenAiCompatConfig {
             provider_name: "test",
             api_key_env: "",
@@ -5552,10 +5612,15 @@ printf 'pwsh:%s' "$1"
             allowed_tools: BTreeSet::new(),
         };
 
-        eprintln!("[测试] client model={}, provider={}", client.model, default_provider);
+        eprintln!(
+            "[测试] client model={}, provider={}",
+            client.model, default_provider
+        );
 
         let request = ApiRequest {
-            system_prompt: vec![String::from("You are a helpful assistant. Reply in one short sentence.")],
+            system_prompt: vec![String::from(
+                "You are a helpful assistant. Reply in one short sentence.",
+            )],
             messages: vec![ConversationMessage::user_text("What is 1+1?")],
         };
 
@@ -5574,7 +5639,9 @@ printf 'pwsh:%s' "$1"
                 });
                 assert!(has_content, "stream 应该返回文本或工具调用");
                 assert!(
-                    events.iter().any(|e| matches!(e, AssistantEvent::MessageStop)),
+                    events
+                        .iter()
+                        .any(|e| matches!(e, AssistantEvent::MessageStop)),
                     "stream 应该包含 MessageStop"
                 );
             }
@@ -5595,7 +5662,11 @@ printf 'pwsh:%s' "$1"
         let default_model = config.llm.default_model.clone();
         let default_provider = &config.llm.default_provider;
         let api_key = config.resolve_api_key(default_provider).expect("api key");
-        let provider_config = config.llm.providers.get(default_provider.as_str()).expect("provider");
+        let provider_config = config
+            .llm
+            .providers
+            .get(default_provider.as_str())
+            .expect("provider");
         let openai_config = api::OpenAiCompatConfig {
             provider_name: "test",
             api_key_env: "",
@@ -5618,7 +5689,9 @@ printf 'pwsh:%s' "$1"
             api_client,
             SubagentToolExecutor::new(BTreeSet::new()),
             agent_permission_policy(),
-            vec![String::from("You are a helpful assistant. Reply in one short sentence.")],
+            vec![String::from(
+                "You are a helpful assistant. Reply in one short sentence.",
+            )],
         );
 
         let result = runtime.run_turn("What is the capital of France?", None);
@@ -5626,7 +5699,11 @@ printf 'pwsh:%s' "$1"
         match &result {
             Ok(summary) => {
                 let text = final_assistant_text(summary);
-                eprintln!("[测试] run_turn 成功, iterations={}, answer={}", summary.iterations, &text[..text.len().min(200)]);
+                eprintln!(
+                    "[测试] run_turn 成功, iterations={}, answer={}",
+                    summary.iterations,
+                    &text[..text.len().min(200)]
+                );
                 assert!(!text.is_empty(), "run_turn 应该返回非空文本");
             }
             Err(e) => {
@@ -5645,23 +5722,30 @@ printf 'pwsh:%s' "$1"
         let config = brain_llm::config::LlmConfig::load_default().expect("config");
         let default_provider = &config.llm.default_provider;
         let api_key = config.resolve_api_key(default_provider).expect("api key");
-        let provider_config = config.llm.providers.get(default_provider.as_str()).expect("provider");
+        let provider_config = config
+            .llm
+            .providers
+            .get(default_provider.as_str())
+            .expect("provider");
         let model = &config.llm.default_model;
         let endpoint = format!("{}/chat/completions", provider_config.api_base);
 
         // 用和子代理完全一样的工具集
         let allowed_tools = allowed_tools_for_subagent("Explore");
-        let tools: Vec<serde_json::Value> = super::tool_specs_for_allowed_tools(Some(&allowed_tools))
-            .into_iter()
-            .map(|spec| serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "parameters": spec.input_schema,
-                }
-            }))
-            .collect();
+        let tools: Vec<serde_json::Value> =
+            super::tool_specs_for_allowed_tools(Some(&allowed_tools))
+                .into_iter()
+                .map(|spec| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "parameters": spec.input_schema,
+                        }
+                    })
+                })
+                .collect();
 
         eprintln!("[测试] 工具数量: {}", tools.len());
         for t in &tools {
@@ -5694,8 +5778,17 @@ printf 'pwsh:%s' "$1"
 
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
-        eprintln!("[测试] MiMo 响应: {}\n{}", status, &body[..body.len().min(1000)]);
-        assert!(status.is_success(), "MiMo 全工具 stream 返回 {}: {}", status, body);
+        eprintln!(
+            "[测试] MiMo 响应: {}\n{}",
+            status,
+            &body[..body.len().min(1000)]
+        );
+        assert!(
+            status.is_success(),
+            "MiMo 全工具 stream 返回 {}: {}",
+            status,
+            body
+        );
     }
 
     /// 端到端：模拟真实子代理场景 — 带工具（read_file + glob_search）+ tool loop
@@ -5714,7 +5807,11 @@ printf 'pwsh:%s' "$1"
 
         // 创建一个临时文件让子代理去读
         let tmp_file = temp_path("subagent-e2e-test.txt");
-        std::fs::write(&tmp_file, "AI Brain v2 sub-agent test file.\nThe answer is 42.").expect("write tmp file");
+        std::fs::write(
+            &tmp_file,
+            "AI Brain v2 sub-agent test file.\nThe answer is 42.",
+        )
+        .expect("write tmp file");
         let tmp_path_str = tmp_file.display().to_string();
 
         let allowed_tools = BTreeSet::from([
@@ -5723,11 +5820,8 @@ printf 'pwsh:%s' "$1"
             String::from("grep_search"),
         ]);
 
-        let api_client = ProviderRuntimeClient::new(
-            String::new(),
-            allowed_tools.clone(),
-        )
-        .expect("ProviderRuntimeClient 应该创建成功");
+        let api_client = ProviderRuntimeClient::new(String::new(), allowed_tools.clone())
+            .expect("ProviderRuntimeClient 应该创建成功");
 
         eprintln!("[测试] 创建带工具的 runtime, model={}", api_client.model);
 
@@ -5748,18 +5842,34 @@ printf 'pwsh:%s' "$1"
         match &result {
             Ok(summary) => {
                 let text = final_assistant_text(summary);
-                eprintln!("[测试] run_turn (with tools) 成功, iterations={}, answer={}", summary.iterations, &text[..text.len().min(300)]);
+                eprintln!(
+                    "[测试] run_turn (with tools) 成功, iterations={}, answer={}",
+                    summary.iterations,
+                    &text[..text.len().min(300)]
+                );
                 assert!(!text.is_empty(), "带工具的 run_turn 应该返回非空文本");
-                assert!(summary.iterations >= 1, "带工具的 run_turn 至少要有 1 次迭代");
+                assert!(
+                    summary.iterations >= 1,
+                    "带工具的 run_turn 至少要有 1 次迭代"
+                );
 
                 // 验证 session 里确实有工具调用
-                let has_tool_use = runtime.session().messages.iter()
+                let has_tool_use = runtime
+                    .session()
+                    .messages
+                    .iter()
                     .flat_map(|m| m.blocks.iter())
                     .any(|b| matches!(b, runtime::ContentBlock::ToolUse { .. }));
-                let has_tool_result = runtime.session().messages.iter()
+                let has_tool_result = runtime
+                    .session()
+                    .messages
+                    .iter()
                     .flat_map(|m| m.blocks.iter())
                     .any(|b| matches!(b, runtime::ContentBlock::ToolResult { .. }));
-                eprintln!("[测试] has_tool_use={}, has_tool_result={}", has_tool_use, has_tool_result);
+                eprintln!(
+                    "[测试] has_tool_use={}, has_tool_result={}",
+                    has_tool_use, has_tool_result
+                );
                 assert!(has_tool_use, "session 应该包含工具调用");
                 assert!(has_tool_result, "session 应该包含工具结果");
             }

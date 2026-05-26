@@ -57,8 +57,7 @@ impl PluginManager {
         let registry = if registry_path.exists() {
             let content = std::fs::read_to_string(&registry_path)
                 .map_err(|e| format!("读取 registry.json 失败: {e}"))?;
-            serde_json::from_str(&content)
-                .map_err(|e| format!("解析 registry.json 失败: {e}"))?
+            serde_json::from_str(&content).map_err(|e| format!("解析 registry.json 失败: {e}"))?
         } else {
             PluginRegistry::default()
         };
@@ -75,11 +74,13 @@ impl PluginManager {
         let manifest: PluginManifest = {
             let content = std::fs::read_to_string(&manifest_path)
                 .map_err(|e| format!("读取 plugin.json 失败: {e}"))?;
-            serde_json::from_str(&content)
-                .map_err(|e| format!("解析 plugin.json 失败: {e}"))?
+            serde_json::from_str(&content).map_err(|e| format!("解析 plugin.json 失败: {e}"))?
         };
 
-        let version = manifest.version.clone().unwrap_or_else(|| "0.0.0".to_string());
+        let version = manifest
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.0.0".to_string());
         let target_dir = self
             .plugins_dir
             .join("cache")
@@ -87,8 +88,7 @@ impl PluginManager {
             .join(&manifest.name)
             .join(&version);
 
-        copy_dir_recursive(source, &target_dir)
-            .map_err(|e| format!("复制插件文件失败: {e}"))?;
+        copy_dir_recursive(source, &target_dir).map_err(|e| format!("复制插件文件失败: {e}"))?;
 
         let meta = PluginMeta {
             name: manifest.name.clone(),
@@ -97,9 +97,7 @@ impl PluginManager {
             installed_at: now_timestamp(),
             source: format!("local:{}", source.display()),
         };
-        self.registry
-            .plugins
-            .insert(manifest.name.clone(), meta);
+        self.registry.plugins.insert(manifest.name.clone(), meta);
         self.save_registry()?;
 
         Ok(manifest.name)
@@ -120,8 +118,7 @@ impl PluginManager {
             .join(name);
 
         if plugin_dir.exists() {
-            std::fs::remove_dir_all(&plugin_dir)
-                .map_err(|e| format!("删除插件目录失败: {e}"))?;
+            std::fs::remove_dir_all(&plugin_dir).map_err(|e| format!("删除插件目录失败: {e}"))?;
         }
 
         self.save_registry()?;
@@ -190,8 +187,7 @@ impl PluginManager {
     }
 
     fn save_registry(&self) -> Result<(), String> {
-        std::fs::create_dir_all(&self.plugins_dir)
-            .map_err(|e| format!("创建插件目录失败: {e}"))?;
+        std::fs::create_dir_all(&self.plugins_dir).map_err(|e| format!("创建插件目录失败: {e}"))?;
         let json = serde_json::to_string_pretty(&self.registry)
             .map_err(|e| format!("序列化注册表失败: {e}"))?;
         std::fs::write(self.plugins_dir.join("registry.json"), json)
@@ -265,7 +261,11 @@ mod tests {
             make_plugin_json("test-plugin", "1.0.0"),
         )
         .unwrap();
-        fs::write(skills_dir.join("SKILL.md"), make_skill_md("tdd", "TDD skill")).unwrap();
+        fs::write(
+            skills_dir.join("SKILL.md"),
+            make_skill_md("tdd", "TDD skill"),
+        )
+        .unwrap();
 
         let mut mgr = PluginManager::load(plugins_dir.path()).unwrap();
         let name = mgr.install(source_dir.path(), "test-publisher").unwrap();
@@ -289,7 +289,11 @@ mod tests {
             make_plugin_json("test-plugin", "1.0.0"),
         )
         .unwrap();
-        fs::write(skills_dir.join("SKILL.md"), make_skill_md("tdd", "TDD skill")).unwrap();
+        fs::write(
+            skills_dir.join("SKILL.md"),
+            make_skill_md("tdd", "TDD skill"),
+        )
+        .unwrap();
 
         let mut mgr = PluginManager::load(plugins_dir.path()).unwrap();
         mgr.install(source_dir.path(), "test-publisher").unwrap();
@@ -311,7 +315,11 @@ mod tests {
             make_plugin_json("test-plugin", "1.0.0"),
         )
         .unwrap();
-        fs::write(skills_dir.join("SKILL.md"), make_skill_md("tdd", "TDD skill")).unwrap();
+        fs::write(
+            skills_dir.join("SKILL.md"),
+            make_skill_md("tdd", "TDD skill"),
+        )
+        .unwrap();
 
         let mut mgr = PluginManager::load(plugins_dir.path()).unwrap();
         mgr.install(source_dir.path(), "test-publisher").unwrap();
@@ -341,7 +349,11 @@ mod tests {
             make_plugin_json("test-plugin", "1.0.0"),
         )
         .unwrap();
-        fs::write(skills_dir.join("SKILL.md"), make_skill_md("tdd", "TDD skill")).unwrap();
+        fs::write(
+            skills_dir.join("SKILL.md"),
+            make_skill_md("tdd", "TDD skill"),
+        )
+        .unwrap();
 
         {
             let mut mgr = PluginManager::load(plugins_dir.path()).unwrap();
