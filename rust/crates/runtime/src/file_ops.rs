@@ -1,13 +1,13 @@
 use std::cmp::Reverse;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
+use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextFilePayload {
@@ -267,7 +267,11 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
     })
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    let started = Instant::now();
+    let deadline = started + std::time::Duration::from_secs(GREP_SEARCH_TIMEOUT_SECS);
+
     let base_path = input
         .path
         .as_deref()
@@ -299,7 +303,17 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut total_matches = 0usize;
 
     for file_path in collect_search_files(&base_path)? {
+        // 超时检查：超过限制则返回已收集到的部分结果
+        if Instant::now() > deadline {
+            break;
+        }
+
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
+            continue;
+        }
+
+        // 二进制文件跳过
+        if is_binary_file(&file_path) {
             continue;
         }
 
@@ -382,14 +396,35 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    let walker = WalkBuilder::new(base_path)
+        .hidden(true)      // 跳过隐藏文件/目录
+        .git_ignore(true)  // 尊重 .gitignore
+        .git_global(true)  // 尊重全局 gitignore
+        .git_exclude(true) // 尊重 .git/info/exclude
+        .ignore(true)      // 尊重 .ignore
+        .build();
+
+    for entry in walker {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
             files.push(entry.path().to_path_buf());
         }
     }
     Ok(files)
 }
+
+/// 检测文件是否为二进制文件（前 8KB 包含 NUL 字节则视为二进制）
+fn is_binary_file(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return true;
+    };
+    let mut buf = [0u8; 8192];
+    let n = file.read(&mut buf).unwrap_or(0);
+    buf[..n].contains(&0)
+}
+
+/// grep_search 的最大执行时间（秒）
+const GREP_SEARCH_TIMEOUT_SECS: u64 = 30;
 
 fn matches_optional_filters(
     path: &Path,

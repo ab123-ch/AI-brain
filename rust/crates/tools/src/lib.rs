@@ -1813,9 +1813,12 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
     Ok(cwd.join(".clawd-todos.json"))
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
-const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
+
+/// 动态获取当前日期字符串（YYYY-MM-DD）
+fn current_date_str() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
@@ -1922,60 +1925,100 @@ fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let start = std::time::Instant::now();
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            let duration_ms = start.elapsed().as_millis() as u64;
-            let done = match result {
-                Ok(Ok(())) => {
-                    // run_agent_job 内部已经调用了 persist_agent_terminal_state
-                    // 从 output_file 读取最后输出段落
-                    let final_text = std::fs::read_to_string(&job.manifest.output_file)
-                        .ok()
-                        .and_then(|content| {
-                            content
-                                .split("## Output\n")
-                                .last()
-                                .or_else(|| content.split("## Result\n").last())
-                                .map(|s| s.trim().to_string())
+            let max_panics = 2u32; // 最多重试 1 次（首次 + 1 次重试）
+            let mut last_error = String::new();
+            let mut final_done = None;
+
+            for attempt in 0..max_panics {
+                let job_clone = job.clone();
+                let start = std::time::Instant::now();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+                    let job_ref = &job_clone;
+                    move || run_agent_job(job_ref)
+                }));
+                let duration_ms = start.elapsed().as_millis() as u64;
+                match result {
+                    Ok(Ok(())) => {
+                        let final_text = std::fs::read_to_string(&job.manifest.output_file)
+                            .ok()
+                            .and_then(|content| {
+                                content
+                                    .split("## Output\n")
+                                    .last()
+                                    .or_else(|| content.split("## Result\n").last())
+                                    .map(|s| s.trim().to_string())
+                            });
+                        final_done = Some(AgentDone {
+                            status: "completed".into(),
+                            final_text,
+                            error: None,
+                            duration_ms,
                         });
-                    AgentDone {
-                        status: "completed".into(),
-                        final_text,
-                        error: None,
-                        duration_ms,
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(
+                            "[子代理] run_agent_job 失败 (attempt {}/{}): {error}",
+                            attempt + 1,
+                            max_panics
+                        );
+                        last_error = error;
+                        // 业务错误不重试，直接失败
+                        let _ = persist_agent_terminal_state(
+                            &job.manifest,
+                            "failed",
+                            None,
+                            Some(last_error.clone()),
+                        );
+                        final_done = Some(AgentDone {
+                            status: "failed".into(),
+                            final_text: None,
+                            error: Some(last_error.clone()),
+                            duration_ms,
+                        });
+                        break;
+                    }
+                    Err(panic_err) => {
+                        let panic_msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            String::from("unknown panic")
+                        };
+                        tracing::error!(
+                            "[子代理] 线程 panic (attempt {}/{}): {panic_msg}",
+                            attempt + 1,
+                            max_panics
+                        );
+                        last_error = format!("sub-agent thread panicked: {panic_msg}");
+                        if attempt + 1 < max_panics {
+                            tracing::info!("[子代理] 重试中...");
+                            continue;
+                        }
+                        // 重试耗尽
+                        let _ = persist_agent_terminal_state(
+                            &job.manifest,
+                            "failed",
+                            None,
+                            Some(last_error.clone()),
+                        );
+                        final_done = Some(AgentDone {
+                            status: "failed".into(),
+                            final_text: None,
+                            error: Some(last_error.clone()),
+                            duration_ms,
+                        });
                     }
                 }
-                Ok(Err(error)) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(error.clone()),
-                    );
-                    AgentDone {
-                        status: "failed".into(),
-                        final_text: None,
-                        error: Some(error),
-                        duration_ms,
-                    }
-                }
-                Err(_) => {
-                    let error = String::from("sub-agent thread panicked");
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(error.clone()),
-                    );
-                    AgentDone {
-                        status: "failed".into(),
-                        final_text: None,
-                        error: Some(error),
-                        duration_ms,
-                    }
-                }
-            };
+            }
+
+            let done = final_done.unwrap_or_else(|| AgentDone {
+                status: "failed".into(),
+                final_text: None,
+                error: Some(last_error),
+                duration_ms: 0,
+            });
             let _ = tx.send(done);
         })
         .map(|_| rx)
@@ -1988,12 +2031,16 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
         job.manifest.agent_id,
         job.manifest.model
     );
+    // 迭代次数优先级：subagent.json 配置 > 默认常量
+    let max_iterations = load_subagent_config()
+        .and_then(|c| c.max_iterations)
+        .unwrap_or(DEFAULT_AGENT_MAX_ITERATIONS);
     let mut runtime = build_agent_runtime(job)
         .map_err(|e| {
             tracing::error!("[子代理] build_agent_runtime 失败: {e}");
             e
         })?
-        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+        .with_max_iterations(max_iterations);
     tracing::debug!("[子代理] build_agent_runtime 成功，开始 run_turn");
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
@@ -2013,7 +2060,7 @@ fn build_agent_runtime(
         .manifest
         .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+        .unwrap_or_else(|| resolve_agent_model(None));
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let tool_executor = SubagentToolExecutor::new(allowed_tools);
@@ -2030,9 +2077,10 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     // 子代理用轻量级系统提示词，不加载完整主脑 prompt（避免 60 万+ 字符撑爆弱模型上下文）
     let os = std::env::consts::OS;
+    let today = current_date_str();
     let prompt = format!(
         "You are a background sub-agent of type `{subagent_type}`.\n\
-         Current date: {DEFAULT_AGENT_SYSTEM_DATE}\n\
+         Current date: {today}\n\
          Operating system: {os}\n\
          Working directory: {}\n\n\
          Instructions:\n\
@@ -2046,17 +2094,32 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    // 优先使用调用者指定的模型，否则从子代理配置或主脑配置中获取
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        return m.to_string();
+    }
+    // 尝试从子代理配置获取
+    if let Some(cfg) = load_subagent_config() {
+        if let Some(m) = cfg.model.filter(|m| !m.is_empty()) {
+            return m;
+        }
+    }
+    // 尝试从主脑配置获取 subagent brain model
+    if let Ok(llm_config) = brain_llm::config::LlmConfig::load_default() {
+        let m = llm_config.model_for_brain("subagent").to_string();
+        if !m.is_empty() {
+            return m;
+        }
+    }
+    // 最终 fallback：使用通用默认值
+    String::from("claude-sonnet-4-6")
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     let tools = match subagent_type {
         "Explore" => vec![
             "read_file",
+            "write_file",
             "glob_search",
             "grep_search",
             "WebFetch",
@@ -2195,6 +2258,8 @@ struct SubagentConfig {
     model: Option<String>,
     /// 可选的API地址覆盖
     base_url: Option<String>,
+    /// 可选的最大迭代次数覆盖
+    max_iterations: Option<usize>,
 }
 
 /// 加载子代理配置文件
@@ -2222,9 +2287,11 @@ struct ProviderRuntimeClient {
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(_model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        // 1. 加载主脑 LLM 配置
-        let llm_config =
-            LlmConfig::load_default().map_err(|e| format!("无法加载主脑 LLM 配置: {e}"))?;
+        // 1. 加载主脑 LLM 配置（失败时使用默认配置，不阻断子代理启动）
+        let llm_config = LlmConfig::load_default().unwrap_or_else(|e| {
+            tracing::warn!("[子代理] 主脑配置加载失败，使用默认配置: {e}");
+            LlmConfig::default_config()
+        });
         let default_provider = &llm_config.llm.default_provider;
         tracing::debug!("[子代理] 主脑配置: provider={default_provider}");
 
@@ -2242,14 +2309,33 @@ impl ProviderRuntimeClient {
             .unwrap_or(subagent_brain_model);
         tracing::debug!("[子代理] 使用模型: {model}");
 
-        // 4. 提供商选择：遍历已配置的提供商，找能服务这个模型的
-        //    策略：模型名以提供商名开头（如 deepseek-chat → deepseek），匹配则用
+        // 4. 提供商选择：多策略匹配
+        //    策略1: 模型名以提供商名开头（如 deepseek-chat → deepseek）
+        //    策略2: 已知模型→提供商映射（如 glm-* → zhipu, grok-* → xai）
         //    找不到时回退到 default_provider
         let provider_name = llm_config
             .llm
             .providers
             .keys()
             .find(|name| model.starts_with(name.as_str()))
+            .or_else(|| {
+                // 已知模型前缀→提供商映射
+                let known_mappings: &[(&str, &str)] = &[
+                    ("glm", "zhipu"),
+                    ("grok", "xai"),
+                    ("gpt", "openai"),
+                    ("claude", "anthropic"),
+                    ("deepseek", "deepseek"),
+                    ("qwen", "alibaba"),
+                    ("gemini", "google"),
+                ];
+                known_mappings
+                    .iter()
+                    .find(|(prefix, _)| model.starts_with(prefix))
+                    .and_then(|(_, provider)| {
+                        llm_config.llm.providers.keys().find(|k| k.as_str() == *provider)
+                    })
+            })
             .map(String::as_str)
             .unwrap_or(default_provider);
         tracing::debug!("[子代理] 选择提供商: {provider_name}");
@@ -2364,11 +2450,41 @@ impl ApiClient for ProviderRuntimeClient {
         }
 
         self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            // 重试机制：最多 3 次，指数退避（1s, 2s, 4s）
+            let max_retries = 3u32;
+            let mut stream = None;
+            for attempt in 0..max_retries {
+                match self.client.stream_message(&message_request).await {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(error) => {
+                        let err_msg = error.to_string();
+                        let is_retryable = err_msg.contains("429")
+                            || err_msg.contains("500")
+                            || err_msg.contains("502")
+                            || err_msg.contains("503")
+                            || err_msg.contains("timeout")
+                            || err_msg.contains("connection")
+                            || err_msg.contains("network");
+                        if is_retryable && attempt + 1 < max_retries {
+                            let wait_ms = 1000u64 * 2u64.pow(attempt);
+                            tracing::warn!(
+                                "[子代理] API 调用失败 (attempt {}/{}): {}，{}ms 后重试",
+                                attempt + 1,
+                                max_retries,
+                                err_msg,
+                                wait_ms
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+                            continue;
+                        }
+                        return Err(RuntimeError::new(err_msg));
+                    }
+                }
+            }
+            let mut stream = stream.ok_or_else(|| RuntimeError::new("重试次数已耗尽"))?;
             let mut events = Vec::new();
             let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
             let mut saw_stop = false;

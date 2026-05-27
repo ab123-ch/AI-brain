@@ -141,6 +141,50 @@ impl PyramidMemoryBrain {
         store.inject_text()
     }
 
+    /// 获取评估信息（转换为 EvalRequirement 格式供评估脑使用）
+    ///
+    /// 将 eval-info.json 中的 requirements + pitfalls + rules 合并为
+    /// 评估脑可消费的 Vec<EvalRequirement>。
+    pub fn load_eval_requirements(&self) -> Vec<brain_core::types::EvalRequirement> {
+        let store = EvalInfoStore::new(self.storage.clone());
+        let Some(info) = store.load().ok().flatten() else {
+            return Vec::new();
+        };
+
+        let mut reqs = Vec::new();
+        let now = chrono::Utc::now();
+
+        for req in &info.requirements {
+            reqs.push(brain_core::types::EvalRequirement {
+                id: format!("eval-req-{}", reqs.len()),
+                content: req.clone(),
+                source: "记忆脑分析".into(),
+                created_at: now,
+                superseded: false,
+            });
+        }
+        for pitfall in &info.pitfalls {
+            reqs.push(brain_core::types::EvalRequirement {
+                id: format!("eval-pitfall-{}", reqs.len()),
+                content: format!("[已知踩坑] {pitfall}"),
+                source: "记忆脑分析".into(),
+                created_at: now,
+                superseded: false,
+            });
+        }
+        for rule in &info.rules {
+            reqs.push(brain_core::types::EvalRequirement {
+                id: format!("eval-rule-{}", reqs.len()),
+                content: format!("[进化规则] {rule}"),
+                source: "记忆脑分析".into(),
+                created_at: now,
+                superseded: false,
+            });
+        }
+
+        reqs
+    }
+
     /// 切换人格
     pub fn switch_persona(&mut self, persona_id: &str) -> Result<()> {
         self.persona_manager.switch(persona_id)?;
@@ -490,5 +534,37 @@ mod tests {
         let brain = make_brain(&tmp);
         let text = brain.build_inject_text().unwrap();
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn load_eval_requirements_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brain = make_brain(&tmp);
+        let reqs = brain.load_eval_requirements();
+        assert!(reqs.is_empty());
+    }
+
+    #[test]
+    fn load_eval_requirements_with_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brain = make_brain(&tmp);
+
+        // 写入评估信息
+        let store = crate::profile_eval::EvalInfoStore::new(brain.storage().clone());
+        store
+            .regenerate(
+                vec!["必须先有计划再动手".into()],
+                vec!["不要自作主张偏离设计".into()],
+                vec!["严格按设计文档执行".into()],
+            )
+            .unwrap();
+
+        let reqs = brain.load_eval_requirements();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0].content, "必须先有计划再动手");
+        assert_eq!(reqs[0].source, "记忆脑分析");
+        assert!(!reqs[0].superseded);
+        assert!(reqs[1].content.contains("[已知踩坑]"));
+        assert!(reqs[2].content.contains("[进化规则]"));
     }
 }

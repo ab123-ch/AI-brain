@@ -194,10 +194,32 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
+    // 按模型族设置安全的 max_tokens 上限，避免超出 API 实际限制
     if canonical.contains("opus") {
         32_000
-    } else {
+    } else if canonical.contains("sonnet") {
+        // Claude Sonnet 4 系列支持 64k 输出
         64_000
+    } else if canonical.contains("haiku") {
+        8_192
+    } else if canonical.starts_with("grok") {
+        // Grok 系列
+        16_384
+    } else if canonical.starts_with("glm") {
+        // 智谱 GLM 系列
+        8_192
+    } else if canonical.starts_with("deepseek") {
+        // DeepSeek 系列
+        8_192
+    } else if canonical.starts_with("gpt") {
+        // GPT 系列
+        16_384
+    } else if canonical.starts_with("qwen") {
+        // 通义千问系列
+        8_192
+    } else {
+        // 未知模型使用保守值
+        8_192
     }
 }
 
@@ -224,6 +246,10 @@ mod tests {
     #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
-        assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("grok-3"), 16_384);
+        assert_eq!(max_tokens_for_model("claude-sonnet-4-6"), 64_000);
+        assert_eq!(max_tokens_for_model("glm-4.7"), 8_192);
+        assert_eq!(max_tokens_for_model("deepseek-chat"), 8_192);
+        assert_eq!(max_tokens_for_model("unknown-model"), 8_192);
     }
 }

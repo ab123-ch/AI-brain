@@ -800,9 +800,11 @@ impl Orchestrator {
                     if should_eval && result.is_ok() {
                         tracing::info!("eval_gate 判定：需要评估");
                         if let Some(ref eb) = this.eval_brain {
-                            // 金字塔模式下暂不加载旧 eval_requirements
-                            // TODO: 适配 EvalBrain 接口以使用 eval-info.json
-                            let eval_requirements: Vec<brain_core::types::EvalRequirement> = Vec::new();
+                            // 从金字塔记忆加载评估信息（requirements + pitfalls + rules）
+                            let eval_requirements = {
+                                let mem = this.memory_brain.lock().await;
+                                mem.load_eval_requirements()
+                            };
 
                             tracing::info!(
                                 "v2 评估脑开始评估 (用户评估要求={})",
