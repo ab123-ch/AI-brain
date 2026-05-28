@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use brain_core::types::ProgressEvent;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -766,6 +766,11 @@ impl App {
     // ─── 事件处理 ──────────────────────────────────────────────────
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // 过滤掉 Release 事件（Windows 上输入法会产生 Release 事件导致重复输入）
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+
         let now = Instant::now();
         self.last_event_time = now;
 
