@@ -75,4 +75,79 @@ impl ThresholdCompressor {
     pub fn new(config: ThresholdCompactionConfig) -> Self {
         Self { config }
     }
+
+    /// 分割消息：旧消息 vs 最近 N 轮
+    pub(crate) fn split_messages<'a>(
+        &self,
+        messages: &'a [ConversationMessage],
+    ) -> (&'a [ConversationMessage], &'a [ConversationMessage]) {
+        let preserve_count = self.config.preserve_recent_turns * 2; // 每轮 = user + assistant
+        let split_point = messages.len().saturating_sub(preserve_count);
+        (&messages[..split_point], &messages[split_point..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_messages(count: usize) -> Vec<ConversationMessage> {
+        (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ConversationMessage::user(format!("消息 {}", i))
+                } else {
+                    ConversationMessage::assistant(format!("消息 {}", i))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_split_messages_basic() {
+        let config = ThresholdCompactionConfig {
+            preserve_recent_turns: 2,
+            ..Default::default()
+        };
+        let compressor = ThresholdCompressor::new(config);
+
+        let messages = create_test_messages(10);
+        let (old, recent) = compressor.split_messages(&messages);
+
+        // preserve_recent_turns=2, 保留最近 2*2=4 条消息
+        assert_eq!(old.len(), 6);
+        assert_eq!(recent.len(), 4);
+    }
+
+    #[test]
+    fn test_split_messages_exact_boundary() {
+        let config = ThresholdCompactionConfig {
+            preserve_recent_turns: 2,
+            ..Default::default()
+        };
+        let compressor = ThresholdCompressor::new(config);
+
+        // 消息数刚好等于 preserve_recent_turns * 2
+        let messages = create_test_messages(4);
+        let (old, recent) = compressor.split_messages(&messages);
+
+        assert_eq!(old.len(), 0);
+        assert_eq!(recent.len(), 4);
+    }
+
+    #[test]
+    fn test_split_messages_fewer_than_preserve() {
+        let config = ThresholdCompactionConfig {
+            preserve_recent_turns: 4,
+            ..Default::default()
+        };
+        let compressor = ThresholdCompressor::new(config);
+
+        // 消息数少于 preserve_recent_turns * 2
+        let messages = create_test_messages(5);
+        let (old, recent) = compressor.split_messages(&messages);
+
+        assert_eq!(old.len(), 0);
+        assert_eq!(recent.len(), 5);
+    }
 }
