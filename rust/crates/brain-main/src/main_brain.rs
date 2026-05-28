@@ -9,8 +9,9 @@ use tokio::sync::Mutex;
 
 use crate::compact::{self, CompactionConfig};
 use crate::conversation::ConversationHistory;
-use crate::error::Result;
+use crate::error::{MainBrainError, Result};
 use crate::prompts;
+use crate::threshold_compression::{ThresholdCompactionConfig, ThresholdCompressor};
 use crate::tool_loop;
 
 /// 主脑 — v2 架构的核心
@@ -33,6 +34,8 @@ pub struct MainBrain {
     memory_context: Option<String>,
     /// 可用技能摘要（追加到 system prompt）
     skill_summary: Option<String>,
+    /// Bootstrap 技能内容（启动时自动注入）
+    bootstrap_content: Option<String>,
     /// 会话级 prompt_tokens 累计
     session_prompt_tokens: u64,
     /// 会话级 completion_tokens 累计
@@ -51,6 +54,8 @@ pub struct MainBrain {
     compaction_count: u32,
     /// 累计节省的字符数
     chars_saved_by_compaction: usize,
+    /// 阈值压缩器
+    threshold_compressor: ThresholdCompressor,
 }
 
 impl MainBrain {
@@ -64,6 +69,11 @@ impl MainBrain {
     ) -> Self {
         // 从 ThresholdConfig 取 max_context_tokens，默认 1M
         let max_context_tokens = config.brain.thresholds.max_context_tokens as usize;
+
+        // 初始化阈值压缩器
+        let threshold_config = ThresholdCompactionConfig::default();
+        let threshold_compressor = ThresholdCompressor::new(threshold_config);
+
         Self {
             llm,
             tool_executor,
@@ -74,6 +84,7 @@ impl MainBrain {
             llm_temperature,
             memory_context: None,
             skill_summary: None,
+            bootstrap_content: None,
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
             session_cache_read_tokens: 0,
@@ -83,6 +94,7 @@ impl MainBrain {
             compaction_config: CompactionConfig::default(),
             compaction_count: 0,
             chars_saved_by_compaction: 0,
+            threshold_compressor,
         }
     }
 
@@ -138,16 +150,42 @@ impl MainBrain {
         // ── 2. 检查上下文使用率 ──
         let thresholds = &self.config.brain.thresholds;
 
-        // 超过危险阈值：强制截断
+        // 超过危险阈值：智能压缩（替代粗暴截断）
         if self
             .history
             .is_context_full(thresholds.context_danger_threshold)
         {
-            let truncated = self.history.truncate_to_recent(20);
             tracing::warn!(
-                "上下文自动重建: 截断 {truncated} 条消息，保留最近 20 条（使用率 {:.0}%）",
+                "上下文使用率超过阈值: {:.0}% >= {:.0}%, 开始智能压缩...",
                 self.history.context_usage() * 100.0,
+                thresholds.context_danger_threshold * 100.0
             );
+
+            match self
+                .threshold_compressor
+                .compress_context(self.history.messages(), self.llm.as_ref())
+                .await
+            {
+                Ok(compressed) => {
+                    // 成功：用压缩结果重建上下文
+                    self.history.clear_and_rebuild_from_compressed(
+                        &compressed.decision_summary,
+                        &compressed.recent_messages,
+                    );
+
+                    tracing::info!(
+                        "阈值压缩完成：压缩了 {} 条消息，保留了 {} 条最近消息，耗时 {}ms",
+                        compressed.metadata.compressed_count,
+                        compressed.metadata.preserved_count,
+                        compressed.metadata.duration_ms,
+                    );
+                }
+                Err(e) => {
+                    // 失败：记录错误，返回错误给用户
+                    tracing::error!("阈值压缩失败: {}", e);
+                    return Err(MainBrainError::ContextCompactionFailed(e.to_string()));
+                }
+            }
         }
 
         // ── 3. 构建 messages（用户消息已在 history 中）──
@@ -499,6 +537,15 @@ impl MainBrain {
         tracing::info!("已注入技能摘要");
     }
 
+    /// 注入 bootstrap 技能内容（启动时自动注入到 system prompt 最前面）
+    pub fn inject_bootstrap(&mut self, content: String) {
+        if content.is_empty() {
+            return;
+        }
+        self.bootstrap_content = Some(content);
+        tracing::info!("已注入 bootstrap 技能");
+    }
+
     /// 注入实时召回的记忆作为独立 system 消息
     pub fn push_memory_context(&mut self, memory_text: &str) {
         if memory_text.is_empty() {
@@ -563,17 +610,24 @@ impl MainBrain {
         let env_info = prompts::build_environment_info();
         // 将记忆上下文追加到 system prompt
         // Prompt cache 排序：越稳定的越靠前
-        // 1. 系统核心规则（永不变化）
-        // 2. 环境信息（每天变化）
-        // 3. 记忆上下文/潜意识（每次会话变化）
-        let full_prompt = match (&self.memory_context, &self.skill_summary) {
-            (Some(ctx), Some(skills)) => {
-                format!("{system_prompt}\n{env_info}\n{skills}\n\n{ctx}")
-            }
-            (Some(ctx), None) => format!("{system_prompt}\n{env_info}\n\n{ctx}"),
-            (None, Some(skills)) => format!("{system_prompt}\n{env_info}\n{skills}"),
-            (None, None) => format!("{system_prompt}\n{env_info}"),
-        };
+        // 1. Bootstrap 技能（插件注入，会话级稳定）
+        // 2. 系统核心规则（永不变化）
+        // 3. 环境信息（每天变化）
+        // 4. 技能摘要（安装时变化）
+        // 5. 记忆上下文/潜意识（每次会话变化）
+        let mut parts = Vec::new();
+        if let Some(ref bs) = self.bootstrap_content {
+            parts.push(bs.clone());
+        }
+        parts.push(system_prompt);
+        parts.push(env_info);
+        if let Some(ref skills) = self.skill_summary {
+            parts.push(skills.clone());
+        }
+        if let Some(ref ctx) = self.memory_context {
+            parts.push(format!("\n{ctx}"));
+        }
+        let full_prompt = parts.join("\n");
         let mut messages = vec![ChatMessage::system(full_prompt)];
         messages.extend(self.history.to_chat_messages());
         messages
