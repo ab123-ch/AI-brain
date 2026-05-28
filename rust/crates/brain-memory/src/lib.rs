@@ -13,6 +13,7 @@ pub mod pyramid_types;
 pub mod raw_pool;
 pub mod summary_pool;
 pub mod subconscious_pool;
+pub mod threshold_compression;
 
 // === 旧模块保留（无交叉依赖，可编译） ===
 pub mod archive;

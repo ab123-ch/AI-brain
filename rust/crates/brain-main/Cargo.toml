@@ -9,6 +9,7 @@ publish.workspace = true
 brain-core = { path = "../brain-core" }
 brain-llm = { path = "../brain-llm" }
 brain-hooks = { path = "../brain-hooks" }
+brain-memory = { path = "../brain-memory" }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 chrono = { version = "0.4", features = ["serde"] }

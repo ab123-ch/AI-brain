@@ -11,8 +11,9 @@ use crate::compact::{self, CompactionConfig};
 use crate::conversation::ConversationHistory;
 use crate::error::{MainBrainError, Result};
 use crate::prompts;
-use crate::threshold_compression::{ThresholdCompactionConfig, ThresholdCompressor};
 use crate::tool_loop;
+
+use brain_memory::threshold_compression::{ThresholdCompactionConfig, ThresholdCompressor};
 
 /// 主脑 — v2 架构的核心
 ///

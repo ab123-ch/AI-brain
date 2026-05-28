@@ -489,7 +489,20 @@ impl LlmProvider for OpenAiCompatClient {
         let api_key = self.api_key.clone();
         let fallback_model = self.model.clone();
 
+        // === DEBUG: 将完整请求体写入文件，用于排查 ===
+        if let Ok(serialized) = serde_json::to_string(&api_request) {
+            let debug_path = "/tmp/ai-brain-last-request.json";
+            let _ = std::fs::write(debug_path, &serialized);
+            tracing::info!(
+                "LLM 请求调试: url={}, body_size={}字节, 已写入 {}",
+                url,
+                serialized.len(),
+                debug_path
+            );
+        }
+
         Box::pin(async move {
+            tracing::info!("LLM 请求发送开始: url={url}");
             let response = self
                 .client
                 .post(&url)
@@ -498,7 +511,11 @@ impl LlmProvider for OpenAiCompatClient {
                 .json(&api_request)
                 .send()
                 .await
-                .map_err(|e| LlmError::RequestFailed(format!("HTTP request failed: {e}")))?;
+                .map_err(|e| {
+                    tracing::error!("LLM 请求发送失败: url={url}, error={e}");
+                    LlmError::RequestFailed(format!("HTTP request failed: {e}"))
+                })?;
+            tracing::info!("LLM 请求发送成功: status={}", response.status());
 
             let status = response.status();
             if !status.is_success() {

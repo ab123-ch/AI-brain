@@ -264,7 +264,6 @@ impl Orchestrator {
         };
         // 加载评估脑内置 skills
         if let Some(ref mut eb) = eval_brain {
-            // TODO: Task 9 - EvalBrain.set_skill_catalog(skill_catalog.clone())
             let skills_dir = std::path::Path::new("rust/crates/brain-eval/skills");
             if let Err(e) = eb.load_skills_from_dir(skills_dir) {
                 tracing::warn!("加载评估脑 skills 失败: {e}");
@@ -398,6 +397,31 @@ impl Orchestrator {
         // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册 + dispatch）
         let (v2_brain, plugin_mgr, skill_catalog, mcp_pool) =
             create_v2_main_brain(Some(Arc::clone(&memory)), dispatch.clone());
+
+        // 12.0 评估脑接入统一 SkillCatalog
+        if let Some(ref mut eb) = eval_brain {
+            eb.set_skill_catalog(Arc::clone(&skill_catalog));
+            tracing::info!("评估脑已接入统一 SkillCatalog（{} 个技能）", skill_catalog.skills.len());
+        }
+
+        // 12.05 Bootstrap 技能注入到主脑
+        if !skill_catalog.bootstrap_skills.is_empty() {
+            if let Ok(mut v2_guard) = v2_brain.try_lock() {
+                if let Some(ref mut brain) = *v2_guard {
+                    for bs in &skill_catalog.bootstrap_skills {
+                        match skill_catalog.load_content(bs) {
+                            Ok(content) => {
+                                brain.inject_bootstrap(content);
+                                tracing::info!("Bootstrap 技能 '{}' 已注入主脑", bs.name);
+                            }
+                            Err(e) => {
+                                tracing::warn!("加载 bootstrap 技能 '{}' 失败: {e}", bs.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // 12.1 [Task 16] 旧守护线程已禁用（guardian.rs 已删除，由金字塔浓缩引擎替代）
         // {
@@ -1744,7 +1768,11 @@ fn create_v2_main_brain(
             return (
                 Arc::new(Mutex::new(None)),
                 None,
-                Arc::new(SkillCatalog { skills: vec![] }),
+                Arc::new(SkillCatalog {
+                    skills: vec![],
+                    packs: vec![],
+                    bootstrap_skills: vec![],
+                }),
                 Arc::new(McpClientPool::new()),
             );
         }
@@ -1787,7 +1815,11 @@ fn create_v2_main_brain(
 
     let skill_catalog = SkillCatalog::scan_all(&skill_roots).unwrap_or_else(|e| {
         tracing::warn!("扫描技能失败: {e}");
-        SkillCatalog { skills: vec![] }
+        SkillCatalog {
+            skills: vec![],
+            packs: vec![],
+            bootstrap_skills: vec![],
+        }
     });
     let skill_catalog = Arc::new(skill_catalog);
     tracing::info!("扫描到 {} 个技能", skill_catalog.skills.len());

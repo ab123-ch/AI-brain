@@ -395,6 +395,7 @@ dependencies = [
  "brain-core",
  "brain-hooks",
  "brain-llm",
+ "brain-memory",
  "chrono",
  "serde_json",
  "thiserror",
@@ -435,8 +436,10 @@ dependencies = [
 name = "brain-memory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "brain-bus",
  "brain-core",
+ "brain-llm",
  "chrono",
  "serde",
  "serde_json",
