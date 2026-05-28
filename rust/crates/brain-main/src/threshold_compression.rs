@@ -85,6 +85,109 @@ impl ThresholdCompressor {
         let split_point = messages.len().saturating_sub(preserve_count);
         (&messages[..split_point], &messages[split_point..])
     }
+
+    /// 构建决策链路保留 prompt
+    pub(crate) fn build_decision_chain_prompt(&self, messages: &[ConversationMessage]) -> String {
+        let weight_desc = match self.config.decision_chain_weight {
+            w if w >= 0.8 => "详细保留每一步决策过程和关键转折点",
+            w if w >= 0.5 => "保留主要决策节点和关键结论",
+            _ => "只保留最终决策和核心结论",
+        };
+
+        format!(
+            r#"你是一个对话历史压缩专家。请将以下对话历史压缩成一个结构化的决策链路摘要。
+
+## 压缩要求
+
+**保留重点**（决策链路保留强度：{weight}）：
+1. **用户目标** — 用户最初想要什么，需求是否有变化
+2. **用户反馈和指令** — ⭐ 重点保留
+   - 用户的纠正："这个不对，应该要 xxxxx"
+   - 用户的认可和改进建议："这个对了，但是可以 xxxx"
+   - 用户的新需求/指令："很好，继续下一个需求，需求：xxxx"
+   - 用户表达的偏好、标准、风格要求
+3. **执行步骤** — 按时间顺序，做了哪些关键操作
+4. **决策转折点** — 遇到了什么问题，如何调整方案的
+5. **最终结果** — 得到了什么结论，完成了什么
+6. **关键上下文** — 重要的文件路径、代码位置、配置信息
+
+**丢弃内容**：
+- 完整的代码输出、grep 结果、文件内容
+- 中间过程的详细日志
+- 重复的信息、确认性对话
+- 工具调用的原始返回（只保留从中得出的结论）
+
+## 输出格式
+
+请严格按照以下格式输出：
+
+```
+## 用户目标
+[一句话描述用户的核心需求]
+
+## 用户反馈和指令
+- [纠正] "这个不对，应该要 xxxxx"
+- [认可+改进] "这个对了，但是可以 xxxx"
+- [新需求] "继续下一个需求：xxxx"
+- [偏好/标准] "我喜欢 xxx 风格"、"要求 xxx 标准"
+
+## 执行过程
+1. [第一步操作] → [结果/发现]
+2. [第二步操作] → [结果/发现]
+3. ...（按时间顺序）
+
+## 关键决策
+- [遇到的问题] → [采取的解决方案] → [原因]
+
+## 最终结论
+[完成情况、核心成果、待办事项（如有）]
+
+## 关键上下文
+- 文件：[重要文件路径和修改内容]
+- 配置：[关键配置项]
+- 其他：[需要记住的重要信息]
+```
+
+## 对话历史
+
+{formatted_messages}
+
+## 开始压缩
+
+请提取决策链路，生成结构化摘要："#,
+            weight = weight_desc,
+            formatted_messages = self.format_messages_for_prompt(messages),
+        )
+    }
+
+    /// 格式化消息用于 prompt
+    pub(crate) fn format_messages_for_prompt(&self, messages: &[ConversationMessage]) -> String {
+        messages
+            .iter()
+            .enumerate()
+            .map(|(i, msg)| {
+                let role = match msg.role {
+                    brain_core::types::MessageRole::User => "用户",
+                    brain_core::types::MessageRole::Assistant => "助手",
+                    brain_core::types::MessageRole::Tool => "工具",
+                    _ => "系统",
+                };
+                let content = msg.text_content();
+                let content_str = if content.len() > 500 {
+                    format!(
+                        "{}...[中间省略 {} 字符]...{}",
+                        &content[..200],
+                        content.len() - 400,
+                        &content[content.len() - 200..]
+                    )
+                } else {
+                    content.to_string()
+                };
+                format!("【{}】{}\n{}", role, i + 1, content_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +252,39 @@ mod tests {
 
         assert_eq!(old.len(), 0);
         assert_eq!(recent.len(), 5);
+    }
+
+    #[test]
+    fn test_build_decision_chain_prompt() {
+        let config = ThresholdCompactionConfig {
+            decision_chain_weight: 0.8,
+            ..Default::default()
+        };
+        let compressor = ThresholdCompressor::new(config);
+
+        let messages = create_test_messages(5);
+        let prompt = compressor.build_decision_chain_prompt(&messages);
+
+        // 验证 prompt 包含关键元素
+        assert!(prompt.contains("决策链路"));
+        assert!(prompt.contains("用户目标"));
+        assert!(prompt.contains("用户反馈和指令"));
+        assert!(prompt.contains("执行过程"));
+        assert!(prompt.contains("关键决策"));
+        assert!(prompt.contains("最终结论"));
+    }
+
+    #[test]
+    fn test_format_messages_for_prompt() {
+        let config = ThresholdCompactionConfig::default();
+        let compressor = ThresholdCompressor::new(config);
+
+        let messages = create_test_messages(4);
+        let formatted = compressor.format_messages_for_prompt(&messages);
+
+        // 验证格式化结果
+        assert!(formatted.contains("【用户】"));
+        assert!(formatted.contains("【助手】"));
+        assert!(formatted.contains("---"));
     }
 }
