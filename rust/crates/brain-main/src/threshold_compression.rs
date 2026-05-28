@@ -3,8 +3,9 @@
 //! 当上下文使用率超过 80% 时，同步调用 LLM 进行智能压缩，
 //! 保留决策链路（用户目标→执行步骤→最终结果），替代粗暴截断。
 
+use std::time::Duration;
+
 use brain_core::types::ConversationMessage;
-#[allow(unused_imports)]
 use brain_llm::LlmProvider;
 
 /// 阈值压缩配置
@@ -188,11 +189,104 @@ impl ThresholdCompressor {
             .collect::<Vec<_>>()
             .join("\n---\n")
     }
+
+    /// 压缩上下文（带超时保护）
+    pub async fn compress_context(
+        &self,
+        messages: &[ConversationMessage],
+        llm: &dyn LlmProvider,
+    ) -> Result<CompressedContext, CompactionError> {
+        let start = std::time::Instant::now();
+
+        // 1. 校验消息数量
+        let min_messages = self.config.preserve_recent_turns * 2;
+        if messages.len() < min_messages {
+            return Err(CompactionError::InsufficientMessages);
+        }
+
+        // 2. 分割消息：旧消息 vs 最近 N 轮
+        let (old_messages, recent_messages) = self.split_messages(messages);
+
+        // 3. 构建决策链路保留 prompt
+        let prompt = self.build_decision_chain_prompt(old_messages);
+
+        // 4. 调用 LLM（带超时）
+        let request = brain_llm::ChatRequest {
+            model: None,
+            messages: vec![brain_llm::ChatMessage::user(prompt)],
+            max_tokens: Some(self.config.max_summary_tokens),
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            llm.complete(request),
+        )
+        .await
+        .map_err(|_| CompactionError::Timeout(self.config.timeout_ms))?
+        .map_err(|e| CompactionError::LlmError(e.to_string()))?;
+
+        let summary = response.text();
+
+        // 5. 构建结果
+        Ok(CompressedContext {
+            decision_summary: summary,
+            recent_messages: recent_messages.to_vec(),
+            metadata: CompressionMetadata {
+                original_count: messages.len(),
+                compressed_count: old_messages.len(),
+                preserved_count: recent_messages.len(),
+                duration_ms: start.elapsed().as_millis() as u64,
+            },
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+/// Mock LLM 客户端
+struct MockLlmProvider {
+    response: String,
+    should_fail: bool,
+}
+
+impl LlmProvider for MockLlmProvider {
+    fn model(&self) -> &str {
+        "mock-model"
+    }
+
+    fn complete(
+        &self,
+        _request: brain_llm::ChatRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = brain_llm::Result<brain_llm::ChatResponse>>
+                + Send
+                + '_,
+        >,
+    > {
+        let should_fail = self.should_fail;
+        let response = self.response.clone();
+        Box::pin(async move {
+            if should_fail {
+                Err(brain_llm::LlmError::RequestFailed(
+                    "Mock LLM error".to_string(),
+                ))
+            } else {
+                Ok(brain_llm::ChatResponse {
+                    content: vec![brain_llm::ContentBlock::text(response)],
+                    model: "mock-model".into(),
+                    usage: brain_llm::TokenUsage::default(),
+                    finish_reason: Some(brain_llm::FinishReason::EndTurn),
+                })
+            }
+        })
+    }
+}
 
     fn create_test_messages(count: usize) -> Vec<ConversationMessage> {
         (0..count)
@@ -286,5 +380,65 @@ mod tests {
         assert!(formatted.contains("【用户】"));
         assert!(formatted.contains("【助手】"));
         assert!(formatted.contains("---"));
+    }
+
+    #[tokio::test]
+    async fn test_compress_context_success() {
+        let config = ThresholdCompactionConfig::default();
+        let compressor = ThresholdCompressor::new(config);
+
+        let messages = create_test_messages(20);
+        let mock_llm = MockLlmProvider {
+            response: "## 用户目标\n测试压缩功能\n\n## 执行过程\n1. 创建测试消息".to_string(),
+            should_fail: false,
+        };
+
+        let result = compressor
+            .compress_context(&messages, &mock_llm)
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata.original_count, 20);
+        assert_eq!(result.metadata.preserved_count, 8); // preserve_recent_turns=4, *2
+        assert!(result.decision_summary.contains("用户目标"));
+    }
+
+    #[tokio::test]
+    async fn test_compress_context_insufficient_messages() {
+        let config = ThresholdCompactionConfig {
+            preserve_recent_turns: 4,
+            ..Default::default()
+        };
+        let compressor = ThresholdCompressor::new(config);
+
+        // 只有 5 条消息，不足 4*2=8
+        let messages = create_test_messages(5);
+        let mock_llm = MockLlmProvider {
+            response: "".to_string(),
+            should_fail: false,
+        };
+
+        let result = compressor.compress_context(&messages, &mock_llm).await;
+
+        assert!(matches!(
+            result,
+            Err(CompactionError::InsufficientMessages)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_compress_context_llm_failure() {
+        let config = ThresholdCompactionConfig::default();
+        let compressor = ThresholdCompressor::new(config);
+
+        let messages = create_test_messages(20);
+        let mock_llm = MockLlmProvider {
+            response: "".to_string(),
+            should_fail: true,
+        };
+
+        let result = compressor.compress_context(&messages, &mock_llm).await;
+
+        assert!(matches!(result, Err(CompactionError::LlmError(_))));
     }
 }
