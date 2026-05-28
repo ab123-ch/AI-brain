@@ -114,6 +114,11 @@ impl ConversationHistory {
         self.tracked_prompt_tokens
     }
 
+    /// 追加消息
+    pub fn push(&mut self, message: ConversationMessage) {
+        self.messages.push(message);
+    }
+
     /// 判断是否超过危险阈值（需要重建）
     pub fn is_context_full(&self, threshold: f64) -> bool {
         self.context_usage() >= threshold
@@ -198,6 +203,40 @@ impl ConversationHistory {
         }
 
         old_len - self.messages.len()
+    }
+
+    /// 从压缩结果重建上下文
+    ///
+    /// 清空现有消息，注入压缩摘要作为系统消息，然后追加最近的消息。
+    /// 用于 decision_chain_threshold 压缩后的上下文重建。
+    pub fn clear_and_rebuild_from_compressed(
+        &mut self,
+        summary: &str,
+        recent_messages: &[ConversationMessage],
+    ) {
+        // 1. 清空现有消息
+        self.messages.clear();
+
+        // 2. 添加压缩摘要作为系统消息
+        let summary_message = ConversationMessage {
+            role: MessageRole::System,
+            content: vec![brain_core::types::ContentBlock::text(format!(
+                r#"以下是之前对话的决策链路摘要：
+
+{summary}
+
+请基于这个摘要继续对话，不要重复已经完成的工作。"#,
+                summary = summary
+            ))],
+            timestamp: chrono::Utc::now(),
+        };
+        self.messages.push(summary_message);
+
+        // 3. 追加最近的消息
+        self.messages.extend(recent_messages.iter().cloned());
+
+        // 4. 重置 token 追踪
+        self.tracked_prompt_tokens = 0;
     }
 
     /// 转换为 LLM ChatMessage 格式
@@ -373,5 +412,45 @@ mod tests {
         assert_eq!(tool_uses.len(), 2);
         let texts: Vec<_> = chat[0].content.iter().filter_map(|b| b.as_text()).collect();
         assert_eq!(texts.len(), 2);
+    }
+
+    #[test]
+    fn test_clear_and_rebuild_from_compressed() {
+        let mut history = ConversationHistory::new(131072);
+
+        // 添加一些消息
+        for i in 0..10 {
+            history.push(if i % 2 == 0 {
+                ConversationMessage::user(format!("消息 {}", i))
+            } else {
+                ConversationMessage::assistant(format!("消息 {}", i))
+            });
+        }
+
+        assert_eq!(history.messages().len(), 10);
+
+        // 重建上下文
+        let summary = "## 用户目标\n测试重建\n\n## 最终结论\n测试完成";
+        let recent_messages = vec![
+            ConversationMessage::user("最近消息1"),
+            ConversationMessage::assistant("最近回复1"),
+        ];
+
+        history.clear_and_rebuild_from_compressed(summary, &recent_messages);
+
+        // 验证：应该有 3 条消息（摘要 + 2 条最近消息）
+        assert_eq!(history.messages().len(), 3);
+
+        // 验证：第一条是系统消息（摘要）
+        assert_eq!(history.messages()[0].role, MessageRole::System);
+        assert!(history.messages()[0].text_content().contains("决策链路摘要"));
+        assert!(history.messages()[0].text_content().contains("测试重建"));
+
+        // 验证：后面是最近的消息
+        assert_eq!(history.messages()[1].text_content(), "最近消息1");
+        assert_eq!(history.messages()[2].text_content(), "最近回复1");
+
+        // 验证：tracked_prompt_tokens 被重置
+        assert_eq!(history.tracked_prompt_tokens(), 0);
     }
 }
