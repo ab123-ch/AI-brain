@@ -1794,9 +1794,38 @@ impl App {
                 }
             }
             "create" => {
-                self.output.push_system("交互式创建暂未实现，请直接编辑:");
-                self.output.push_system("  ~/.ai-brain/personas/registry.json");
-                self.output.push_system("  然后重启生效");
+                // :persona create <id> <name> [description]
+                let id = args.get(1);
+                let name = args.get(2);
+                let desc = args.get(3).map(|s| s.as_str()).unwrap_or("自定义人格");
+
+                match (id, name) {
+                    (Some(id), Some(name)) => {
+                        let config = brain_memory::persona_types::PersonaConfig::default();
+                        match mem.persona_manager_mut().create(
+                            id.clone(),
+                            name.clone(),
+                            desc.to_string(),
+                            String::new(), // system_prompt 初始为空
+                            config,
+                        ) {
+                            Ok(persona) => {
+                                self.output.push_system(&format!(
+                                    "✅ 已创建人格: {} ({})",
+                                    persona.name, persona.id
+                                ));
+                                self.output.push_system("提示: 使用 `/memory manage` 可设置专属 system prompt");
+                            }
+                            Err(e) => {
+                                self.output.push_system(&format!("创建失败: {e}"));
+                            }
+                        }
+                    }
+                    _ => {
+                        self.output.push_system("用法: :persona create <id> <name> [description]");
+                        self.output.push_system("示例: :persona create writer 滚开作家 网文写作助手");
+                    }
+                }
             }
             other => {
                 self.output.push_system(&format!(
