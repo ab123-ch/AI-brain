@@ -1,5 +1,6 @@
 mod api_server;
 mod command;
+mod config_manager;
 mod init;
 mod llm_usage_logger;
 mod orchestrator;

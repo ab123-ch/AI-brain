@@ -683,6 +683,11 @@ impl Orchestrator {
         self.plugin_mgr.as_ref()
     }
 
+    /// 获取插件管理器（可变引用，用于 install/uninstall）
+    pub fn plugin_mgr_mut(&mut self) -> Option<&mut PluginManager> {
+        self.plugin_mgr.as_mut()
+    }
+
     /// 获取技能目录引用
     pub fn skill_catalog(&self) -> &SkillCatalog {
         &self.skill_catalog

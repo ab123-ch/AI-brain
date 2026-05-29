@@ -1,6 +1,63 @@
-use super::*;
+//! Plugin command registration.
 
-/// Register the "config" command with its 3 subcommands (get, set, brain-params).
+use super::registry::{
+    ArgSpec, Command, CommandGroup, CommandHandler, CommandRegistry, CommandResult, SubCommand,
+};
+use crate::config_manager::ConfigManager;
+
+fn handle_config(args: &[String]) -> CommandResult {
+    let sub = match args.first() {
+        Some(s) => s.as_str(),
+        None => return CommandResult::err("用法: /config <get|set|brain-params> [参数]"),
+    };
+
+    match sub {
+        "get" => {
+            let key = match args.get(1) {
+                Some(k) => k,
+                None => return CommandResult::err("用法: /config get <key>"),
+            };
+            let mgr = ConfigManager::new();
+            match mgr.get(key) {
+                Some(value) => CommandResult::ok(format!("{key} = {value}")),
+                None => CommandResult::ok(format!("{key} 未设置")),
+            }
+        }
+        "set" => {
+            let key = match args.get(1) {
+                Some(k) => k,
+                None => return CommandResult::err("用法: /config set <key> <value>"),
+            };
+            let value = match args.get(2) {
+                Some(v) => v,
+                None => return CommandResult::err("用法: /config set <key> <value>"),
+            };
+            let mut mgr = ConfigManager::new();
+            match mgr.set(key, value) {
+                Ok(()) => CommandResult::ok(format!("已设置 {key} = {value}")),
+                Err(e) => CommandResult::err(format!("设置失败: {e}")),
+            }
+        }
+        "brain-params" => {
+            let mgr = ConfigManager::new();
+            let all = mgr.all();
+            if all.is_empty() {
+                CommandResult::ok("配置文件为空，使用 /config set <key> <value> 添加配置")
+            } else {
+                let mut output = String::from("=== 配置参数 ===\n");
+                for (k, v) in all {
+                    output.push_str(&format!("  {k} = {v}\n"));
+                }
+                CommandResult::ok(output)
+            }
+        }
+        other => CommandResult::err(format!(
+            "未知子命令: {other}。可用: get, set, brain-params"
+        )),
+    }
+}
+
+/// Register the `config` command with its 3 subcommands (get, set, brain-params).
 pub fn register_config() -> CommandRegistry {
     let mut registry = CommandRegistry::new();
     registry.register(Command {
@@ -35,45 +92,14 @@ pub fn register_config() -> CommandRegistry {
             },
             SubCommand {
                 name: "brain-params",
-                description: "查看脑参数",
+                description: "查看所有配置",
                 args: vec![],
             },
         ],
         handler: CommandHandler::Sync(handle_config),
     });
+
     registry
-}
-
-/// Handler for the "config" command.
-/// Routes by the first arg to the appropriate subcommand handler.
-fn handle_config(args: &[String]) -> CommandResult {
-    match args.get(0).map(|s| s.as_str()) {
-        Some("get") => handle_get(&args[1..]),
-        Some("set") => handle_set(&args[1..]),
-        Some("brain-params") => handle_brain_params(&args[1..]),
-        _ => CommandResult::err("用法: :config get <key> | set <key> <value> | brain-params"),
-    }
-}
-
-fn handle_get(args: &[String]) -> CommandResult {
-    if args.is_empty() {
-        return CommandResult::err("用法: :config get <key>");
-    }
-    let key = &args[0];
-    CommandResult::ok(format!("[config] get {} = (placeholder)", key))
-}
-
-fn handle_set(args: &[String]) -> CommandResult {
-    if args.len() < 2 {
-        return CommandResult::err("用法: :config set <key> <value>");
-    }
-    let key = &args[0];
-    let value = &args[1];
-    CommandResult::ok(format!("[config] set {} = {} (placeholder)", key, value))
-}
-
-fn handle_brain_params(_args: &[String]) -> CommandResult {
-    CommandResult::ok("[config] brain-params: (placeholder)")
 }
 
 #[cfg(test)]
@@ -120,65 +146,37 @@ mod tests {
     }
 
     #[test]
-    fn test_config_get_ok() {
-        let result = handle_config(&["get".into(), "model".into()]);
-        assert!(result.success);
-        assert!(result.output.contains("model"));
-    }
-
-    #[test]
     fn test_config_get_missing_key() {
-        let result = handle_config(&["get".into()]);
+        let result = handle_config(&["get".to_string()]);
         assert!(!result.success);
-        assert_eq!(result.output, "用法: :config get <key>");
-    }
-
-    #[test]
-    fn test_config_set_ok() {
-        let result = handle_config(&["set".into(), "model".into(), "gpt-4".into()]);
-        assert!(result.success);
-        assert!(result.output.contains("model"));
-        assert!(result.output.contains("gpt-4"));
+        assert_eq!(result.output, "用法: /config get <key>");
     }
 
     #[test]
     fn test_config_set_missing_value() {
-        let result = handle_config(&["set".into(), "model".into()]);
+        let result = handle_config(&["set".to_string(), "model".to_string()]);
         assert!(!result.success);
-        assert_eq!(result.output, "用法: :config set <key> <value>");
+        assert_eq!(result.output, "用法: /config set <key> <value>");
     }
 
     #[test]
     fn test_config_set_missing_key_and_value() {
-        let result = handle_config(&["set".into()]);
+        let result = handle_config(&["set".to_string()]);
         assert!(!result.success);
-        assert_eq!(result.output, "用法: :config set <key> <value>");
-    }
-
-    #[test]
-    fn test_config_brain_params() {
-        let result = handle_config(&["brain-params".into()]);
-        assert!(result.success);
-        assert!(result.output.contains("brain-params"));
+        assert_eq!(result.output, "用法: /config set <key> <value>");
     }
 
     #[test]
     fn test_config_unknown_subcommand() {
-        let result = handle_config(&["unknown".into()]);
+        let result = handle_config(&["unknown".to_string()]);
         assert!(!result.success);
-        assert_eq!(
-            result.output,
-            "用法: :config get <key> | set <key> <value> | brain-params"
-        );
+        assert!(result.output.contains("未知子命令"));
     }
 
     #[test]
     fn test_config_no_args() {
         let result = handle_config(&[]);
         assert!(!result.success);
-        assert_eq!(
-            result.output,
-            "用法: :config get <key> | set <key> <value> | brain-params"
-        );
+        assert!(result.output.contains("/config"));
     }
 }

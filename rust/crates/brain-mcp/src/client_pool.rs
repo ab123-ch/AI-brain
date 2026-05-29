@@ -127,6 +127,19 @@ impl McpClientPool {
         let servers = self.servers.lock().await;
         servers.get(name).map(|s| s.status.clone())
     }
+
+    /// 重新连接指定的 MCP 服务器
+    pub async fn reconnect(&self, name: &str) -> Result<(), String> {
+        let mut servers = self.servers.lock().await;
+        let server = servers.get_mut(name).ok_or_else(|| {
+            format!("未找到 MCP 服务: {name}")
+        })?;
+
+        // 尝试重新连接（将状态重置为 Disconnected，等待下次调用时重连）
+        server.status = ServerStatus::Disconnected;
+        tracing::info!("MCP 服务 '{name}' 状态已重置为断开，下次使用时将自动重连");
+        Ok(())
+    }
 }
 
 /// 解析 MCP 工具名 "mcp__{server}__{tool}" → (server, tool)

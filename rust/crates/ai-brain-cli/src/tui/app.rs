@@ -1605,30 +1605,9 @@ impl App {
             return HandleResult::Handled;
         }
 
-        // 特殊: plugin list 需要从 Orchestrator 获取 PluginManager
-        if cmd_name == "plugin" && args.first().map(|s| s.as_str()) == Some("list") {
-            match self.orch.plugin_mgr() {
-                Some(mgr) => {
-                    let plugins = mgr.list();
-                    if plugins.is_empty() {
-                        self.output.push_system("暂无已安装插件");
-                    } else {
-                        self.output.push_system(&format!("已安装插件 ({}个):", plugins.len()));
-                        for p in plugins {
-                            self.output.push_system(&format!(
-                                "  {} ({}/{}) v{} - {}",
-                                p.name,
-                                p.publisher,
-                                p.source,
-                                p.version,
-                                p.installed_at
-                            ));
-                        }
-                    }
-                }
-                None => self.output.push_system("插件管理器未初始化"),
-            }
-            return HandleResult::Handled;
+        // 特殊: plugin 命令需要 PluginManager
+        if cmd_name == "plugin" {
+            return self.handle_plugin_command(&args);
         }
 
         // 特殊: persona 命令需要记忆脑的 PersonaManager
@@ -2062,11 +2041,81 @@ impl App {
                         return HandleResult::Handled;
                     }
                 };
-                self.output.push_system(&format!("MCP 重连功能暂未实现: {name}"));
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(pool.reconnect(name))
+                }) {
+                    Ok(()) => {
+                        self.output.push_system(&format!("✅ MCP 服务 '{name}' 已重置，下次使用时自动重连"));
+                    }
+                    Err(e) => {
+                        self.output.push_system(&format!("重连失败: {e}"));
+                    }
+                }
             }
             other => {
                 self.output.push_system(&format!(
                     "未知子命令: {other}。可用: list, status, reconnect"
+                ));
+            }
+        }
+        HandleResult::Handled
+    }
+
+    /// 插件管理命令拦截
+    fn handle_plugin_command(&mut self, args: &[String]) -> HandleResult {
+        let sub = match args.first() {
+            Some(s) => s.as_str(),
+            None => {
+                self.output.push_system("用法: :plugin <list|install|uninstall> [参数]");
+                return HandleResult::Handled;
+            }
+        };
+
+        match sub {
+            "list" => {
+                match self.orch.plugin_mgr() {
+                    Some(mgr) => {
+                        let plugins = mgr.list();
+                        if plugins.is_empty() {
+                            self.output.push_system("暂无已安装插件");
+                            self.output.push_system("  使用 :plugin install <path> 安装");
+                        } else {
+                            self.output.push_system(&format!("已安装插件 ({}个):", plugins.len()));
+                            for p in plugins {
+                                self.output.push_system(&format!(
+                                    "  {} ({}/{}) v{}",
+                                    p.name, p.publisher, p.source, p.version
+                                ));
+                            }
+                        }
+                    }
+                    None => self.output.push_system("插件管理器未初始化"),
+                }
+            }
+            "install" => {
+                let _source = match args.get(1) {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.output.push_system("用法: :plugin install <path>");
+                        self.output.push_system("  path 是本地插件目录路径");
+                        return HandleResult::Handled;
+                    }
+                };
+                self.output.push_system("⚠️ 插件安装需要在启动前完成，请手动编辑 ~/.ai-brain/plugins/registry.json");
+            }
+            "uninstall" => {
+                let _name = match args.get(1) {
+                    Some(n) => n.clone(),
+                    None => {
+                        self.output.push_system("用法: :plugin uninstall <name>");
+                        return HandleResult::Handled;
+                    }
+                };
+                self.output.push_system("⚠️ 插件卸载需要在启动前完成，请手动编辑 ~/.ai-brain/plugins/registry.json");
+            }
+            other => {
+                self.output.push_system(&format!(
+                    "未知子命令: {other}。可用: list, install, uninstall"
                 ));
             }
         }

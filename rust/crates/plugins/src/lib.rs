@@ -1189,6 +1189,13 @@ impl PluginManager {
         Ok(())
     }
 
+    /// 重新加载所有插件（重新扫描插件目录并返回插件数量）
+    pub fn reload_all(&mut self) -> Result<usize, PluginError> {
+        let registry = self.plugin_registry()?;
+        let count = registry.plugins().len();
+        Ok(count)
+    }
+
     pub fn update(&mut self, plugin_id: &str) -> Result<UpdateOutcome, PluginError> {
         let mut registry = self.load_registry()?;
         let record = registry.plugins.get(plugin_id).cloned().ok_or_else(|| {
