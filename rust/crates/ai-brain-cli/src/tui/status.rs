@@ -28,10 +28,6 @@ pub struct StatusBar {
     pub cumulative_completion_tokens: u64,
     /// 会话累计 cache read tokens
     pub cumulative_cache_read_tokens: u64,
-    /// 累计压缩次数
-    pub compaction_count: u32,
-    /// 累计节省的字符数
-    pub chars_saved_by_compaction: usize,
 }
 
 impl StatusBar {
@@ -45,8 +41,6 @@ impl StatusBar {
             cumulative_prompt_tokens: status.cumulative_prompt_tokens,
             cumulative_completion_tokens: status.cumulative_completion_tokens,
             cumulative_cache_read_tokens: status.cumulative_cache_read_tokens,
-            compaction_count: status.compaction_count,
-            chars_saved_by_compaction: status.chars_saved_by_compaction,
         }
     }
 
@@ -109,27 +103,14 @@ impl StatusBar {
             String::new()
         };
 
-        // 压缩信息
-        let compaction_str = if self.compaction_count > 0 {
-            let saved = short_chars(self.chars_saved_by_compaction);
-            format!("压缩:{}次({})", self.compaction_count, saved)
-        } else {
-            String::new()
-        };
-
         let text = format!(
-            " {} | 上下文 {}%{}{} | 第{}轮 | {}{} ",
+            " {} | 上下文 {}%{} | 第{}轮 | {}{} ",
             self.model,
             ctx_display,
             if tok_display.is_empty() {
                 String::new()
             } else {
                 format!(" | {tok_display}")
-            },
-            if compaction_str.is_empty() {
-                String::new()
-            } else {
-                format!(" | {compaction_str}")
             },
             self.round,
             eval_str,
@@ -155,17 +136,6 @@ fn short_tokens(tokens: u64) -> String {
         format!("{:.1}k", tokens as f64 / 1_000.0)
     } else {
         format!("{tokens}")
-    }
-}
-
-/// 字符数简写：>=1000 用 k，否则直接用数字
-fn short_chars(chars: usize) -> String {
-    if chars >= 1_000_000 {
-        format!("{:.1}M", chars as f64 / 1_000_000.0)
-    } else if chars >= 1_000 {
-        format!("{:.1}k", chars as f64 / 1_000.0)
-    } else {
-        format!("{chars}")
     }
 }
 

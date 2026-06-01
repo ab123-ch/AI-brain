@@ -1,8 +1,5 @@
 use brain_core::types::{BrainState, ConversationMessage, MessageRole};
 use brain_llm::{ChatMessage, MessageRole as LlmRole};
-use std::collections::HashMap;
-
-use crate::compact::CompactionResult;
 
 /// 对话历史管理
 ///
@@ -142,17 +139,6 @@ impl ConversationHistory {
         // 截断后重置 tracked_prompt_tokens，使用估算值
         self.tracked_prompt_tokens = 0;
         truncated
-    }
-
-    /// 应用已压缩的 pending 内容（替换 Tool 消息）
-    pub fn apply_pending_compaction(
-        &mut self,
-        pending: &HashMap<usize, String>,
-    ) -> CompactionResult {
-        let result = crate::compact::apply_pending(&mut self.messages, pending);
-        // 压缩后重新估算 tracked tokens
-        self.tracked_prompt_tokens = self.estimate_tokens() as u64;
-        result
     }
 
     /// 上下文重建 — 清空后注入记忆脑快照 + 最近 N 轮

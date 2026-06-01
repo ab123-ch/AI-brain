@@ -212,10 +212,6 @@ pub struct SystemStatus {
     pub cumulative_completion_tokens: u64,
     /// 会话累计 cache read tokens
     pub cumulative_cache_read_tokens: u64,
-    /// 累计压缩次数
-    pub compaction_count: u32,
-    /// 累计节省的字符数
-    pub chars_saved_by_compaction: usize,
 }
 
 impl Orchestrator {
@@ -705,14 +701,7 @@ impl Orchestrator {
 
     /// 系统状态结构体（TUI 用）
     pub fn status_structured(&self) -> SystemStatus {
-        let (
-            context_usage,
-            cumulative_prompt,
-            cumulative_completion,
-            cumulative_cache_read,
-            compaction_count,
-            chars_saved,
-        ) = self
+        let (context_usage, cumulative_prompt, cumulative_completion, cumulative_cache_read) = self
             .v2_brain
             .try_lock()
             .ok()
@@ -723,12 +712,10 @@ impl Orchestrator {
                         b.cumulative_prompt_tokens(),
                         b.cumulative_completion_tokens(),
                         b.cumulative_cache_read_tokens(),
-                        b.compaction_count(),
-                        b.chars_saved_by_compaction(),
                     )
                 })
             })
-            .unwrap_or((0.0, 0, 0, 0, 0, 0));
+            .unwrap_or((0.0, 0, 0, 0));
         SystemStatus {
             model: self.model_name.clone(),
             query_count: self.query_count.load(std::sync::atomic::Ordering::Relaxed),
@@ -737,8 +724,6 @@ impl Orchestrator {
             cumulative_prompt_tokens: cumulative_prompt,
             cumulative_completion_tokens: cumulative_completion,
             cumulative_cache_read_tokens: cumulative_cache_read,
-            compaction_count,
-            chars_saved_by_compaction: chars_saved,
         }
     }
 

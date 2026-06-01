@@ -1,13 +1,10 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use brain_core::config::BrainConfig;
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{MainBrainOutput, ProgressEvent, TurnRecord, TurnRole, TurnUsage};
 use brain_llm::{ChatMessage, LlmProvider, ToolDefinition};
-use tokio::sync::Mutex;
 
-use crate::compact::{self, CompactionConfig};
 use crate::conversation::ConversationHistory;
 use crate::error::{MainBrainError, Result};
 use crate::prompts;
@@ -43,18 +40,6 @@ pub struct MainBrain {
     session_completion_tokens: u64,
     /// 会话级 cache read tokens 累计
     session_cache_read_tokens: u64,
-    /// 后台压缩结果（消息索引 → 压缩后内容）
-    pending_compressions: Arc<Mutex<HashMap<usize, String>>>,
-    /// 已压缩的消息索引集合
-    compressed_indices: Arc<Mutex<HashSet<usize>>>,
-    /// 是否已触发过压缩
-    compaction_triggered: bool,
-    /// 压缩配置
-    compaction_config: CompactionConfig,
-    /// 累计压缩次数
-    compaction_count: u32,
-    /// 累计节省的字符数
-    chars_saved_by_compaction: usize,
     /// 阈值压缩器
     threshold_compressor: ThresholdCompressor,
 }
@@ -89,12 +74,6 @@ impl MainBrain {
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
             session_cache_read_tokens: 0,
-            pending_compressions: Arc::new(Mutex::new(HashMap::new())),
-            compressed_indices: Arc::new(Mutex::new(HashSet::new())),
-            compaction_triggered: false,
-            compaction_config: CompactionConfig::default(),
-            compaction_count: 0,
-            chars_saved_by_compaction: 0,
             threshold_compressor,
         }
     }
@@ -112,12 +91,11 @@ impl MainBrain {
     ///
     /// 流程：
     /// 1. 立即保存用户消息到历史（防止取消时丢失上下文）
-    /// 2. 应用后台预压缩结果（零阻塞）
-    /// 3. 检查上下文使用率 — 超危险阈值截断
-    /// 4. 构建 messages（system_prompt + 历史）
-    /// 5. 跑 tool_loop
-    /// 6. 成功后写入 LLM 响应和工具调用到历史
-    /// 7. 更新 session token 追踪 + 触发后台预压缩
+    /// 2. 检查上下文使用率 — 超危险阈值智能压缩
+    /// 3. 构建 messages（system_prompt + 历史）
+    /// 4. 跑 tool_loop
+    /// 5. 成功后写入 LLM 响应和工具调用到历史
+    /// 6. 更新 session token 追踪
     pub async fn process_input(
         &mut self,
         input: &str,
@@ -129,26 +107,7 @@ impl MainBrain {
         // ── 0. 立即保存用户消息（防止取消时上下文丢失）──
         self.history.push_user(input);
 
-        // ── 1. 应用后台预压缩结果（零阻塞内存操作）──
-        let pending = {
-            let mut p = self.pending_compressions.lock().await;
-            std::mem::take(&mut *p)
-        };
-        if !pending.is_empty() {
-            let mut indices = self.compressed_indices.lock().await;
-            indices.extend(pending.keys().copied());
-            let result = self.history.apply_pending_compaction(&pending);
-            // 更新压缩统计
-            self.compaction_count += result.compacted_groups as u32;
-            self.chars_saved_by_compaction += result.chars_saved;
-            tracing::info!(
-                "应用后台压缩: {} 条消息, 节省 {} 字符",
-                result.compacted_groups,
-                result.chars_saved
-            );
-        }
-
-        // ── 2. 检查上下文使用率 ──
+        // ── 1. 检查上下文使用率 ──
         let thresholds = &self.config.brain.thresholds;
 
         // 超过危险阈值：智能压缩（替代粗暴截断）
@@ -202,68 +161,150 @@ impl MainBrain {
                 .await;
         }
 
-        // ── 4. 跑 tool_loop ──
-        let loop_result = match tool_loop::run_tool_loop_with_config(
-            self.llm.as_ref(),
-            self.tool_executor.as_ref(),
-            &mut messages,
-            &self.tools,
-            progress_tx,
-            None,
-            self.llm_max_tokens,
-            self.llm_temperature,
-            cancel,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // 失败时：用户消息已保存，继续写入已执行的部分和错误信息
-                // 将 tool_loop 中已执行的部分（assistant 中间回复 + tool 结果）写入
-                let old_len = self.history.len() - 1;
-                let skip = 1 + old_len + 1;
-                for msg in messages.iter().skip(skip) {
-                    if msg.role == brain_llm::MessageRole::System {
+        // ── 4. 跑 tool_loop（支持上下文溢出时压缩 + 重入）──
+        let mut loop_result;
+        let mut messages = messages;
+        let mut overflow_count = 0u32;
+
+        loop {
+            let result = tool_loop::run_tool_loop_with_config(
+                self.llm.as_ref(),
+                self.tool_executor.as_ref(),
+                &mut messages,
+                &self.tools,
+                progress_tx,
+                None,
+                self.llm_max_tokens,
+                self.llm_temperature,
+                cancel.clone(),
+            )
+            .await;
+
+            match result {
+                Ok(r) => {
+                    if r.context_overflow && overflow_count < 2 {
+                        overflow_count += 1;
+                        // 上下文溢出：同步 messages → history → 压缩 → 重建 messages → 重入
+                        tracing::warn!(
+                            "tool_loop 因上下文溢出中断（第{overflow_count}次），执行压缩后重入"
+                        );
+
+                        // 1) 同步 messages 回 history
+                        let old_history_len = self.history.len() - 1;
+                        let skip = 1 + old_history_len + 1;
+                        for msg in messages.iter().skip(skip) {
+                            if msg.role == brain_llm::MessageRole::System {
+                                continue;
+                            }
+                            match msg.role {
+                                brain_llm::MessageRole::Assistant => {
+                                    let has_tool_use = msg.content.iter().any(|b| b.is_tool_use());
+                                    if has_tool_use {
+                                        self.history
+                                            .push_assistant_blocks(msg.content.clone());
+                                    } else {
+                                        let text = msg.text_content();
+                                        if !text.is_empty() {
+                                            self.history.push_assistant(&text);
+                                        }
+                                    }
+                                }
+                                brain_llm::MessageRole::User => {
+                                    for block in &msg.content {
+                                        if let brain_llm::ContentBlock::ToolResult {
+                                            tool_use_id,
+                                            content,
+                                            is_error,
+                                        } = block
+                                        {
+                                            self.history.push_tool_result(
+                                                tool_use_id.clone(),
+                                                content.clone(),
+                                                *is_error,
+                                            );
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // 2) 执行整体压缩（阈值压缩）
+                        match self
+                            .threshold_compressor
+                            .compress_context(self.history.messages(), self.llm.as_ref())
+                            .await
+                        {
+                            Ok(compressed) => {
+                                self.history.clear_and_rebuild_from_compressed(
+                                    &compressed.decision_summary,
+                                    &compressed.recent_messages,
+                                );
+                                tracing::info!(
+                                    "溢出压缩完成：压缩 {} 条 → 保留 {} 条，耗时 {}ms",
+                                    compressed.metadata.compressed_count,
+                                    compressed.metadata.preserved_count,
+                                    compressed.metadata.duration_ms,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!("溢出压缩失败: {e}，改用粗暴截断");
+                                self.history.truncate_to_recent(20);
+                            }
+                        }
+
+                        // 3) 重建 messages 并重入 tool_loop
+                        messages = self.build_messages();
                         continue;
                     }
-                    match msg.role {
-                        brain_llm::MessageRole::Assistant => {
-                            let has_tool_use = msg.content.iter().any(|b| b.is_tool_use());
-                            if has_tool_use {
-                                // Assistant message with tool calls → save entire blocks
-                                self.history.push_assistant_blocks(msg.content.clone());
-                            } else {
-                                // Pure text response → simplified storage
-                                let text = msg.text_content();
-                                if !text.is_empty() {
-                                    self.history.push_assistant(&text);
-                                }
-                            }
-                        }
-                        brain_llm::MessageRole::User => {
-                            for block in &msg.content {
-                                if let brain_llm::ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                } = block
-                                {
-                                    self.history.push_tool_result(
-                                        tool_use_id.clone(),
-                                        content.clone(),
-                                        *is_error,
-                                    );
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                    loop_result = r;
+                    break;
                 }
-                // 写入错误信息作为 assistant 消息
-                self.history.push_assistant(&format!("[系统错误] {e}"));
-                return Err(e);
+                Err(e) => {
+                    // 失败时：用户消息已保存，继续写入已执行的部分和错误信息
+                    let old_len = self.history.len() - 1;
+                    let skip = 1 + old_len + 1;
+                    for msg in messages.iter().skip(skip) {
+                        if msg.role == brain_llm::MessageRole::System {
+                            continue;
+                        }
+                        match msg.role {
+                            brain_llm::MessageRole::Assistant => {
+                                let has_tool_use = msg.content.iter().any(|b| b.is_tool_use());
+                                if has_tool_use {
+                                    self.history.push_assistant_blocks(msg.content.clone());
+                                } else {
+                                    let text = msg.text_content();
+                                    if !text.is_empty() {
+                                        self.history.push_assistant(&text);
+                                    }
+                                }
+                            }
+                            brain_llm::MessageRole::User => {
+                                for block in &msg.content {
+                                    if let brain_llm::ContentBlock::ToolResult {
+                                        tool_use_id,
+                                        content,
+                                        is_error,
+                                    } = block
+                                    {
+                                        self.history.push_tool_result(
+                                            tool_use_id.clone(),
+                                            content.clone(),
+                                            *is_error,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // 写入错误信息作为 assistant 消息
+                    self.history.push_assistant(&format!("[系统错误] {e}"));
+                    return Err(e);
+                }
             }
-        };
+        }
 
         let answer = loop_result.response.text();
         // 使用 usage_records 中的修正后 usage（如果 API 不返回则使用估算值）
@@ -336,63 +377,6 @@ impl MainBrain {
         // 使用最后一次 LLM 调用的 prompt_tokens 计算上下文使用率
         // （不能用 total_prompt_tokens，那是所有工具调用轮次的累加，会远大于实际上下文窗口）
         self.history.set_tracked_tokens(last_prompt_tokens);
-
-        // ── 6. 后台预压缩：滑动窗口 ──
-        let turn_tool_chars = compact::last_turn_tool_chars(self.history.messages());
-        if turn_tool_chars > self.compaction_config.tool_result_compress_threshold {
-            self.compaction_triggered = true;
-        }
-
-        // 基于上下文占用率触发压缩：超过 60% 时开始压缩
-        let context_usage_ratio = self.history.context_usage();
-        if context_usage_ratio > 0.6 {
-            self.compaction_triggered = true;
-            tracing::info!(
-                "上下文占用 {:.0}%，触发压缩机制",
-                context_usage_ratio * 100.0
-            );
-        }
-
-        if self.compaction_triggered {
-            let indices_guard = self.compressed_indices.lock().await;
-            if let Some((start_idx, end_idx)) = compact::find_slide_out_turn(
-                self.history.messages(),
-                &indices_guard,
-                &self.compaction_config,
-            ) {
-                drop(indices_guard);
-
-                let pending = self.pending_compressions.clone();
-                let compressed_idx = self.compressed_indices.clone();
-                let messages_snapshot: Vec<_> =
-                    self.history.messages()[start_idx..end_idx].to_vec();
-                let llm = self.llm.clone();
-                let compact_max_tokens = self.compaction_config.max_tokens;
-
-                tokio::spawn(async move {
-                    let compressed = compact::compress_single_turn(
-                        &messages_snapshot,
-                        0,
-                        messages_snapshot.len(),
-                        llm.as_ref(),
-                        compact_max_tokens,
-                    )
-                    .await;
-                    if !compressed.is_empty() {
-                        // key 加上 start_idx 偏移
-                        let offset_map: HashMap<usize, String> = compressed
-                            .into_iter()
-                            .map(|(k, v)| (k + start_idx, v))
-                            .collect();
-                        let keys: Vec<usize> = offset_map.keys().copied().collect();
-                        let mut p = pending.lock().await;
-                        p.extend(offset_map);
-                        let mut idx = compressed_idx.lock().await;
-                        idx.extend(keys);
-                    }
-                });
-            }
-        }
 
         let elapsed = start.elapsed();
 
@@ -588,16 +572,6 @@ impl MainBrain {
     /// 会话累计 cache read tokens
     pub fn cumulative_cache_read_tokens(&self) -> u64 {
         self.session_cache_read_tokens
-    }
-
-    /// 累计压缩次数
-    pub fn compaction_count(&self) -> u32 {
-        self.compaction_count
-    }
-
-    /// 累计节省的字符数
-    pub fn chars_saved_by_compaction(&self) -> usize {
-        self.chars_saved_by_compaction
     }
 
     /// 构建完整 messages = system_prompt + 环境信息 + 记忆上下文 + 历史

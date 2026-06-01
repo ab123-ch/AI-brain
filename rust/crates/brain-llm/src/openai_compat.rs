@@ -20,6 +20,37 @@ fn truncate_chars(s: &str, max: usize) -> &str {
 // OpenAI-compatible API Client
 // ---------------------------------------------------------------------------
 
+/// 重试配置
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// 最大重试次数（不含首次请求）
+    pub max_retries: u32,
+    /// 初始退避时间
+    pub initial_backoff: std::time::Duration,
+    /// 最大退避时间
+    pub max_backoff: std::time::Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            initial_backoff: std::time::Duration::from_secs(1),
+            max_backoff: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+impl RetryConfig {
+    /// 计算第 N 次重试的退避时间（指数退避，带上限）
+    pub fn backoff_for_attempt(&self, attempt: u32) -> std::time::Duration {
+        let multiplier = 1u32.checked_shl(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+        self.initial_backoff
+            .checked_mul(multiplier)
+            .map_or(self.max_backoff, |delay| delay.min(self.max_backoff))
+    }
+}
+
 pub struct OpenAiCompatClient {
     api_base: String,
     api_key: String,
@@ -27,6 +58,7 @@ pub struct OpenAiCompatClient {
     max_tokens: u32,
     temperature: f64,
     client: reqwest::Client,
+    retry_config: RetryConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,10 +159,17 @@ impl OpenAiCompatClient {
             temperature,
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(180))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            retry_config: RetryConfig::default(),
         }
+    }
+
+    /// 设置重试配置
+    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+        self.retry_config = config;
+        self
     }
 
     fn chat_url(&self) -> String {
@@ -488,6 +527,7 @@ impl LlmProvider for OpenAiCompatClient {
         let url = self.chat_url();
         let api_key = self.api_key.clone();
         let fallback_model = self.model.clone();
+        let retry_config = self.retry_config.clone();
 
         // === DEBUG: 将完整请求体写入文件，用于排查 ===
         if let Ok(serialized) = serde_json::to_string(&api_request) {
@@ -502,81 +542,119 @@ impl LlmProvider for OpenAiCompatClient {
         }
 
         Box::pin(async move {
-            tracing::info!("LLM 请求发送开始: url={url}");
-            let response = self
-                .client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&api_request)
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::error!("LLM 请求发送失败: url={url}, error={e}");
-                    LlmError::RequestFailed(format!("HTTP request failed: {e}"))
-                })?;
-            tracing::info!("LLM 请求发送成功: status={}", response.status());
+            let mut attempts = 0u32;
+            let max_attempts = retry_config.max_retries + 1;
 
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                tracing::warn!(
-                    "LLM API 非成功响应: status={}, body={}",
-                    status,
-                    truncate_chars(&body, 500)
-                );
-                return Err(LlmError::ApiError {
-                    status: status.as_u16(),
-                    message: body,
-                });
+            loop {
+                attempts += 1;
+                tracing::info!("LLM 请求发送开始: url={url}, 第{attempts}次尝试");
+
+                let result = self
+                    .client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .json(&api_request)
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(response) => {
+                        let status = response.status();
+                        tracing::info!("LLM 请求发送成功: status={status}");
+
+                        if !status.is_success() {
+                            let body = response.text().await.unwrap_or_default();
+                            let error = LlmError::ApiError {
+                                status: status.as_u16(),
+                                message: body,
+                            };
+
+                            if error.is_retryable() && attempts < max_attempts {
+                                let backoff = retry_config.backoff_for_attempt(attempts);
+                                tracing::warn!(
+                                    "LLM 返回可重试错误: status={status}, 第{attempts}次尝试, \
+                                     {backoff:?}后重试"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                continue;
+                            }
+                            tracing::error!(
+                                "LLM API 非成功响应: status={status}, body={}",
+                                truncate_chars(&error.to_string(), 500)
+                            );
+                            return Err(error);
+                        }
+
+                        // 记录原始响应体
+                        let raw_body = response.text().await.map_err(|e| {
+                            LlmError::RequestFailed(format!("Failed to read response body: {e}"))
+                        })?;
+                        tracing::debug!(
+                            "LLM API 原始响应 ({}字节): {}",
+                            raw_body.len(),
+                            truncate_chars(&raw_body, 2000)
+                        );
+
+                        let api_resp: ApiChatResponse =
+                            serde_json::from_str(&raw_body).map_err(|e| {
+                                tracing::error!(
+                                    "LLM API 响应 JSON 解析失败: {e}, 原始内容: {}",
+                                    truncate_chars(&raw_body, 500)
+                                );
+                                LlmError::RequestFailed(format!("Failed to parse response: {e}"))
+                            })?;
+
+                        let parsed = Self::parse_response(api_resp, fallback_model.clone());
+
+                        // 检测异常：空内容 + 非工具调用
+                        let has_text = parsed
+                            .content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::Text { .. }));
+                        let has_tool = parsed
+                            .content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                        if !has_text && !has_tool {
+                            tracing::warn!(
+                                "LLM 返回空响应（无文本无工具调用）: finish_reason={:?}, model={}",
+                                parsed.finish_reason,
+                                parsed.model
+                            );
+                        }
+
+                        if matches!(parsed.finish_reason, Some(FinishReason::MaxTokens)) {
+                            tracing::warn!(
+                                "LLM 达到 max_tokens 限制（输出被截断）: \
+                                 prompt_tokens={}, completion_tokens={}, model={}",
+                                parsed.usage.prompt_tokens,
+                                parsed.usage.completion_tokens,
+                                parsed.model
+                            );
+                        }
+
+                        return Ok(parsed);
+                    }
+                    Err(e) => {
+                        let error =
+                            LlmError::RequestFailed(format!("HTTP request failed: {e}"));
+
+                        if error.is_retryable() && attempts < max_attempts {
+                            let backoff = retry_config.backoff_for_attempt(attempts);
+                            tracing::warn!(
+                                "LLM 请求发送失败（可重试）: 第{attempts}次尝试, \
+                                 error={e}, {backoff:?}后重试"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+
+                        tracing::error!("LLM 请求发送失败: url={url}, error={e}");
+                        return Err(error);
+                    }
+                }
             }
-
-            // 记录原始响应体（用于排查空响应、异常格式等问题）
-            let raw_body = response.text().await.map_err(|e| {
-                LlmError::RequestFailed(format!("Failed to read response body: {e}"))
-            })?;
-            tracing::debug!(
-                "LLM API 原始响应 ({}字节): {}",
-                raw_body.len(),
-                truncate_chars(&raw_body, 2000)
-            );
-
-            let api_resp: ApiChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
-                tracing::error!(
-                    "LLM API 响应 JSON 解析失败: {e}, 原始内容: {}",
-                    truncate_chars(&raw_body, 500)
-                );
-                LlmError::RequestFailed(format!("Failed to parse response: {e}"))
-            })?;
-
-            let parsed = Self::parse_response(api_resp, fallback_model);
-
-            // 检测异常：空内容 + 非工具调用
-            let has_text = parsed
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text { .. }));
-            let has_tool = parsed
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-            if !has_text && !has_tool {
-                tracing::warn!(
-                    "LLM 返回空响应（无文本无工具调用）: finish_reason={:?}, model={}",
-                    parsed.finish_reason,
-                    parsed.model
-                );
-            }
-            if matches!(parsed.finish_reason, Some(FinishReason::MaxTokens)) {
-                tracing::warn!(
-                    "LLM 达到 max_tokens 限制（输出被截断）: prompt_tokens={}, completion_tokens={}, model={}",
-                    parsed.usage.prompt_tokens,
-                    parsed.usage.completion_tokens,
-                    parsed.model
-                );
-            }
-
-            Ok(parsed)
         })
     }
 

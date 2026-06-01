@@ -87,6 +87,8 @@ pub(crate) struct ToolLoopResult {
     pub(crate) last_prompt_tokens: u64,
     /// 每次 LLM 调用的详细 usage 信息
     pub(crate) usage_records: Vec<brain_llm::types::TokenUsage>,
+    /// 上下文溢出标记：tool_loop 因上下文过大而中断，调用方应压缩后重入
+    pub(crate) context_overflow: bool,
 }
 
 /// 运行 tool_loop — LLM ↔ 工具 循环直到 LLM 不再调用工具（默认参数的便捷入口）
@@ -153,6 +155,7 @@ pub async fn run_tool_loop_with_config(
                         total_prompt_tokens,
                         last_prompt_tokens,
                         usage_records,
+                        context_overflow: false,
                     });
                 }
                 // 还没有任何 LLM 响应，返回错误
@@ -216,7 +219,8 @@ pub async fn run_tool_loop_with_config(
         }
 
         // === 调用 LLM（带超时保护，防止 API 无响应永久挂起） ===
-        let llm_timeout = Duration::from_secs(180);
+        // 重试已在 brain-llm 的 complete() 内部实现（指数退避），此处超时为兜底保护
+        let llm_timeout = Duration::from_secs(360);
         let response = match tokio::time::timeout(llm_timeout, llm.complete(request)).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
@@ -225,9 +229,9 @@ pub async fn run_tool_loop_with_config(
                 return Err(MainBrainError::LlmError(err_msg));
             }
             Err(_) => {
-                tracing::error!("=== LLM 调用超时 [第{llm_calls}次] === 等待超过180秒");
+                tracing::error!("=== LLM 调用超时 [第{llm_calls}次] === 等待超过360秒（含重试）");
                 return Err(MainBrainError::LlmError(
-                    "LLM 请求超时（180秒），请检查网络连接或模型服务状态".into(),
+                    "LLM 请求超时（360秒，含重试），请检查网络连接或模型服务状态".into(),
                 ));
             }
         };
@@ -377,6 +381,7 @@ pub async fn run_tool_loop_with_config(
                 total_prompt_tokens,
                 last_prompt_tokens,
                 usage_records,
+                context_overflow: false,
             });
         }
 
@@ -401,6 +406,89 @@ pub async fn run_tool_loop_with_config(
             &mut turns,
         )
         .await;
+
+        // === 上下文溢出检测：每次 LLM 返回后检查 ===
+        let health = check_context_health(messages);
+        match health {
+            ContextHealth::DangerFull => {
+                // 超过 80%：中断 tool_loop，让 main_brain 执行整体压缩后重入
+                tracing::warn!(
+                    "⚠ 上下文溢出检测 [第{llm_calls}次] 超过80%阈值，中断 tool_loop 等待压缩"
+                );
+                return Ok(ToolLoopResult {
+                    response: last_response.clone().unwrap_or(response),
+                    llm_calls,
+                    turns,
+                    total_prompt_tokens,
+                    last_prompt_tokens,
+                    usage_records,
+                    context_overflow: true,
+                });
+            }
+            ContextHealth::WarningToolResults => {
+                // 超过 60%：记录警告，tool_loop 结束后 main_brain 会触发后台工具结果压缩
+                tracing::info!(
+                    "上下文使用率超过60% [第{llm_calls}次]，待 tool_loop 结束后触发工具结果压缩"
+                );
+            }
+            ContextHealth::Healthy => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 上下文健康检测（公共函数）
+// ---------------------------------------------------------------------------
+
+/// 上下文窗口 token 上限（与 ConversationHistory 的 max_context_tokens 对齐）
+const CONTEXT_MAX_TOKENS: usize = 131_072;
+
+/// 上下文健康状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextHealth {
+    /// 正常（< 60%）
+    Healthy,
+    /// 超过 60%，建议压缩工具结果
+    WarningToolResults,
+    /// 超过 80%，需要整体压缩
+    DangerFull,
+}
+
+/// 公共上下文健康检测函数
+///
+/// 每次 LLM 返回响应后调用，估算当前 messages 的 token 使用率，
+/// 返回应采取的行动建议。
+///
+/// 这个函数可以被任何使用 LLM 的地方调用，不限于 tool_loop。
+pub fn check_context_health(messages: &[ChatMessage]) -> ContextHealth {
+    let estimated_tokens: usize = messages
+        .iter()
+        .map(|m| {
+            let chars = m.text_content().chars().count();
+            // 中文友好估算：每字符约 0.75 token
+            chars * 3 / 4
+        })
+        .sum();
+
+    #[allow(clippy::cast_precision_loss)]
+    let usage_ratio = estimated_tokens as f64 / CONTEXT_MAX_TOKENS as f64;
+
+    if usage_ratio >= 0.80 {
+        tracing::warn!(
+            "上下文健康检测: 估算 {} tokens, 使用率 {:.0}%, 状态=DangerFull",
+            estimated_tokens,
+            usage_ratio * 100.0
+        );
+        ContextHealth::DangerFull
+    } else if usage_ratio >= 0.60 {
+        tracing::info!(
+            "上下文健康检测: 估算 {} tokens, 使用率 {:.0}%, 状态=WarningToolResults",
+            estimated_tokens,
+            usage_ratio * 100.0
+        );
+        ContextHealth::WarningToolResults
+    } else {
+        ContextHealth::Healthy
     }
 }
 
