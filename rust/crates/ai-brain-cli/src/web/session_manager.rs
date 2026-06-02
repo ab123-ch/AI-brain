@@ -141,30 +141,27 @@ impl SessionManager {
             content: content.to_string(),
             timestamp: Utc::now(),
         };
-        {
-            let session = self.sessions.get_mut(&self.active_id).unwrap();
-            session.messages.push(msg);
-            Self::persist_to_disk(&self.persist_dir, session);
-        }
+
+        let session = self.sessions.get_mut(&self.active_id).unwrap();
+        session.messages.push(msg);
 
         // 若是第一条用户消息且标题是默认的，自动更新标题
-        {
-            let session = self.sessions.get_mut(&self.active_id).unwrap();
-            if session.title == "New Session" && !session.messages.is_empty() {
-                // 取第一条用户消息的前 30 个字符作为标题
-                if let Some(first_user) = session.messages.iter().find(|m| m.role == "user") {
-                    let new_title: String = first_user.content.chars().take(30).collect();
-                    let new_title = if first_user.content.chars().count() > 30 {
-                        format!("{}...", new_title)
-                    } else {
-                        new_title
-                    };
-                    if !new_title.is_empty() {
-                        session.title = new_title;
-                        Self::persist_to_disk(&self.persist_dir, session);
-                    }
+        if session.title == "New Session" {
+            if let Some(first_user) = session.messages.iter().find(|m| m.role == "user") {
+                let truncated: String = first_user.content.chars().take(30).collect();
+                if first_user.content.chars().count() > 30 {
+                    session.title = format!("{truncated}...");
+                } else {
+                    session.title = truncated;
                 }
             }
+        }
+
+        // 持久化（clone 出 session 的关键数据，避免借用冲突）
+        let id = self.active_id.clone();
+        let dir = self.persist_dir.clone();
+        if let Some(s) = self.sessions.get(&id) {
+            Self::persist_to_disk(&dir, s);
         }
     }
 
