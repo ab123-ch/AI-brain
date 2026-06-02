@@ -46,6 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 thiserror = "2"
 brain-plugin = { path = "../brain-plugin" }
 brain-mcp = { path = "../brain-mcp" }
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true
