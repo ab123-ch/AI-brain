@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智脑 AI</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header id="header">
+        <div class="header-left">
+            <button id="sidebar-toggle" class="icon-btn mobile-only">&#9776;</button>
+            <h1>&#129504; 智脑</h1>
+        </div>
+        <div class="header-center">
+            <select id="persona-select"><option>加载中...</option></select>
+        </div>
+        <div class="header-right">
+            <button id="thinking-toggle" class="icon-btn" title="切换思考内容">&#128173;</button>
+            <button id="new-session-btn" class="icon-btn" title="新建会话">+</button>
+        </div>
+    </header>
+    <div id="main">
+        <aside id="sidebar">
+            <div id="session-list"></div>
+        </aside>
+        <main id="chat-area">
+            <div id="messages"></div>
+            <div id="input-area">
+                <textarea id="input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
+                <button id="send-btn">&#10148;</button>
+            </div>
+        </main>
+    </div>
+    <div id="ask-modal" class="modal hidden">
+        <div class="modal-content">
+            <p id="ask-question"></p>
+            <div id="ask-options"></div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+    <script src="/app.js"></script>
+</body>
+</html>

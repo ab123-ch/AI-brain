@@ -44,6 +44,11 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:3141")]
         addr: String,
     },
+    /// 启动 Web UI
+    Web {
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        addr: String,
+    },
     /// v2 路径集成测试（3 轮对话，验证 eval_gate + 评估脑）
     V2Test,
     /// 导出完整 system prompt 到桌面文件（调试用）
@@ -168,6 +173,10 @@ async fn run_command(cli: Cli) {
         Some(Commands::Serve { addr }) => {
             let orch = init_or_die().await;
             api_server::serve(orch, addr).await;
+        }
+        Some(Commands::Web { addr }) => {
+            let orch = init_or_die().await;
+            api_server::serve_web(orch, &addr).await;
         }
         Some(Commands::Brain { action }) => {
             let orch = init_or_die().await;

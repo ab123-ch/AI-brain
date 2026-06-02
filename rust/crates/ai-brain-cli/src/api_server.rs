@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::orchestrator::Orchestrator;
+use crate::web::session_manager::SessionManager;
+use crate::web::ws_handler::{ws_upgrade, AppState};
+
+// ─── 内嵌静态文件 ─────────────────────────────────────────────────
+static INDEX_HTML: &str = include_str!("web/static/index.html");
+static STYLE_CSS: &str = include_str!("web/static/style.css");
+static APP_JS: &str = include_str!("web/static/app.js");
 
 // ─── 请求/响应类型 ───────────────────────────────────────────────
 
@@ -337,4 +344,61 @@ async fn handle_suggest(State(orch): State<SharedOrch>) -> impl IntoResponse {
             })
             .collect(),
     })
+}
+
+// ─── Web UI 服务 ──────────────────────────────────────────────────
+
+/// 启动 Web UI 服务（静态文件 + WebSocket）
+pub async fn serve_web(orch: Orchestrator, addr: &str) {
+    let base_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("ai-brain");
+    let sessions = Arc::new(Mutex::new(SessionManager::new(&base_dir)));
+    let state = Arc::new(AppState {
+        orch: Arc::new(orch),
+        sessions,
+    });
+
+    let app = Router::new()
+        .route("/", get(serve_index))
+        .route("/style.css", get(serve_css))
+        .route("/app.js", get(serve_js))
+        .route("/ws", get(ws_upgrade))
+        .with_state(state);
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("绑定 {addr} 失败: {e}");
+            return;
+        }
+    };
+    tracing::info!("Web UI 启动于 http://{addr}");
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("Web 服务错误: {e}");
+    }
+}
+
+async fn serve_index() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
+}
+
+async fn serve_css() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+}
+
+async fn serve_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        APP_JS,
+    )
 }
