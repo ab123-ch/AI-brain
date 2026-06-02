@@ -7,6 +7,7 @@ mod orchestrator;
 mod real_tool_executor;
 mod repl;
 mod tui;
+mod web;
 
 use clap::{Parser, Subcommand};
 use orchestrator::{format_output, Orchestrator};
