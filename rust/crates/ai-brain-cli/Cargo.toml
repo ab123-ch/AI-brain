@@ -49,5 +49,8 @@ brain-mcp = { path = "../brain-mcp" }
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
