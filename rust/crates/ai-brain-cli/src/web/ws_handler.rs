@@ -22,6 +22,7 @@ use crate::orchestrator::Orchestrator;
 use crate::web::progress_adapter::{
     ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent,
 };
+use brain_core::types::ProgressEvent;
 use crate::web::session_manager::SessionManager;
 
 // ─── AppState ────────────────────────────────────────────────────────
@@ -67,6 +68,12 @@ pub async fn ws_upgrade(
 // ─── 核心处理 ────────────────────────────────────────────────────────
 
 /// 处理一个完整的 WebSocket 连接生命周期
+///
+/// 使用 `tokio::select!` 并发处理两个分支：
+///   - 客户端消息（新建/切换会话、人格切换等）
+///   - 查询流式事件（TextDelta、ThinkingDelta 等）
+///
+/// 这样即使在流式查询期间，客户端仍可执行新建会话等操作，不会卡住。
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -78,41 +85,102 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     info!("WebSocket 客户端已连接");
 
-    // 2. 消息循环
-    while let Some(msg_result) = receiver.next().await {
-        match msg_result {
-            Ok(Message::Text(text)) => {
-                match serde_json::from_str::<ClientMessage>(&text) {
-                    Ok(client_msg) => {
-                        handle_client_message(&mut sender, &state, client_msg).await;
+    let mut query_rx: Option<tokio::sync::mpsc::Receiver<ProgressEvent>> = None;
+    let mut assistant_text = String::new();
+    let mut query_session_id: Option<String> = None;
+
+    // 2. 并发消息循环 — tokio::select! 同时处理客户端消息和查询流式事件
+    loop {
+        tokio::select! {
+            // ── 分支1: 客户端消息（始终活跃） ──
+            maybe_msg = receiver.next() => {
+                match maybe_msg {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(ClientMessage::Query { input }) => {
+                                if query_rx.is_some() {
+                                    send_event(&mut sender, WebProgressEvent::Error {
+                                        message: "当前有查询正在进行，请等待完成".into(),
+                                    }).await.ok();
+                                    continue;
+                                }
+
+                                // 记录用户消息到当前会话，并记住查询所属会话
+                                let current_id = {
+                                    let mut sessions = state.sessions.lock().await;
+                                    sessions.push_message("user", &input);
+                                    sessions.active().id.clone()
+                                };
+                                query_session_id = Some(current_id);
+
+                                // 启动流式查询
+                                let (rx, _, _) = state.orch.query_streaming(&input);
+                                query_rx = Some(rx);
+                                assistant_text.clear();
+                            }
+                            Ok(client_msg) => {
+                                handle_client_message(&mut sender, &state, client_msg).await;
+                            }
+                            Err(e) => {
+                                warn!("解析客户端消息失败: {e}, 原始: {text}");
+                                send_event(
+                                    &mut sender,
+                                    WebProgressEvent::Error {
+                                        message: format!("无法解析消息: {e}"),
+                                    },
+                                )
+                                .await
+                                .ok();
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!("解析客户端消息失败: {e}, 原始: {text}");
-                        send_event(
-                            &mut sender,
-                            WebProgressEvent::Error {
-                                message: format!("无法解析消息: {e}"),
-                            },
-                        )
-                        .await
-                        .ok();
+                    Some(Ok(Message::Close(_))) => {
+                        info!("WebSocket 客户端关闭连接");
+                        break;
                     }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = sender.send(Message::Pong(data)).await;
+                    }
+                    Some(Err(e)) => {
+                        error!("WebSocket 接收错误: {e}");
+                        break;
+                    }
+                    None => break,
+                    _ => {}
                 }
             }
-            Ok(Message::Close(_)) => {
-                info!("WebSocket 客户端关闭连接");
-                break;
-            }
-            Ok(Message::Ping(data)) => {
-                // axum 自动处理 Ping/Pong
-                let _ = sender.send(Message::Pong(data)).await;
-            }
-            Err(e) => {
-                error!("WebSocket 接收错误: {e}");
-                break;
-            }
-            _ => {
-                // 忽略 Binary, Pong 等消息
+
+            // ── 分支2: 查询流式事件（仅当查询活跃时） ──
+            maybe_event = async {
+                match &mut query_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match maybe_event {
+                    Some(event) => {
+                        if let Some(web_event) = WebProgressEvent::from_progress(&event) {
+                            if let WebProgressEvent::TextDelta { ref text } = web_event {
+                                assistant_text.push_str(text);
+                            }
+                            if send_event(&mut sender, web_event).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        // 查询完成 — 将 assistant 回复记录到查询所属的会话
+                        if !assistant_text.is_empty() {
+                            let mut sessions = state.sessions.lock().await;
+                            if let Some(ref sid) = query_session_id {
+                                sessions.push_message_to(sid, "assistant", &assistant_text);
+                            }
+                        }
+                        query_rx = None;
+                        query_session_id = None;
+                        assistant_text.clear();
+                    }
+                }
             }
         }
     }
@@ -195,7 +263,9 @@ async fn handle_client_message(
     msg: ClientMessage,
 ) {
     match msg {
-        ClientMessage::Query { input } => handle_query(sender, state, input).await,
+        ClientMessage::Query { .. } => {
+            // 已在 handle_socket 的 select! 中直接处理
+        }
         ClientMessage::Cancel => {
             // MVP: 暂空实现
             send_event(
@@ -228,46 +298,6 @@ async fn handle_client_message(
         ClientMessage::DeleteSession { session_id } => {
             handle_delete_session(sender, state, session_id).await
         }
-    }
-}
-
-// ─── Query 处理 ──────────────────────────────────────────────────────
-
-/// 处理查询消息: 调用 query_streaming，转发 ProgressEvent
-async fn handle_query(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    state: &Arc<AppState>,
-    input: String,
-) {
-    // 记录用户消息到会话
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.push_message("user", &input);
-    }
-
-    // 调用流式查询
-    let (mut rx, _handle, _cancel) = state.orch.query_streaming(&input);
-
-    // 持续转发 ProgressEvent
-    let mut assistant_text = String::new();
-    while let Some(event) = rx.recv().await {
-        if let Some(web_event) = WebProgressEvent::from_progress(&event) {
-            // 收集 assistant 文本
-            if let WebProgressEvent::TextDelta { ref text } = web_event {
-                assistant_text.push_str(text);
-            }
-
-            if send_event(sender, web_event).await.is_err() {
-                // 发送失败（客户端断开），退出循环
-                break;
-            }
-        }
-    }
-
-    // 查询完成后记录 assistant 回复到会话
-    if !assistant_text.is_empty() {
-        let mut sessions = state.sessions.lock().await;
-        sessions.push_message("assistant", &assistant_text);
     }
 }
 

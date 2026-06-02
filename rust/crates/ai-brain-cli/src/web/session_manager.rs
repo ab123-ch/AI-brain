@@ -165,6 +165,35 @@ impl SessionManager {
         }
     }
 
+    /// 向指定会话追加一条消息并持久化（不切换活跃会话）
+    pub fn push_message_to(&mut self, session_id: &str, role: &str, content: &str) {
+        let msg = ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+        };
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.messages.push(msg);
+
+            // 若是第一条用户消息且标题是默认的，自动更新标题
+            if session.title == "New Session" {
+                if let Some(first_user) = session.messages.iter().find(|m| m.role == "user") {
+                    let truncated: String = first_user.content.chars().take(30).collect();
+                    if first_user.content.chars().count() > 30 {
+                        session.title = format!("{truncated}...");
+                    } else {
+                        session.title = truncated;
+                    }
+                }
+            }
+
+            if let Some(s) = self.sessions.get(session_id) {
+                Self::persist_to_disk(&self.persist_dir, s);
+            }
+        }
+    }
+
     // ─── 私有辅助方法 ───────────────────────────────────────────────
 
     /// 创建一个新的 WebSession 实例（不插入到 map）

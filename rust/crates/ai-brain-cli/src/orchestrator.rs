@@ -776,6 +776,12 @@ impl Orchestrator {
                 if let Some(ref mut brain) = *guard {
                     tracing::info!("使用 v2 MainBrain (带工具) 处理查询");
 
+                    // 发送记忆召回提示
+                    let _ = tx.send(ProgressEvent::MemoryInjected {
+                        count: 0,
+                        preview: "正在检索相关记忆上下文".to_string(),
+                    }).await;
+
                     // --- 1. 主脑首次处理 ---
                     let mut result = brain
                         .process_input(&input_owned, Some(&tx), Some(cancel_clone.clone()))

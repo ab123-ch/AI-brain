@@ -9,6 +9,12 @@ let currentToolGroup = null;
 let currentSpinnerEl = null;
 let activeSessionId = null;
 
+// ── Typewriter State ──────────────────────────────────────────
+let thinkingFullContent = '';
+let thinkingDisplayPos = 0;
+let thinkingRaf = null;
+const CHARS_PER_FRAME = 3;
+
 // ── DOM References ──────────────────────────────────────────────
 const $messages = document.getElementById('messages');
 const $input = document.getElementById('input');
@@ -93,7 +99,7 @@ function handleServerMessage(data) {
             break;
 
         case 'memory_injected':
-            addSystemMessage(`记忆注入: ${data.count} 条 - ${data.preview}`);
+            addMemoryIndicator(data.count, data.preview);
             break;
 
         case 'evaluation_start':
@@ -172,8 +178,14 @@ function finalizeStreaming() {
         renderMarkdown(currentStreamingEl, currentStreamingEl.dataset.rawText);
         currentStreamingEl = null;
     }
+    // 确保思考内容全部显示完毕
+    if (thinkingDisplayPos < thinkingFullContent.length && currentThinkingEl) {
+        thinkingDisplayPos = thinkingFullContent.length;
+        currentThinkingEl.textContent = thinkingFullContent;
+    }
     currentThinkingEl = null;
     currentToolGroup = null;
+    resetThinkingState();
 }
 
 function renderMarkdown(el, text) {
@@ -190,32 +202,62 @@ function renderMarkdown(el, text) {
     }
 }
 
-// ── Thinking ────────────────────────────────────────────────────
+// ── Thinking (Typewriter) ───────────────────────────────────────
 function appendThinking(content) {
     if (!showThinking) return;
 
     if (!currentThinkingEl) {
         currentThinkingEl = document.createElement('div');
-        currentThinkingEl.className = 'thinking-block collapsed';
-        currentThinkingEl.dataset.fullContent = '';
-        currentThinkingEl.addEventListener('click', () => {
-            currentThinkingEl.classList.toggle('collapsed');
-            if (!currentThinkingEl.classList.contains('collapsed')) {
-                currentThinkingEl.textContent = currentThinkingEl.dataset.fullContent;
-            } else {
-                currentThinkingEl.textContent = currentThinkingEl.dataset.fullContent.substring(0, 60);
-            }
-        });
+        currentThinkingEl.className = 'thinking-block';
         $messages.appendChild(currentThinkingEl);
     }
 
-    currentThinkingEl.dataset.fullContent += content;
-    if (currentThinkingEl.classList.contains('collapsed')) {
-        currentThinkingEl.textContent = currentThinkingEl.dataset.fullContent.substring(0, 60) + '...';
-    } else {
-        currentThinkingEl.textContent = currentThinkingEl.dataset.fullContent;
+    thinkingFullContent += content;
+
+    if (!thinkingRaf) {
+        thinkingRaf = requestAnimationFrame(typeThinkingFrame);
     }
+}
+
+function typeThinkingFrame() {
+    if (!currentThinkingEl || thinkingDisplayPos >= thinkingFullContent.length) {
+        thinkingRaf = null;
+        return;
+    }
+
+    // 自适应速度：积压越多打字越快
+    const remaining = thinkingFullContent.length - thinkingDisplayPos;
+    const speed = Math.max(CHARS_PER_FRAME, Math.ceil(remaining / 30));
+    thinkingDisplayPos = Math.min(thinkingDisplayPos + speed, thinkingFullContent.length);
+
+    currentThinkingEl.textContent = thinkingFullContent.substring(0, thinkingDisplayPos);
     scrollToBottom();
+
+    thinkingRaf = requestAnimationFrame(typeThinkingFrame);
+}
+
+function resetThinkingState() {
+    thinkingFullContent = '';
+    thinkingDisplayPos = 0;
+    if (thinkingRaf) {
+        cancelAnimationFrame(thinkingRaf);
+        thinkingRaf = null;
+    }
+}
+
+// ── Welcome ────────────────────────────────────────────────────
+function showWelcome() {
+    const el = document.createElement('div');
+    el.className = 'welcome';
+    el.innerHTML = `
+        <h2>智脑 AI v2</h2>
+        <p>一主二从架构 · 主脑 + 记忆脑 + 评估脑</p>
+        <div class="welcome-tips">
+            <div class="welcome-tip">输入查询开始对话</div>
+            <div class="welcome-tip">Enter 发送 · Shift+Enter 换行</div>
+        </div>
+    `;
+    $messages.appendChild(el);
 }
 
 // ── Tool Calls ──────────────────────────────────────────────────
@@ -282,6 +324,15 @@ function addSystemMessage(text) {
     const el = document.createElement('div');
     el.className = 'msg system';
     el.textContent = text;
+    $messages.appendChild(el);
+    scrollToBottom();
+    return el;
+}
+
+function addMemoryIndicator(count, preview) {
+    const el = document.createElement('div');
+    el.className = 'memory-indicator';
+    el.textContent = `记忆召回: ${preview}`;
     $messages.appendChild(el);
     scrollToBottom();
     return el;
@@ -354,6 +405,10 @@ function renderSessionList(sessions) {
 
 function renderMessages(messages) {
     $messages.innerHTML = '';
+    if (messages.length === 0) {
+        showWelcome();
+        return;
+    }
     messages.forEach((m) => {
         if (m.role === 'user') {
             addUserMessage(m.content);
@@ -436,6 +491,7 @@ function submitQuery() {
     currentStreamingEl = null;
     currentThinkingEl = null;
     currentToolGroup = null;
+    resetThinkingState();
 }
 
 // ── Event Bindings ──────────────────────────────────────────────

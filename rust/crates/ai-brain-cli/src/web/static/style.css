@@ -269,21 +269,89 @@ body {
     font-style: italic;
     font-size: 13px;
     color: var(--text-secondary);
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
 }
 
-.thinking-block.collapsed {
-    max-height: 40px;
-    overflow: hidden;
-    cursor: pointer;
-    position: relative;
+.thinking-block .cursor {
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    background: var(--warning);
+    animation: blink 0.8s step-end infinite;
+    vertical-align: text-bottom;
+    margin-left: 1px;
 }
 
-.thinking-block.collapsed::after {
-    content: "...";
-    position: absolute;
-    bottom: 0;
-    right: 8px;
-    color: var(--warning);
+@keyframes blink {
+    50% { opacity: 0; }
+}
+
+/* ── Welcome ─────────────────────────────────────────────────── */
+.welcome {
+    align-self: center;
+    text-align: center;
+    padding: 48px 24px;
+    max-width: 400px;
+}
+
+.welcome h2 {
+    font-size: 22px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    color: var(--text-primary);
+}
+
+.welcome p {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 24px;
+}
+
+.welcome-tips {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.welcome-tip {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+/* ── Memory Indicator ────────────────────────────────────────── */
+.memory-indicator {
+    align-self: flex-start;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--accent);
+    background: rgba(108, 99, 255, 0.08);
+    border-radius: 12px;
+    border: 1px solid rgba(108, 99, 255, 0.2);
+}
+
+.memory-indicator::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
 }
 
 /* ── Spinner ──────────────────────────────────────────────────── */
