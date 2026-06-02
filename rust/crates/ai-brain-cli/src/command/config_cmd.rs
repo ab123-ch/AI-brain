@@ -45,7 +45,7 @@ fn handle_config(args: &[String]) -> CommandResult {
                 CommandResult::ok("配置文件为空，使用 /config set <key> <value> 添加配置")
             } else {
                 let mut output = String::from("=== 配置参数 ===\n");
-                for (k, v) in all {
+                for (k, v) in &all {
                     output.push_str(&format!("  {k} = {v}\n"));
                 }
                 CommandResult::ok(output)
