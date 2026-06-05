@@ -51,7 +51,7 @@ pub fn build_read_only_tool_definitions() -> Vec<ToolDefinition> {
         // Skill tool
         ToolDefinition {
             name: "Skill".into(),
-            description: "加载审查技能的完整规则。可用技能：code-verification（代码变更验证）、conclusion-verification（结论真实性验证）。".into(),
+            description: "加载审查技能的完整规则。可用技能：troubleshooting-verification（排查问题结论验证）、code-verification（代码变更验证）、writing-verification（写作内容评估）、conclusion-verification（结论真实性验证）。".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -471,16 +471,18 @@ impl EvalBrain {
         &self.skill_registry
     }
 
-    /// 评估主脑输出（需求驱动版本）
+    /// 评估主脑输出（副脑验证版本）
     ///
-    /// 聚焦当前用户需求，不再依赖历史记忆（用户画像/踩坑库/进化规则）。
-    /// 三步法：理解需求 → 对照输出 → 二次校验
+    /// 副脑验证主脑结论正确性，支持注入用户画像和踩坑记录。
+    /// 四步法：识别任务类型 → 加载对应Skill → 证据搜集验证 → 用户要求合规检查
     pub async fn evaluate(
         &self,
         user_input: &str,
         ai_output: &str,
         turns: &[TurnRecord],
         eval_requirements: &[EvalRequirement],
+        profile_summary: Option<&str>,
+        pitfall_descriptions: Option<&[String]>,
     ) -> Result<EvalResult> {
         if user_input.trim().is_empty() || ai_output.trim().is_empty() {
             return Err(EvalError::InvalidInput(
@@ -494,8 +496,13 @@ impl EvalBrain {
         }
 
         // 统一使用 with_tools=true 构建系统提示词
-        let system_prompt =
-            prompts::build_evaluation_system_prompt(eval_requirements, &self.skill_registry, true);
+        let system_prompt = prompts::build_evaluation_system_prompt(
+            eval_requirements,
+            &self.skill_registry,
+            true,
+            profile_summary,
+            pitfall_descriptions,
+        );
         let user_prompt = prompts::build_evaluation_user_prompt(
             user_input,
             ai_output,
@@ -666,6 +673,8 @@ mod tests {
                 "fn add(a: i32, b: i32) -> i32 { a + b }",
                 &[], // turns
                 &[], // eval_requirements
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -684,6 +693,8 @@ mod tests {
                 "fn process() {\n    // TODO: implement this\n}",
                 &[], // turns
                 &[], // eval_requirements
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -701,6 +712,8 @@ mod tests {
                 "some output",
                 &[],
                 &[],
+                None,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -716,6 +729,8 @@ mod tests {
                 "",
                 &[],
                 &[],
+                None,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -731,6 +746,8 @@ mod tests {
                 "fn add(a: i32, b: i32) -> i32 { a + b }",
                 &[], // turns
                 &[], // eval_requirements
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -761,6 +778,24 @@ mod tests {
 
         // 应该检测到：TODO（lazy）、unsafe（taboo）、unwrap/panic（pitfall repeat）
         assert!(!issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn evaluate_with_profile_and_pitfalls() {
+        let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
+        let brain = EvalBrain::new(llm);
+        let result = brain
+            .evaluate(
+                "写代码",
+                "fn add() {}",
+                &[],
+                &[],
+                Some("用户偏好 Rust，禁忌使用 unwrap"),
+                Some(&["使用 unwrap 导致 panic".into()]),
+            )
+            .await
+            .unwrap();
+        assert!(result.passed);
     }
 
     #[test]
@@ -822,6 +857,8 @@ mod tests {
                 "fn add() {}",
                 &[], // turns 为空，无文件变更
                 &[], // eval_requirements
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -894,6 +931,8 @@ mod tests {
                 "已修改",
                 &turns,
                 &[], // eval_requirements
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -965,6 +1004,8 @@ mod tests {
                 "已修改",
                 &turns,
                 &[], // eval_requirements
+                None,
+                None,
             )
             .await
             .unwrap();

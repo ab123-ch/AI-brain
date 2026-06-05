@@ -53,51 +53,45 @@ pub fn build_available_skills(registry: &SkillRegistry) -> String {
     s
 }
 
-/// 构建评估系统提示词（需求驱动版本）
+/// 构建评估系统提示词（副脑验证版本）
 ///
-/// 核心理念：评估脑聚焦当前用户需求，而非历史记忆。
-/// 三步评估逻辑：理解需求 → 对照输出 → 二次校验
+/// 核心理念：副脑验证主脑结论的正确性，加载技能路由表，注入用户画像和踩坑记录。
+/// 四步评估逻辑：识别任务类型 → 加载对应Skill → 证据搜集验证 → 用户要求合规检查
 pub fn build_evaluation_system_prompt(
     eval_requirements: &[EvalRequirement],
     registry: &SkillRegistry,
     with_tools: bool,
+    profile_summary: Option<&str>,
+    pitfall_descriptions: Option<&[String]>,
 ) -> String {
     let mut prompt = String::new();
 
-    // 第一段：角色定义 + 评估方法论
+    // 第一段：角色定义 + 四步法
     prompt.push_str(
         r"# 角色定义
 
-你是 AI Brain 系统的质量审核员。你的唯一职责是验证主脑的输出是否真正满足了用户的当前需求。
+你是主脑的副脑。你的唯一职责是验证主脑的结论是否正确、是否有数据支撑、是否违反用户要求。
 
-## 评估方法论（三步法）
+你不做需求满足度检查——那是主脑自己的事。你只关注两件事：
+1. 主脑的结论是否经得起验证（有数据/代码/日志佐证）
+2. 主脑是否违反了用户在各会话中明确或隐含的要求
 
-你必须严格按以下三步进行评估，不得跳步：
+## 评估流程（四步法）
 
-### 第一步：理解用户需求
-仔细分析用户的原始输入，拆解出：
-- 核心意图：用户到底想要什么
-- 具体要求：有哪些明确的约束、条件、格式要求
-- 隐含期望：从需求上下文可以合理推断的期望（必须与当前需求直接相关）
+### 第一步：识别任务类型
+从主脑的操作轨迹判断主脑做了什么类型的任务。
 
-### 第二步：对照主脑输出
-将主脑的输出与第一步理解的需求逐条对照：
-- 是否完成了用户要求的核心任务？
-- 是否满足所有明确约束？
-- 代码/结论中是否存在安全风险或事实性错误？
-- 是否存在偷懒行为（TODO占位、省略实现等）？
+### 第二步：加载对应审查技能
+按技能路由表调用 Skill 工具，获取该任务类型的审查规则。
 
-### 第三步：二次校验（关键）
-如果第二步发现问题，**必须进行二次校验**：
-- 重新审视用户原始需求，确认自己的理解是否正确
-- 如果是自己理解有误 → 输出「评估结果-正常」
-- 如果确认主脑确实有问题 → 输出具体问题和修正建议
+### 第三步：证据搜集验证
+调用只读工具（read_file、grep_search、bash）搜集佐证数据。
+验证主脑的每个事实性断言——能证实的标记为已验证，能证伪的标记为问题。
+**用户提出的问题，主脑的回答必须有事实性数据/案例/代码支撑。**
 
-## 评估原则
-- **只关注当前需求**：不参考任何用户的历史偏好、习惯、画像
-- **宁漏勿报**：只报告确实存在的问题，不确定的不报
-- **不吹毛求疵**：风格、措辞、称呼等不涉及任务正确性的细节不评估
-- **不重复劳动**：主脑已完成的任务不要要求换一种方式重做
+### 第四步：用户要求合规检查
+对照用户画像（禁忌/习惯/偏好）+ 踩坑记录 + 用户评估要求。
+检查主脑输出是否违反了任何用户要求。
 
 ",
     );
@@ -107,8 +101,8 @@ pub fn build_evaluation_system_prompt(
         prompt.push_str(
             r"## 工具使用
 - 你可以调用 Skill 工具加载具体的审查规则
-- 你可以使用只读工具（read_file、grep、bash）验证代码
-- 不确定的事实不要标记为错误，可以用工具验证后再判断
+- 你可以使用只读工具（read_file、grep_search、bash）验证代码和事实
+- 不确定的事实用工具验证，不凭感觉判断
 
 ",
         );
@@ -125,6 +119,27 @@ pub fn build_evaluation_system_prompt(
     prompt.push_str(&build_environment_info());
     prompt.push('\n');
 
+    // 用户画像注入
+    if let Some(summary) = profile_summary {
+        if !summary.is_empty() {
+            prompt.push_str("\n# 用户画像\n\n");
+            prompt.push_str(summary);
+            prompt.push_str("\n");
+        }
+    }
+
+    // 踩坑记录注入
+    if let Some(pitfalls) = pitfall_descriptions {
+        if !pitfalls.is_empty() {
+            prompt.push_str("\n# 踩坑记录（主脑不能重复犯的错误）\n\n");
+            for (i, desc) in pitfalls.iter().enumerate() {
+                let _ = writeln!(prompt, "{}. {}", i + 1, desc);
+            }
+        }
+    }
+
+    prompt.push('\n');
+
     // 第三段：available_skills
     prompt.push_str(&build_available_skills(registry));
 
@@ -134,14 +149,34 @@ pub fn build_evaluation_system_prompt(
             r#"# Skill 工具
 
 你可以调用 Skill 工具加载具体审查规则：
-- `Skill("code-verification")` — 代码变更验证（编译、测试、空实现、日志、需求匹配）
-- `Skill("conclusion-verification")` — 结论真实性验证（证据验证、逻辑链检查）
+- `Skill("troubleshooting-verification")` — 排查问题结论验证
+- `Skill("code-verification")` — 代码变更验证
+- `Skill("writing-verification")` — 写作内容评估
+- `Skill("conclusion-verification")` — 结论真实性验证
 
-加载后你将看到完整的检查维度和铁律。
+先根据技能路由表判断任务类型，再加载对应 Skill。
 
 "#,
         );
     }
+
+    // 技能路由表
+    prompt.push_str(
+        r"## 技能路由表
+
+根据主脑操作轨迹判断任务类型，加载对应 Skill：
+
+| 任务类型 | 判断依据 | 加载的 Skill |
+|---------|---------|-------------|
+| 排查问题 | 主脑调用了 grep/read_file/bash 查日志、查链路、查配置 | troubleshooting-verification |
+| 代码修改 | 主脑调用了 edit_file/write_file | code-verification |
+| 写作/创作 | 主脑输出了长文本（>500字），无 edit_file/write_file | writing-verification |
+| 通用问答 | 简短回答、事实性断言、其他类型 | conclusion-verification |
+
+**重要：用户提出的问题必须走深度验证。** 主脑回答中必须有事实性数据、案例、代码等支撑，不能只有推理。
+
+",
+    );
 
     // 第四段：用户评估要求
     if !eval_requirements.is_empty() {
@@ -153,6 +188,28 @@ pub fn build_evaluation_system_prompt(
         prompt.push_str("\n**用户评估要求优先级高于固定评估维度。**\n\n");
     }
 
+    // 评估原则
+    prompt.push_str(
+        r"## 评估原则
+- **验证优先**：不确定的事实用工具验证，不凭感觉判断
+- **用户要求至上**：用户定义的禁忌和规则必须严格执行
+- **宁漏勿报**：不确定的问题不报，但确定的问题必须报
+
+",
+    );
+
+    // 严重程度说明
+    prompt.push_str(
+        r"## 严重程度判定
+
+- Critical（必须通知用户）：事实性错误、结论被证伪、违反用户禁忌、重复踩坑
+- Warning（自动修正）：非关键建议、风格问题、非最佳实践
+
+输出格式中用 [Critical] 或 [Warning] 标记每个问题的严重程度。
+
+",
+    );
+
     // 输出格式
     prompt.push_str(
         r"# 输出格式
@@ -161,7 +218,7 @@ pub fn build_evaluation_system_prompt(
 评估结果-正常
 
 有问题时，严格输出（不要附加其他文字）：
-评估结果-存在问题。具体问题：1.问题描述及修正建议 2.问题描述及修正建议 ...
+评估结果-存在问题。具体问题：1.[Critical/Warning] 问题描述及修正建议 2.[Critical/Warning] 问题描述及修正建议 ...
 
 注意：不要输出 JSON，不要使用代码块，只输出纯文本。",
     );
@@ -196,7 +253,7 @@ pub fn build_evaluation_user_prompt(
         prompt.push_str(&trace_text);
     }
 
-    prompt.push_str("请按照三步法评估：1)理解用户需求 → 2)对照主脑输出 → 3)二次校验。没有问题输出「评估结果-正常」，有问题输出「评估结果-存在问题。具体问题：...」");
+    prompt.push_str("请按照四步法评估：1)识别任务类型 → 2)加载对应Skill → 3)证据搜集验证 → 4)用户要求合规检查。没有问题输出「评估结果-正常」，有问题输出「评估结果-存在问题。具体问题：...」");
 
     prompt
 }
@@ -278,42 +335,157 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn system_prompt_has_role_definition() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        assert!(prompt.contains("角色定义"));
-        assert!(prompt.contains("质量审核员"));
-        assert!(prompt.contains("三步法"));
+    fn system_prompt_has_vice_brain_role() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(prompt.contains("副脑"));
     }
 
     #[test]
-    fn system_prompt_has_evaluation_dimensions() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        // 需求驱动版本不再有"偏好合规检查"，改为三步法
-        assert!(prompt.contains("理解用户需求"));
-        assert!(prompt.contains("对照主脑输出"));
-        assert!(prompt.contains("二次校验"));
+    fn system_prompt_has_skill_routing() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(prompt.contains("技能路由表"));
+        assert!(prompt.contains("troubleshooting-verification"));
+        assert!(prompt.contains("writing-verification"));
     }
 
     #[test]
-    fn system_prompt_no_preference_check() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        // 确保不再包含"偏好合规检查"
-        assert!(!prompt.contains("偏好合规检查"));
+    fn system_prompt_has_four_steps() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(prompt.contains("四步法"));
+        assert!(prompt.contains("识别任务类型"));
+        assert!(prompt.contains("证据搜集验证"));
+        assert!(prompt.contains("用户要求合规检查"));
+    }
+
+    #[test]
+    fn system_prompt_no_old_three_steps() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(!prompt.contains("三步法"));
+        assert!(!prompt.contains("理解用户需求"));
+        assert!(!prompt.contains("对照主脑输出"));
+        assert!(!prompt.contains("二次校验"));
+    }
+
+    #[test]
+    fn system_prompt_no_quality_auditor() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(!prompt.contains("质量审核员"));
+    }
+
+    #[test]
+    fn system_prompt_has_evaluation_principles() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(prompt.contains("验证优先"));
+        assert!(prompt.contains("用户要求至上"));
+        assert!(prompt.contains("宁漏勿报"));
+    }
+
+    #[test]
+    fn system_prompt_has_severity_levels() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(prompt.contains("严重程度判定"));
+        assert!(prompt.contains("Critical"));
+        assert!(prompt.contains("Warning"));
+    }
+
+    #[test]
+    fn system_prompt_with_profile_summary() {
+        let prompt = build_evaluation_system_prompt(
+            &[],
+            &SkillRegistry::new(),
+            false,
+            Some("用户偏好 Rust，禁忌使用 unwrap"),
+            None,
+        );
+        assert!(prompt.contains("# 用户画像"));
+        assert!(prompt.contains("禁忌使用 unwrap"));
+    }
+
+    #[test]
+    fn system_prompt_without_profile_summary() {
+        let prompt = build_evaluation_system_prompt(
+            &[],
+            &SkillRegistry::new(),
+            false,
+            None,
+            None,
+        );
+        // 没有传入 profile_summary 时，不应出现 "# 用户画像" 标题
+        assert!(!prompt.contains("# 用户画像"));
+    }
+
+    #[test]
+    fn system_prompt_with_empty_profile_summary() {
+        let prompt = build_evaluation_system_prompt(
+            &[],
+            &SkillRegistry::new(),
+            false,
+            Some(""),
+            None,
+        );
+        // 空字符串 profile_summary 时，不应出现 "# 用户画像" 标题
+        assert!(!prompt.contains("# 用户画像"));
+    }
+
+    #[test]
+    fn system_prompt_with_pitfall_descriptions() {
+        let pitfalls = vec!["使用 unwrap 导致 panic".to_string()];
+        let prompt = build_evaluation_system_prompt(
+            &[],
+            &SkillRegistry::new(),
+            false,
+            None,
+            Some(&pitfalls),
+        );
+        assert!(prompt.contains("# 踩坑记录"));
+        assert!(prompt.contains("使用 unwrap 导致 panic"));
+    }
+
+    #[test]
+    fn system_prompt_without_pitfall_descriptions() {
+        let prompt = build_evaluation_system_prompt(
+            &[],
+            &SkillRegistry::new(),
+            false,
+            None,
+            None,
+        );
+        // 没有传入 pitfall_descriptions 时，不应出现 "# 踩坑记录" 标题
+        assert!(!prompt.contains("# 踩坑记录"));
+    }
+
+    #[test]
+    fn system_prompt_with_empty_pitfall_descriptions() {
+        let pitfalls: Vec<String> = vec![];
+        let prompt = build_evaluation_system_prompt(
+            &[],
+            &SkillRegistry::new(),
+            false,
+            None,
+            Some(&pitfalls),
+        );
+        // 空列表时，不应出现 "# 踩坑记录" 标题
+        assert!(!prompt.contains("# 踩坑记录"));
     }
 
     #[test]
     fn system_prompt_has_output_format() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
         assert!(prompt.contains("评估结果-正常"));
         assert!(prompt.contains("评估结果-存在问题"));
         assert!(prompt.contains("不要输出 JSON"));
     }
 
     #[test]
-    fn system_prompt_has_judgment_principles() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        assert!(prompt.contains("宁漏勿报"));
-        assert!(prompt.contains("不吹毛求疵"));
+    fn system_prompt_output_format_has_severity_tags() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(prompt.contains("[Critical/Warning]"));
+    }
+
+    #[test]
+    fn system_prompt_no_preference_check() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        assert!(!prompt.contains("偏好合规检查"));
     }
 
     #[test]
@@ -334,8 +506,8 @@ mod tests {
                 superseded: false,
             },
         ];
-        let prompt = build_evaluation_system_prompt(&reqs, &SkillRegistry::new(), false);
-        assert!(prompt.contains("用户评估要求"));
+        let prompt = build_evaluation_system_prompt(&reqs, &SkillRegistry::new(), false, None, None);
+        assert!(prompt.contains("# 用户评估要求"));
         assert!(prompt.contains("不要将简单问答判定为问题"));
         assert!(prompt.contains("重点关注代码安全性"));
         assert!(prompt.contains("优先级高于固定评估维度"));
@@ -343,8 +515,9 @@ mod tests {
 
     #[test]
     fn system_prompt_without_eval_requirements() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        assert!(!prompt.contains("用户评估要求"));
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        // 没有传入 eval_requirements 时，不应出现 "# 用户评估要求" 标题
+        assert!(!prompt.contains("# 用户评估要求"));
     }
 
     #[test]
@@ -356,17 +529,22 @@ mod tests {
         );
         assert!(prompt.contains("帮我写一个函数"));
         assert!(prompt.contains("fn add"));
-        assert!(prompt.contains("三步法"));
+    }
+
+    #[test]
+    fn user_prompt_uses_four_steps() {
+        let prompt = build_evaluation_user_prompt("测试", "输出", &[]);
+        assert!(prompt.contains("四步法"));
+        assert!(!prompt.contains("三步法"));
     }
 
     #[test]
     fn user_prompt_no_user_profile() {
-        // 确保不再包含用户画像相关内容
+        // 确保用户 prompt 中不包含用户画像标题
         let prompt = build_evaluation_user_prompt("写代码", "some code", &[]);
-        assert!(!prompt.contains("用户画像"));
+        assert!(!prompt.contains("# 用户画像"));
         assert!(!prompt.contains("显性偏好"));
         assert!(!prompt.contains("隐性偏好"));
-        assert!(!prompt.contains("禁忌"));
     }
 
     #[test]
@@ -384,17 +562,20 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_with_tools_has_verification_section() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), true);
-        assert!(prompt.contains("Skill 工具"));
+    fn system_prompt_with_tools_has_skill_section() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), true, None, None);
+        assert!(prompt.contains("# Skill 工具"));
+        assert!(prompt.contains("troubleshooting-verification"));
         assert!(prompt.contains("code-verification"));
+        assert!(prompt.contains("writing-verification"));
         assert!(prompt.contains("conclusion-verification"));
     }
 
     #[test]
-    fn system_prompt_without_tools_no_verification_section() {
-        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false);
-        assert!(!prompt.contains("Skill 工具"));
+    fn system_prompt_without_tools_no_skill_section() {
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
+        // 没有 with_tools=true 时，不应出现 "# Skill 工具" 标题
+        assert!(!prompt.contains("# Skill 工具"));
     }
 
     #[test]

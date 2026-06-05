@@ -141,6 +141,37 @@ impl PyramidMemoryBrain {
         store.inject_text()
     }
 
+    /// 获取用户画像摘要文本（用于注入评估脑 prompt）
+    pub fn load_profile_summary(&self) -> Result<String> {
+        let store = ProfileStore::new(self.storage.clone());
+        store.summary()
+    }
+
+    /// 获取活跃踩坑记录（用于评估脑用户要求合规检查）
+    ///
+    /// 从 EvalInfo 中的 pitfalls 文本转换为 PitfallRecord 格式。
+    pub fn load_active_pitfalls(&self) -> Vec<brain_core::types::PitfallRecord> {
+        let store = EvalInfoStore::new(self.storage.clone());
+        let Some(info) = store.load().ok().flatten() else {
+            return Vec::new();
+        };
+
+        let now = chrono::Utc::now();
+        info.pitfalls
+            .into_iter()
+            .enumerate()
+            .map(|(i, desc)| brain_core::types::PitfallRecord {
+                id: format!("pitfall-{}", i),
+                category: brain_core::types::PitfallCategory::Other,
+                description: desc,
+                user_correction: None,
+                occurred_at: now,
+                occurrence_count: 1,
+                superseded: false,
+            })
+            .collect()
+    }
+
     /// 获取评估信息（转换为 EvalRequirement 格式供评估脑使用）
     ///
     /// 将 eval-info.json 中的 requirements + pitfalls + rules 合并为
