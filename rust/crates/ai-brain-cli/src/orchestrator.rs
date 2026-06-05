@@ -820,10 +820,15 @@ impl Orchestrator {
                     if should_eval && result.is_ok() {
                         tracing::info!("eval_gate 判定：需要评估");
                         if let Some(ref eb) = this.eval_brain {
-                            // 从金字塔记忆加载评估信息（requirements + pitfalls + rules）
-                            let eval_requirements = {
+                            // 从金字塔记忆加载评估信息（requirements + profile + pitfalls）
+                            let (eval_requirements, profile_summary, pitfall_descriptions) = {
                                 let mem = this.memory_brain.lock().await;
-                                mem.load_eval_requirements()
+                                let reqs = mem.load_eval_requirements();
+                                let profile = mem.load_profile_summary().ok();
+                                let pitfalls = mem.load_active_pitfalls();
+                                let pitfall_descs: Vec<String> =
+                                    pitfalls.iter().map(|p| p.description.clone()).collect();
+                                (reqs, profile, pitfall_descs)
                             };
 
                             tracing::info!(
@@ -852,6 +857,8 @@ impl Orchestrator {
                                         &answer,
                                         &result.as_ref().unwrap().turns,
                                         &eval_requirements,
+                                        profile_summary.as_deref(),
+                                        Some(&pitfall_descriptions),
                                     )
                                     .await
                                 {
@@ -874,6 +881,22 @@ impl Orchestrator {
                                             break;
                                         }
 
+                                        // 判断严重程度：检查反馈中是否包含 [Critical] 标记
+                                        let has_critical =
+                                            eval_result.feedback.contains("[Critical]");
+
+                                        if has_critical {
+                                            // Critical: 严重问题（事实性错误/结论被证伪/违反禁忌）
+                                            // 注入反馈让主脑看到，但不自动重试，让用户决定
+                                            tracing::warn!(
+                                                "v2 评估发现 Critical 问题(第{}次): {}",
+                                                attempt + 1,
+                                                truncate_chars(&eval_result.feedback, 300)
+                                            );
+                                            brain.push_evaluator_to_history(&eval_result.feedback);
+                                            break; // 不重试，直接输出当前结果 + 评估反馈
+                                        }
+
                                         if attempt >= max_eval_retries {
                                             tracing::warn!(
                                                 "v2 评估达到最大重试次数({}), 使用当前输出",
@@ -882,8 +905,9 @@ impl Orchestrator {
                                             break;
                                         }
 
+                                        // Warning: 非严重问题，自动注入历史重试
                                         tracing::warn!(
-                                            "v2 评估发现问题(第{}次): {}",
+                                            "v2 评估发现 Warning 问题(第{}次): {}",
                                             attempt + 1,
                                             truncate_chars(&eval_result.feedback, 200)
                                         );
