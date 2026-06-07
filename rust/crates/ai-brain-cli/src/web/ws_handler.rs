@@ -7,6 +7,7 @@
 //!   4. 将 ProgressEvent 转发为 WebProgressEvent 给前端
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::State,
@@ -17,6 +18,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
+
+/// 服务端 Ping 间隔（秒）— 防止中间代理/浏览器因空闲超时断开连接
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 use crate::orchestrator::Orchestrator;
 use crate::web::progress_adapter::{
@@ -53,6 +57,8 @@ enum ClientMessage {
     SwitchSession { session_id: String },
     /// 删除会话
     DeleteSession { session_id: String },
+    /// 应用层心跳（浏览器无法发送原生 Ping 帧）
+    Heartbeat,
 }
 
 // ─── WebSocket 升级入口 ──────────────────────────────────────────────
@@ -89,9 +95,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut assistant_text = String::new();
     let mut query_session_id: Option<String> = None;
 
-    // 2. 并发消息循环 — tokio::select! 同时处理客户端消息和查询流式事件
+    // 心跳定时器 — 定期发送 Ping 防止连接因空闲被中间代理/浏览器断开
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    heartbeat.tick().await; // 消耗首次立即触发
+
+    // 2. 并发消息循环 — tokio::select! 同时处理客户端消息、查询流式事件、心跳
     loop {
         tokio::select! {
+            // ── 分支0: 心跳保活（定时 Ping） ──
+            _ = heartbeat.tick() => {
+                if sender.send(Message::Ping(vec![].into())).await.is_err() {
+                    warn!("心跳 Ping 发送失败，连接可能已断开");
+                    break;
+                }
+            }
+
             // ── 分支1: 客户端消息（始终活跃） ──
             maybe_msg = receiver.next() => {
                 match maybe_msg {
@@ -265,6 +283,10 @@ async fn handle_client_message(
     match msg {
         ClientMessage::Query { .. } => {
             // 已在 handle_socket 的 select! 中直接处理
+        }
+        ClientMessage::Heartbeat => {
+            // 应用层心跳 — 浏览器无法发送原生 Ping，用 JSON 消息替代
+            // 无需回复，仅用于保持连接活跃
         }
         ClientMessage::Cancel => {
             // MVP: 暂空实现

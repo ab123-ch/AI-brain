@@ -2,6 +2,8 @@
 let ws = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 5;
+const HEARTBEAT_INTERVAL_MS = 25000; // 25秒心跳，服务端30秒Ping互补
+let heartbeatTimer = null;
 let showThinking = false;
 let currentStreamingEl = null;
 let currentThinkingEl = null;
@@ -37,6 +39,7 @@ function connect() {
     ws.onopen = () => {
         reconnectAttempts = 0;
         console.log('WebSocket connected');
+        startHeartbeat();
     };
 
     ws.onmessage = (e) => {
@@ -50,6 +53,7 @@ function connect() {
 
     ws.onclose = () => {
         console.log('WebSocket closed');
+        stopHeartbeat();
         if (reconnectAttempts < MAX_RECONNECT) {
             const delay = Math.pow(2, reconnectAttempts) * 1000;
             reconnectAttempts++;
@@ -65,6 +69,21 @@ function connect() {
 function send(type, data = {}) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type, ...data }));
+    }
+}
+
+// ── Heartbeat ────────────────────────────────────────────────────
+function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+        send('heartbeat');
+    }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
     }
 }
 
