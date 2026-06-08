@@ -5,6 +5,7 @@ pub mod evolver_brain;
 pub mod guard;
 pub mod idle_scanner;
 pub mod sandbox;
+pub mod target;
 pub mod tdd_runner;
 
 pub use error::{EvolverError, Result};
