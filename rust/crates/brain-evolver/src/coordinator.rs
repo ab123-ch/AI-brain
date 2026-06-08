@@ -1,5 +1,6 @@
 use crate::backlog::{BacklogEntry, BacklogStatus, EvolutionBacklog};
 use crate::capability_tree::CapabilityTree;
+use crate::error::{EvolverError, Result};
 use crate::evo_log::{EvoCycleStatus, EvoLogEntry, EvoLogStore, PhaseRecord};
 use crate::target::{EvoTarget, EvoTargetQueue, TargetStatus};
 
@@ -93,14 +94,15 @@ pub struct EvolutionCoordinator {
 
 impl EvolutionCoordinator {
     /// Initialise all sub-components from the given base directory.
-    pub fn new(base_dir: &Path, config: EvoConfig) -> Result<Self, String> {
+    pub fn new(base_dir: &Path, config: EvoConfig) -> Result<Self> {
         let evolver_dir = base_dir.join("evolver");
-        std::fs::create_dir_all(&evolver_dir).map_err(|e| format!("create evolver dir: {e}"))?;
+        std::fs::create_dir_all(&evolver_dir)?;
 
         Ok(Self {
             target_queue: EvoTargetQueue::new(&evolver_dir),
             backlog: EvolutionBacklog::new(&evolver_dir),
-            capability_tree: CapabilityTree::load(&evolver_dir)?,
+            capability_tree: CapabilityTree::load(&evolver_dir)
+                .map_err(|e| EvolverError::Persistence(format!("load capability tree: {e}")))?,
             log: EvoLogStore::new(&evolver_dir),
             config,
             base_dir: evolver_dir,
@@ -201,7 +203,7 @@ impl EvolutionCoordinator {
         target_id: &str,
         evo_log_id: &str,
         skills: Vec<String>,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         // Update the user target queue if this is a user target.
         if self
             .target_queue
@@ -210,7 +212,8 @@ impl EvolutionCoordinator {
             .any(|t| t.id == target_id)
         {
             self.target_queue
-                .update_status(target_id, TargetStatus::Completed)?;
+                .update_status(target_id, TargetStatus::Completed)
+                .map_err(EvolverError::Persistence)?;
         }
 
         // Try to resolve a matching backlog entry.
@@ -222,7 +225,9 @@ impl EvolutionCoordinator {
             .map(|e| e.id.clone())
             .collect();
         for bid in &backlog_entries {
-            let _ = self.backlog.resolve_entry(bid, evo_log_id);
+            self.backlog
+                .resolve_entry(bid, evo_log_id)
+                .map_err(EvolverError::Persistence)?;
         }
 
         // Update capability tree with newly created skills.
@@ -231,13 +236,13 @@ impl EvolutionCoordinator {
         }
         self.capability_tree
             .save(&self.base_dir)
-            .map_err(|e| format!("save capability tree: {e}"))?;
+            .map_err(|e| EvolverError::Persistence(format!("save capability tree: {e}")))?;
 
         Ok(())
     }
 
     /// Mark a target as blocked with a reason.
-    pub fn block_target(&mut self, target_id: &str, reason: &str) -> Result<(), String> {
+    pub fn block_target(&mut self, target_id: &str, reason: &str) -> Result<()> {
         // Try user target queue first.
         let is_user_target = self
             .target_queue
@@ -247,13 +252,12 @@ impl EvolutionCoordinator {
 
         if is_user_target {
             self.target_queue
-                .update_status(target_id, TargetStatus::Blocked)?;
+                .update_status(target_id, TargetStatus::Blocked)
+                .map_err(EvolverError::Persistence)?;
             return Ok(());
         }
 
-        // Try backlog entries — update status to Blocked.
-        // We need to find and mutate the entry directly since EvolutionBacklog
-        // does not expose a block_entry() method.
+        // Try backlog entries — set status to Blocked via block_entry().
         let found_in_backlog = {
             let entries = self.backlog.query_by_status(BacklogStatus::Pending);
             entries
@@ -267,18 +271,15 @@ impl EvolutionCoordinator {
         };
 
         if found_in_backlog {
-            // Use resolve_entry with a marker; or we need to access the entries
-            // via persist to update status. Since backlog has no block method,
-            // we mark it resolved with a "blocked: reason" marker.
-            // For proper blocking, we would need to add a method to EvolutionBacklog,
-            // but we follow the existing API contract.
-            let _ = self
-                .backlog
-                .resolve_entry(target_id, &format!("blocked: {reason}"));
+            self.backlog
+                .block_entry(target_id, reason)
+                .map_err(EvolverError::Persistence)?;
             return Ok(());
         }
 
-        Err(format!("target not found in queue or backlog: {target_id}"))
+        Err(EvolverError::NotFound(format!(
+            "target not found in queue or backlog: {target_id}"
+        )))
     }
 
     // -- Logging ------------------------------------------------------------
@@ -312,32 +313,10 @@ impl EvolutionCoordinator {
         skills: Vec<String>,
         resolved_backlog: Vec<String>,
         status: EvoCycleStatus,
-    ) {
-        // Find and update the entry by id.
-        // Since EvoLogStore does not expose a mutable accessor by id,
-        // we read the file directly, update in place, and re-persist.
-        let path = self.base_dir.join("evolution_log.json");
-        if path.exists() {
-            if let Ok(json) = std::fs::read_to_string(&path) {
-                if let Ok(mut entries) = serde_json::from_str::<Vec<EvoLogEntry>>(&json) {
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == log_id) {
-                        entry.finished_at = Some(Utc::now().to_rfc3339());
-                        entry.phases = phases;
-                        entry.total_tokens = tokens;
-                        entry.skills_created = skills;
-                        entry.backlog_resolved = resolved_backlog;
-                        entry.status = status;
-
-                        // Write updated entries back.
-                        if let Ok(pretty) = serde_json::to_string_pretty(&entries) {
-                            let _ = std::fs::write(&path, pretty);
-                        }
-                        // Reload the log store to reflect changes.
-                        self.log = EvoLogStore::new(&self.base_dir);
-                    }
-                }
-            }
-        }
+    ) -> Result<()> {
+        self.log
+            .update_entry(log_id, phases, tokens, skills, resolved_backlog, status)
+            .map_err(EvolverError::Persistence)
     }
 
     // -- Night session summary ----------------------------------------------
@@ -684,7 +663,10 @@ mod tests {
 
         coord.block_target("b-block", "cannot fix").unwrap();
 
-        // Backlog entry should no longer be Pending.
+        // Backlog entry should be Blocked, not Resolved.
+        let blocked = coord.backlog().query_by_status(BacklogStatus::Blocked);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].id, "b-block");
         let pending = coord.backlog().query_by_status(BacklogStatus::Pending);
         assert!(pending.is_empty());
     }
@@ -716,19 +698,21 @@ mod tests {
         assert!(latest.finished_at.is_none());
 
         // End the cycle.
-        coord.log_cycle_end(
-            &log_id,
-            vec![PhaseRecord {
-                phase: crate::evo_log::EvoPhase::Learn,
-                duration_secs: 42,
-                summary: "learned something".to_string(),
-                tokens_used: 5000,
-            }],
-            5000,
-            vec!["new-skill".to_string()],
-            vec!["old-backlog-id".to_string()],
-            EvoCycleStatus::Completed,
-        );
+        coord
+            .log_cycle_end(
+                &log_id,
+                vec![PhaseRecord {
+                    phase: crate::evo_log::EvoPhase::Learn,
+                    duration_secs: 42,
+                    summary: "learned something".to_string(),
+                    tokens_used: 5000,
+                }],
+                5000,
+                vec!["new-skill".to_string()],
+                vec!["old-backlog-id".to_string()],
+                EvoCycleStatus::Completed,
+            )
+            .unwrap();
 
         // Verify the log entry was updated.
         let latest = coord.log_store().latest().unwrap();
@@ -750,25 +734,29 @@ mod tests {
 
         // Start and complete a cycle.
         let log_id = coord.log_cycle_start("target-1");
-        coord.log_cycle_end(
-            &log_id,
-            vec![],
-            1000,
-            vec!["skill-x".to_string()],
-            vec![],
-            EvoCycleStatus::Completed,
-        );
+        coord
+            .log_cycle_end(
+                &log_id,
+                vec![],
+                1000,
+                vec!["skill-x".to_string()],
+                vec![],
+                EvoCycleStatus::Completed,
+            )
+            .unwrap();
 
         // Start and block another cycle.
         let log_id2 = coord.log_cycle_start("target-2");
-        coord.log_cycle_end(
-            &log_id2,
-            vec![],
-            500,
-            vec![],
-            vec!["bl-1".to_string()],
-            EvoCycleStatus::Blocked,
-        );
+        coord
+            .log_cycle_end(
+                &log_id2,
+                vec![],
+                500,
+                vec![],
+                vec!["bl-1".to_string()],
+                EvoCycleStatus::Blocked,
+            )
+            .unwrap();
 
         let summary = coord.night_session_summary();
         assert_eq!(summary.targets_processed, 1);

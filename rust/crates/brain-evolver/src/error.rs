@@ -28,6 +28,12 @@ pub enum EvolverError {
 
     #[error("Evolution not found: {0}")]
     NotFound(String),
+
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
+
+    #[error("Persistence error: {0}")]
+    Persistence(String),
 }
 
 pub type Result<T> = std::result::Result<T, EvolverError>;

@@ -1,5 +1,7 @@
+use brain_evolver::backlog::{
+    BacklogCategory, BacklogEntry, BacklogSource, BacklogStatus, Severity,
+};
 use brain_evolver::coordinator::{EvoConfig, EvoTargetCandidate, EvolutionCoordinator};
-use brain_evolver::backlog::{BacklogCategory, BacklogEntry, BacklogSource, BacklogStatus, Severity};
 use brain_evolver::evo_log::{EvoCycleStatus, EvoPhase, PhaseRecord};
 use brain_evolver::target::{EvoTarget, TargetStatus};
 use chrono::Utc;
@@ -193,9 +195,7 @@ fn test_block_target() {
         .target_queue_mut()
         .add_target(make_target("t-block", 1, TargetStatus::InProgress))
         .unwrap();
-    coord
-        .block_target("t-block", "dependency missing")
-        .unwrap();
+    coord.block_target("t-block", "dependency missing").unwrap();
 
     let target = coord
         .target_queue()
@@ -239,19 +239,21 @@ fn test_log_cycle_start_and_end() {
     assert!(latest.finished_at.is_none());
 
     // End the cycle.
-    coord.log_cycle_end(
-        &log_id,
-        vec![PhaseRecord {
-            phase: EvoPhase::Learn,
-            duration_secs: 42,
-            summary: "learned something".to_string(),
-            tokens_used: 5000,
-        }],
-        5000,
-        vec!["new-skill".to_string()],
-        vec!["old-backlog-id".to_string()],
-        EvoCycleStatus::Completed,
-    );
+    coord
+        .log_cycle_end(
+            &log_id,
+            vec![PhaseRecord {
+                phase: EvoPhase::Learn,
+                duration_secs: 42,
+                summary: "learned something".to_string(),
+                tokens_used: 5000,
+            }],
+            5000,
+            vec!["new-skill".to_string()],
+            vec!["old-backlog-id".to_string()],
+            EvoCycleStatus::Completed,
+        )
+        .unwrap();
 
     // Verify the log entry was updated.
     let latest = coord.log_store().latest().unwrap();

@@ -105,11 +105,13 @@ impl EvolutionBacklog {
                 if entry.severity > existing.severity {
                     existing.severity = entry.severity.clone();
                 }
+                self.persist()?;
                 return Ok(());
             }
         }
 
         self.entries.push(entry);
+        self.persist()?;
         Ok(())
     }
 
@@ -135,7 +137,19 @@ impl EvolutionBacklog {
         entry.status = BacklogStatus::Resolved;
         entry.resolved_at = Some(Utc::now());
         entry.evolution_log_id = Some(evo_log_id.to_string());
-        Ok(())
+        self.persist()
+    }
+
+    /// Block a backlog entry with a reason, setting status to Blocked.
+    pub fn block_entry(&mut self, id: &str, reason: &str) -> Result<(), String> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| format!("entry not found: {id}"))?;
+        entry.status = BacklogStatus::Blocked;
+        entry.context_snapshot = Some(reason.to_string());
+        self.persist()
     }
 
     /// Persist the backlog to `base_dir/targets.json`.

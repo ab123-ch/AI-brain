@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,6 +93,31 @@ impl EvoLogStore {
     /// Return a reference to the most recent entry (by insertion order), or None.
     pub fn latest(&self) -> Option<&EvoLogEntry> {
         self.entries.last()
+    }
+
+    /// Update an existing entry by log id, filling in end-of-cycle fields.
+    /// Returns Err if the log id is not found.
+    pub fn update_entry(
+        &mut self,
+        log_id: &str,
+        phases: Vec<PhaseRecord>,
+        tokens: u64,
+        skills: Vec<String>,
+        resolved_backlog: Vec<String>,
+        status: EvoCycleStatus,
+    ) -> Result<(), String> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == log_id)
+            .ok_or_else(|| format!("log entry not found: {log_id}"))?;
+        entry.finished_at = Some(Utc::now().to_rfc3339());
+        entry.phases = phases;
+        entry.total_tokens = tokens;
+        entry.skills_created = skills;
+        entry.backlog_resolved = resolved_backlog;
+        entry.status = status;
+        self.persist()
     }
 
     /// Persist the store to `base_dir/evolution_log.json`.
