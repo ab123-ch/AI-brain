@@ -1,5 +1,6 @@
 pub mod backlog;
 pub mod capability_tree;
+pub mod coordinator;
 pub mod error;
 pub mod evo_log;
 pub mod evolution_engine;
@@ -11,6 +12,7 @@ pub mod target;
 pub mod tdd_runner;
 pub mod trigger;
 
+pub use coordinator::{EvoConfig, EvoTargetCandidate, EvolutionCoordinator, NightSessionResult};
 pub use error::{EvolverError, Result};
 pub use evolution_engine::{EvolutionEngine, EvolutionResult, EvolutionStatus};
 pub use evolver_brain::EvolverBrain;
