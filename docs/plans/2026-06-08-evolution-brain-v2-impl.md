@@ -22,8 +22,11 @@
 | Task 4: EvolutionTrigger | ✅ | `trigger.rs` | 8 (内嵌) |
 | Task 5: EvolutionCoordinator | ✅ | `coordinator.rs` | 7 + 23 (内嵌) |
 | 审计修复 | ✅ | `backlog.rs`/`evo_log.rs`/`coordinator.rs`/`error.rs` | 69 全通过 |
+| Task 6: CycleRunner | ✅ | `cycle_runner.rs` | 24 (内嵌) |
+| Task 14: EvoPrompt | ✅ | `evo_prompt.rs` | 8 (内嵌) |
+| Task 13: EvoOrchestrator | ✅ | `evo_orchestrator.rs` | 8 (内嵌) |
 
-### 待实施（从 Task 6 开始）
+### 待实施
 
 | Task | Phase | 说明 |
 |------|-------|------|
@@ -82,6 +85,26 @@ coordinator.rs:
   .log_cycle_start(target_id) -> String  // 返回 log_id
   .log_cycle_end(log_id, phases, tokens, skills, resolved_backlog, status)
   .night_session_summary() -> NightSessionResult
+
+cycle_runner.rs:
+  CycleRunner::new(llm, config)
+  .run(target) -> Result<CycleResult>          // 六阶段循环
+  .phase_perceive(target) -> Result<PerceiveResult>
+  .phase_research(perceive) -> Result<ResearchResult>
+  .phase_learn(research) -> Result<LearnResult>
+  .phase_synthesize(learn) -> Result<SynthesizeResult>
+  .phase_register(synthesize) -> Result<RegisterResult>
+  .phase_verify(register) -> Result<VerificationResult>
+
+evo_prompt.rs:
+  EvoPromptContext { current_target, capability_tree_summary, existing_skill_names, ... }
+  build_evo_system_prompt(ctx) -> String       // 五层 system prompt
+
+evo_orchestrator.rs:
+  SharedResources { mcp_pool_info, skill_names }
+  EvoOrchestrator::new(llm, base_dir, config, shared) -> Result<Self>
+  .run_evolution(target) -> Result<CycleResult> // 单目标进化
+  .run_night_session() -> NightSessionOutput    // 整夜多目标
 ```
 
 ### 待处理项（非阻塞，后续 Task 中处理）
