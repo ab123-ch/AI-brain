@@ -28,6 +28,11 @@ impl EvolverBrain {
     pub fn engine(&self) -> Arc<Mutex<EvolutionEngine>> {
         self.engine.clone()
     }
+
+    /// Access the LLM provider (for v2 EvoOrchestrator reuse).
+    pub fn llm_provider(&self) -> Arc<dyn LlmProvider> {
+        self.llm.clone()
+    }
 }
 
 impl BrainAgent for EvolverBrain {

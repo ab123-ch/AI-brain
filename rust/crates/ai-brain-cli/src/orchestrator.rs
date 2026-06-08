@@ -29,7 +29,9 @@ use brain_evaluation::EvaluationBrain;
 use brain_evolution::{
     BrainRegistry, BrainRegistryStatus, BrainTemplate, CreationSuggestion, SuggestionEngine,
 };
-use brain_evolver::{EvolutionGoal, EvolverBrain};
+use brain_evolver::{
+    EvoConfig, EvoOrchestrator, EvolutionCoordinator, EvolutionGoal, EvolverBrain, SharedResources,
+};
 use brain_hooks::config::HooksConfig;
 use brain_hooks::runner::HookRunner;
 use brain_hooks::types::{HookEvent, HookInput};
@@ -176,6 +178,12 @@ pub struct Orchestrator {
     registry: Arc<Mutex<BrainRegistry>>,
     suggestion_engine: Arc<Mutex<SuggestionEngine>>,
     evolver: Arc<Mutex<EvolverBrain>>,
+    /// v2 进化脑: 调度器（目标选择 + 日志）
+    evo_coordinator: Arc<Mutex<Option<EvolutionCoordinator>>>,
+    /// v2 进化脑: 后台进化任务句柄（用于 cancel）
+    evo_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// v2 进化脑: 是否正在进化中（防重入）
+    evo_running: Arc<tokio::sync::watch::Sender<bool>>,
     #[allow(dead_code)]
     tasks: Vec<tokio::task::JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -590,6 +598,9 @@ impl Orchestrator {
             registry,
             suggestion_engine,
             evolver,
+            evo_coordinator: Arc::new(Mutex::new(None)),
+            evo_handle: Arc::new(Mutex::new(None)),
+            evo_running: Arc::new(tokio::sync::watch::channel(false).0),
             tasks,
             shutdown_tx,
             query_count: std::sync::atomic::AtomicU32::new(0),
@@ -1388,6 +1399,174 @@ impl Orchestrator {
         let engine = self.evolver.lock().await.engine();
         let engine = engine.lock().await;
         engine.current_diff().await.map_err(|e| e.to_string())
+    }
+
+    // ─── 进化脑 v2 方法 ──────────────────────────────────────────
+
+    /// 初始化 v2 进化脑调度器（在首次 /evo 调用时惰性初始化）。
+    async fn ensure_evo_coordinator(&self) -> Result<(), String> {
+        let mut guard = self.evo_coordinator.lock().await;
+        if guard.is_none() {
+            let base_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".ai-brain")
+                    .join("evolution");
+            let config = EvoConfig::default();
+            let coord = EvolutionCoordinator::new(&base_dir, config)
+                .map_err(|e| format!("Failed to init evo coordinator: {e}"))?;
+            *guard = Some(coord);
+        }
+        Ok(())
+    }
+
+    /// v2: 启动一次进化循环（后台 tokio::task）。
+    ///
+    /// `target_hint`: 可选的目标描述。如果为 None，由 coordinator 自动选择。
+    pub async fn spawn_evolution(&self, target_hint: Option<String>) -> Result<(), String> {
+        self.ensure_evo_coordinator().await?;
+
+        // 防重入
+        if *self.evo_running.borrow() {
+            return Err("进化脑正在运行中，请稍后再试".into());
+        }
+
+        // 获取 LLM 实例（复用 evolver 的 LLM 配置）
+        let llm: Arc<dyn brain_llm::LlmProvider> = {
+            let evolver = self.evolver.lock().await;
+            evolver.llm_provider()
+        };
+
+        // 获取 skill 名称
+        let skill_names: Vec<String> = self
+            .skill_catalog
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        let base_dir =
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".ai-brain")
+                .join("evolution");
+
+        let shared = SharedResources {
+            mcp_pool_info: String::new(),
+            skill_names,
+        };
+
+        // 如果指定了目标描述，创建临时 target
+        if let Some(desc) = &target_hint {
+            let mut guard = self.evo_coordinator.lock().await;
+            if let Some(coord) = guard.as_mut() {
+                use brain_evolver::target::{EvoTarget, TargetStatus};
+                use chrono::Utc;
+                let target = EvoTarget {
+                    id: format!("tgt-{}", Utc::now().format("%Y%m%d%H%M%S")),
+                    direction: desc.clone(),
+                    description: desc.clone(),
+                    priority: 1,
+                    status: TargetStatus::Pending,
+                    checkpoints: vec![],
+                    created_at: Utc::now(),
+                    related_skills: vec![],
+                };
+                coord.target_queue_mut().add_target(target).map_err(|e| e)?;
+            }
+        }
+
+        // 创建 EvoOrchestrator
+        let mut evo_orch = EvoOrchestrator::new(llm, &base_dir, EvoConfig::default(), shared)
+            .map_err(|e| format!("Failed to create EvoOrchestrator: {e}"))?;
+
+        // Pick target
+        let target = {
+            let guard = self.evo_coordinator.lock().await;
+            if let Some(coord) = guard.as_ref() {
+                coord.pick_next_target()
+            } else {
+                None
+            }
+        };
+
+        let target = match target {
+            Some(t) => t,
+            None => return Err("没有可用的进化目标".into()),
+        };
+
+        // Mark running
+        let _ = self.evo_running.send(true);
+
+        // Spawn background task
+        let evo_running_tx = self.evo_running.clone();
+        let handle = tokio::spawn(async move {
+            tracing::info!("进化脑 v2 启动，开始进化循环...");
+
+            match evo_orch.run_evolution(&target).await {
+                Ok(result) => {
+                    tracing::info!("进化脑 v2 完成: {:?}", result);
+                }
+                Err(e) => {
+                    tracing::error!("进化脑 v2 失败: {e}");
+                }
+            }
+
+            let _ = evo_running_tx.send(false);
+        });
+
+        // Store handle
+        let mut handle_guard = self.evo_handle.lock().await;
+        *handle_guard = Some(handle);
+
+        Ok(())
+    }
+
+    /// v2: 停止正在运行的进化循环。
+    pub async fn stop_evolution(&self) -> Result<(), String> {
+        let mut handle_guard = self.evo_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+            let _ = self.evo_running.send(false);
+            tracing::info!("进化脑 v2 已中止");
+            Ok(())
+        } else {
+            Err("没有正在运行的进化任务".into())
+        }
+    }
+
+    /// v2: 查询进化脑状态。
+    pub async fn evo_status_v2(&self) -> String {
+        let is_running = *self.evo_running.borrow();
+
+        let coordinator_info = {
+            let guard = self.evo_coordinator.lock().await;
+            match guard.as_ref() {
+                Some(coord) => {
+                    let has_work = coord.has_pending_work();
+                    let log_count = coord.log_store().latest().map_or(0, |_| 1);
+                    format!(
+                        "has_pending_work={has_work}, log_entries={log_count}",
+                    )
+                }
+                None => "未初始化".into(),
+            }
+        };
+
+        format!(
+            "进化脑 v2 状态: running={is_running}, coordinator=[{coordinator_info}]"
+        )
+    }
+
+    /// v2: 获取进化调度器的可变引用（用于命令接口直接操作）。
+    pub async fn evo_coordinator_mut(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, Option<EvolutionCoordinator>> {
+        self.evo_coordinator.lock().await
+    }
+
+    /// 通知进化脑有用户活动（用于空闲检测）。
+    pub fn touch_evo_activity(&self) {
+        // Future: self.evo_trigger.touch_activity()
+        // For now, this is a no-op placeholder until EvolutionTrigger is integrated
     }
 
     /// 优雅关闭（含强制四步分析）
