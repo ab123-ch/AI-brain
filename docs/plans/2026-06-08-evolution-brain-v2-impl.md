@@ -23,6 +23,9 @@
 | Task 5: EvolutionCoordinator | ✅ | `coordinator.rs` | 7 + 23 (内嵌) |
 | 审计修复 | ✅ | `backlog.rs`/`evo_log.rs`/`coordinator.rs`/`error.rs` | 69 全通过 |
 | Task 6: CycleRunner | ✅ | `cycle_runner.rs` | 24 (内嵌) |
+| Task 7: Phase 1 感知 | ✅ | `cycle_runner.rs` + `memory_access.rs` | 内嵌 |
+| Task 8: Phase 2 研究 | ✅ | `cycle_runner.rs` + `web_search.rs` | 内嵌 |
+| Task 9: Phase 3 学习 | ✅ | `cycle_runner.rs`（四步分析+记忆集成） | 67 全通过 |
 | Task 14: EvoPrompt | ✅ | `evo_prompt.rs` | 8 (内嵌) |
 | Task 13: EvoOrchestrator | ✅ | `evo_orchestrator.rs` | 8 (内嵌) |
 | Task 15: Orchestrator 集成 | ✅ | `orchestrator.rs` | 编译通过 |
@@ -32,11 +35,10 @@
 
 | Task | Phase | 说明 |
 |------|-------|------|
-| Task 6 | Phase 3 | CycleRunner 核心循环框架 |
-| Task 7-10 | Phase 3 | 六阶段实现 (感知/研究/学习/合成) |
-| Task 11-12 | Phase 3 | 注册 + VerificationAgent |
-| Task 13-14 | Phase 4 | EvoOrchestrator + System Prompt |
-| Task 15-17 | Phase 5 | Orchestrator 集成 + 命令接口 |
+| Task 10: Phase 4 合成 | Phase 3 | SKILL.md 生成（增强） |
+| Task 11: Phase 5 注册 | Phase 3 | SkillCatalog 写入 |
+| Task 12: Phase 6 验证 | Phase 3 | VerificationAgent |
+| Task 17: 旧 EvolverBrain 改造 | Phase 5 | 接入新架构 |
 | Task 18-19 | Phase 6 | Backlog 收集集成 |
 | Task 20 | Phase 7 | 端到端测试 |
 
