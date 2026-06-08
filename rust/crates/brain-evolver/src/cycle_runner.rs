@@ -10,6 +10,8 @@
 use crate::coordinator::EvoTargetCandidate;
 use crate::error::{EvolverError, Result};
 use crate::evo_log::EvoPhase;
+use crate::memory_access::{MemoryAccess, RecallResult, StubMemoryAccess};
+use crate::web_search::{SearchResult, StubWebSearch, WebSearch};
 use brain_llm::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -223,16 +225,56 @@ pub struct CycleRunner {
     config: CycleConfig,
     /// Cross-phase conversation history — preserves context across all six phases.
     history: Vec<ChatMessage>,
+    /// Memory access for progressive recall and writing.
+    memory: Arc<dyn MemoryAccess>,
+    /// Web search for MCP tool calls.
+    web_search: Arc<dyn WebSearch>,
 }
 
 impl CycleRunner {
-    /// Create a new runner with the given LLM and config.
+    /// Create a new runner with the given LLM, config, and memory access.
     pub fn new(llm: Arc<dyn LlmProvider>, config: CycleConfig) -> Self {
+        Self::with_resources(
+            llm,
+            config,
+            Arc::new(StubMemoryAccess),
+            Arc::new(StubWebSearch),
+        )
+    }
+
+    /// Create a new runner with explicit memory access.
+    pub fn with_memory(
+        llm: Arc<dyn LlmProvider>,
+        config: CycleConfig,
+        memory: Arc<dyn MemoryAccess>,
+    ) -> Self {
+        Self::with_resources(llm, config, memory, Arc::new(StubWebSearch))
+    }
+
+    /// Create a new runner with full resources (memory + web search).
+    pub fn with_resources(
+        llm: Arc<dyn LlmProvider>,
+        config: CycleConfig,
+        memory: Arc<dyn MemoryAccess>,
+        web_search: Arc<dyn WebSearch>,
+    ) -> Self {
         Self {
             llm,
             config,
             history: Vec::new(),
+            memory,
+            web_search,
         }
+    }
+
+    /// Update memory access (called by EvoOrchestrator when memory is initialized).
+    pub fn set_memory(&mut self, memory: Arc<dyn MemoryAccess>) {
+        self.memory = memory;
+    }
+
+    /// Update web search (called when MCP tools are connected).
+    pub fn set_web_search(&mut self, web_search: Arc<dyn WebSearch>) {
+        self.web_search = web_search;
     }
 
     /// Update the system prompt (called by EvoOrchestrator before each target).
@@ -336,17 +378,30 @@ impl CycleRunner {
 
     /// Phase 1: Perceive — identify gaps and recall previous progress.
     ///
-    /// Uses the LLM to analyze the target and identify knowledge gaps.
+    /// Uses memory brain progressive recall (L4→L3→L2→L1) to recover
+    /// previous learning progress, then uses LLM to analyze the target.
     pub async fn phase_perceive(&mut self, target: &EvoTargetCandidate) -> Result<PerceiveResult> {
         let start = Instant::now();
 
         let target_desc = describe_target(target);
+
+        // Step 1: Progressive recall (跨夜续学恢复进度)
+        let recall = self
+            .memory
+            .progressive_recall(&target_desc)
+            .map_err(|e| EvolverError::Memory(e.to_string()))?;
+
+        // Step 2: Build context from recall
+        let recall_context = build_recall_context(&recall);
+
+        // Step 3: LLM analysis with recall context
         let prompt = format!(
             "你是一个知识分析专家。分析以下进化目标，识别需要学习的知识缺口。\n\n\
              目标: {target_desc}\n\n\
+             {recall_context}\n\n\
              请列出:\n\
              1. 需要掌握的关键知识点（每行一个）\n\
-             2. 已有的基础（如果有）\n\
+             2. 已有的基础（结合召回结果）\n\
              3. 相关的待解决问题（如果有）\n\n\
              格式:\n\
              GAPS:\n- 知识点1\n- 知识点2\n\
@@ -360,7 +415,10 @@ impl CycleRunner {
             .map_err(|e| EvolverError::Llm(e.to_string()))?;
         let text = response.text();
 
-        let (gaps, previous_progress, related_backlog) = parse_perceive_response(&text);
+        let (gaps, llm_progress, related_backlog) = parse_perceive_response(&text);
+
+        // Step 4: Merge recall progress with LLM progress
+        let previous_progress = merge_progress(recall.task_summary.clone(), llm_progress);
 
         Ok(PerceiveResult {
             output: PhaseOutput {
@@ -377,22 +435,64 @@ impl CycleRunner {
 
     /// Phase 2: Research — search for information.
     ///
-    /// In this initial implementation, uses the LLM to generate research notes
-    /// based on the perceived gaps. MCP tools will be integrated in Task 8.
+    /// Uses WebSearch interface to query relevant sources,
+    /// then fetches and consolidates key content.
     pub async fn phase_research(&mut self, perceive: &PerceiveResult) -> Result<ResearchResult> {
         let start = Instant::now();
 
-        let gaps_text = perceive.gaps.join("\n- ");
+        // Step 1: Generate search queries from gaps
+        let search_queries = generate_search_queries(&perceive.gaps);
+
+        // Step 2: Execute searches (use web_search interface)
+        let mut all_results: Vec<SearchResult> = Vec::new();
+        for query in &search_queries {
+            let results = self
+                .web_search
+                .search(query, 5)
+                .map_err(|e| EvolverError::WebSearch(e.to_string()))?;
+            all_results.extend(results);
+        }
+
+        // Step 3: Fetch top pages by credibility
+        let top_urls: Vec<String> = all_results
+            .iter()
+            .filter(|r| r.credibility >= 70)
+            .take(3)
+            .map(|r| r.url.clone())
+            .collect();
+
+        let pages = self
+            .web_search
+            .fetch_pages(&top_urls)
+            .map_err(|e| EvolverError::WebSearch(e.to_string()))?;
+
+        // Step 4: Write raw content to memory (L1)
+        for page in &pages {
+            self.memory.write_memory(crate::memory_access::MemoryWriteRequest {
+                layer: crate::memory_access::MemoryLayer::Raw,
+                content: page.content.clone(),
+                source: page.url.clone(),
+            }).map_err(|e| EvolverError::Memory(e.to_string()))?;
+        }
+
+        // Step 5: LLM synthesis of research results
+        let pages_text = pages
+            .iter()
+            .map(|p| format!("## {} ({})\n{}", p.title, p.url, p.content))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
         let prompt = format!(
-            "基于以下知识缺口，进行深入研究并总结:\n\n\
-             缺口:\n- {gaps_text}\n\n\
+            "基于以下研究资料，提炼关键知识:\n\n\
+             {pages_text}\n\n\
              请提供:\n\
-             1. 每个缺口的详细解释\n\
+             1. 核心概念解释\n\
              2. 最佳实践和模式\n\
              3. 常见陷阱\n\
              4. 实际示例\n\n\
-             SOURCES:\n- 来源1\n- 来源2\n\
-             SUMMARY:\n研究总结内容"
+             SOURCES:\n{}\n\
+             SUMMARY:\n研究总结（~500字）",
+            top_urls.join("\n- ")
         );
 
         let response = self
@@ -402,6 +502,13 @@ impl CycleRunner {
         let text = response.text();
 
         let (research_summary, sources_used) = parse_research_response(&text);
+
+        // Step 6: Write summary to memory (L2)
+        self.memory.write_memory(crate::memory_access::MemoryWriteRequest {
+            layer: crate::memory_access::MemoryLayer::Summary,
+            content: research_summary.clone(),
+            source: "phase_research".into(),
+        }).map_err(|e| EvolverError::Memory(e.to_string()))?;
 
         Ok(ResearchResult {
             output: PhaseOutput {
@@ -632,6 +739,14 @@ impl CycleRunner {
 // Response parsing helpers
 // ---------------------------------------------------------------------------
 
+/// Generate search queries from knowledge gaps.
+fn generate_search_queries(gaps: &[String]) -> Vec<String> {
+    // Simple strategy: use each gap as a query, add domain context
+    gaps.iter()
+        .map(|g| format!("{} 教程 最佳实践", g))
+        .collect()
+}
+
 /// Describe a target candidate for prompt construction.
 pub fn describe_target(target: &EvoTargetCandidate) -> String {
     match target {
@@ -648,6 +763,51 @@ pub fn describe_target(target: &EvoTargetCandidate) -> String {
         EvoTargetCandidate::CapabilityGap { domain, missing } => {
             format!("能力缺口 — {}: 缺少 {}", domain, missing.join(", "))
         }
+    }
+}
+
+// -- Recall context helpers -------------------------------------------------
+
+/// Build context string from recall results for LLM prompt injection.
+fn build_recall_context(recall: &RecallResult) -> String {
+    let mut parts = Vec::new();
+
+    if !recall.trigger_matches.is_empty() {
+        parts.push(format!(
+            "[上次学习触发词] {}\n（这些关键词表明你之前已学习过相关内容）",
+            recall.trigger_matches.join(", ")
+        ));
+    }
+
+    if let Some(ref exp) = recall.experience_summary {
+        parts.push(format!("[已抽象的经验]\n{exp}"));
+    }
+
+    if let Some(ref summary) = recall.task_summary {
+        parts.push(format!("[上次学习进度]\n{summary}"));
+    }
+
+    if !recall.related_pitfalls.is_empty() {
+        parts.push(format!(
+            "[相关踩坑记录]\n{}\n（这些是之前遇到的问题，学习时需避免重犯）",
+            recall.related_pitfalls.join("\n")
+        ));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("[记忆脑召回 — 跨夜续学上下文]\n{}", parts.join("\n\n"))
+    }
+}
+
+/// Merge memory recall progress with LLM-analyzed progress.
+fn merge_progress(recall_progress: Option<String>, llm_progress: Option<String>) -> Option<String> {
+    match (recall_progress, llm_progress) {
+        (Some(r), Some(l)) => Some(format!("{r}\n\n[本次分析补充]\n{l}")),
+        (Some(r), None) => Some(r),
+        (None, Some(l)) => Some(l),
+        (None, None) => None,
     }
 }
 

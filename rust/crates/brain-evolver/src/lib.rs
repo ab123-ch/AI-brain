@@ -10,12 +10,16 @@ pub mod evolution_engine;
 pub mod evolver_brain;
 pub mod guard;
 pub mod idle_scanner;
+pub mod memory_access;
 pub mod sandbox;
 pub mod target;
 pub mod tdd_runner;
 pub mod trigger;
+pub mod web_search;
 
 pub use coordinator::{EvoConfig, EvoTargetCandidate, EvolutionCoordinator, NightSessionResult};
+pub use memory_access::{MemoryAccess, MemoryLayer, MemoryWriteRequest, RecallResult, MockMemoryAccess, StubMemoryAccess};
+pub use web_search::{WebSearch, SearchResult, PageContent, MockWebSearch, StubWebSearch};
 pub use cycle_runner::{
     CycleConfig, CycleResult, CycleRunner, PerceiveResult, ResearchResult, LearnResult,
     SynthesizeResult, RegisterResult, VerificationResult, SkillDraft, VerificationSpec,

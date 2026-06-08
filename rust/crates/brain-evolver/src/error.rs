@@ -14,6 +14,12 @@ pub enum EvolverError {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    #[error("Memory access error: {0}")]
+    Memory(String),
+
+    #[error("Web search error: {0}")]
+    WebSearch(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

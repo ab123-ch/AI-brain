@@ -339,6 +339,7 @@ version = "0.1.0"
 dependencies = [
  "brain-core",
  "brain-llm",
+ "brain-memory",
  "chrono",
  "reqwest",
  "serde",
