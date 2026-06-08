@@ -9,6 +9,7 @@ pub mod idle_scanner;
 pub mod sandbox;
 pub mod target;
 pub mod tdd_runner;
+pub mod trigger;
 
 pub use error::{EvolverError, Result};
 pub use evolution_engine::{EvolutionEngine, EvolutionResult, EvolutionStatus};
