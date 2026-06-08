@@ -522,12 +522,14 @@ impl CycleRunner {
         })
     }
 
-    /// Phase 3: Learn — digest and analyze research material.
+    /// Phase 3: Learn — digest and analyze research material with four-step analysis.
     pub async fn phase_learn(&mut self, research: &ResearchResult) -> Result<LearnResult> {
         self.phase_learn_with_feedback(research, "").await
     }
 
     /// Phase 3 with feedback from a previous verification failure.
+    ///
+    /// Task 9 implementation: Four-step analysis + memory integration.
     async fn phase_learn_with_feedback(
         &mut self,
         research: &ResearchResult,
@@ -535,22 +537,67 @@ impl CycleRunner {
     ) -> Result<LearnResult> {
         let start = Instant::now();
 
+        // Step 1: Recall previous learning progress from memory
+        let recall = self
+            .memory
+            .progressive_recall(&research.research_summary)
+            .map_err(|e| EvolverError::Memory(e.to_string()))?;
+
+        // Build previous progress section
+        let previous_section = build_previous_progress_section(&recall);
+
+        // Build feedback section
         let feedback_section = if feedback.is_empty() {
             String::new()
         } else {
-            format!("\n上一次验证反馈（需要改进）:\n{feedback}\n")
+            format!("\n## 上一次验证反馈（需要改进）\n{feedback}\n")
         };
 
+        // Step 2: Four-step analysis prompt (inspired by brain-memory concentration engine)
         let prompt = format!(
-            "学习以下研究材料，提取关键知识:\n\n\
-             研究资料:\n{}\n\
+            "## 身份\n\
+             你是一个知识消化引擎。你将研究材料转化为结构化的学习成果，\
+             同时维护一份渐进式的学习进度记录。\n\n\
+             ## 输入\n\
+             ### 研究资料\n\
+             {research_summary}\n\n\
+             {previous_section}\
              {feedback_section}\
-             请整理:\n\
-             1. 已掌握的知识点\n\
-             2. 仍然不清楚的问题\n\n\
-             MASTERED:\n- 知识点1\n- 知识点2\n\
-             UNRESOLVED:\n- 问题1",
-            research.research_summary
+             ## 分析规则（四步分析）\n\n\
+             ### Step 1: 事实总结\n\
+             - 从研究资料中提取客观事实和技术要点\n\
+             - 保留所有关键细节：概念定义、代码片段、最佳实践\n\
+             - 用中文输出，控制在 200 字以内\n\n\
+             ### Step 2: 已掌握知识点\n\
+             - 列出本次学习后理解的核心概念\n\
+             - 每条用简洁的一句话描述\n\
+             - 标注是否为新增掌握（vs 上次已掌握）\n\n\
+             ### Step 3: 仍然不清楚的问题\n\
+             - 列出仍有疑问的点，用于后续研究\n\
+             - 每条用具体的问题形式描述\n\n\
+             ### Step 4: 经验提炼\n\
+             - 提炼 1-3 条可复用的经验规则\n\
+             - 格式：\"当 [场景] 时，应该 [行为]\"\n\n\
+             ## 输出格式（严格 JSON）\n\
+             ```json\n\
+             {{\n\
+               \"fact_summary\": \"事实总结内容\",\n\
+               \"mastered\": [\n\
+                 \"知识点1（新增）\",\n\
+                 \"知识点2\"\n\
+               ],\n\
+               \"unresolved\": [\n\
+                 \"问题1\",\n\
+                 \"问题2\"\n\
+               ],\n\
+               \"experience_rules\": [\n\
+                 \"当遇到 X 时，应该 Y\"\n\
+               ]\n\
+             }}\n\
+             ```",
+            research_summary = research.research_summary,
+            previous_section = previous_section,
+            feedback_section = feedback_section,
         );
 
         let response = self
@@ -559,7 +606,29 @@ impl CycleRunner {
             .map_err(|e| EvolverError::Llm(e.to_string()))?;
         let text = response.text();
 
-        let (mastered_points, unresolved_questions) = parse_learn_response(&text);
+        // Step 3: Parse structured response
+        let parsed = parse_learn_json_response(&text);
+
+        // Step 4: Write learning results to memory (L2 Summary + L3 Abstract)
+        // Write fact summary to L2
+        self.memory
+            .write_memory(crate::memory_access::MemoryWriteRequest {
+                layer: crate::memory_access::MemoryLayer::Summary,
+                content: parsed.fact_summary.clone(),
+                source: format!("phase_learn_{}", self.config.verify_threshold),
+            })
+            .map_err(|e| EvolverError::Memory(e.to_string()))?;
+
+        // Write experience rules to L3
+        for rule in &parsed.experience_rules {
+            self.memory
+                .write_memory(crate::memory_access::MemoryWriteRequest {
+                    layer: crate::memory_access::MemoryLayer::Abstract,
+                    content: rule.clone(),
+                    source: "phase_learn_experience".into(),
+                })
+                .map_err(|e| EvolverError::Memory(e.to_string()))?;
+        }
 
         Ok(LearnResult {
             output: PhaseOutput {
@@ -568,8 +637,8 @@ impl CycleRunner {
                 tokens_used: response.usage.total_tokens,
                 duration_secs: start.elapsed().as_secs(),
             },
-            mastered_points,
-            unresolved_questions,
+            mastered_points: parsed.mastered,
+            unresolved_questions: parsed.unresolved,
         })
     }
 
@@ -881,6 +950,124 @@ fn parse_research_response(response: &str) -> (String, Vec<String>) {
     };
 
     (research_summary, sources)
+}
+
+/// Build previous progress section from recall result.
+fn build_previous_progress_section(recall: &RecallResult) -> String {
+    let mut sections = Vec::new();
+
+    // L4 trigger matches
+    if !recall.trigger_matches.is_empty() {
+        sections.push(format!(
+            "### L4 触发词匹配\n- {}",
+            recall.trigger_matches.join("\n- ")
+        ));
+    }
+
+    // L3 experience summary
+    if let Some(ref exp) = recall.experience_summary {
+        sections.push(format!("### L3 经验摘要\n{}", exp));
+    }
+
+    // L2 task summary (previous learning progress)
+    if let Some(ref task) = recall.task_summary {
+        sections.push(format!("### L2 上次学习进度\n{}", task));
+    }
+
+    // Related pitfalls
+    if !recall.related_pitfalls.is_empty() {
+        sections.push(format!(
+            "### 相关踩坑记录\n- {}",
+            recall.related_pitfalls.join("\n- ")
+        ));
+    }
+
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("## 上次学习进度（渐进式召回）\n{}\n\n", sections.join("\n\n"))
+    }
+}
+
+/// Parsed learn JSON response.
+struct LearnJsonResponse {
+    fact_summary: String,
+    mastered: Vec<String>,
+    unresolved: Vec<String>,
+    experience_rules: Vec<String>,
+}
+
+/// Parse JSON-formatted learn response (Task 9 format).
+fn parse_learn_json_response(response: &str) -> LearnJsonResponse {
+    // Extract JSON from response (handle markdown code blocks)
+    let json_str = extract_json_from_response(response);
+
+    // Parse JSON
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+        let fact_summary = parsed
+            .get("fact_summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mastered = parsed
+            .get("mastered")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let unresolved = parsed
+            .get("unresolved")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let experience_rules = parsed
+            .get("experience_rules")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        LearnJsonResponse {
+            fact_summary,
+            mastered,
+            unresolved,
+            experience_rules,
+        }
+    } else {
+        // Fallback to legacy parsing if JSON fails
+        let (mastered, unresolved) = parse_learn_response(response);
+        LearnJsonResponse {
+            fact_summary: response.to_string(),
+            mastered,
+            unresolved,
+            experience_rules: Vec::new(),
+        }
+    }
+}
+
+/// Extract JSON string from response (handle markdown code blocks).
+fn extract_json_from_response(response: &str) -> &str {
+    let trimmed = response.trim();
+
+    // Try to extract ```json ... ```
+    if let Some(start) = trimmed.find("```json") {
+        let json_start = start + 7;
+        if let Some(end) = trimmed[json_start..].find("```") {
+            return trimmed[json_start..json_start + end].trim();
+        }
+    }
+
+    // Try to extract ``` ... ```
+    if let Some(start) = trimmed.find("```") {
+        let json_start = start + 3;
+        if let Some(end) = trimmed[json_start..].find("```") {
+            return trimmed[json_start..json_start + end].trim();
+        }
+    }
+
+    // Return raw response
+    trimmed
 }
 
 fn parse_learn_response(response: &str) -> (Vec<String>, Vec<String>) {
