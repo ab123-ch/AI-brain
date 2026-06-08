@@ -10,6 +10,98 @@
 
 ---
 
+## 实施进度（2026-06-08 更新）
+
+### 已完成
+
+| Task | 状态 | 文件 | 测试数 |
+|------|------|------|--------|
+| Task 1: EvolutionBacklog | ✅ | `backlog.rs` | 4 |
+| Task 2: EvoTarget | ✅ | `target.rs` | 5 |
+| Task 3: EvoLog + CapabilityTree | ✅ | `evo_log.rs` + `capability_tree.rs` | 6 |
+| Task 4: EvolutionTrigger | ✅ | `trigger.rs` | 8 (内嵌) |
+| Task 5: EvolutionCoordinator | ✅ | `coordinator.rs` | 7 + 23 (内嵌) |
+| 审计修复 | ✅ | `backlog.rs`/`evo_log.rs`/`coordinator.rs`/`error.rs` | 69 全通过 |
+
+### 待实施（从 Task 6 开始）
+
+| Task | Phase | 说明 |
+|------|-------|------|
+| Task 6 | Phase 3 | CycleRunner 核心循环框架 |
+| Task 7-10 | Phase 3 | 六阶段实现 (感知/研究/学习/合成) |
+| Task 11-12 | Phase 3 | 注册 + VerificationAgent |
+| Task 13-14 | Phase 4 | EvoOrchestrator + System Prompt |
+| Task 15-17 | Phase 5 | Orchestrator 集成 + 命令接口 |
+| Task 18-19 | Phase 6 | Backlog 收集集成 |
+| Task 20 | Phase 7 | 端到端测试 |
+
+### 已完成模块的关键 API 速查
+
+```
+backlog.rs:
+  EvolutionBacklog::new(base_dir)
+  .add_entry(entry)       // 自动去重+持久化
+  .query_by_status(status) -> Vec<&BacklogEntry>
+  .query_sorted_by_priority() -> Vec<&BacklogEntry>
+  .resolve_entry(id, evo_log_id)  // 自动持久化
+  .block_entry(id, reason)        // 自动持久化
+
+target.rs:
+  EvoTargetQueue::new(base_dir)
+  .add_target(target)     // 自动持久化
+  .list_targets() -> &[EvoTarget]
+  .sorted_targets() -> Vec<&EvoTarget>  // 按 priority 升序
+  .update_status(id, status)
+  .update_checkpoint(id, idx, met)
+
+evo_log.rs:
+  EvoLogStore::new(base_dir)
+  .append(entry)          // 自动持久化
+  .query_by_date(prefix) -> Vec<&EvoLogEntry>
+  .latest() -> Option<&EvoLogEntry>
+  .update_entry(log_id, phases, tokens, skills, resolved_backlog, status)  // 自动持久化
+
+capability_tree.rs:
+  CapabilityTree::load(base_dir) -> Result<Self>
+  .save(base_dir) -> Result<()>
+  .update_with_new_skill(skill_name, domain_hint)
+
+trigger.rs:
+  EvolutionTrigger::new(config)
+  .should_trigger() -> TriggerDecision
+  .touch_activity()
+  .set_evolving(bool)
+  .set_has_targets(bool)
+
+coordinator.rs:
+  EvolutionCoordinator::new(base_dir, config) -> Result<Self>
+  .pick_next_target() -> Option<EvoTargetCandidate>
+  .has_pending_work() -> bool
+  .resolve_target(target_id, evo_log_id, skills)
+  .block_target(target_id, reason)
+  .log_cycle_start(target_id) -> String  // 返回 log_id
+  .log_cycle_end(log_id, phases, tokens, skills, resolved_backlog, status)
+  .night_session_summary() -> NightSessionResult
+```
+
+### 待处理项（非阻塞，后续 Task 中处理）
+
+1. **Severity 重复定义**: backlog.rs (4级) vs idle_scanner.rs (3级) → Phase 3 集成时统一
+2. **IdleScanner vs EvolutionTrigger**: 功能重叠 → Phase 5 改造时决定去留
+3. **reqwest 依赖**: Cargo.toml 声明但未使用 → 清理
+4. **旧骨架未连接**: evolver_brain.rs / evolution_engine.rs 仍用旧架构 → Task 15-17 核心工作
+
+### 新会话接续指南
+
+1. 读取设计文档: `docs/plans/2026-06-08-evolution-brain-v2-design.md`
+2. 从 Task 6 (CycleRunner) 开始实施
+3. CycleRunner 需要依赖 LlmProvider trait — 参见 `brain-llm/src/lib.rs`
+4. MCP 工具调用通过 `brain-mcp/src/client_pool.rs` 的 McpClientPool（当前为 stub）
+5. 记忆脑接口参见 `brain-memory/src/pyramid_memory_brain.rs`
+6. SkillCatalog 参见 `brain-plugin/src/skill_loader.rs`
+
+---
+
 ## Phase 1: 数据模型与 Backlog（基础层）
 
 ### Task 1: EvolutionBacklog 数据模型
