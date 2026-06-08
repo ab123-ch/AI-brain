@@ -1,3 +1,4 @@
+pub mod backlog;
 pub mod error;
 pub mod evolution_engine;
 pub mod evolver_brain;
