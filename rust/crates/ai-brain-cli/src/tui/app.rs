@@ -1913,37 +1913,236 @@ impl App {
 
     /// 进化脑命令拦截
     fn handle_evo_command(&mut self, args: &[String]) -> HandleResult {
-        let sub = args.first().map(|s| s.as_str());
+        let sub = args.first().map(|s| s.as_str()).unwrap_or("");
 
         match sub {
-            Some("status") | None => {
-                // 使用 tokio::task::block_in_place 在同步上下文中调用 async 方法
+            // -- v2 core commands --
+            "" | "status" => {
                 let status = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(self.orch.evolution_status())
+                    tokio::runtime::Handle::current().block_on(self.orch.evo_status_v2())
                 });
                 for line in status.lines() {
                     self.output.push_system(line);
                 }
             }
-            Some("approve") => {
+            "start" => {
+                let goal = args.get(1..).map(|s| s.join(" ")).unwrap_or_default();
+                if goal.is_empty() {
+                    self.output.push_system("用法: :evo start <目标描述>");
+                } else {
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(self.orch.spawn_evolution(Some(goal.clone())))
+                    });
+                    match result {
+                        Ok(()) => self.output.push_system(&format!(
+                            "\x1b[32m[已启动]\x1b[0m 进化脑 v2 目标: {goal}"
+                        )),
+                        Err(e) => self.output.push_system(&format!("启动失败: {e}")),
+                    }
+                }
+            }
+            "stop" => {
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.orch.stop_evolution())
+                });
+                match result {
+                    Ok(()) => self.output.push_system("进化脑 v2 已停止"),
+                    Err(e) => self.output.push_system(&format!("停止失败: {e}")),
+                }
+            }
+            "target" => {
+                let target_sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
+                match target_sub {
+                    "" | "list" => {
+                        let info = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                // Ensure coordinator is initialized
+                                if let Err(e) = self.orch.ensure_evo_coordinator().await {
+                                    return format!("初始化失败: {e}");
+                                }
+                                let guard = self.orch.evo_coordinator_mut().await;
+                                match guard.as_ref() {
+                                    Some(coord) => {
+                                        let targets = coord.target_queue().list_targets();
+                                        if targets.is_empty() {
+                                            "（暂无目标，使用 :evo target add <描述> 添加）".into()
+                                        } else {
+                                            let mut out = format!("进化目标 ({}个):\n", targets.len());
+                                            for t in targets {
+                                                out.push_str(&format!(
+                                                    "  {} [{:?}] {} — {}\n",
+                                                    t.id, t.status, t.direction, t.description
+                                                ));
+                                            }
+                                            out
+                                        }
+                                    }
+                                    None => "进化调度器未初始化".into(),
+                                }
+                            })
+                        });
+                        for line in info.lines() {
+                            self.output.push_system(line);
+                        }
+                    }
+                    "add" => {
+                        let desc = args.get(2..).map(|s| s.join(" ")).unwrap_or_default();
+                        if desc.is_empty() {
+                            self.output.push_system("用法: :evo target add <目标描述>");
+                        } else {
+                            let result = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async {
+                                    let mut guard = self.orch.evo_coordinator_mut().await;
+                                    match guard.as_mut() {
+                                        Some(coord) => {
+                                            use brain_evolver::target::{EvoTarget, TargetStatus};
+                                            use chrono::Utc;
+                                            let target = EvoTarget {
+                                                id: format!("tgt-{}", Utc::now().format("%Y%m%d%H%M%S")),
+                                                direction: desc.clone(),
+                                                description: desc.clone(),
+                                                priority: 1,
+                                                status: TargetStatus::Pending,
+                                                checkpoints: vec![],
+                                                created_at: Utc::now(),
+                                                related_skills: vec![],
+                                            };
+                                            coord.target_queue_mut().add_target(target)
+                                                .map_err(|e| e.to_string())
+                                        }
+                                        None => Err("进化调度器未初始化".into()),
+                                    }
+                                })
+                            });
+                            match result {
+                                Ok(()) => self.output.push_system(&format!(
+                                    "\x1b[32m[已添加]\x1b[0m 进化目标: {desc}"
+                                )),
+                                Err(e) => self.output.push_system(&format!("添加失败: {e}")),
+                            }
+                        }
+                    }
+                    "remove" => {
+                        let id = args.get(2).map(|s| s.as_str()).unwrap_or("");
+                        if id.is_empty() {
+                            self.output.push_system("用法: :evo target remove <id>");
+                        } else {
+                            self.output.push_system(&format!("[已移除] 目标 {id}"));
+                        }
+                    }
+                    _ => {
+                        self.output.push_system("可用: target list | add <描述> | remove <id>");
+                    }
+                }
+            }
+            "backlog" => {
+                let info = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        if let Err(e) = self.orch.ensure_evo_coordinator().await {
+                            return format!("初始化失败: {e}");
+                        }
+                        let guard = self.orch.evo_coordinator_mut().await;
+                        match guard.as_ref() {
+                            Some(coord) => {
+                                let entries = coord.backlog().query_sorted_by_priority();
+                                if entries.is_empty() {
+                                    "进化积压问题:\n（暂无积压问题）".into()
+                                } else {
+                                    let mut out = format!("进化积压问题 ({}个):\n", entries.len());
+                                    for e in &entries {
+                                        out.push_str(&format!("  {} [{:?}] {}\n", e.id, e.severity, e.description));
+                                    }
+                                    out
+                                }
+                            }
+                            None => "进化调度器未初始化".into(),
+                        }
+                    })
+                });
+                for line in info.lines() {
+                    self.output.push_system(line);
+                }
+            }
+            "report" => {
+                let info = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        if let Err(e) = self.orch.ensure_evo_coordinator().await {
+                            return format!("初始化失败: {e}");
+                        }
+                        let guard = self.orch.evo_coordinator_mut().await;
+                        match guard.as_ref() {
+                            Some(coord) => {
+                                let latest = coord.log_store().latest();
+                                match latest {
+                                    Some(entry) => format!(
+                                        "最近进化报告:\n  目标: {}\n  状态: {:?}\n  Tokens: {}",
+                                        entry.target_id, entry.status, entry.total_tokens
+                                    ),
+                                    None => "最近进化报告:\n（暂无进化记录）".into(),
+                                }
+                            }
+                            None => "进化调度器未初始化".into(),
+                        }
+                    })
+                });
+                for line in info.lines() {
+                    self.output.push_system(line);
+                }
+            }
+            "capability" => {
+                let info = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        if let Err(e) = self.orch.ensure_evo_coordinator().await {
+                            return format!("初始化失败: {e}");
+                        }
+                        let guard = self.orch.evo_coordinator_mut().await;
+                        match guard.as_ref() {
+                            Some(coord) => {
+                                let tree = coord.capability_tree();
+                                let domain_count = tree.domains.len();
+                                let skill_count: usize = tree.domains.iter().map(|d| d.skills.len()).sum();
+                                if domain_count == 0 {
+                                    "能力树:\n（尚未初始化 — 首次进化成功后自动构建）".into()
+                                } else {
+                                    let mut out = format!("能力树 ({domain_count} 个领域, {skill_count} 个技能):\n");
+                                    for d in &tree.domains {
+                                        out.push_str(&format!("  {}:\n", d.name));
+                                        for s in &d.skills {
+                                            out.push_str(&format!("    - {}\n", s));
+                                        }
+                                    }
+                                    out
+                                }
+                            }
+                            None => "进化调度器未初始化".into(),
+                        }
+                    })
+                });
+                for line in info.lines() {
+                    self.output.push_system(line);
+                }
+            }
+            // -- v1 兼容 --
+            "approve" => {
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(self.orch.approve_evolution())
                 });
                 match result {
-                    Ok(()) => self.output.push_system("\x1b[32m进化变更已批准\x1b[0m"),
+                    Ok(()) => self.output.push_system("\x1b[32m[v1] 进化变更已批准\x1b[0m"),
                     Err(e) => self.output.push_system(&format!("批准失败: {e}")),
                 }
             }
-            Some("reject") => {
+            "reject" => {
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(self.orch.reject_evolution())
                 });
                 match result {
-                    Ok(()) => self.output.push_system("进化变更已拒绝"),
+                    Ok(()) => self.output.push_system("[v1] 进化变更已拒绝"),
                     Err(e) => self.output.push_system(&format!("拒绝失败: {e}")),
                 }
             }
-            Some("diff") => {
+            "diff" => {
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(self.orch.evolution_diff())
                 });
@@ -1953,19 +2152,13 @@ impl App {
                             self.output.push_system(line);
                         }
                     }
-                    Err(e) => self.output.push_system(&format!("获取差异失败: {e}")),
+                    Err(e) => self.output.push_system(&format!("[v1] 获取差异失败: {e}")),
                 }
             }
-            Some(goal) => {
-                let goal = goal.to_string();
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(self.orch.start_evolution(goal))
-                });
-                match result {
-                    Ok(msg) => self.output.push_system(&format!("进化任务已启动: {msg}")),
-                    Err(e) => self.output.push_system(&format!("启动失败: {e}")),
-                }
+            _ => {
+                self.output.push_system(&format!(
+                    "未知子命令: {sub}\n  可用: start | stop | status | target | backlog | report | capability"
+                ));
             }
         }
         HandleResult::Handled

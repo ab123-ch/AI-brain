@@ -63,21 +63,22 @@ impl EvoOrchestrator {
             EvolverError::InvalidState(format!("Failed to create coordinator: {e}"))
         })?;
 
-        // Build the cycle runner
-        let cycle_config = CycleConfig {
-            max_iterations: config.max_iterations_per_target,
-            token_budget_per_target: config.token_budget_per_target,
-            verify_threshold: config.verify_threshold,
-            ..CycleConfig::default()
-        };
-        let cycle_runner = CycleRunner::new(llm.clone(), cycle_config);
-
         // Build the system prompt (initial, will be updated per target)
         let system_prompt = evo_prompt::build_evo_system_prompt(&EvoPromptContext {
             existing_skill_names: shared.skill_names.clone(),
             token_budget: config.token_budget_per_target,
             ..Default::default()
         });
+
+        // Build the cycle runner (initial prompt; will be updated per target)
+        let cycle_config = CycleConfig {
+            max_iterations: config.max_iterations_per_target,
+            token_budget_per_target: config.token_budget_per_target,
+            verify_threshold: config.verify_threshold,
+            system_prompt: system_prompt.clone(),
+            ..CycleConfig::default()
+        };
+        let cycle_runner = CycleRunner::new(llm.clone(), cycle_config);
 
         Ok(Self {
             llm,
@@ -96,6 +97,9 @@ impl EvoOrchestrator {
     pub async fn run_evolution(&mut self, target: &EvoTargetCandidate) -> Result<CycleResult> {
         // Update system prompt for this specific target
         self.update_system_prompt(target);
+
+        // Pass the updated prompt to CycleRunner
+        self.cycle_runner.set_system_prompt(self.system_prompt.clone());
 
         // Log cycle start
         let target_id = target_id_from_candidate(target);

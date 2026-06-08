@@ -30,6 +30,9 @@ pub struct CycleConfig {
     pub verify_threshold: f64,
     /// Max wall-clock time per target.
     pub max_duration: Duration,
+    /// Evolution system prompt (built by EvoPrompt five-layer generator).
+    /// If empty, a minimal fallback prompt is used.
+    pub system_prompt: String,
 }
 
 impl Default for CycleConfig {
@@ -39,6 +42,7 @@ impl Default for CycleConfig {
             token_budget_per_target: 100_000,
             verify_threshold: 70.0,
             max_duration: Duration::from_secs(3600),
+            system_prompt: String::new(),
         }
     }
 }
@@ -217,22 +221,41 @@ impl CycleResult {
 pub struct CycleRunner {
     llm: Arc<dyn LlmProvider>,
     config: CycleConfig,
+    /// Cross-phase conversation history — preserves context across all six phases.
+    history: Vec<ChatMessage>,
 }
 
 impl CycleRunner {
     /// Create a new runner with the given LLM and config.
     pub fn new(llm: Arc<dyn LlmProvider>, config: CycleConfig) -> Self {
-        Self { llm, config }
+        Self {
+            llm,
+            config,
+            history: Vec::new(),
+        }
+    }
+
+    /// Update the system prompt (called by EvoOrchestrator before each target).
+    pub fn set_system_prompt(&mut self, prompt: String) {
+        self.config.system_prompt = prompt;
+    }
+
+    /// Clear conversation history (called at the start of each new target cycle).
+    pub fn clear_history(&mut self) {
+        self.history.clear();
     }
 
     /// Run the full evolution cycle for a target.
     ///
     /// If verification fails, retries from Learn with feedback.
     /// Stops after `max_iterations` retries and returns `Blocked`.
-    pub async fn run(&self, target: &EvoTargetCandidate) -> Result<CycleResult> {
+    pub async fn run(&mut self, target: &EvoTargetCandidate) -> Result<CycleResult> {
         let start = Instant::now();
         let mut total_tokens = 0u64;
         let mut feedback = String::new();
+
+        // Clear history for this new target cycle
+        self.clear_history();
 
         for iteration in 0..self.config.max_iterations {
             // Check timeout
@@ -314,7 +337,7 @@ impl CycleRunner {
     /// Phase 1: Perceive — identify gaps and recall previous progress.
     ///
     /// Uses the LLM to analyze the target and identify knowledge gaps.
-    pub async fn phase_perceive(&self, target: &EvoTargetCandidate) -> Result<PerceiveResult> {
+    pub async fn phase_perceive(&mut self, target: &EvoTargetCandidate) -> Result<PerceiveResult> {
         let start = Instant::now();
 
         let target_desc = describe_target(target);
@@ -356,7 +379,7 @@ impl CycleRunner {
     ///
     /// In this initial implementation, uses the LLM to generate research notes
     /// based on the perceived gaps. MCP tools will be integrated in Task 8.
-    pub async fn phase_research(&self, perceive: &PerceiveResult) -> Result<ResearchResult> {
+    pub async fn phase_research(&mut self, perceive: &PerceiveResult) -> Result<ResearchResult> {
         let start = Instant::now();
 
         let gaps_text = perceive.gaps.join("\n- ");
@@ -393,13 +416,13 @@ impl CycleRunner {
     }
 
     /// Phase 3: Learn — digest and analyze research material.
-    pub async fn phase_learn(&self, research: &ResearchResult) -> Result<LearnResult> {
+    pub async fn phase_learn(&mut self, research: &ResearchResult) -> Result<LearnResult> {
         self.phase_learn_with_feedback(research, "").await
     }
 
     /// Phase 3 with feedback from a previous verification failure.
     async fn phase_learn_with_feedback(
-        &self,
+        &mut self,
         research: &ResearchResult,
         feedback: &str,
     ) -> Result<LearnResult> {
@@ -444,7 +467,7 @@ impl CycleRunner {
     }
 
     /// Phase 4: Synthesize — generate SKILL.md drafts.
-    pub async fn phase_synthesize(&self, learn: &LearnResult) -> Result<SynthesizeResult> {
+    pub async fn phase_synthesize(&mut self, learn: &LearnResult) -> Result<SynthesizeResult> {
         let start = Instant::now();
 
         let mastered = learn.mastered_points.join("\n- ");
@@ -485,7 +508,7 @@ impl CycleRunner {
     ///
     /// In this initial implementation, returns the skill names as "registered".
     /// Actual file writing and PluginManager integration will be added in Task 11.
-    pub async fn phase_register(&self, synthesize: &SynthesizeResult) -> Result<RegisterResult> {
+    pub async fn phase_register(&mut self, synthesize: &SynthesizeResult) -> Result<RegisterResult> {
         let start = Instant::now();
 
         let registered_skills: Vec<String> =
@@ -516,7 +539,7 @@ impl CycleRunner {
     /// Phase 6: Verify — verify skills using LLM.
     ///
     /// Constructs test questions and evaluates the skill quality.
-    pub async fn phase_verify(&self, register: &RegisterResult) -> Result<VerificationResult> {
+    pub async fn phase_verify(&mut self, register: &RegisterResult) -> Result<VerificationResult> {
         let start = Instant::now();
 
         let specs_text = register
@@ -568,19 +591,35 @@ impl CycleRunner {
 
     // -- Helpers --------------------------------------------------------------
 
-    async fn llm_complete(&self, prompt: String) -> brain_llm::Result<ChatResponse> {
+    async fn llm_complete(&mut self, prompt: String) -> brain_llm::Result<ChatResponse> {
+        // Append user message to history
+        self.history.push(ChatMessage::user(&prompt));
+
+        // Build messages: system prompt + full history
+        let system_text = if self.config.system_prompt.is_empty() {
+            "你是智脑的进化子系统，负责学习、研究和生成技能文件。".to_string()
+        } else {
+            self.config.system_prompt.clone()
+        };
+        let mut messages = vec![ChatMessage::system(&system_text)];
+        messages.extend(self.history.iter().cloned());
+
         let request = ChatRequest {
             model: None,
-            messages: vec![
-                ChatMessage::system("你是智脑的进化子系统，负责学习、研究和生成技能文件。"),
-                ChatMessage::user(prompt),
-            ],
+            messages,
             max_tokens: Some(4096),
             temperature: Some(0.3),
             tools: None,
             tool_choice: None,
         };
-        self.llm.complete(request).await
+        let response = self.llm.complete(request).await;
+
+        // Append assistant response to history (preserve cross-phase context)
+        if let Ok(ref resp) = response {
+            self.history.push(ChatMessage::assistant(resp.text()));
+        }
+
+        response
     }
 
     /// Access the config.
@@ -939,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn test_cycle_runner_phase_perceive() {
         let llm = Arc::new(EchoLlmProvider::new("test-model"));
-        let runner = CycleRunner::new(llm, CycleConfig::default());
+        let mut runner = CycleRunner::new(llm, CycleConfig::default());
 
         let result = runner.phase_perceive(&make_target()).await.unwrap();
         assert_eq!(result.output.phase, EvoPhase::Perceive);
@@ -949,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn test_cycle_runner_phase_research() {
         let llm = Arc::new(EchoLlmProvider::new("test-model"));
-        let runner = CycleRunner::new(llm, CycleConfig::default());
+        let mut runner = CycleRunner::new(llm, CycleConfig::default());
 
         let perceive = PerceiveResult {
             output: PhaseOutput {
@@ -970,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn test_cycle_runner_full_cycle_echo() {
         let llm = Arc::new(EchoLlmProvider::new("test-model"));
-        let runner = CycleRunner::new(llm, CycleConfig::default());
+        let mut runner = CycleRunner::new(llm, CycleConfig::default());
 
         let result = runner.run(&make_target()).await.unwrap();
         // With EchoLlmProvider, the cycle will run through phases
@@ -1085,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn test_cycle_success_first_try() {
         let mock = Arc::new(MockLlm::new(success_responses()));
-        let runner = CycleRunner::new(mock.clone(), CycleConfig::default());
+        let mut runner = CycleRunner::new(mock.clone(), CycleConfig::default());
 
         let result = runner.run(&make_target()).await.unwrap();
 
@@ -1111,7 +1150,7 @@ mod tests {
             max_iterations: 3,
             ..CycleConfig::default()
         };
-        let runner = CycleRunner::new(mock.clone(), config);
+        let mut runner = CycleRunner::new(mock.clone(), config);
 
         let result = runner.run(&make_target()).await.unwrap();
 
@@ -1160,7 +1199,7 @@ mod tests {
             max_iterations: 2,
             ..CycleConfig::default()
         };
-        let runner = CycleRunner::new(mock.clone(), config);
+        let mut runner = CycleRunner::new(mock.clone(), config);
 
         let result = runner.run(&make_target()).await.unwrap();
 

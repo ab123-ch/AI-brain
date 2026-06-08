@@ -1404,7 +1404,7 @@ impl Orchestrator {
     // ─── 进化脑 v2 方法 ──────────────────────────────────────────
 
     /// 初始化 v2 进化脑调度器（在首次 /evo 调用时惰性初始化）。
-    async fn ensure_evo_coordinator(&self) -> Result<(), String> {
+    pub async fn ensure_evo_coordinator(&self) -> Result<(), String> {
         let mut guard = self.evo_coordinator.lock().await;
         if guard.is_none() {
             let base_dir =
