@@ -25,6 +25,8 @@
 | Task 6: CycleRunner | ✅ | `cycle_runner.rs` | 24 (内嵌) |
 | Task 14: EvoPrompt | ✅ | `evo_prompt.rs` | 8 (内嵌) |
 | Task 13: EvoOrchestrator | ✅ | `evo_orchestrator.rs` | 8 (内嵌) |
+| Task 15: Orchestrator 集成 | ✅ | `orchestrator.rs` | 编译通过 |
+| Task 16: 命令接口重写 | ✅ | `evolver_cmd.rs` | 10 |
 
 ### 待实施
 
