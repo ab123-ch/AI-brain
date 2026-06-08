@@ -1,5 +1,7 @@
 pub mod backlog;
+pub mod capability_tree;
 pub mod error;
+pub mod evo_log;
 pub mod evolution_engine;
 pub mod evolver_brain;
 pub mod guard;
