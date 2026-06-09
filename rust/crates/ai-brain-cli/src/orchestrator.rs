@@ -1452,6 +1452,10 @@ impl Orchestrator {
         let shared = SharedResources {
             mcp_pool_info: String::new(),
             skill_names,
+            // TODO: Create real MemoryAccess adapter from memory_brain
+            memory: Arc::new(brain_evolver::StubMemoryAccess),
+            // TODO: Create real WebSearch from MCP pool
+            web_search: Arc::new(brain_evolver::StubWebSearch),
         };
 
         // 如果指定了目标描述，创建临时 target

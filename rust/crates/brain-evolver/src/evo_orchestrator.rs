@@ -15,6 +15,8 @@ use crate::cycle_runner::{CycleConfig, CycleResult, CycleRunner};
 use crate::error::{EvolverError, Result};
 use crate::evo_log::PhaseRecord;
 use crate::evo_prompt::{self, EvoPromptContext};
+use crate::memory_access::MemoryAccess;
+use crate::web_search::WebSearch;
 use brain_llm::provider::LlmProvider;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +29,10 @@ pub struct SharedResources {
     pub mcp_pool_info: String,
     /// Skill catalog info (read-only).
     pub skill_names: Vec<String>,
+    /// Memory access (shared with main brain).
+    pub memory: Arc<dyn MemoryAccess>,
+    /// Web search capability (shared MCP tools).
+    pub web_search: Arc<dyn WebSearch>,
 }
 
 /// The evolution orchestrator — runs independently from the main brain.
@@ -70,7 +76,7 @@ impl EvoOrchestrator {
             ..Default::default()
         });
 
-        // Build the cycle runner (initial prompt; will be updated per target)
+        // Build the cycle runner with shared resources
         let cycle_config = CycleConfig {
             max_iterations: config.max_iterations_per_target,
             token_budget_per_target: config.token_budget_per_target,
@@ -78,7 +84,12 @@ impl EvoOrchestrator {
             system_prompt: system_prompt.clone(),
             ..CycleConfig::default()
         };
-        let cycle_runner = CycleRunner::new(llm.clone(), cycle_config);
+        let cycle_runner = CycleRunner::with_resources(
+            llm.clone(),
+            cycle_config,
+            shared.memory.clone(),
+            shared.web_search.clone(),
+        );
 
         Ok(Self {
             llm,
@@ -334,6 +345,8 @@ mod tests {
         SharedResources {
             mcp_pool_info: String::new(),
             skill_names: vec!["rust-basics".into()],
+            memory: Arc::new(crate::memory_access::MockMemoryAccess::empty()),
+            web_search: Arc::new(crate::web_search::MockWebSearch::empty()),
         }
     }
 
