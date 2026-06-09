@@ -92,6 +92,8 @@ pub struct LearnResult {
     pub mastered_points: Vec<String>,
     /// Questions still unresolved (feed back into next iteration).
     pub unresolved_questions: Vec<String>,
+    /// Sources used in research (passed for SKILL.md references).
+    pub sources_used: Vec<String>,
 }
 
 /// A draft skill file (SKILL.md content).
@@ -639,26 +641,86 @@ impl CycleRunner {
             },
             mastered_points: parsed.mastered,
             unresolved_questions: parsed.unresolved,
+            sources_used: research.sources_used.clone(),
         })
     }
 
-    /// Phase 4: Synthesize — generate SKILL.md drafts.
+    /// Phase 4: Synthesize — generate SKILL.md drafts with references and triggers.
+    ///
+    /// Task 10 implementation: Full SKILL.md generation with:
+    /// - YAML frontmatter (name, description, when_to_use, bootstrap)
+    /// - Knowledge body + examples + references
+    /// - Trigger keywords written to L4
     pub async fn phase_synthesize(&mut self, learn: &LearnResult) -> Result<SynthesizeResult> {
         let start = Instant::now();
 
+        // Build mastered points section
         let mastered = learn.mastered_points.join("\n- ");
+
+        // Build references section
+        let references = if learn.sources_used.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n## 参考来源\n{}\n",
+                learn.sources_used.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+            )
+        };
+
+        // Build unresolved section (for skill limitation notes)
+        let unresolved_section = if learn.unresolved_questions.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n## 尚未掌握\n{}\n",
+                learn.unresolved_questions.iter().map(|q| format!("- {}", q)).collect::<Vec<_>>().join("\n")
+            )
+        };
+
         let prompt = format!(
-            "基于以下已掌握的知识，生成 SKILL.md 技能文件:\n\n\
-             已掌握:\n- {mastered}\n\n\
-             请生成 SKILL.md 格式的内容，包含:\n\
-             1. YAML frontmatter (name, description, when_to_use)\n\
-             2. 知识正文\n\
-             3. 示例代码（如适用）\n\
-             4. 触发关键词\n\n\
-             SKILL_NAME: 技能名\n\
-             SKILL_DESCRIPTION: 技能描述\n\
-             SKILL_CONTENT:\n技能正文\n\
-             TRIGGER_KEYWORDS: 关键词1, 关键词2"
+            "## 身份\n\
+             你是一个技能文件生成引擎。你将学习成果转化为结构化的 SKILL.md 格式。\n\n\
+             ## 输入\n\
+             ### 已掌握的知识\n\
+             - {mastered}\n\
+             {references}\
+             {unresolved_section}\
+             ## 输出要求\n\
+             生成一个完整的 SKILL.md 文件，包含:\n\n\
+             ### YAML Frontmatter\n\
+             ```yaml\n\
+             name: 技能名称（英文小写-分隔）\n\
+             description: 简短描述（20字以内）\n\
+             when_to_use: 使用场景（逗号分隔的关键词）\n\
+             bootstrap: 引导步骤（可选，如有必要）\n\
+             ```\n\n\
+             ### Markdown Body\n\
+             1. 核心知识（2-5 个要点）\n\
+             2. 代码示例（如适用，使用代码块）\n\
+             3. 最佳实践/注意事项\n\
+             4. 参考来源（从输入中复制）\n\n\
+             ### 触发关键词\n\
+             提取 3-5 个能触发此技能召回的关键词\n\n\
+             ## 输出格式（严格 JSON）\n\
+             ```json\n\
+             {{\n\
+               \"skills\": [\n\
+                 {{\n\
+                   \"name\": \"skill-name\",\n\
+                   \"description\": \"技能描述\",\n\
+                   \"content\": \"---\\nname: skill-name\\ndescription: ...\\nwhen_to_use: ...\\n---\\n\\n# 知识标题\\n\\n内容...\",\n\
+                   \"trigger_keywords\": [\"关键词1\", \"关键词2\"]\n\
+                 }}\n\
+               ]\n\
+             }}\n\
+             ```\n\n\
+             注意:\n\
+             - 一个学习阶段可能生成多个技能（如果知识覆盖多个领域）\n\
+             - 技能名称使用英文小写+连字符\n\
+             - content 字段必须是完整的 SKILL.md 格式（含 frontmatter）",
+            mastered = mastered,
+            references = references,
+            unresolved_section = unresolved_section,
         );
 
         let response = self
@@ -667,7 +729,21 @@ impl CycleRunner {
             .map_err(|e| EvolverError::Llm(e.to_string()))?;
         let text = response.text();
 
-        let skills = parse_synthesize_response(&text);
+        // Parse structured response
+        let skills = parse_synthesize_json_response(&text);
+
+        // Write trigger keywords to L4 (subconscious)
+        for skill in &skills {
+            for keyword in &skill.trigger_keywords {
+                self.memory
+                    .write_memory(crate::memory_access::MemoryWriteRequest {
+                        layer: crate::memory_access::MemoryLayer::Subconscious,
+                        content: format!("{} -> {}", keyword, skill.name),
+                        source: "phase_synthesize_trigger".into(),
+                    })
+                    .map_err(|e| EvolverError::Memory(e.to_string()))?;
+            }
+        }
 
         Ok(SynthesizeResult {
             output: PhaseOutput {
@@ -1098,6 +1174,60 @@ fn parse_learn_response(response: &str) -> (Vec<String>, Vec<String>) {
     }
 
     (mastered, unresolved)
+}
+
+/// Parse JSON-formatted synthesize response (Task 10 format).
+fn parse_synthesize_json_response(response: &str) -> Vec<SkillDraft> {
+    // Extract JSON from response (handle markdown code blocks)
+    let json_str = extract_json_from_response(response);
+
+    // Parse JSON
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+        let skills: Vec<SkillDraft> = parsed
+            .get("skills")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let name = v.get("name").and_then(|n| n.as_str())?;
+                        let description = v
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let content = v
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let trigger_keywords = v
+                            .get("trigger_keywords")
+                            .and_then(|t| t.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|k| k.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        Some(SkillDraft {
+                            name: name.to_string(),
+                            description,
+                            content,
+                            trigger_keywords,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !skills.is_empty() {
+            return skills;
+        }
+    }
+
+    // Fallback to legacy parsing if JSON fails
+    parse_synthesize_response(response)
 }
 
 fn parse_synthesize_response(response: &str) -> Vec<SkillDraft> {
