@@ -250,6 +250,21 @@ impl EvoOrchestrator {
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
+
+    /// Access the LLM provider.
+    pub fn llm(&self) -> &Arc<dyn LlmProvider> {
+        &self.llm
+    }
+
+    /// Access the base directory.
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    /// Access the config.
+    pub fn config(&self) -> &EvoConfig {
+        &self.config
+    }
 }
 
 /// Output of a night evolution session.
