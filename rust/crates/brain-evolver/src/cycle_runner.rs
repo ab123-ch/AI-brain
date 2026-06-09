@@ -14,6 +14,7 @@ use crate::memory_access::{MemoryAccess, RecallResult, StubMemoryAccess};
 use crate::web_search::{SearchResult, StubWebSearch, WebSearch};
 use brain_llm::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -231,6 +232,8 @@ pub struct CycleRunner {
     memory: Arc<dyn MemoryAccess>,
     /// Web search for MCP tool calls.
     web_search: Arc<dyn WebSearch>,
+    /// Skills directory for SKILL.md file writing (Phase 5 Register).
+    skills_dir: PathBuf,
 }
 
 impl CycleRunner {
@@ -260,12 +263,36 @@ impl CycleRunner {
         memory: Arc<dyn MemoryAccess>,
         web_search: Arc<dyn WebSearch>,
     ) -> Self {
+        // Default skills directory: ~/.ai-brain/skills/evo/
+        let skills_dir = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".ai-brain").join("skills").join("evo"))
+            .unwrap_or_else(|_| PathBuf::from(".ai-brain/skills/evo"));
+
         Self {
             llm,
             config,
             history: Vec::new(),
             memory,
             web_search,
+            skills_dir,
+        }
+    }
+
+    /// Create a new runner with custom skills directory.
+    pub fn with_skills_dir(
+        llm: Arc<dyn LlmProvider>,
+        config: CycleConfig,
+        memory: Arc<dyn MemoryAccess>,
+        web_search: Arc<dyn WebSearch>,
+        skills_dir: PathBuf,
+    ) -> Self {
+        Self {
+            llm,
+            config,
+            history: Vec::new(),
+            memory,
+            web_search,
+            skills_dir,
         }
     }
 
@@ -756,19 +783,47 @@ impl CycleRunner {
         })
     }
 
-    /// Phase 5: Register — prepare skills for registration.
+    /// Phase 5: Register — write SKILL.md files and prepare for verification.
     ///
-    /// In this initial implementation, returns the skill names as "registered".
-    /// Actual file writing and PluginManager integration will be added in Task 11.
+    /// Task 11 implementation:
+    /// - Write SKILL.md content to ~/.ai-brain/skills/evo/<skill-name>/SKILL.md
+    /// - SkillCatalog will auto-discover on next scan
+    /// - Generate VerificationSpec for Phase 6
     pub async fn phase_register(&mut self, synthesize: &SynthesizeResult) -> Result<RegisterResult> {
         let start = Instant::now();
+        let mut registered_skills = Vec::new();
+        let mut failed_skills = Vec::new();
 
-        let registered_skills: Vec<String> =
-            synthesize.skills.iter().map(|s| s.name.clone()).collect();
+        // Ensure skills directory exists
+        std::fs::create_dir_all(&self.skills_dir)
+            .map_err(EvolverError::Io)?;
 
+        // Write each skill to file
+        for skill in &synthesize.skills {
+            let skill_dir = self.skills_dir.join(&skill.name);
+            let skill_file = skill_dir.join("SKILL.md");
+
+            // Create skill directory
+            if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+                failed_skills.push(format!("{}: {}", skill.name, e));
+                continue;
+            }
+
+            // Write SKILL.md content
+            if let Err(e) = std::fs::write(&skill_file, &skill.content) {
+                failed_skills.push(format!("{}: {}", skill.name, e));
+                continue;
+            }
+
+            registered_skills.push(skill.name.clone());
+            tracing::info!("Registered skill: {} -> {}", skill.name, skill_file.display());
+        }
+
+        // Build verification specs for registered skills
         let verification_specs: Vec<VerificationSpec> = synthesize
             .skills
             .iter()
+            .filter(|s| registered_skills.contains(&s.name))
             .map(|s| VerificationSpec {
                 skill_name: s.name.clone(),
                 skill_description: s.description.clone(),
@@ -776,10 +831,22 @@ impl CycleRunner {
             })
             .collect();
 
+        // Build summary
+        let summary = if failed_skills.is_empty() {
+            format!("Registered {} skills successfully", registered_skills.len())
+        } else {
+            format!(
+                "Registered {} skills, {} failed: {}",
+                registered_skills.len(),
+                failed_skills.len(),
+                failed_skills.join(", ")
+            )
+        };
+
         Ok(RegisterResult {
             output: PhaseOutput {
                 phase: EvoPhase::Register,
-                summary: format!("Registered {} skills", registered_skills.len()),
+                summary,
                 tokens_used: 50,
                 duration_secs: start.elapsed().as_secs(),
             },
