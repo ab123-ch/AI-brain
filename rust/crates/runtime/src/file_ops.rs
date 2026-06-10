@@ -397,11 +397,11 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
 
     let mut files = Vec::new();
     let walker = WalkBuilder::new(base_path)
-        .hidden(true)      // 跳过隐藏文件/目录
-        .git_ignore(true)  // 尊重 .gitignore
-        .git_global(true)  // 尊重全局 gitignore
+        .hidden(true) // 跳过隐藏文件/目录
+        .git_ignore(true) // 尊重 .gitignore
+        .git_global(true) // 尊重全局 gitignore
         .git_exclude(true) // 尊重 .git/info/exclude
-        .ignore(true)      // 尊重 .ignore
+        .ignore(true) // 尊重 .ignore
         .build();
 
     for entry in walker {

@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
     response::IntoResponse,
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -23,11 +23,9 @@ use tracing::{error, info, warn};
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 use crate::orchestrator::Orchestrator;
-use crate::web::progress_adapter::{
-    ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent,
-};
-use brain_core::types::ProgressEvent;
+use crate::web::progress_adapter::{ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent};
 use crate::web::session_manager::SessionManager;
+use brain_core::types::ProgressEvent;
 
 // ─── AppState ────────────────────────────────────────────────────────
 
@@ -222,9 +220,7 @@ async fn send_initial_state(
             .map(|s| SessionInfo {
                 id: s.id.clone(),
                 title: s.title.clone(),
-                created_at: s.created_at.parse().unwrap_or_else(|_| {
-                    chrono::Utc::now()
-                }),
+                created_at: s.created_at.parse().unwrap_or_else(|_| chrono::Utc::now()),
                 message_count: s.messages.len(),
             })
             .collect();
@@ -339,12 +335,9 @@ async fn handle_switch_persona(
 
     match result {
         Ok(()) => {
-            send_event(
-                sender,
-                WebProgressEvent::PersonaSwitched { persona_id },
-            )
-            .await
-            .ok();
+            send_event(sender, WebProgressEvent::PersonaSwitched { persona_id })
+                .await
+                .ok();
         }
         Err(e) => {
             send_event(

@@ -44,7 +44,9 @@ impl Default for RetryConfig {
 impl RetryConfig {
     /// 计算第 N 次重试的退避时间（指数退避，带上限）
     pub fn backoff_for_attempt(&self, attempt: u32) -> std::time::Duration {
-        let multiplier = 1u32.checked_shl(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+        let multiplier = 1u32
+            .checked_shl(attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX);
         self.initial_backoff
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff))
@@ -637,8 +639,7 @@ impl LlmProvider for OpenAiCompatClient {
                         return Ok(parsed);
                     }
                     Err(e) => {
-                        let error =
-                            LlmError::RequestFailed(format!("HTTP request failed: {e}"));
+                        let error = LlmError::RequestFailed(format!("HTTP request failed: {e}"));
 
                         if error.is_retryable() && attempts < max_attempts {
                             let backoff = retry_config.backoff_for_attempt(attempts);

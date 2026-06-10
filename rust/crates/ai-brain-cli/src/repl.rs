@@ -75,36 +75,19 @@ pub async fn run(orch: Orchestrator) {
                 if goal.is_empty() {
                     println!("用法: :evo <目标描述>");
                 } else {
-                    match orch.start_evolution(goal.to_string()).await {
-                        Ok(status) => println!("进化已启动: {status}"),
+                    match orch.spawn_evolution(Some(goal.to_string())).await {
+                        Ok(()) => println!("进化已启动（后台运行），使用 :evo-status 查看"),
                         Err(e) => eprintln!("启动失败: {e}"),
                     }
                 }
                 continue;
             }
             ":evo-status" => {
-                println!("{}", orch.evolution_status().await);
+                println!("{}", orch.evo_status_v2().await);
                 continue;
             }
-            ":evo-approve" => {
-                match orch.approve_evolution().await {
-                    Ok(()) => println!("进化结果已确认合并。"),
-                    Err(e) => eprintln!("确认失败: {e}"),
-                }
-                continue;
-            }
-            ":evo-reject" => {
-                match orch.reject_evolution().await {
-                    Ok(()) => println!("进化已拒绝并回滚。"),
-                    Err(e) => eprintln!("回滚失败: {e}"),
-                }
-                continue;
-            }
-            ":evo-diff" => {
-                match orch.evolution_diff().await {
-                    Ok(diff) => println!("{diff}"),
-                    Err(e) => eprintln!("获取 diff 失败: {e}"),
-                }
+            ":evo-approve" | ":evo-reject" | ":evo-diff" => {
+                println!("v1 引擎已移除，请使用 :evo <目标> 启动 v2 进化循环");
                 continue;
             }
             ":quit" | ":exit" | "exit" | "quit" => {

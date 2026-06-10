@@ -340,6 +340,7 @@ dependencies = [
  "brain-core",
  "brain-llm",
  "brain-memory",
+ "brain-plugin",
  "chrono",
  "reqwest",
  "serde",

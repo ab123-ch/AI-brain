@@ -7,7 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use brain_core::types::{BrainId, MemoryEntry, MemoryLayer, KnowledgeSource, TurnRecord};
+use brain_core::types::{BrainId, KnowledgeSource, MemoryEntry, MemoryLayer, TurnRecord};
 
 use crate::abstract_layer::AbstractLayer;
 use crate::concentration::{ConcentrationEngine, ConcentrationReport};
@@ -66,12 +66,7 @@ impl PyramidMemoryBrain {
     }
 
     /// 存储对话轮次到 L1
-    pub fn store_turn(
-        &self,
-        role: &str,
-        content: &str,
-        tool_output: Option<&str>,
-    ) -> Result<()> {
+    pub fn store_turn(&self, role: &str, content: &str, tool_output: Option<&str>) -> Result<()> {
         let pool = RawPool::new(self.storage.clone());
         pool.append_turn(&self.config.session_id, role, content, tool_output)
     }
@@ -219,10 +214,7 @@ impl PyramidMemoryBrain {
     /// 切换人格
     pub fn switch_persona(&mut self, persona_id: &str) -> Result<()> {
         self.persona_manager.switch(persona_id)?;
-        self.storage = PyramidStorage::new(
-            self.config.base_dir.clone(),
-            persona_id,
-        );
+        self.storage = PyramidStorage::new(self.config.base_dir.clone(), persona_id);
         self.storage.ensure_dirs()?;
         self.query_count.store(0, Ordering::Relaxed);
         Ok(())
@@ -285,9 +277,18 @@ impl PyramidMemoryBrain {
         for turn in turns {
             let role = format!("{:?}", turn.role).to_lowercase();
             let tool_output = turn.tool_call.as_ref().map(|tc| {
-                format!("{}: {}", tc.tool_name, tc.output.chars().take(200).collect::<String>())
+                format!(
+                    "{}: {}",
+                    tc.tool_name,
+                    tc.output.chars().take(200).collect::<String>()
+                )
             });
-            pool.append_turn(&self.config.session_id, &role, &turn.content, tool_output.as_deref())?;
+            pool.append_turn(
+                &self.config.session_id,
+                &role,
+                &turn.content,
+                tool_output.as_deref(),
+            )?;
         }
         tracing::info!("L1 完整轨迹追加 {} 条", turns.len());
         Ok(())
@@ -363,7 +364,9 @@ impl PyramidMemoryBrain {
             .take(limit)
             .enumerate()
             .map(|(i, s)| RecentSummary {
-                file_path: self.storage.l2_dir()
+                file_path: self
+                    .storage
+                    .l2_dir()
                     .join(format!("{}.json", s.task_id))
                     .to_string_lossy()
                     .to_string(),
@@ -389,7 +392,9 @@ impl PyramidMemoryBrain {
 
     /// 加载潜意识摘要（兼容旧接口返回 Option）
     pub fn load_subconscious_summary_opt(&self) -> Option<String> {
-        self.load_subconscious_summary().ok().filter(|s| !s.is_empty())
+        self.load_subconscious_summary()
+            .ok()
+            .filter(|s| !s.is_empty())
     }
 
     /// 获取记忆统计（兼容旧 MemoryStats 格式）
@@ -466,10 +471,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let brain = make_brain(&tmp);
         brain
-            .store_turns_batch(&[
-                ("User", "hello", None),
-                ("Tool", "ls", Some("file1")),
-            ])
+            .store_turns_batch(&[("User", "hello", None), ("Tool", "ls", Some("file1"))])
             .unwrap();
 
         let pool = RawPool::new(brain.storage().clone());
@@ -524,8 +526,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut brain = make_brain(&tmp);
 
-        brain.persona_manager_mut()
-            .create("writer".into(), "作家".into(), "网文".into(), "".into(), PersonaConfig::default())
+        brain
+            .persona_manager_mut()
+            .create(
+                "writer".into(),
+                "作家".into(),
+                "网文".into(),
+                "".into(),
+                PersonaConfig::default(),
+            )
             .unwrap();
 
         // 触发一些 tick

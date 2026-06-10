@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use brain_core::tool_executor::ToolExecutor;
-use brain_core::types::{
-    EvalRequirement, PitfallRecord, ProgressEvent, ToolCall, TurnRecord,
-};
+use brain_core::types::{EvalRequirement, PitfallRecord, ProgressEvent, ToolCall, TurnRecord};
 use brain_llm::{ChatMessage, ChatRequest, ContentBlock, LlmProvider, ToolChoice, ToolDefinition};
 use brain_plugin::SkillCatalog;
 use serde::{Deserialize, Serialize};
@@ -503,11 +501,7 @@ impl EvalBrain {
             profile_summary,
             pitfall_descriptions,
         );
-        let user_prompt = prompts::build_evaluation_user_prompt(
-            user_input,
-            ai_output,
-            turns,
-        );
+        let user_prompt = prompts::build_evaluation_user_prompt(user_input, ai_output, turns);
 
         let messages = vec![
             ChatMessage::system(&system_prompt),
@@ -571,12 +565,52 @@ impl EvalBrain {
         }
     }
 
-    /// 快速规则预检（不调 LLM，纯规则匹配）
+    /// 报告问题到进化脑 backlog（通过 ProgressEvent 传递）
+    ///
+    /// 当检测到 Critical/Warning 问题时，发送 BacklogEntryDetected 事件，
+    /// Orchestrator 监听后会写入 EvolutionBacklog。
+    fn report_to_backlog(&self, issue: &EvalIssue, context: Option<&str>) {
+        if let Some(tx) = &self.progress_tx {
+            // 将 EvalIssue 映射到 backlog category
+            let category = match issue.category {
+                IssueCategory::PitfallRepeat => "KnowledgeGap",
+                IssueCategory::PreferenceViolation => "ReasoningWeakness",
+                IssueCategory::KnownFailurePattern => "CodeQuality",
+                IssueCategory::LazyBehavior => "CodeQuality",
+                IssueCategory::FactError => "KnowledgeGap",
+                IssueCategory::InstructionIgnored => "ReasoningWeakness",
+            };
+
+            // 将 severity 映射
+            let severity = match issue.severity {
+                IssueSeverity::Critical => "Critical",
+                IssueSeverity::Warning => "High",
+            };
+
+            let _ = tx.try_send(ProgressEvent::BacklogEntryDetected {
+                source: "Eval".to_string(),
+                category: category.to_string(),
+                description: issue.description.clone(),
+                severity: severity.to_string(),
+                context_snapshot: context.map(|s| s.to_string()),
+            });
+
+            tracing::info!(
+                "EvalBrain 报告 backlog: {} ({})",
+                issue.description,
+                severity
+            );
+        }
+    }
+
+    /// 快速规则预检（不调 LLM，纯规则匹配)
     ///
     /// 检查项：
     /// 1. 偷懒模式检测（TODO/FIXME/HACK/省略号实现）
     /// 2. 禁忌词匹配
     /// 3. 已踩坑模式复现检测（基于踩坑描述的关键词匹配）
+    ///
+    /// 检测到 Critical/Warning 问题时会自动报告到 backlog。
     pub fn quick_check(
         &self,
         ai_output: &str,
@@ -593,6 +627,11 @@ impl EvalBrain {
 
         // 检查 3: 已踩坑模式复现
         issues.extend(checker::detect_pitfall_repeats(ai_output, pitfalls));
+
+        // 报告 Critical/Warning 问题到 backlog
+        for issue in &issues {
+            self.report_to_backlog(issue, Some(ai_output));
+        }
 
         issues
     }
@@ -707,14 +746,7 @@ mod tests {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
         let result = brain
-            .evaluate(
-                "",
-                "some output",
-                &[],
-                &[],
-                None,
-                None,
-            )
+            .evaluate("", "some output", &[], &[], None, None)
             .await;
         assert!(result.is_err());
     }
@@ -723,16 +755,7 @@ mod tests {
     async fn evaluate_rejects_empty_output() {
         let llm = Arc::new(MockLlmProvider::new("评估结果-正常"));
         let brain = EvalBrain::new(llm);
-        let result = brain
-            .evaluate(
-                "some input",
-                "",
-                &[],
-                &[],
-                None,
-                None,
-            )
-            .await;
+        let result = brain.evaluate("some input", "", &[], &[], None, None).await;
         assert!(result.is_err());
     }
 

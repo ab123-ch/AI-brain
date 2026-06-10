@@ -1,6 +1,6 @@
 use crate::error::{EvolverError, Result};
 use crate::sandbox::Sandbox;
-use crate::tdd_runner::{EvolutionGoal, TestResult};
+use crate::tdd_runner::EvolutionGoal;
 use brain_llm::LlmProvider;
 use std::path::Path;
 use std::sync::Arc;
@@ -37,16 +37,6 @@ impl std::fmt::Display for EvolutionStatus {
             Self::Discarded => write!(f, "已丢弃"),
         }
     }
-}
-
-/// 进化结果
-#[derive(Debug)]
-pub struct EvolutionResult {
-    pub success: bool,
-    pub diff: String,
-    pub test_results: Option<TestResult>,
-    pub iterations_used: u32,
-    pub report: String,
 }
 
 /// 进化引擎

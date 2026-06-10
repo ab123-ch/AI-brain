@@ -3,13 +3,13 @@
 //! 按任务类型存储经验，每个类型一个文件。全量重生成模式。
 //! 路径: `personas/{persona_id}/pyramid/l3-abstract/`
 
-use chrono::Utc;
 use crate::error::Result;
 use crate::pyramid_storage::PyramidStorage;
 use crate::pyramid_types::{
     AbstractIndex, AbstractIndexEntry, Experience, TaskType, TypeExperience,
 };
 use crate::summary_pool::task_type_name;
+use chrono::Utc;
 
 /// L3 经验抽象层
 pub struct AbstractLayer {
@@ -208,10 +208,10 @@ mod tests {
         let (layer, _tmp) = make_layer("test");
         layer
             .regenerate(vec![
-                make_type_experience(TaskType::Coding, vec![
-                    ("可注入", true),
-                    ("不可注入", false),
-                ]),
+                make_type_experience(
+                    TaskType::Coding,
+                    vec![("可注入", true), ("不可注入", false)],
+                ),
                 make_type_experience(TaskType::Writing, vec![("也可注入", true)]),
             ])
             .unwrap();

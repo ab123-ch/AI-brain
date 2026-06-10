@@ -2333,7 +2333,11 @@ impl ProviderRuntimeClient {
                     .iter()
                     .find(|(prefix, _)| model.starts_with(prefix))
                     .and_then(|(_, provider)| {
-                        llm_config.llm.providers.keys().find(|k| k.as_str() == *provider)
+                        llm_config
+                            .llm
+                            .providers
+                            .keys()
+                            .find(|k| k.as_str() == *provider)
                     })
             })
             .map(String::as_str)

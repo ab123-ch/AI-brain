@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use brain_core::types::ProgressEvent;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -1047,6 +1049,38 @@ impl App {
                             self.try_collect_result();
                             return;
                         }
+                        // BacklogEntryDetected 事件：写入进化脑 backlog
+                        if let ProgressEvent::BacklogEntryDetected {
+                            source,
+                            category,
+                            description,
+                            severity,
+                            context_snapshot,
+                        } = event
+                        {
+                            // 异步写入 backlog（不阻塞 TUI）
+                            let orch = self.orch.clone();
+                            let source = source.clone();
+                            let category = category.clone();
+                            let description = description.clone();
+                            let severity = severity.clone();
+                            let context_snapshot = context_snapshot.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = orch
+                                    .add_backlog_entry(
+                                        &source,
+                                        &category,
+                                        &description,
+                                        &severity,
+                                        context_snapshot.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("写入 backlog 失败: {}", e);
+                                }
+                            });
+                            continue;
+                        }
                         // AskUser 事件：提取 sender 存储，显示问题和选项
                         if let ProgressEvent::AskUser {
                             question,
@@ -1543,7 +1577,8 @@ impl App {
             if catalog.skills.is_empty() {
                 self.output.push_system("暂无已注册技能");
             } else {
-                self.output.push_system(&format!("已注册技能 ({}个):", catalog.skills.len()));
+                self.output
+                    .push_system(&format!("已注册技能 ({}个):", catalog.skills.len()));
                 self.output.push_system("\x1b[33m  \x1b[0m\x1b[33m[兼容 Claude Code]\x1b[0m 也扫描 ~/.claude/skills 目录");
                 for skill in &catalog.skills {
                     let display = match &skill.namespace {
@@ -1551,9 +1586,17 @@ impl App {
                         None => skill.name.clone(),
                     };
                     // 判断来源
-                    let source_tag = if skill.source_path.to_string_lossy().contains(".claude/skills") {
+                    let source_tag = if skill
+                        .source_path
+                        .to_string_lossy()
+                        .contains(".claude/skills")
+                    {
                         "\x1b[33m[Claude]\x1b[0m "
-                    } else if skill.source_path.to_string_lossy().contains(".codex/skills") {
+                    } else if skill
+                        .source_path
+                        .to_string_lossy()
+                        .contains(".codex/skills")
+                    {
                         "\x1b[33m[Codex]\x1b[0m "
                     } else {
                         ""
@@ -1563,8 +1606,10 @@ impl App {
                         .as_deref()
                         .map(|w| format!(" [触发: {w}]"))
                         .unwrap_or_default();
-                    self.output
-                        .push_system(&format!("  {}{} - {}{}", source_tag, display, skill.description, when));
+                    self.output.push_system(&format!(
+                        "  {}{} - {}{}",
+                        source_tag, display, skill.description, when
+                    ));
                 }
             }
             return HandleResult::Handled;
@@ -1581,7 +1626,8 @@ impl App {
                             None => meta.name.clone(),
                         };
                         self.output.push_system(&format!("技能: {display}"));
-                        self.output.push_system(&format!("  描述: {}", meta.description));
+                        self.output
+                            .push_system(&format!("  描述: {}", meta.description));
                         if let Some(ref when) = meta.when_to_use {
                             self.output.push_system(&format!("  触发条件: {when}"));
                         }
@@ -1674,7 +1720,8 @@ impl App {
         let sub = match args.first() {
             Some(s) => s.as_str(),
             None => {
-                self.output.push_system("用法: :persona <list|switch|info|delete> [参数]");
+                self.output
+                    .push_system("用法: :persona <list|switch|info|delete> [参数]");
                 return HandleResult::Handled;
             }
         };
@@ -1692,7 +1739,8 @@ impl App {
             "list" => {
                 let personas = mem.persona_manager().list();
                 let active_id = mem.persona_manager().active_id().to_string();
-                self.output.push_system(&format!("已注册人格 ({}个):", personas.len()));
+                self.output
+                    .push_system(&format!("已注册人格 ({}个):", personas.len()));
                 for p in personas {
                     let marker = if p.id == active_id {
                         "\x1b[33m ← 当前\x1b[0m"
@@ -1713,7 +1761,9 @@ impl App {
                         return HandleResult::Handled;
                     }
                 };
-                let new_name = mem.persona_manager().list()
+                let new_name = mem
+                    .persona_manager()
+                    .list()
                     .iter()
                     .find(|p| p.id == id)
                     .map(|p| p.name.clone());
@@ -1721,10 +1771,8 @@ impl App {
                     Ok(()) => {
                         let name = new_name.unwrap_or_else(|| id.clone());
                         drop(mem);
-                        self.output.push_system(&format!(
-                            "\x1b[32m已切换到人格: {}\x1b[0m",
-                            name
-                        ));
+                        self.output
+                            .push_system(&format!("\x1b[32m已切换到人格: {}\x1b[0m", name));
                         self.output.push_system("  (主脑上下文将在下次对话时刷新)");
                     }
                     Err(e) => {
@@ -1734,18 +1782,21 @@ impl App {
             }
             "info" => {
                 let p = mem.active_persona();
-                self.output.push_system(&format!("\x1b[36m当前人格: {}\x1b[0m ({})", p.name, p.id));
-                self.output.push_system(&format!("  描述: {}", p.description));
+                self.output
+                    .push_system(&format!("\x1b[36m当前人格: {}\x1b[0m ({})", p.name, p.id));
+                self.output
+                    .push_system(&format!("  描述: {}", p.description));
                 self.output.push_system(&format!(
                     "  语言: {} | 风格: {} | 评估敏感度: {}",
                     p.config.language, p.config.output_style, p.config.eval_sensitivity
                 ));
-                self.output.push_system(&format!(
-                    "  分析间隔: {} 轮",
-                    p.config.analysis_interval
-                ));
+                self.output
+                    .push_system(&format!("  分析间隔: {} 轮", p.config.analysis_interval));
                 if !p.system_prompt.is_empty() {
-                    self.output.push_system(&format!("  Prompt: {}...", &p.system_prompt[..p.system_prompt.len().min(80)]));
+                    self.output.push_system(&format!(
+                        "  Prompt: {}...",
+                        &p.system_prompt[..p.system_prompt.len().min(80)]
+                    ));
                 }
                 let stats = mem.stats();
                 if let Ok(s) = stats {
@@ -1793,7 +1844,9 @@ impl App {
                                     "✅ 已创建人格: {} ({})",
                                     persona.name, persona.id
                                 ));
-                                self.output.push_system("提示: 使用 `/memory manage` 可设置专属 system prompt");
+                                self.output.push_system(
+                                    "提示: 使用 `/memory manage` 可设置专属 system prompt",
+                                );
                             }
                             Err(e) => {
                                 self.output.push_system(&format!("创建失败: {e}"));
@@ -1801,8 +1854,10 @@ impl App {
                         }
                     }
                     _ => {
-                        self.output.push_system("用法: :persona create <id> <name> [description]");
-                        self.output.push_system("示例: :persona create writer 滚开作家 网文写作助手");
+                        self.output
+                            .push_system("用法: :persona create <id> <name> [description]");
+                        self.output
+                            .push_system("示例: :persona create writer 滚开作家 网文写作助手");
                     }
                 }
             }
@@ -1820,7 +1875,8 @@ impl App {
         let sub = match args.first() {
             Some(s) => s.as_str(),
             None => {
-                self.output.push_system("用法: :memory <stats|recall|save|daily> [参数]");
+                self.output
+                    .push_system("用法: :memory <stats|recall|save|daily> [参数]");
                 return HandleResult::Handled;
             }
         };
@@ -1835,20 +1891,30 @@ impl App {
         };
 
         match sub {
-            "stats" => {
-                match mem.stats() {
-                    Ok(s) => {
-                        self.output.push_system("=== 金字塔记忆统计 ===");
-                        self.output.push_system(&format!("  L1 全量基座: {} 条", s.l1_count));
-                        self.output.push_system(&format!("  L2 任务摘要: {} 条", s.l2_count));
-                        self.output.push_system(&format!("  L3 经验条目: {} 条", s.l3_count));
-                        self.output.push_system(&format!("  L4 潜意识: {}", if s.l4_exists { "已生成" } else { "未生成" }));
-                        self.output.push_system(&format!("  活跃人格: {}", s.active_persona));
-                        self.output.push_system(&format!("  会话ID: {}", s.session_id));
-                    }
-                    Err(e) => self.output.push_system(&format!("统计读取失败: {e}")),
+            "stats" => match mem.stats() {
+                Ok(s) => {
+                    self.output.push_system("=== 金字塔记忆统计 ===");
+                    self.output
+                        .push_system(&format!("  L1 全量基座: {} 条", s.l1_count));
+                    self.output
+                        .push_system(&format!("  L2 任务摘要: {} 条", s.l2_count));
+                    self.output
+                        .push_system(&format!("  L3 经验条目: {} 条", s.l3_count));
+                    self.output.push_system(&format!(
+                        "  L4 潜意识: {}",
+                        if s.l4_exists {
+                            "已生成"
+                        } else {
+                            "未生成"
+                        }
+                    ));
+                    self.output
+                        .push_system(&format!("  活跃人格: {}", s.active_persona));
+                    self.output
+                        .push_system(&format!("  会话ID: {}", s.session_id));
                 }
-            }
+                Err(e) => self.output.push_system(&format!("统计读取失败: {e}")),
+            },
             "recall" => {
                 let query = match args.get(1) {
                     Some(q) => q,
@@ -1859,16 +1925,19 @@ impl App {
                 };
                 let results = mem.recall_for_context(query, 5);
                 if results.is_empty() {
-                    self.output.push_system(&format!("未找到与 '{}' 相关的记忆", query));
+                    self.output
+                        .push_system(&format!("未找到与 '{}' 相关的记忆", query));
                 } else {
-                    self.output.push_system(&format!("找到 {} 条相关记忆:", results.len()));
+                    self.output
+                        .push_system(&format!("找到 {} 条相关记忆:", results.len()));
                     for (i, entry) in results.iter().enumerate() {
                         let preview = if entry.content.len() > 120 {
                             format!("{}...", &entry.content[..120])
                         } else {
                             entry.content.clone()
                         };
-                        self.output.push_system(&format!("  {}. {}", i + 1, preview));
+                        self.output
+                            .push_system(&format!("  {}. {}", i + 1, preview));
                     }
                 }
             }
@@ -1891,14 +1960,16 @@ impl App {
                 if summaries.is_empty() {
                     self.output.push_system("暂无任务摘要");
                 } else {
-                    self.output.push_system(&format!("最近 {} 条任务摘要:", summaries.len()));
+                    self.output
+                        .push_system(&format!("最近 {} 条任务摘要:", summaries.len()));
                     for s in &summaries {
                         let preview = if s.summary_preview.len() > 100 {
                             format!("{}...", &s.summary_preview[..100])
                         } else {
                             s.summary_preview.clone()
                         };
-                        self.output.push_system(&format!("  [{}] {}", s.session_start, preview));
+                        self.output
+                            .push_system(&format!("  [{}] {}", s.session_start, preview));
                     }
                 }
             }
@@ -1968,7 +2039,8 @@ impl App {
                                         if targets.is_empty() {
                                             "（暂无目标，使用 :evo target add <描述> 添加）".into()
                                         } else {
-                                            let mut out = format!("进化目标 ({}个):\n", targets.len());
+                                            let mut out =
+                                                format!("进化目标 ({}个):\n", targets.len());
                                             for t in targets {
                                                 out.push_str(&format!(
                                                     "  {} [{:?}] {} — {}\n",
@@ -1999,7 +2071,10 @@ impl App {
                                             use brain_evolver::target::{EvoTarget, TargetStatus};
                                             use chrono::Utc;
                                             let target = EvoTarget {
-                                                id: format!("tgt-{}", Utc::now().format("%Y%m%d%H%M%S")),
+                                                id: format!(
+                                                    "tgt-{}",
+                                                    Utc::now().format("%Y%m%d%H%M%S")
+                                                ),
                                                 direction: desc.clone(),
                                                 description: desc.clone(),
                                                 priority: 1,
@@ -2008,7 +2083,9 @@ impl App {
                                                 created_at: Utc::now(),
                                                 related_skills: vec![],
                                             };
-                                            coord.target_queue_mut().add_target(target)
+                                            coord
+                                                .target_queue_mut()
+                                                .add_target(target)
                                                 .map_err(|e| e.to_string())
                                         }
                                         None => Err("进化调度器未初始化".into()),
@@ -2032,7 +2109,8 @@ impl App {
                         }
                     }
                     _ => {
-                        self.output.push_system("可用: target list | add <描述> | remove <id>");
+                        self.output
+                            .push_system("可用: target list | add <描述> | remove <id>");
                     }
                 }
             }
@@ -2051,7 +2129,10 @@ impl App {
                                 } else {
                                     let mut out = format!("进化积压问题 ({}个):\n", entries.len());
                                     for e in &entries {
-                                        out.push_str(&format!("  {} [{:?}] {}\n", e.id, e.severity, e.description));
+                                        out.push_str(&format!(
+                                            "  {} [{:?}] {}\n",
+                                            e.id, e.severity, e.description
+                                        ));
                                     }
                                     out
                                 }
@@ -2101,11 +2182,14 @@ impl App {
                             Some(coord) => {
                                 let tree = coord.capability_tree();
                                 let domain_count = tree.domains.len();
-                                let skill_count: usize = tree.domains.iter().map(|d| d.skills.len()).sum();
+                                let skill_count: usize =
+                                    tree.domains.iter().map(|d| d.skills.len()).sum();
                                 if domain_count == 0 {
                                     "能力树:\n（尚未初始化 — 首次进化成功后自动构建）".into()
                                 } else {
-                                    let mut out = format!("能力树 ({domain_count} 个领域, {skill_count} 个技能):\n");
+                                    let mut out = format!(
+                                        "能力树 ({domain_count} 个领域, {skill_count} 个技能):\n"
+                                    );
                                     for d in &tree.domains {
                                         out.push_str(&format!("  {}:\n", d.name));
                                         for s in &d.skills {
@@ -2123,37 +2207,10 @@ impl App {
                     self.output.push_system(line);
                 }
             }
-            // -- v1 兼容 --
-            "approve" => {
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(self.orch.approve_evolution())
-                });
-                match result {
-                    Ok(()) => self.output.push_system("\x1b[32m[v1] 进化变更已批准\x1b[0m"),
-                    Err(e) => self.output.push_system(&format!("批准失败: {e}")),
-                }
-            }
-            "reject" => {
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(self.orch.reject_evolution())
-                });
-                match result {
-                    Ok(()) => self.output.push_system("[v1] 进化变更已拒绝"),
-                    Err(e) => self.output.push_system(&format!("拒绝失败: {e}")),
-                }
-            }
-            "diff" => {
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(self.orch.evolution_diff())
-                });
-                match result {
-                    Ok(diff) => {
-                        for line in diff.lines() {
-                            self.output.push_system(line);
-                        }
-                    }
-                    Err(e) => self.output.push_system(&format!("[v1] 获取差异失败: {e}")),
-                }
+            // -- v1 已移除 --
+            "approve" | "reject" | "diff" => {
+                self.output
+                    .push_system("v1 引擎已移除，请使用 :evo start 启动 v2 进化循环");
             }
             _ => {
                 self.output.push_system(&format!(
@@ -2169,7 +2226,8 @@ impl App {
         let sub = match args.first() {
             Some(s) => s.as_str(),
             None => {
-                self.output.push_system("用法: :mcp <list|status|reconnect> [参数]");
+                self.output
+                    .push_system("用法: :mcp <list|status|reconnect> [参数]");
                 return HandleResult::Handled;
             }
         };
@@ -2182,19 +2240,19 @@ impl App {
                 });
                 if servers.is_empty() {
                     self.output.push_system("暂无已配置的 MCP 服务");
-                    self.output.push_system("  配置文件: ~/.ai-brain/mcp_servers.json");
+                    self.output
+                        .push_system("  配置文件: ~/.ai-brain/mcp_servers.json");
                 } else {
-                    self.output.push_system(&format!("MCP 服务 ({}个):", servers.len()));
+                    self.output
+                        .push_system(&format!("MCP 服务 ({}个):", servers.len()));
                     for (name, status) in &servers {
                         let status_str = match status {
                             ServerStatus::Connected => "\x1b[32m已连接\x1b[0m",
                             ServerStatus::Disconnected => "\x1b[33m未连接\x1b[0m",
                             ServerStatus::Error(e) => &format!("\x1b[31m错误: {e}\x1b[0m"),
                         };
-                        self.output.push_system(&format!(
-                            "  \x1b[36m{}\x1b[0m — {}",
-                            name, status_str
-                        ));
+                        self.output
+                            .push_system(&format!("  \x1b[36m{}\x1b[0m — {}", name, status_str));
                     }
                 }
             }
@@ -2238,7 +2296,9 @@ impl App {
                     tokio::runtime::Handle::current().block_on(pool.reconnect(name))
                 }) {
                     Ok(()) => {
-                        self.output.push_system(&format!("✅ MCP 服务 '{name}' 已重置，下次使用时自动重连"));
+                        self.output.push_system(&format!(
+                            "✅ MCP 服务 '{name}' 已重置，下次使用时自动重连"
+                        ));
                     }
                     Err(e) => {
                         self.output.push_system(&format!("重连失败: {e}"));
@@ -2259,32 +2319,33 @@ impl App {
         let sub = match args.first() {
             Some(s) => s.as_str(),
             None => {
-                self.output.push_system("用法: :plugin <list|install|uninstall> [参数]");
+                self.output
+                    .push_system("用法: :plugin <list|install|uninstall> [参数]");
                 return HandleResult::Handled;
             }
         };
 
         match sub {
-            "list" => {
-                match self.orch.plugin_mgr() {
-                    Some(mgr) => {
-                        let plugins = mgr.list();
-                        if plugins.is_empty() {
-                            self.output.push_system("暂无已安装插件");
-                            self.output.push_system("  使用 :plugin install <path> 安装");
-                        } else {
-                            self.output.push_system(&format!("已安装插件 ({}个):", plugins.len()));
-                            for p in plugins {
-                                self.output.push_system(&format!(
-                                    "  {} ({}/{}) v{}",
-                                    p.name, p.publisher, p.source, p.version
-                                ));
-                            }
+            "list" => match self.orch.plugin_mgr() {
+                Some(mgr) => {
+                    let plugins = mgr.list();
+                    if plugins.is_empty() {
+                        self.output.push_system("暂无已安装插件");
+                        self.output
+                            .push_system("  使用 :plugin install <path> 安装");
+                    } else {
+                        self.output
+                            .push_system(&format!("已安装插件 ({}个):", plugins.len()));
+                        for p in plugins {
+                            self.output.push_system(&format!(
+                                "  {} ({}/{}) v{}",
+                                p.name, p.publisher, p.source, p.version
+                            ));
                         }
                     }
-                    None => self.output.push_system("插件管理器未初始化"),
                 }
-            }
+                None => self.output.push_system("插件管理器未初始化"),
+            },
             "install" => {
                 let _source = match args.get(1) {
                     Some(s) => s.clone(),
@@ -2294,7 +2355,9 @@ impl App {
                         return HandleResult::Handled;
                     }
                 };
-                self.output.push_system("⚠️ 插件安装需要在启动前完成，请手动编辑 ~/.ai-brain/plugins/registry.json");
+                self.output.push_system(
+                    "⚠️ 插件安装需要在启动前完成，请手动编辑 ~/.ai-brain/plugins/registry.json",
+                );
             }
             "uninstall" => {
                 let _name = match args.get(1) {
@@ -2304,7 +2367,9 @@ impl App {
                         return HandleResult::Handled;
                     }
                 };
-                self.output.push_system("⚠️ 插件卸载需要在启动前完成，请手动编辑 ~/.ai-brain/plugins/registry.json");
+                self.output.push_system(
+                    "⚠️ 插件卸载需要在启动前完成，请手动编辑 ~/.ai-brain/plugins/registry.json",
+                );
             }
             other => {
                 self.output.push_system(&format!(

@@ -265,7 +265,12 @@ impl CycleRunner {
     ) -> Self {
         // Default skills directory: ~/.ai-brain/skills/evo/
         let skills_dir = std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".ai-brain").join("skills").join("evo"))
+            .map(|h| {
+                PathBuf::from(h)
+                    .join(".ai-brain")
+                    .join("skills")
+                    .join("evo")
+            })
             .unwrap_or_else(|_| PathBuf::from(".ai-brain/skills/evo"));
 
         Self {
@@ -497,11 +502,13 @@ impl CycleRunner {
 
         // Step 4: Write raw content to memory (L1)
         for page in &pages {
-            self.memory.write_memory(crate::memory_access::MemoryWriteRequest {
-                layer: crate::memory_access::MemoryLayer::Raw,
-                content: page.content.clone(),
-                source: page.url.clone(),
-            }).map_err(|e| EvolverError::Memory(e.to_string()))?;
+            self.memory
+                .write_memory(crate::memory_access::MemoryWriteRequest {
+                    layer: crate::memory_access::MemoryLayer::Raw,
+                    content: page.content.clone(),
+                    source: page.url.clone(),
+                })
+                .map_err(|e| EvolverError::Memory(e.to_string()))?;
         }
 
         // Step 5: LLM synthesis of research results
@@ -533,11 +540,13 @@ impl CycleRunner {
         let (research_summary, sources_used) = parse_research_response(&text);
 
         // Step 6: Write summary to memory (L2)
-        self.memory.write_memory(crate::memory_access::MemoryWriteRequest {
-            layer: crate::memory_access::MemoryLayer::Summary,
-            content: research_summary.clone(),
-            source: "phase_research".into(),
-        }).map_err(|e| EvolverError::Memory(e.to_string()))?;
+        self.memory
+            .write_memory(crate::memory_access::MemoryWriteRequest {
+                layer: crate::memory_access::MemoryLayer::Summary,
+                content: research_summary.clone(),
+                source: "phase_research".into(),
+            })
+            .map_err(|e| EvolverError::Memory(e.to_string()))?;
 
         Ok(ResearchResult {
             output: PhaseOutput {
@@ -690,7 +699,12 @@ impl CycleRunner {
         } else {
             format!(
                 "\n## 参考来源\n{}\n",
-                learn.sources_used.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+                learn
+                    .sources_used
+                    .iter()
+                    .map(|s| format!("- {}", s))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         };
 
@@ -700,7 +714,12 @@ impl CycleRunner {
         } else {
             format!(
                 "\n## 尚未掌握\n{}\n",
-                learn.unresolved_questions.iter().map(|q| format!("- {}", q)).collect::<Vec<_>>().join("\n")
+                learn
+                    .unresolved_questions
+                    .iter()
+                    .map(|q| format!("- {}", q))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         };
 
@@ -789,14 +808,16 @@ impl CycleRunner {
     /// - Write SKILL.md content to ~/.ai-brain/skills/evo/<skill-name>/SKILL.md
     /// - SkillCatalog will auto-discover on next scan
     /// - Generate VerificationSpec for Phase 6
-    pub async fn phase_register(&mut self, synthesize: &SynthesizeResult) -> Result<RegisterResult> {
+    pub async fn phase_register(
+        &mut self,
+        synthesize: &SynthesizeResult,
+    ) -> Result<RegisterResult> {
         let start = Instant::now();
         let mut registered_skills = Vec::new();
         let mut failed_skills = Vec::new();
 
         // Ensure skills directory exists
-        std::fs::create_dir_all(&self.skills_dir)
-            .map_err(EvolverError::Io)?;
+        std::fs::create_dir_all(&self.skills_dir).map_err(EvolverError::Io)?;
 
         // Write each skill to file
         for skill in &synthesize.skills {
@@ -816,7 +837,11 @@ impl CycleRunner {
             }
 
             registered_skills.push(skill.name.clone());
-            tracing::info!("Registered skill: {} -> {}", skill.name, skill_file.display());
+            tracing::info!(
+                "Registered skill: {} -> {}",
+                skill.name,
+                skill_file.display()
+            );
         }
 
         // Build verification specs for registered skills
@@ -1128,7 +1153,10 @@ fn build_previous_progress_section(recall: &RecallResult) -> String {
     if sections.is_empty() {
         String::new()
     } else {
-        format!("## 上次学习进度（渐进式召回）\n{}\n\n", sections.join("\n\n"))
+        format!(
+            "## 上次学习进度（渐进式召回）\n{}\n\n",
+            sections.join("\n\n")
+        )
     }
 }
 
@@ -1156,19 +1184,31 @@ fn parse_learn_json_response(response: &str) -> LearnJsonResponse {
         let mastered = parsed
             .get("mastered")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let unresolved = parsed
             .get("unresolved")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let experience_rules = parsed
             .get("experience_rules")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         LearnJsonResponse {

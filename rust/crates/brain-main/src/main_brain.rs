@@ -200,8 +200,7 @@ impl MainBrain {
                                 brain_llm::MessageRole::Assistant => {
                                     let has_tool_use = msg.content.iter().any(|b| b.is_tool_use());
                                     if has_tool_use {
-                                        self.history
-                                            .push_assistant_blocks(msg.content.clone());
+                                        self.history.push_assistant_blocks(msg.content.clone());
                                     } else {
                                         let text = msg.text_content();
                                         if !text.is_empty() {

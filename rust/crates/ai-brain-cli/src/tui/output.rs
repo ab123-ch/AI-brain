@@ -228,6 +228,17 @@ impl OutputArea {
                     .push(OutputLine::System(format!("等待用户回答: {question}")));
                 self.spinner_label = Some("等待用户回答...".into());
             }
+            ProgressEvent::BacklogEntryDetected {
+                source,
+                category,
+                description,
+                ..
+            } => {
+                let short_desc: String = description.chars().take(120).collect();
+                self.lines.push(OutputLine::System(format!(
+                    "进化脑: 记录能力缺口 [{source}/{category}] {short_desc}"
+                )));
+            }
             ProgressEvent::Done => {
                 self.flush_streaming();
                 self.spinner_label = None;

@@ -1,8 +1,12 @@
 use crate::backlog::{BacklogEntry, BacklogStatus, EvolutionBacklog};
 use crate::capability_tree::CapabilityTree;
+use crate::cycle_runner::CycleResult;
 use crate::error::{EvolverError, Result};
 use crate::evo_log::{EvoCycleStatus, EvoLogEntry, EvoLogStore, PhaseRecord};
+use crate::memory_access::MemoryAccess;
 use crate::target::{EvoTarget, EvoTargetQueue, TargetStatus};
+use crate::web_search::WebSearch;
+use std::sync::Arc;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -392,6 +396,98 @@ impl EvolutionCoordinator {
 }
 
 // ---------------------------------------------------------------------------
+// SharedResources — shared read-only resources for evolution
+// ---------------------------------------------------------------------------
+
+/// Shared resources passed from the main Orchestrator to evolution runners.
+/// These are read-only references to shared infrastructure.
+#[derive(Clone)]
+pub struct SharedResources {
+    /// MCP client pool (read-only).
+    pub mcp_pool_info: String,
+    /// Skill catalog info (read-only).
+    pub skill_names: Vec<String>,
+    /// Memory access (shared with main brain).
+    pub memory: Arc<dyn MemoryAccess>,
+    /// Web search capability (shared MCP tools).
+    pub web_search: Arc<dyn WebSearch>,
+}
+
+// ---------------------------------------------------------------------------
+// NightSessionOutput — summary of a night evolution session
+// ---------------------------------------------------------------------------
+
+/// Output of a night evolution session.
+#[derive(Clone, Debug, Default)]
+pub struct NightSessionOutput {
+    pub targets_attempted: u32,
+    pub targets_completed: u32,
+    pub targets_blocked: u32,
+    pub targets_failed: u32,
+    pub skills_created: Vec<String>,
+    pub blocked_reasons: Vec<String>,
+    pub errors: Vec<String>,
+    pub total_tokens: u64,
+    pub duration_secs: u64,
+    pub stop_reason: String,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a stable target ID from an `EvoTargetCandidate`.
+pub fn target_id_from_candidate(candidate: &EvoTargetCandidate) -> String {
+    match candidate {
+        EvoTargetCandidate::UserTarget(t) => t.id.clone(),
+        EvoTargetCandidate::BacklogEntry(e) => e.id.clone(),
+        EvoTargetCandidate::CodeSelfCheck => "code-self-check".into(),
+        EvoTargetCandidate::CapabilityGap { domain, .. } => {
+            format!("gap-{domain}")
+        }
+    }
+}
+
+/// Extract metadata from a `CycleResult` for logging.
+pub fn extract_cycle_metadata(
+    result: &CycleResult,
+) -> (
+    Vec<PhaseRecord>,
+    u64,
+    Vec<String>,
+    Vec<String>,
+    EvoCycleStatus,
+) {
+    match result {
+        CycleResult::Success {
+            skills_created,
+            total_tokens,
+            ..
+        } => (
+            vec![],
+            *total_tokens,
+            skills_created.clone(),
+            vec![],
+            EvoCycleStatus::Completed,
+        ),
+        CycleResult::Blocked { total_tokens, .. } => (
+            vec![],
+            *total_tokens,
+            vec![],
+            vec![],
+            EvoCycleStatus::Blocked,
+        ),
+        CycleResult::Cancelled { total_tokens, .. } => (
+            vec![],
+            *total_tokens,
+            vec![],
+            vec![],
+            EvoCycleStatus::Cancelled,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -764,5 +860,38 @@ mod tests {
         assert_eq!(summary.total_tokens, 1500);
         assert_eq!(summary.skills_created, vec!["skill-x".to_string()]);
         assert_eq!(summary.backlog_resolved, vec!["bl-1".to_string()]);
+    }
+
+    // -- target_id_from_candidate tests (migrated from evo_orchestrator) ---
+
+    #[test]
+    fn test_target_id_from_candidate_user() {
+        let target =
+            EvoTargetCandidate::UserTarget(make_target("test-target", 1, TargetStatus::Pending));
+        let id = target_id_from_candidate(&target);
+        assert_eq!(id, "test-target");
+    }
+
+    #[test]
+    fn test_target_id_from_candidate_gap() {
+        let target = EvoTargetCandidate::CapabilityGap {
+            domain: "Rust".into(),
+            missing: vec!["async".into()],
+        };
+        let id = target_id_from_candidate(&target);
+        assert_eq!(id, "gap-Rust");
+    }
+
+    #[test]
+    fn test_target_id_from_candidate_self_check() {
+        let id = target_id_from_candidate(&EvoTargetCandidate::CodeSelfCheck);
+        assert_eq!(id, "code-self-check");
+    }
+
+    #[test]
+    fn test_night_session_output_default() {
+        let output = NightSessionOutput::default();
+        assert_eq!(output.targets_attempted, 0);
+        assert_eq!(output.stop_reason, "");
     }
 }

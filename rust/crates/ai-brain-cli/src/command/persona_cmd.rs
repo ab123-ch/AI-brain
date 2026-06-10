@@ -9,7 +9,9 @@ use super::registry::{
 fn handle_persona(args: &[String]) -> CommandResult {
     let sub = match args.first() {
         Some(s) => s.as_str(),
-        None => return CommandResult::err("用法: /persona <list|switch|info|create|delete> [参数]"),
+        None => {
+            return CommandResult::err("用法: /persona <list|switch|info|create|delete> [参数]")
+        }
     };
 
     match sub {
@@ -23,12 +25,8 @@ fn handle_persona(args: &[String]) -> CommandResult {
                 None => CommandResult::err("用法: /persona switch <id>"),
             }
         }
-        "info" => {
-            CommandResult::ok("[persona info 由 TUI app.rs 特殊处理，此处不应到达]")
-        }
-        "create" => {
-            CommandResult::ok("[persona create 由 TUI app.rs 特殊处理，此处不应到达]")
-        }
+        "info" => CommandResult::ok("[persona info 由 TUI app.rs 特殊处理，此处不应到达]"),
+        "create" => CommandResult::ok("[persona create 由 TUI app.rs 特殊处理，此处不应到达]"),
         "delete" => {
             let id = args.get(1);
             match id {

@@ -429,7 +429,9 @@ mod tests {
 
         // 验证：第一条是系统消息（摘要）
         assert_eq!(history.messages()[0].role, MessageRole::System);
-        assert!(history.messages()[0].text_content().contains("决策链路摘要"));
+        assert!(history.messages()[0]
+            .text_content()
+            .contains("决策链路摘要"));
         assert!(history.messages()[0].text_content().contains("测试重建"));
 
         // 验证：后面是最近的消息

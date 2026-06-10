@@ -24,7 +24,12 @@ use crate::summary_pool::SummaryPool;
 /// LLM 分析接口（由调用方实现）
 pub trait AnalysisLlm: Send + Sync {
     /// 调用 LLM，返回文本响应
-    fn analyze(&self, prompt: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>>;
+    fn analyze(
+        &self,
+        prompt: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
+    >;
 }
 
 /// 浓缩报告
@@ -48,7 +53,10 @@ pub struct ConcentrationEngine {
 impl ConcentrationEngine {
     /// 创建浓缩引擎
     pub fn new(storage: PyramidStorage, session_id: String) -> Self {
-        Self { storage, session_id }
+        Self {
+            storage,
+            session_id,
+        }
     }
 
     /// 执行四步浓缩
@@ -141,7 +149,11 @@ impl ConcentrationEngine {
     }
 
     /// Step 1: L1→L2 任务拆分
-    async fn step1_l1_to_l2(&self, llm: &dyn AnalysisLlm, conversation_json: &str) -> Result<usize> {
+    async fn step1_l1_to_l2(
+        &self,
+        llm: &dyn AnalysisLlm,
+        conversation_json: &str,
+    ) -> Result<usize> {
         // 读取现有 L2 索引
         let summary_pool = SummaryPool::new(self.storage.clone());
         let existing_index = summary_pool.load_index()?;
@@ -149,7 +161,10 @@ impl ConcentrationEngine {
 
         // 调用 LLM
         let prompt = prompts::build_concentration_step1_prompt(conversation_json, &existing_json);
-        let response = llm.analyze(&prompt).await.map_err(MemoryError::ConsolidationFailed)?;
+        let response = llm
+            .analyze(&prompt)
+            .await
+            .map_err(MemoryError::ConsolidationFailed)?;
 
         // 解析返回
         let tasks: Vec<TaskSummary> = parse_json_response(&response)?;
@@ -175,7 +190,10 @@ impl ConcentrationEngine {
 
         // 调用 LLM
         let prompt = prompts::build_concentration_step2_prompt(&l2_json, &existing_l3_json);
-        let response = llm.analyze(&prompt).await.map_err(MemoryError::ConsolidationFailed)?;
+        let response = llm
+            .analyze(&prompt)
+            .await
+            .map_err(MemoryError::ConsolidationFailed)?;
 
         // 解析返回
         let type_experiences: Vec<TypeExperience> = parse_json_response(&response)?;
@@ -201,7 +219,10 @@ impl ConcentrationEngine {
 
         // 调用 LLM
         let prompt = prompts::build_concentration_step3_prompt(&l3_json, &existing_l4_json);
-        let response = llm.analyze(&prompt).await.map_err(MemoryError::ConsolidationFailed)?;
+        let response = llm
+            .analyze(&prompt)
+            .await
+            .map_err(MemoryError::ConsolidationFailed)?;
 
         // 解析返回
         let data: SubconsciousData = parse_json_response(&response)?;
@@ -231,7 +252,10 @@ impl ConcentrationEngine {
             &existing_profile,
             &existing_eval_json,
         );
-        let response = llm.analyze(&prompt).await.map_err(MemoryError::ConsolidationFailed)?;
+        let response = llm
+            .analyze(&prompt)
+            .await
+            .map_err(MemoryError::ConsolidationFailed)?;
 
         // 解析返回
         #[derive(Deserialize)]
@@ -260,7 +284,8 @@ impl ConcentrationEngine {
 /// 从 LLM 返回中提取 JSON（支持 markdown 代码块包裹）
 fn parse_json_response<T: serde::de::DeserializeOwned>(response: &str) -> Result<T> {
     let json_str = extract_json_str(response);
-    serde_json::from_str(json_str).map_err(|e| MemoryError::ConsolidationFailed(format!("JSON解析失败: {e}")))
+    serde_json::from_str(json_str)
+        .map_err(|e| MemoryError::ConsolidationFailed(format!("JSON解析失败: {e}")))
 }
 
 fn extract_json_str(response: &str) -> &str {
@@ -316,7 +341,8 @@ mod tests {
 
     #[test]
     fn parse_json_response_with_markdown() {
-        let response = "```json\n{\"profile\":\"test\",\"requirements\":[],\"pitfalls\":[],\"rules\":[]}\n```";
+        let response =
+            "```json\n{\"profile\":\"test\",\"requirements\":[],\"pitfalls\":[],\"rules\":[]}\n```";
         let result: serde_json::Value = parse_json_response(response).unwrap();
         assert_eq!(result["profile"], "test");
     }
@@ -341,12 +367,19 @@ mod tests {
 
     impl MockLlm {
         fn new(response: &str) -> Self {
-            Self { response: response.to_string() }
+            Self {
+                response: response.to_string(),
+            }
         }
     }
 
     impl AnalysisLlm for MockLlm {
-        fn analyze(&self, _prompt: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>> {
+        fn analyze(
+            &self,
+            _prompt: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
+        > {
             let response = self.response.clone();
             Box::pin(async move { Ok(response) })
         }
@@ -360,7 +393,8 @@ mod tests {
 
         // 写一些 L1 数据
         let raw = RawPool::new(storage.clone());
-        raw.append_turn("sess-001", "User", "帮我修复TUI鼠标问题", None).unwrap();
+        raw.append_turn("sess-001", "User", "帮我修复TUI鼠标问题", None)
+            .unwrap();
 
         let engine = ConcentrationEngine::new(storage.clone(), "sess-001".into());
 

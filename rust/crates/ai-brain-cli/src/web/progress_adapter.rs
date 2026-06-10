@@ -137,9 +137,7 @@ impl WebProgressEvent {
             ProgressEvent::Thinking { brain } => WebProgressEvent::Thinking {
                 brain: brain.clone(),
             },
-            ProgressEvent::TextDelta { text } => WebProgressEvent::TextDelta {
-                text: text.clone(),
-            },
+            ProgressEvent::TextDelta { text } => WebProgressEvent::TextDelta { text: text.clone() },
             ProgressEvent::ThinkingDelta { content } => WebProgressEvent::ThinkingDelta {
                 content: content.clone(),
             },
@@ -192,6 +190,8 @@ impl WebProgressEvent {
                 max_attempts: *max_attempts,
                 error: error.clone(),
             },
+            // Backlog 条目是后台事件，Web UI 不需要展示
+            ProgressEvent::BacklogEntryDetected { .. } => return None,
             // AskUser 去掉 response_tx，前端通过 WebSocket 消息回复
             ProgressEvent::AskUser {
                 question,

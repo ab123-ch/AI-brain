@@ -143,7 +143,9 @@ impl ProgressiveRecall {
             for te in &all {
                 // 检查经验模式是否匹配
                 let matched = te.experiences.iter().any(|e| {
-                    l4.content.to_lowercase().contains(&e.pattern.to_lowercase())
+                    l4.content
+                        .to_lowercase()
+                        .contains(&e.pattern.to_lowercase())
                 });
                 if matched {
                     let exp_summary: Vec<String> = te
@@ -185,8 +187,7 @@ impl ProgressiveRecall {
 mod tests {
     use super::*;
     use crate::pyramid_types::{
-        SubconsciousData, SubconsciousTrigger, TaskType, TypeExperience,
-        Experience,
+        Experience, SubconsciousData, SubconsciousTrigger, TaskType, TypeExperience,
     };
     use chrono::Utc;
 

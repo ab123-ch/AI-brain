@@ -121,11 +121,7 @@ fn migrate_l1_sessions(base_dir: &PathBuf, stats: &mut MigrationStats) {
     let jsonl_files = match fs::read_dir(&old_sessions_dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "jsonl")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
             .map(|e| e.path())
             .collect::<Vec<_>>(),
         Err(e) => {
@@ -195,9 +191,9 @@ fn convert_session(old_path: &PathBuf, new_path: &PathBuf) -> Result<usize, Stri
                 brain_core::types::TurnRole::ToolCall => "ToolCall",
                 brain_core::types::TurnRole::ToolResult => "ToolResult",
             };
-            let tool_output = turn.tool_call.map(|tc| {
-                format!("{}: {}", tc.tool_name, tc.output)
-            });
+            let tool_output = turn
+                .tool_call
+                .map(|tc| format!("{}: {}", tc.tool_name, tc.output));
             RawTurn {
                 role: role_str.to_string(),
                 content: turn.content,
@@ -213,10 +209,7 @@ fn convert_session(old_path: &PathBuf, new_path: &PathBuf) -> Result<usize, Stri
                 timestamp: flexible.timestamp.unwrap_or_else(Utc::now),
             }
         } else {
-            eprintln!(
-                "    警告: 第 {} 行无法解析，跳过",
-                line_no + 1
-            );
+            eprintln!("    警告: 第 {} 行无法解析，跳过", line_no + 1);
             continue;
         };
 
@@ -355,11 +348,7 @@ fn load_json_files_as<T: serde::de::DeserializeOwned>(dir: &PathBuf) -> Vec<T> {
 
     entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .filter_map(|e| {
             let data = fs::read_to_string(e.path()).ok()?;
             serde_json::from_str::<T>(&data).ok()
@@ -402,7 +391,10 @@ fn migrate_profile(base_dir: &PathBuf, stats: &mut MigrationStats) {
 
     match profile_store.regenerate(&summary) {
         Ok(()) => {
-            println!("  ✓ profile.json 已生成 ({}/100字)", summary.chars().count());
+            println!(
+                "  ✓ profile.json 已生成 ({}/100字)",
+                summary.chars().count()
+            );
             stats.profile_migrated = true;
         }
         Err(e) => eprintln!("  ✗ 生成 profile.json 失败: {e}"),
@@ -422,8 +414,7 @@ fn build_profile_summary(path: &PathBuf) -> Result<String, String> {
     }
 
     let data = fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
-    let profile: OldProfile =
-        serde_json::from_str(&data).map_err(|e| format!("解析失败: {e}"))?;
+    let profile: OldProfile = serde_json::from_str(&data).map_err(|e| format!("解析失败: {e}"))?;
 
     // 合并所有偏好和习惯
     let mut parts = Vec::new();
@@ -455,10 +446,23 @@ fn build_profile_summary(path: &PathBuf) -> Result<String, String> {
 
 fn print_summary(stats: &MigrationStats) {
     println!("\n=== 迁移摘要 ===");
-    println!("  L1 会话: {} 个已迁移, {} 个跳过", stats.sessions_migrated, stats.sessions_skipped);
+    println!(
+        "  L1 会话: {} 个已迁移, {} 个跳过",
+        stats.sessions_migrated, stats.sessions_skipped
+    );
     println!("  L1 记录: {} 条已转换", stats.turns_converted);
-    println!("  评估信息: {} 要求 + {} 踩坑 + {} 规则", stats.requirements_merged, stats.pitfalls_merged, stats.rules_merged);
-    println!("  用户画像: {}", if stats.profile_migrated { "已迁移" } else { "无数据" });
+    println!(
+        "  评估信息: {} 要求 + {} 踩坑 + {} 规则",
+        stats.requirements_merged, stats.pitfalls_merged, stats.rules_merged
+    );
+    println!(
+        "  用户画像: {}",
+        if stats.profile_migrated {
+            "已迁移"
+        } else {
+            "无数据"
+        }
+    );
     println!();
     println!("注意: L2/L3/L4 层级不迁移，将在下次四步分析时由 LLM 自动生成。");
 }
@@ -517,7 +521,8 @@ mod tests {
         // 灵活格式 JSONL
         let flex_path = sessions_dir.join("sess-flex.jsonl");
         let mut f2 = fs::File::create(&flex_path).unwrap();
-        let flex_line = r#"{"role":"User","content":"灵活格式测试","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let flex_line =
+            r#"{"role":"User","content":"灵活格式测试","timestamp":"2026-01-01T00:00:00Z"}"#;
         writeln!(f2, "{flex_line}").unwrap();
 
         // 旧 pitfall 数据
@@ -705,7 +710,12 @@ mod tests {
         // 验证完整目录结构
         assert!(base.join("personas").join("registry.json").exists());
         assert!(base.join("personas").join("default").exists());
-        assert!(base.join("personas").join("default").join("pyramid").join("l1-raw").exists());
+        assert!(base
+            .join("personas")
+            .join("default")
+            .join("pyramid")
+            .join("l1-raw")
+            .exists());
 
         // 验证幂等性（再跑一次不会出错）
         let mut stats2 = MigrationStats::default();

@@ -54,7 +54,7 @@ fn handle_evolver(args: &[String]) -> CommandResult {
 fn evo_status_overview() -> CommandResult {
     CommandResult::ok(
         "进化脑 v2 状态:\n\
-         ├─ 框架: 已就绪（CycleRunner + EvoOrchestrator）\n\
+         ├─ 框架: 已就绪（CycleRunner 直接驱动）\n\
          ├─ 数据模型: Backlog + Target + EvoLog + CapabilityTree\n\
          ├─ 触发器: EvolutionTrigger（定时 + 空闲检测）\n\
          └─ 集成: Orchestrator 已连接\n\n\

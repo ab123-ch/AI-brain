@@ -24,10 +24,7 @@ pub enum LlmError {
     BrainNotConfigured(String),
 
     #[error("retries exhausted after {attempts} attempts: {last_error}")]
-    RetriesExhausted {
-        attempts: u32,
-        last_error: String,
-    },
+    RetriesExhausted { attempts: u32, last_error: String },
 
     #[error("JSON parse error: {0}")]
     JsonError(#[from] serde_json::Error),

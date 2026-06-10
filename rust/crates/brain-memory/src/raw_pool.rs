@@ -114,8 +114,7 @@ mod tests {
     #[test]
     fn append_and_read_session() {
         let (pool, _tmp) = make_pool("test");
-        pool.append_turn("sess-001", "User", "你好", None)
-            .unwrap();
+        pool.append_turn("sess-001", "User", "你好", None).unwrap();
         pool.append_turn("sess-001", "Assistant", "你好！有什么可以帮你的？", None)
             .unwrap();
 
@@ -128,22 +127,27 @@ mod tests {
     #[test]
     fn append_with_tool_output() {
         let (pool, _tmp) = make_pool("test");
-        pool.append_turn("sess-001", "Tool", "ls result", Some("file1.txt\nfile2.txt"))
-            .unwrap();
+        pool.append_turn(
+            "sess-001",
+            "Tool",
+            "ls result",
+            Some("file1.txt\nfile2.txt"),
+        )
+        .unwrap();
 
         let turns = pool.read_session("sess-001").unwrap();
-        assert_eq!(turns[0].tool_output.as_deref(), Some("file1.txt\nfile2.txt"));
+        assert_eq!(
+            turns[0].tool_output.as_deref(),
+            Some("file1.txt\nfile2.txt")
+        );
     }
 
     #[test]
     fn list_multiple_sessions() {
         let (pool, _tmp) = make_pool("test");
-        pool.append_turn("sess-a", "User", "hello", None)
-            .unwrap();
-        pool.append_turn("sess-b", "User", "world", None)
-            .unwrap();
-        pool.append_turn("sess-c", "User", "foo", None)
-            .unwrap();
+        pool.append_turn("sess-a", "User", "hello", None).unwrap();
+        pool.append_turn("sess-b", "User", "world", None).unwrap();
+        pool.append_turn("sess-c", "User", "foo", None).unwrap();
 
         let sessions = pool.list_sessions().unwrap();
         assert_eq!(sessions.len(), 3);
@@ -152,12 +156,9 @@ mod tests {
     #[test]
     fn count_across_sessions() {
         let (pool, _tmp) = make_pool("test");
-        pool.append_turn("sess-a", "User", "hello", None)
-            .unwrap();
-        pool.append_turn("sess-a", "Assistant", "hi", None)
-            .unwrap();
-        pool.append_turn("sess-b", "User", "world", None)
-            .unwrap();
+        pool.append_turn("sess-a", "User", "hello", None).unwrap();
+        pool.append_turn("sess-a", "Assistant", "hi", None).unwrap();
+        pool.append_turn("sess-b", "User", "world", None).unwrap();
 
         assert_eq!(pool.count().unwrap(), 3);
     }
@@ -200,8 +201,7 @@ mod tests {
     #[test]
     fn session_to_json_outputs_valid_json() {
         let (pool, _tmp) = make_pool("test");
-        pool.append_turn("sess-001", "User", "hello", None)
-            .unwrap();
+        pool.append_turn("sess-001", "User", "hello", None).unwrap();
 
         let json = pool.session_to_json("sess-001").unwrap();
         let parsed: Vec<RawTurn> = serde_json::from_str(&json).unwrap();
@@ -211,13 +211,11 @@ mod tests {
     #[test]
     fn uses_persona_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage =
-            PyramidStorage::new(tmp.path().to_path_buf(), "cyber-brain");
+        let storage = PyramidStorage::new(tmp.path().to_path_buf(), "cyber-brain");
         storage.ensure_dirs().unwrap();
         let pool = RawPool::new(storage);
 
-        pool.append_turn("sess-001", "User", "hello", None)
-            .unwrap();
+        pool.append_turn("sess-001", "User", "hello", None).unwrap();
 
         let expected = tmp
             .path()

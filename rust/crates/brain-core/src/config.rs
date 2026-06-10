@@ -76,7 +76,6 @@ pub struct WeightConfig {
     pub memory: f64,
     pub motor: f64,
     pub validation: f64,
-    pub evolver: f64,
 }
 
 impl Default for WeightConfig {
@@ -86,7 +85,6 @@ impl Default for WeightConfig {
             memory: 0.5,
             motor: 0.5,
             validation: 0.5,
-            evolver: 0.3,
         }
     }
 }
@@ -100,7 +98,6 @@ impl WeightConfig {
         m.insert(BrainId::memory(), Weight(self.memory));
         m.insert(BrainId::motor(), Weight(self.motor));
         m.insert(BrainId::validation(), Weight(self.validation));
-        m.insert(BrainId::evolver(), Weight(self.evolver));
         m
     }
 }

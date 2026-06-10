@@ -253,11 +253,7 @@ mod tests {
         let store_b = PyramidStorage::new(PathBuf::from("/tmp/brain"), "writer");
 
         // L1 路径隔离
-        assert!(store_a
-            .l1_dir()
-            .to_str()
-            .unwrap()
-            .contains("cyber-brain"));
+        assert!(store_a.l1_dir().to_str().unwrap().contains("cyber-brain"));
         assert!(store_b.l1_dir().to_str().unwrap().contains("writer"));
 
         // L4 路径隔离

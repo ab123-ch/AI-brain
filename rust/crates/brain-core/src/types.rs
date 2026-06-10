@@ -112,9 +112,6 @@ impl BrainId {
     pub fn evaluation() -> Self {
         Self("evaluation".into())
     }
-    pub fn evolver() -> Self {
-        Self("evolver".into())
-    }
 }
 
 impl std::fmt::Display for BrainId {
@@ -133,7 +130,6 @@ pub enum BrainKind {
     Motor,
     Validation,
     Evaluation,
-    Evolver,
 }
 
 /// 权重 [0.1, 1.0]
@@ -785,6 +781,19 @@ pub enum ProgressEvent {
         /// 是否允许多选
         multi_select: bool,
         response_tx: UserResponseSender,
+    },
+    /// 进化脑 backlog 收集：检测到需要学习的问题
+    BacklogEntryDetected {
+        /// 来源：Eval（评估脑）、SelfDiagnosis（主脑诊断）
+        source: String,
+        /// 分类：KnowledgeGap、CodeQuality、ReasoningWeakness 等
+        category: String,
+        /// 问题描述
+        description: String,
+        /// 严重程度：Critical、High、Medium、Low
+        severity: String,
+        /// 上下文快照（可选）
+        context_snapshot: Option<String>,
     },
     Done,
 }

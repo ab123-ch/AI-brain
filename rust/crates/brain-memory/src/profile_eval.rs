@@ -4,10 +4,10 @@
 //! EvalInfo: 为评估脑提供的评估信息（requirements + pitfalls + rules）
 //! 路径: `personas/{persona_id}/profile.json` 和 `eval-info.json`
 
-use chrono::Utc;
 use crate::error::Result;
 use crate::pyramid_storage::PyramidStorage;
 use crate::pyramid_types::{EvalInfo, PersonaProfile};
+use chrono::Utc;
 
 /// 用户画像存储（100字上限）
 pub struct ProfileStore {
@@ -32,7 +32,8 @@ impl ProfileStore {
             summary: summary.to_string(),
             updated_at: Utc::now(),
         };
-        self.storage.write_json(&self.storage.profile_path(), &profile)
+        self.storage
+            .write_json(&self.storage.profile_path(), &profile)
     }
 
     /// 获取画像文本（用于注入）
@@ -91,19 +92,31 @@ impl EvalInfoStore {
         if !info.requirements.is_empty() {
             parts.push(format!(
                 "[评估要求]\n{}",
-                info.requirements.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n")
+                info.requirements
+                    .iter()
+                    .map(|r| format!("- {r}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
         if !info.pitfalls.is_empty() {
             parts.push(format!(
                 "[已知踩坑]\n{}",
-                info.pitfalls.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+                info.pitfalls
+                    .iter()
+                    .map(|p| format!("- {p}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
         if !info.rules.is_empty() {
             parts.push(format!(
                 "[进化规则]\n{}",
-                info.rules.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n")
+                info.rules
+                    .iter()
+                    .map(|r| format!("- {r}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
 
@@ -204,8 +217,7 @@ mod tests {
     #[test]
     fn eval_info_regenerate_overwrites() {
         let (_, eval, _tmp) = make_stores("test");
-        eval.regenerate(vec!["旧".into()], vec![], vec![])
-            .unwrap();
+        eval.regenerate(vec!["旧".into()], vec![], vec![]).unwrap();
         eval.regenerate(vec!["新".into()], vec!["坑".into()], vec![])
             .unwrap();
 

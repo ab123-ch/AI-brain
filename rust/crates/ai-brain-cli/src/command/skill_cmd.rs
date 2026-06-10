@@ -22,7 +22,9 @@ fn handle_skill(args: &[String]) -> CommandResult {
         "info" => {
             let name = args.get(1);
             match name {
-                Some(n) => CommandResult::ok(format!("[skill info 由 TUI app.rs 特殊处理，此处不应到达: {n}]")),
+                Some(n) => CommandResult::ok(format!(
+                    "[skill info 由 TUI app.rs 特殊处理，此处不应到达: {n}]"
+                )),
                 None => CommandResult::err("用法: /skill info <name>"),
             }
         }

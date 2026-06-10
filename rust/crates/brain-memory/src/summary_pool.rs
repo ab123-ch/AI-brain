@@ -3,10 +3,10 @@
 //! 按任务分类的摘要，不是按会话。全量重生成模式。
 //! 路径: `personas/{persona_id}/pyramid/l2-summary/`
 
-use chrono::Utc;
 use crate::error::Result;
 use crate::pyramid_storage::PyramidStorage;
 use crate::pyramid_types::{SummaryIndex, SummaryIndexEntry, TaskSummary};
+use chrono::Utc;
 
 /// L2 记忆摘要池
 pub struct SummaryPool {
@@ -60,7 +60,11 @@ impl SummaryPool {
             tasks.push(task);
         }
         // 按 importance 降序排序
-        tasks.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+        tasks.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(tasks)
     }
 
@@ -82,8 +86,11 @@ impl SummaryPool {
         let results: Vec<TaskSummary> = all
             .into_iter()
             .filter(|t| {
-                tags.iter()
-                    .any(|tag| t.tags.iter().any(|t_tag| t_tag.to_lowercase() == tag.to_lowercase()))
+                tags.iter().any(|tag| {
+                    t.tags
+                        .iter()
+                        .any(|t_tag| t_tag.to_lowercase() == tag.to_lowercase())
+                })
             })
             .collect();
         Ok(results)

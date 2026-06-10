@@ -53,20 +53,20 @@ impl ConfigManager {
             Ok(c) => c,
             Err(_) => return toml::Value::Table(toml::map::Map::new()),
         };
-        content.parse::<toml::Value>().unwrap_or(toml::Value::Table(toml::map::Map::new()))
+        content
+            .parse::<toml::Value>()
+            .unwrap_or(toml::Value::Table(toml::map::Map::new()))
     }
 
     fn save_doc(&self) -> Result<(), String> {
         if let Some(parent) = self.config_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("创建配置目录失败: {e}"))?;
+            fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
         }
 
-        let content = toml::to_string_pretty(&self.doc)
-            .map_err(|e| format!("序列化配置失败: {e}"))?;
+        let content =
+            toml::to_string_pretty(&self.doc).map_err(|e| format!("序列化配置失败: {e}"))?;
 
-        fs::write(&self.config_path, content)
-            .map_err(|e| format!("写入配置文件失败: {e}"))?;
+        fs::write(&self.config_path, content).map_err(|e| format!("写入配置文件失败: {e}"))?;
 
         Ok(())
     }
@@ -208,7 +208,11 @@ reasoning = "glm-5.1"
         ConfigManager::set_nested(&mut mgr.doc, "llm.default_model", "glm-5.1");
         ConfigManager::set_nested(&mut mgr.doc, "llm.defaults.max_tokens", "8192");
         let all = mgr.all();
-        assert!(all.iter().any(|(k, v)| k == "llm.default_model" && v == "glm-5.1"));
-        assert!(all.iter().any(|(k, v)| k == "llm.defaults.max_tokens" && v == "8192"));
+        assert!(all
+            .iter()
+            .any(|(k, v)| k == "llm.default_model" && v == "glm-5.1"));
+        assert!(all
+            .iter()
+            .any(|(k, v)| k == "llm.defaults.max_tokens" && v == "8192"));
     }
 }

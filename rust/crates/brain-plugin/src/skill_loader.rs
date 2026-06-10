@@ -130,8 +130,7 @@ impl SkillCatalog {
                     // 优先级 C：展平技能包
                     if let Some((pack, sub_skills)) = try_scan_as_flat_pack(&dir) {
                         let pack_name = pack.name.clone();
-                        let bootstrap_name =
-                            detect_bootstrap_skill(&pack.skills_dir, &pack_name);
+                        let bootstrap_name = detect_bootstrap_skill(&pack.skills_dir, &pack_name);
                         for mut meta in sub_skills {
                             if seen_paths.insert(meta.source_path.clone()) {
                                 let is_bootstrap = bootstrap_name.as_deref() == Some(&meta.name);
@@ -192,9 +191,11 @@ impl SkillCatalog {
         // 3. 包名匹配：返回 bootstrap 技能或第一个子技能
         if let Some(pack) = self.packs.iter().find(|p| p.name == query) {
             if let Some(ref bs_name) = pack.bootstrap_skill {
-                if let Some(bs) = self.skills.iter().find(|s| {
-                    s.pack_name.as_deref() == Some(&pack.name) && s.name == *bs_name
-                }) {
+                if let Some(bs) = self
+                    .skills
+                    .iter()
+                    .find(|s| s.pack_name.as_deref() == Some(&pack.name) && s.name == *bs_name)
+                {
                     return Some(bs);
                 }
             }
@@ -206,11 +207,9 @@ impl SkillCatalog {
         }
 
         // 4. 模糊匹配
-        self.skills
-            .iter()
-            .find(|s| {
-                s.name.contains(query) || s.description.to_lowercase().contains(&query.to_lowercase())
-            })
+        self.skills.iter().find(|s| {
+            s.name.contains(query) || s.description.to_lowercase().contains(&query.to_lowercase())
+        })
     }
 
     /// 列出包下所有技能
@@ -418,8 +417,7 @@ fn try_scan_as_flat_pack(dir: &Path) -> Option<(SkillPackMeta, Vec<SkillMeta>)> 
             let sf = sub.join("SKILL.md");
             if sf.exists() {
                 if let Some(parsed) = parse_skill_file(&sf) {
-                    let namespace = infer_namespace(&sf)
-                        .unwrap_or_else(|| dir_name.clone());
+                    let namespace = infer_namespace(&sf).unwrap_or_else(|| dir_name.clone());
                     sub_skills.push(SkillMeta {
                         name: parsed.name,
                         namespace: Some(namespace.clone()),
@@ -527,7 +525,12 @@ mod tests {
         format!("---\nname: {name}\ndescription: \"{description}\"\n---\n\n{body}")
     }
 
-    fn make_skill_md_with_bootstrap(name: &str, description: &str, bootstrap: bool, body: &str) -> String {
+    fn make_skill_md_with_bootstrap(
+        name: &str,
+        description: &str,
+        bootstrap: bool,
+        body: &str,
+    ) -> String {
         format!(
             "---\nname: {name}\ndescription: \"{description}\"\nbootstrap: {bootstrap}\n---\n\n{body}"
         )
@@ -578,7 +581,12 @@ mod tests {
 
     #[test]
     fn parse_skill_bootstrap_field() {
-        let content = make_skill_md_with_bootstrap("using-superpowers", "Bootstrap skill", true, "# Bootstrap");
+        let content = make_skill_md_with_bootstrap(
+            "using-superpowers",
+            "Bootstrap skill",
+            true,
+            "# Bootstrap",
+        );
         let result = parse_skill_content(&content).unwrap();
         assert_eq!(result.name, "using-superpowers");
         assert!(result.bootstrap);
@@ -745,8 +753,7 @@ mod tests {
 
         // 同一个根目录扫两次也不应重复
         let catalog =
-            SkillCatalog::scan_all(&[dir.path().to_path_buf(), dir.path().to_path_buf()])
-                .unwrap();
+            SkillCatalog::scan_all(&[dir.path().to_path_buf(), dir.path().to_path_buf()]).unwrap();
         assert_eq!(catalog.skills.len(), 1);
     }
 
@@ -762,11 +769,7 @@ mod tests {
             fs::create_dir_all(&manifest_dir).unwrap();
             fs::create_dir_all(skills_dir.join("s1")).unwrap();
 
-            fs::write(
-                pack_dir.join(rel),
-                r#"{"name": "test-pack"}"#,
-            )
-            .unwrap();
+            fs::write(pack_dir.join(rel), r#"{"name": "test-pack"}"#).unwrap();
             fs::write(
                 skills_dir.join("s1").join("SKILL.md"),
                 make_skill_md("s1", "Skill 1", "# S1"),
@@ -789,11 +792,7 @@ mod tests {
         fs::create_dir_all(skills_dir.join("s1")).unwrap();
 
         // name 含 /
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            r#"{"name": "bad/name"}"#,
-        )
-        .unwrap();
+        fs::write(plugin_dir.join("plugin.json"), r#"{"name": "bad/name"}"#).unwrap();
         fs::write(
             skills_dir.join("s1").join("SKILL.md"),
             make_skill_md("s1", "Skill 1", "# S1"),
@@ -819,11 +818,7 @@ mod tests {
         fs::create_dir_all(skills_dir.join("bootstrap-skill")).unwrap();
         fs::create_dir_all(skills_dir.join("normal-skill")).unwrap();
 
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            r#"{"name": "pack"}"#,
-        )
-        .unwrap();
+        fs::write(plugin_dir.join("plugin.json"), r#"{"name": "pack"}"#).unwrap();
         fs::write(
             skills_dir.join("bootstrap-skill").join("SKILL.md"),
             make_skill_md_with_bootstrap("bootstrap-skill", "Bootstrap!", true, "# BS"),
@@ -850,11 +845,7 @@ mod tests {
         fs::create_dir_all(skills_dir.join("using-mypack")).unwrap();
         fs::create_dir_all(skills_dir.join("other")).unwrap();
 
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            r#"{"name": "mypack"}"#,
-        )
-        .unwrap();
+        fs::write(plugin_dir.join("plugin.json"), r#"{"name": "mypack"}"#).unwrap();
         fs::write(
             skills_dir.join("using-mypack").join("SKILL.md"),
             make_skill_md("using-mypack", "Convention bootstrap", "# BS"),

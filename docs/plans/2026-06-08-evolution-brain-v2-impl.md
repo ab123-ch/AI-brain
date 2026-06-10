@@ -32,16 +32,15 @@
 | Task 13: EvoOrchestrator | ✅ | `evo_orchestrator.rs` | 8 (内嵌) |
 | Task 15: Orchestrator 集成 | ✅ | `orchestrator.rs` | 编译通过 |
 | Task 16: 命令接口重写 | ✅ | `evolver_cmd.rs` | 10 |
+| Task 12: Phase 6 验证 | ✅ | `verification.rs` | 8 |
+| Task 17: 旧 EvolverBrain 改造 | ✅ | `evolver_brain.rs` | 编译通过 |
+| Task 18: EvalBrain → Backlog | ✅ | `orchestrator.rs` | 编译通过 |
+| Task 19: 主脑自我诊断 | ✅ | `prompts.rs` + `output.rs` + `progress_adapter.rs` | 编译通过 |
 
 ### 待实施
 
 | Task | Phase | 说明 |
 |------|-------|------|
-| Task 10: Phase 4 合成 | Phase 3 | SKILL.md 生成（增强） |
-| Task 11: Phase 5 注册 | Phase 3 | SkillCatalog 写入 |
-| Task 12: Phase 6 验证 | Phase 3 | VerificationAgent |
-| Task 17: 旧 EvolverBrain 改造 | Phase 5 | 接入新架构 |
-| Task 18-19 | Phase 6 | Backlog 收集集成 |
 | Task 20 | Phase 7 | 端到端测试 |
 
 ### 已完成模块的关键 API 速查

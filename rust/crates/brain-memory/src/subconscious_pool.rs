@@ -97,8 +97,8 @@ impl SubconsciousPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::pyramid_types::TaskType;
+    use chrono::Utc;
 
     fn make_pool(persona_id: &str) -> (SubconsciousPool, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -126,10 +126,7 @@ mod tests {
     #[test]
     fn save_and_load() {
         let (pool, _tmp) = make_pool("test");
-        let data = make_data(
-            vec![("红冲逻辑", "task-033")],
-            "用户是Rust开发者",
-        );
+        let data = make_data(vec![("红冲逻辑", "task-033")], "用户是Rust开发者");
         pool.regenerate(&data).unwrap();
 
         let loaded = pool.load().unwrap().unwrap();
@@ -182,9 +179,7 @@ mod tests {
         );
         pool.regenerate(&data).unwrap();
 
-        let hits = pool
-            .match_triggers("用Rust和crossterm做TUI")
-            .unwrap();
+        let hits = pool.match_triggers("用Rust和crossterm做TUI").unwrap();
         assert_eq!(hits.len(), 2);
     }
 

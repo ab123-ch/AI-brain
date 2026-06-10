@@ -30,7 +30,8 @@ use brain_evolution::{
     BrainRegistry, BrainRegistryStatus, BrainTemplate, CreationSuggestion, SuggestionEngine,
 };
 use brain_evolver::{
-    EvoConfig, EvoOrchestrator, EvolutionCoordinator, EvolutionGoal, EvolverBrain, SharedResources,
+    extract_cycle_metadata, target_id_from_candidate, CycleConfig, CycleRunner, EvoConfig,
+    EvolutionCoordinator, EvolutionTrigger, SharedResources,
 };
 use brain_hooks::config::HooksConfig;
 use brain_hooks::runner::HookRunner;
@@ -177,9 +178,10 @@ pub struct Orchestrator {
     hook_runner: HookRunner,
     registry: Arc<Mutex<BrainRegistry>>,
     suggestion_engine: Arc<Mutex<SuggestionEngine>>,
-    evolver: Arc<Mutex<EvolverBrain>>,
     /// v2 进化脑: 调度器（目标选择 + 日志）
     evo_coordinator: Arc<Mutex<Option<EvolutionCoordinator>>>,
+    /// v2 进化脑: 空闲触发检测器
+    evo_trigger: Arc<Mutex<EvolutionTrigger>>,
     /// v2 进化脑: 后台进化任务句柄（用于 cancel）
     evo_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// v2 进化脑: 是否正在进化中（防重入）
@@ -354,26 +356,9 @@ impl Orchestrator {
         let registry = Arc::new(Mutex::new(BrainRegistry::new()));
         let suggestion_engine = Arc::new(Mutex::new(SuggestionEngine::new()));
 
-        // 11.1 进化脑（EvolverBrain）
-        let evolver = if let Ok(config) = LlmConfig::load_default() {
-            if let Ok(client) = config.create_brain_client("evolver") {
-                let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
-                Some(EvolverBrain::new(llm, std::path::Path::new(".")))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if evolver.is_some() {
-            tracing::info!("进化脑已创建（EvolverBrain）");
-        }
-        let evolver = Arc::new(Mutex::new(evolver.unwrap_or_else(|| {
-            // 此时 create_sensory_llm 已成功，sensory LLM 必定可用
-            let client = try_create_llm_client("sensory")
-                .expect("sensory LLM should be available after successful create_sensory_llm()");
-            EvolverBrain::new(client, std::path::Path::new("."))
-        })));
+        // 11.1 进化脑 coordinator（惰性初始化，首次 /evo 时创建）
+        let evo_coordinator_arc: Arc<Mutex<Option<EvolutionCoordinator>>> =
+            Arc::new(Mutex::new(None));
 
         tracing::info!("AI Brain 初始化完成，{} 个副脑任务已启动", tasks.len());
 
@@ -405,7 +390,10 @@ impl Orchestrator {
         // 12.0 评估脑接入统一 SkillCatalog
         if let Some(ref mut eb) = eval_brain {
             eb.set_skill_catalog(Arc::clone(&skill_catalog));
-            tracing::info!("评估脑已接入统一 SkillCatalog（{} 个技能）", skill_catalog.skills.len());
+            tracing::info!(
+                "评估脑已接入统一 SkillCatalog（{} 个技能）",
+                skill_catalog.skills.len()
+            );
         }
 
         // 12.05 Bootstrap 技能注入到主脑
@@ -496,7 +484,6 @@ impl Orchestrator {
 
         // 12.5 启动时注入金字塔记忆上下文（潜意识 + 画像 + 可注入经验 + 人格 prompt）
         let injection_text = if let Ok(mem_guard) = memory.try_lock() {
-
             let pp = mem_guard.persona_manager().build_persona_prompt();
             let inject_ctx = match mem_guard.auto_inject() {
                 Ok(ctx) => ctx,
@@ -597,8 +584,8 @@ impl Orchestrator {
             hook_runner,
             registry,
             suggestion_engine,
-            evolver,
-            evo_coordinator: Arc::new(Mutex::new(None)),
+            evo_coordinator: evo_coordinator_arc,
+            evo_trigger: Arc::new(Mutex::new(EvolutionTrigger::new(Default::default()))),
             evo_handle: Arc::new(Mutex::new(None)),
             evo_running: Arc::new(tokio::sync::watch::channel(false).0),
             tasks,
@@ -616,6 +603,9 @@ impl Orchestrator {
 
     /// 提交查询
     pub async fn query(&self, input: &str) -> Result<MasterOutput, String> {
+        // 通知进化脑有用户活动（重置空闲计时器）
+        self.touch_evo_activity().await;
+
         self.sensory
             .process_input(input)
             .await
@@ -788,10 +778,12 @@ impl Orchestrator {
                     tracing::info!("使用 v2 MainBrain (带工具) 处理查询");
 
                     // 发送记忆召回提示
-                    let _ = tx.send(ProgressEvent::MemoryInjected {
-                        count: 0,
-                        preview: "正在检索相关记忆上下文".to_string(),
-                    }).await;
+                    let _ = tx
+                        .send(ProgressEvent::MemoryInjected {
+                            count: 0,
+                            preview: "正在检索相关记忆上下文".to_string(),
+                        })
+                        .await;
 
                     // --- 1. 主脑首次处理 ---
                     let mut result = brain
@@ -905,6 +897,18 @@ impl Orchestrator {
                                                 truncate_chars(&eval_result.feedback, 300)
                                             );
                                             brain.push_evaluator_to_history(&eval_result.feedback);
+
+                                            // Task 18: 写入 evolution backlog
+                                            let _ = this
+                                                .add_backlog_entry(
+                                                    "Eval",
+                                                    "KnowledgeGap",
+                                                    &truncate_chars(&eval_result.feedback, 500),
+                                                    "Critical",
+                                                    None,
+                                                )
+                                                .await;
+
                                             break; // 不重试，直接输出当前结果 + 评估反馈
                                         }
 
@@ -913,6 +917,18 @@ impl Orchestrator {
                                                 "v2 评估达到最大重试次数({}), 使用当前输出",
                                                 max_eval_retries + 1
                                             );
+
+                                            // Task 18: 写入 evolution backlog
+                                            let _ = this
+                                                .add_backlog_entry(
+                                                    "Eval",
+                                                    "ReasoningWeakness",
+                                                    &truncate_chars(&eval_result.feedback, 500),
+                                                    "High",
+                                                    None,
+                                                )
+                                                .await;
+
                                             break;
                                         }
 
@@ -1090,9 +1106,12 @@ impl Orchestrator {
                  \x20 L4 潜意识: {}\n\
                  \x20 活跃人格: {}\n\
                  \x20 会话ID: {}\n",
-                s.l1_count, s.l2_count, s.l3_count,
+                s.l1_count,
+                s.l2_count,
+                s.l3_count,
                 if s.l4_exists { "有" } else { "无" },
-                s.active_persona, s.session_id,
+                s.active_persona,
+                s.session_id,
             ),
             Err(e) => format!("获取记忆统计失败: {e}"),
         }
@@ -1355,52 +1374,6 @@ impl Orchestrator {
         out
     }
 
-    // ─── 进化脑方法 ──────────────────────────────────────────────────
-
-    /// 启动进化任务
-    pub async fn start_evolution(&self, goal: String) -> Result<String, String> {
-        let engine = self.evolver.lock().await.engine();
-        let mut engine = engine.lock().await;
-
-        let evo_goal = EvolutionGoal {
-            description: goal.clone(),
-            target_files: vec![],
-            expected_outcome: String::new(),
-            test_scenarios: vec![],
-        };
-
-        engine.start(evo_goal).await.map_err(|e| e.to_string())?;
-        Ok(engine.status().to_string())
-    }
-
-    /// 查看进化状态
-    pub async fn evolution_status(&self) -> String {
-        let engine = self.evolver.lock().await.engine();
-        let engine = engine.lock().await;
-        format!("{}", engine.status())
-    }
-
-    /// 确认合并进化结果
-    pub async fn approve_evolution(&self) -> Result<(), String> {
-        let engine = self.evolver.lock().await.engine();
-        let mut engine = engine.lock().await;
-        engine.approve().await.map_err(|e| e.to_string())
-    }
-
-    /// 拒绝并回滚进化
-    pub async fn reject_evolution(&self) -> Result<(), String> {
-        let engine = self.evolver.lock().await.engine();
-        let mut engine = engine.lock().await;
-        engine.reject().await.map_err(|e| e.to_string())
-    }
-
-    /// 查看进化 diff
-    pub async fn evolution_diff(&self) -> Result<String, String> {
-        let engine = self.evolver.lock().await.engine();
-        let engine = engine.lock().await;
-        engine.current_diff().await.map_err(|e| e.to_string())
-    }
-
     // ─── 进化脑 v2 方法 ──────────────────────────────────────────
 
     /// 初始化 v2 进化脑调度器（在首次 /evo 调用时惰性初始化）。
@@ -1430,11 +1403,10 @@ impl Orchestrator {
             return Err("进化脑正在运行中，请稍后再试".into());
         }
 
-        // 获取 LLM 实例（复用 evolver 的 LLM 配置）
-        let llm: Arc<dyn brain_llm::LlmProvider> = {
-            let evolver = self.evolver.lock().await;
-            evolver.llm_provider()
-        };
+        // 直接创建 LLM（不再从 EvolverBrain 获取）
+        let llm: Arc<dyn brain_llm::LlmProvider> = try_create_llm_client("evolver")
+            .or_else(|| try_create_llm_client("sensory"))
+            .ok_or("无法创建 LLM 客户端")?;
 
         // 获取 skill 名称
         let skill_names: Vec<String> = self
@@ -1444,17 +1416,16 @@ impl Orchestrator {
             .map(|s| s.name.clone())
             .collect();
 
-        let base_dir =
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".ai-brain")
-                .join("evolution");
+        // 获取金字塔根目录
+        let pyramid_root = {
+            let mem = self.memory_brain.lock().await;
+            mem.storage().pyramid_root()
+        };
 
         let shared = SharedResources {
             mcp_pool_info: String::new(),
             skill_names,
-            // TODO: Create real MemoryAccess adapter from memory_brain
-            memory: Arc::new(brain_evolver::StubMemoryAccess),
-            // TODO: Create real WebSearch from MCP pool
+            memory: Arc::new(brain_evolver::PyramidMemoryAccess::new(pyramid_root)),
             web_search: Arc::new(brain_evolver::StubWebSearch),
         };
 
@@ -1478,10 +1449,6 @@ impl Orchestrator {
             }
         }
 
-        // 创建 EvoOrchestrator
-        let mut evo_orch = EvoOrchestrator::new(llm, &base_dir, EvoConfig::default(), shared)
-            .map_err(|e| format!("Failed to create EvoOrchestrator: {e}"))?;
-
         // Pick target
         let target = {
             let guard = self.evo_coordinator.lock().await;
@@ -1497,23 +1464,101 @@ impl Orchestrator {
             None => return Err("没有可用的进化目标".into()),
         };
 
+        // 构建系统 prompt（原 EvoOrchestrator.update_system_prompt 逻辑内联）
+        let (system_prompt, log_id) = {
+            let mut guard = self.evo_coordinator.lock().await;
+            let coord = guard.as_mut().ok_or("coordinator 未初始化")?;
+            let ctx = brain_evolver::EvoPromptContext {
+                current_target: brain_evolver::describe_target(&target),
+                existing_skill_names: coord
+                    .capability_tree()
+                    .domains
+                    .iter()
+                    .flat_map(|d| d.skills.clone())
+                    .collect(),
+                related_backlog_entries: coord
+                    .backlog()
+                    .query_sorted_by_priority()
+                    .iter()
+                    .map(|e| e.description.clone())
+                    .take(5)
+                    .collect(),
+                token_budget: EvoConfig::default().token_budget_per_target,
+                ..Default::default()
+            };
+            let prompt = brain_evolver::evo_prompt::build_evo_system_prompt(&ctx);
+            let tid = target_id_from_candidate(&target);
+            let log_id = coord.log_cycle_start(&tid);
+            (prompt, log_id)
+        };
+
+        // 构建 CycleConfig
+        let evo_config = EvoConfig::default();
+        let cycle_config = CycleConfig {
+            max_iterations: evo_config.max_iterations_per_target,
+            token_budget_per_target: evo_config.token_budget_per_target,
+            verify_threshold: evo_config.verify_threshold,
+            system_prompt: system_prompt.clone(),
+            ..CycleConfig::default()
+        };
+
+        // 创建 CycleRunner（替代 EvoOrchestrator）
+        let mut cycle_runner = CycleRunner::with_resources(
+            llm,
+            cycle_config,
+            shared.memory.clone(),
+            shared.web_search.clone(),
+        );
+        cycle_runner.set_system_prompt(system_prompt);
+
         // Mark running
         let _ = self.evo_running.send(true);
 
         // Spawn background task
         let evo_running_tx = self.evo_running.clone();
+        let evo_coordinator = self.evo_coordinator.clone();
         let handle = tokio::spawn(async move {
             tracing::info!("进化脑 v2 启动，开始进化循环...");
 
-            match evo_orch.run_evolution(&target).await {
-                Ok(result) => {
-                    tracing::info!("进化脑 v2 完成: {:?}", result);
-                }
-                Err(e) => {
-                    tracing::error!("进化脑 v2 失败: {e}");
+            let result = cycle_runner.run(&target).await;
+
+            // 处理结果
+            let mut guard = evo_coordinator.lock().await;
+            if let Some(coord) = guard.as_mut() {
+                match &result {
+                    Ok(cycle_result) => {
+                        let (phases, tokens, skills, resolved_backlog, status) =
+                            extract_cycle_metadata(cycle_result);
+
+                        let _ = coord.log_cycle_end(
+                            &log_id,
+                            phases,
+                            tokens,
+                            skills.clone(),
+                            resolved_backlog,
+                            status,
+                        );
+
+                        if cycle_result.is_success() {
+                            let tid = target_id_from_candidate(&target);
+                            let _ = coord.resolve_target(&tid, &log_id, skills);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = coord.log_cycle_end(
+                            &log_id,
+                            vec![],
+                            0,
+                            vec![],
+                            vec![],
+                            brain_evolver::evo_log::EvoCycleStatus::Blocked,
+                        );
+                        tracing::error!("进化脑 v2 失败: {e}");
+                    }
                 }
             }
 
+            tracing::info!("进化脑 v2 循环结束");
             let _ = evo_running_tx.send(false);
         });
 
@@ -1547,17 +1592,13 @@ impl Orchestrator {
                 Some(coord) => {
                     let has_work = coord.has_pending_work();
                     let log_count = coord.log_store().latest().map_or(0, |_| 1);
-                    format!(
-                        "has_pending_work={has_work}, log_entries={log_count}",
-                    )
+                    format!("has_pending_work={has_work}, log_entries={log_count}",)
                 }
                 None => "未初始化".into(),
             }
         };
 
-        format!(
-            "进化脑 v2 状态: running={is_running}, coordinator=[{coordinator_info}]"
-        )
+        format!("进化脑 v2 状态: running={is_running}, coordinator=[{coordinator_info}]")
     }
 
     /// v2: 获取进化调度器的可变引用（用于命令接口直接操作）。
@@ -1568,9 +1609,86 @@ impl Orchestrator {
     }
 
     /// 通知进化脑有用户活动（用于空闲检测）。
-    pub fn touch_evo_activity(&self) {
-        // Future: self.evo_trigger.touch_activity()
-        // For now, this is a no-op placeholder until EvolutionTrigger is integrated
+    pub async fn touch_evo_activity(&self) {
+        let trigger = self.evo_trigger.lock().await;
+        trigger.touch_activity();
+    }
+
+    /// 添加 backlog 条目（用于 EvalBrain/主脑诊断 → Backlog 集成）
+    ///
+    /// 将检测到的问题写入 EvolutionBacklog，作为进化脑的驱动力。
+    pub async fn add_backlog_entry(
+        &self,
+        source: &str,
+        category: &str,
+        description: &str,
+        severity: &str,
+        context_snapshot: Option<&str>,
+    ) -> Result<(), String> {
+        // 确保 coordinator 已初始化
+        self.ensure_evo_coordinator().await?;
+
+        let mut guard = self.evo_coordinator.lock().await;
+        if let Some(coord) = guard.as_mut() {
+            use brain_evolver::backlog::{
+                BacklogCategory, BacklogEntry, BacklogSource, BacklogStatus, Severity,
+            };
+            use chrono::Utc;
+
+            // 映射 source
+            let backlog_source = match source {
+                "Eval" => BacklogSource::Eval,
+                "SelfDiagnosis" => BacklogSource::SelfDiagnosis,
+                "Memory" => BacklogSource::Memory,
+                _ => BacklogSource::User,
+            };
+
+            // 映射 category
+            let backlog_category = match category {
+                "KnowledgeGap" => BacklogCategory::KnowledgeGap,
+                "CodeQuality" => BacklogCategory::CodeQuality,
+                "ReasoningWeakness" => BacklogCategory::ReasoningWeakness,
+                "ToolMissing" => BacklogCategory::ToolMissing,
+                _ => BacklogCategory::KnowledgeGap,
+            };
+
+            // 映射 severity
+            let backlog_severity = match severity {
+                "Critical" => Severity::Critical,
+                "High" => Severity::High,
+                "Medium" => Severity::Medium,
+                _ => Severity::Low,
+            };
+
+            let entry = BacklogEntry {
+                id: format!("blg_{}", Utc::now().format("%Y%m%d%H%M%S%f")),
+                source: backlog_source,
+                category: backlog_category,
+                description: description.to_string(),
+                severity: backlog_severity,
+                frequency: 1,
+                status: BacklogStatus::Pending,
+                created_at: Utc::now(),
+                context_snapshot: context_snapshot.map(|s| s.to_string()),
+                resolved_at: None,
+                evolution_log_id: None,
+            };
+
+            coord
+                .backlog_mut()
+                .add_entry(entry)
+                .map_err(|e| format!("写入 backlog 失败: {}", e))?;
+
+            tracing::info!(
+                "Orchestrator 收到 backlog 条目: {} ({}/{})",
+                description,
+                source,
+                severity
+            );
+            Ok(())
+        } else {
+            Err("EvolutionCoordinator 未初始化".into())
+        }
     }
 
     /// 优雅关闭（含强制四步分析）
@@ -1596,7 +1714,10 @@ impl Orchestrator {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            (mem.tick_and_should_analyze(), mem.persona_manager().analysis_interval())
+            (
+                mem.tick_and_should_analyze(),
+                mem.persona_manager().analysis_interval(),
+            )
         };
 
         if should {
@@ -1659,7 +1780,7 @@ impl Orchestrator {
         }
     }
 
-/// 强制执行一次四步浓缩（保留供手动调用）
+    /// 强制执行一次四步浓缩（保留供手动调用）
     #[allow(dead_code)]
     async fn run_analysis_force(&self) {
         let (base_dir, session_id) = {
@@ -2128,7 +2249,11 @@ mod tests {
         let orch = Orchestrator::new().await;
         assert!(orch.is_ok(), "Orchestrator 初始化应该成功");
         let orch = orch.unwrap();
-        assert_eq!(orch.task_count(), 5, "应该有 5 个任务（3副脑+1进化+1守护线程）");
+        assert_eq!(
+            orch.task_count(),
+            4,
+            "应该有 4 个任务（3副脑+1dispatch_loop）"
+        );
     }
 
     #[tokio::test]

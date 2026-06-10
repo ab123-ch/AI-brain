@@ -248,45 +248,45 @@ impl ThresholdCompressor {
 mod tests {
     use super::*;
 
-/// Mock LLM 客户端
-struct MockLlmProvider {
-    response: String,
-    should_fail: bool,
-}
-
-impl LlmProvider for MockLlmProvider {
-    fn model(&self) -> &str {
-        "mock-model"
+    /// Mock LLM 客户端
+    struct MockLlmProvider {
+        response: String,
+        should_fail: bool,
     }
 
-    fn complete(
-        &self,
-        _request: brain_llm::ChatRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = brain_llm::Result<brain_llm::ChatResponse>>
-                + Send
-                + '_,
-        >,
-    > {
-        let should_fail = self.should_fail;
-        let response = self.response.clone();
-        Box::pin(async move {
-            if should_fail {
-                Err(brain_llm::LlmError::RequestFailed(
-                    "Mock LLM error".to_string(),
-                ))
-            } else {
-                Ok(brain_llm::ChatResponse {
-                    content: vec![brain_llm::ContentBlock::text(response)],
-                    model: "mock-model".into(),
-                    usage: brain_llm::TokenUsage::default(),
-                    finish_reason: Some(brain_llm::FinishReason::EndTurn),
-                })
-            }
-        })
+    impl LlmProvider for MockLlmProvider {
+        fn model(&self) -> &str {
+            "mock-model"
+        }
+
+        fn complete(
+            &self,
+            _request: brain_llm::ChatRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = brain_llm::Result<brain_llm::ChatResponse>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let should_fail = self.should_fail;
+            let response = self.response.clone();
+            Box::pin(async move {
+                if should_fail {
+                    Err(brain_llm::LlmError::RequestFailed(
+                        "Mock LLM error".to_string(),
+                    ))
+                } else {
+                    Ok(brain_llm::ChatResponse {
+                        content: vec![brain_llm::ContentBlock::text(response)],
+                        model: "mock-model".into(),
+                        usage: brain_llm::TokenUsage::default(),
+                        finish_reason: Some(brain_llm::FinishReason::EndTurn),
+                    })
+                }
+            })
+        }
     }
-}
 
     fn create_test_messages(count: usize) -> Vec<ConversationMessage> {
         (0..count)
@@ -420,10 +420,7 @@ impl LlmProvider for MockLlmProvider {
 
         let result = compressor.compress_context(&messages, &mock_llm).await;
 
-        assert!(matches!(
-            result,
-            Err(CompactionError::InsufficientMessages)
-        ));
+        assert!(matches!(result, Err(CompactionError::InsufficientMessages)));
     }
 
     #[tokio::test]

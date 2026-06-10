@@ -51,9 +51,7 @@ fn handle_config(args: &[String]) -> CommandResult {
                 CommandResult::ok(output)
             }
         }
-        other => CommandResult::err(format!(
-            "未知子命令: {other}。可用: get, set, brain-params"
-        )),
+        other => CommandResult::err(format!("未知子命令: {other}。可用: get, set, brain-params")),
     }
 }
 

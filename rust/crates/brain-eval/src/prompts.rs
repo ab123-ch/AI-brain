@@ -403,26 +403,15 @@ mod tests {
 
     #[test]
     fn system_prompt_without_profile_summary() {
-        let prompt = build_evaluation_system_prompt(
-            &[],
-            &SkillRegistry::new(),
-            false,
-            None,
-            None,
-        );
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
         // 没有传入 profile_summary 时，不应出现 "# 用户画像" 标题
         assert!(!prompt.contains("# 用户画像"));
     }
 
     #[test]
     fn system_prompt_with_empty_profile_summary() {
-        let prompt = build_evaluation_system_prompt(
-            &[],
-            &SkillRegistry::new(),
-            false,
-            Some(""),
-            None,
-        );
+        let prompt =
+            build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, Some(""), None);
         // 空字符串 profile_summary 时，不应出现 "# 用户画像" 标题
         assert!(!prompt.contains("# 用户画像"));
     }
@@ -443,13 +432,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_pitfall_descriptions() {
-        let prompt = build_evaluation_system_prompt(
-            &[],
-            &SkillRegistry::new(),
-            false,
-            None,
-            None,
-        );
+        let prompt = build_evaluation_system_prompt(&[], &SkillRegistry::new(), false, None, None);
         // 没有传入 pitfall_descriptions 时，不应出现 "# 踩坑记录" 标题
         assert!(!prompt.contains("# 踩坑记录"));
     }
@@ -506,7 +489,8 @@ mod tests {
                 superseded: false,
             },
         ];
-        let prompt = build_evaluation_system_prompt(&reqs, &SkillRegistry::new(), false, None, None);
+        let prompt =
+            build_evaluation_system_prompt(&reqs, &SkillRegistry::new(), false, None, None);
         assert!(prompt.contains("# 用户评估要求"));
         assert!(prompt.contains("不要将简单问答判定为问题"));
         assert!(prompt.contains("重点关注代码安全性"));
@@ -597,11 +581,7 @@ mod tests {
             }),
             timestamp: String::new(),
         }];
-        let prompt = build_evaluation_user_prompt(
-            "改代码",
-            "已修改",
-            &turns,
-        );
+        let prompt = build_evaluation_user_prompt("改代码", "已修改", &turns);
         assert!(prompt.contains("主脑操作轨迹"));
         assert!(prompt.contains("src/main.rs"));
         assert!(prompt.contains("fn new()"));
@@ -609,8 +589,7 @@ mod tests {
 
     #[test]
     fn user_prompt_without_file_changes_no_section() {
-        let prompt =
-            build_evaluation_user_prompt("闲聊", "你好", &[]);
+        let prompt = build_evaluation_user_prompt("闲聊", "你好", &[]);
         assert!(!prompt.contains("主脑操作轨迹"));
     }
 

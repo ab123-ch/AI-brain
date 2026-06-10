@@ -129,15 +129,15 @@ impl WebSearch for MockWebSearch {
 pub struct StubWebSearch;
 
 impl WebSearch for StubWebSearch {
-    fn search(&self, _query: &str, _max_results: usize) -> Result<Vec<SearchResult>> {
-        // Stub: 暂不实现真实搜索
+    fn search(&self, query: &str, _max_results: usize) -> Result<Vec<SearchResult>> {
+        tracing::warn!("WebSearch unavailable (MCP not connected): query={query}");
         Ok(vec![])
     }
 
-    fn fetch_page(&self, _url: &str) -> Result<PageContent> {
-        // Stub: 暂不实现真实抓取
+    fn fetch_page(&self, url: &str) -> Result<PageContent> {
+        tracing::warn!("WebSearch fetch_page unavailable (MCP not connected): url={url}");
         Ok(PageContent {
-            url: "stub".into(),
+            url: url.into(),
             content: String::new(),
             title: "Stub".into(),
         })
