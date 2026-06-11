@@ -23,13 +23,24 @@ use crate::summary_pool::SummaryPool;
 
 /// LLM 分析接口（由调用方实现）
 pub trait AnalysisLlm: Send + Sync {
-    /// 调用 LLM，返回文本响应
+    /// 结构化调用: 分离 system（稳定模板）和 user（变化数据）
+    fn analyze_structured(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
+    >;
+
+    /// 向后兼容: 单条 prompt 全放 user
     fn analyze(
         &self,
         prompt: &str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
-    >;
+    > {
+        self.analyze_structured("", prompt)
+    }
 }
 
 /// 浓缩报告
@@ -374,9 +385,10 @@ mod tests {
     }
 
     impl AnalysisLlm for MockLlm {
-        fn analyze(
+        fn analyze_structured(
             &self,
-            _prompt: &str,
+            _system: &str,
+            _user: &str,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
         > {
