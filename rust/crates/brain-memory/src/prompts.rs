@@ -994,3 +994,142 @@ pub fn build_concentration_step4_prompt(
         .replace("{existing_profile}", existing_profile)
         .replace("{existing_eval_info}", existing_eval_info)
 }
+
+// ===========================================================================
+// 金字塔浓缩 Prompt — 拆分版（system 稳定 + user 变化，优化 KV Cache）
+// ===========================================================================
+
+/// Step1 系统指令（稳定，KV Cache 可命中）
+pub const CONCENTRATION_STEP1_SYSTEM: &str = "\
+# 身份
+你是一个对话分析引擎。你将原始对话内容拆分为独立的任务，跨会话合并同类任务。
+
+# 规则
+1. 将对话拆分为独立任务（一个会话可拆出多个任务，多个会话的任务可合并）
+2. 每个任务需分类到以下类型之一：Coding, Writing, Troubleshooting, Research, Multimedia, Configuration, Other
+3. 合并：新对话中的内容如果与已有任务属于同类工作，合并到同一任务中（更新 summary）
+4. 每个任务提供：task_id, task_type, task_name, summary, l1_refs, tags, importance
+5. 最多保留 50 个任务，超过请合并相关任务
+6. 用中文输出
+
+# 输出格式（严格 JSON 数组）
+[
+  {
+    \"task_id\": \"task-001\",
+    \"task_type\": \"Coding\",
+    \"task_name\": \"TUI鼠标修复\",
+    \"summary\": \"修复EnableMouseCapture拦截导致终端原生选择失效...\",
+    \"l1_refs\": [{\"session\": \"sess-xxx\", \"paragraphs\": [3, 4]}],
+    \"tags\": [\"TUI\", \"鼠标\", \"crossterm\"],
+    \"importance\": 0.85
+  }
+]\
+";
+
+/// Step2 系统指令（稳定）
+pub const CONCENTRATION_STEP2_SYSTEM: &str = "\
+# 身份
+你是一个经验提炼引擎。你从任务摘要中提炼出按类型汇总的可复用经验。
+
+# 规则
+1. 按任务类型分组提炼经验
+2. 每条经验包括：pattern, description, source_tasks, frequency, injectable
+3. 每个类型最多保留 10 条经验
+4. 为每个类型生成关键词索引
+5. 合并：新经验与已有经验重合时融合为更精炼的一条
+6. 用中文输出
+
+# 输出格式（严格 JSON 数组，每个类型一个对象）
+[
+  {
+    \"task_type\": \"Coding\",
+    \"experiences\": [{\"pattern\": \"...\",\"description\": \"...\",\"source_tasks\": [],\"frequency\": 1,\"injectable\": false}],
+    \"l2_refs\": [],
+    \"index\": [{\"keyword\": \"...\",\"l2_task_ids\": []}]
+  }
+]\
+";
+
+/// Step3 系统指令（稳定）
+pub const CONCENTRATION_STEP3_SYSTEM: &str = "\
+# 身份
+你是一个触发词提取引擎。你从 L3 经验中提取关键触发词和一段关于用户的流动叙事。
+
+# 规则
+1. 从 L3 经验中提取触发词（关键词短语，能触发相关记忆的召回）
+2. 每个触发词指向一个 L3 类型和 L2 任务
+3. 叙事文本：用最少的文字描述用户做过什么、擅长什么、踩过什么坑
+4. 容量限制：触发词最多 50 个，叙事文本最多 500 字
+5. 只有真正有价值的经验才值得设为触发词
+6. 用中文输出
+
+# 输出格式（严格 JSON）
+{
+  \"triggers\": [{\"keyword\": \"...\",\"l3_type\": \"Coding\",\"l2_task\": \"task-xxx\"}],
+  \"narrative\": \"用户是...的开发者\"
+}\
+";
+
+/// Step4 系统指令（稳定）
+pub const CONCENTRATION_STEP4_SYSTEM: &str = "\
+# 身份
+你是一个用户画像和评估信息生成引擎。你从对话中提炼精炼的用户画像和评估信息。
+
+# 规则
+## 用户画像
+1. 用 100 字以内自然语言描述用户：身份、擅长、偏好、工作模式
+2. 融合已有画像和新对话中的信息
+
+## 评估信息
+1. requirements（评估要求）：最多 5 条
+2. pitfalls（已知踩坑）：最多 5 条
+3. rules（进化规则）：最多 3 条，格式：\"当 [条件] 时，[行为]\"
+4. 用中文输出
+
+# 输出格式（严格 JSON）
+{
+  \"profile\": \"用户是...\",
+  \"requirements\": [\"...\"],
+  \"pitfalls\": [\"...\"],
+  \"rules\": [\"...\"]
+}\
+";
+
+/// 构建第一步拆分 prompt（返回 system, user）
+pub fn build_concentration_step1_split(
+    conversation_json: &str,
+    existing_l2_index: &str,
+) -> (&'static str, String) {
+    let user = format!(
+        "# 输入数据\n\n新会话原始对话（JSON 数组）：\n{conversation_json}\n\n现有 L2 任务索引：\n{existing_l2_index}"
+    );
+    (CONCENTRATION_STEP1_SYSTEM, user)
+}
+
+/// 构建第二步拆分 prompt（返回 system, user）
+pub fn build_concentration_step2_split(l2_data: &str, existing_l3: &str) -> (&'static str, String) {
+    let user = format!(
+        "# 输入数据\n\nL2 任务摘要数据：\n{l2_data}\n\n现有 L3 经验数据：\n{existing_l3}"
+    );
+    (CONCENTRATION_STEP2_SYSTEM, user)
+}
+
+/// 构建第三步拆分 prompt（返回 system, user）
+pub fn build_concentration_step3_split(l3_data: &str, existing_l4: &str) -> (&'static str, String) {
+    let user = format!(
+        "# 输入数据\n\nL3 经验数据：\n{l3_data}\n\n现有 L4 潜意识数据：\n{existing_l4}"
+    );
+    (CONCENTRATION_STEP3_SYSTEM, user)
+}
+
+/// 构建第四步拆分 prompt（返回 system, user）
+pub fn build_concentration_step4_split(
+    conversation_json: &str,
+    existing_profile: &str,
+    existing_eval_info: &str,
+) -> (&'static str, String) {
+    let user = format!(
+        "# 输入数据\n\n对话记录：\n{conversation_json}\n\n现有用户画像：\n{existing_profile}\n\n现有评估信息：\n{existing_eval_info}"
+    );
+    (CONCENTRATION_STEP4_SYSTEM, user)
+}

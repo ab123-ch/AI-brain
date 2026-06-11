@@ -171,9 +171,9 @@ impl ConcentrationEngine {
         let existing_json = serde_json::to_string_pretty(&existing_index)?;
 
         // 调用 LLM
-        let prompt = prompts::build_concentration_step1_prompt(conversation_json, &existing_json);
+        let (system, user) = prompts::build_concentration_step1_split(conversation_json, &existing_json);
         let response = llm
-            .analyze(&prompt)
+            .analyze_structured(system, &user)
             .await
             .map_err(MemoryError::ConsolidationFailed)?;
 
@@ -200,9 +200,9 @@ impl ConcentrationEngine {
         let existing_l3_json = serde_json::to_string_pretty(&existing_l3)?;
 
         // 调用 LLM
-        let prompt = prompts::build_concentration_step2_prompt(&l2_json, &existing_l3_json);
+        let (system, user) = prompts::build_concentration_step2_split(&l2_json, &existing_l3_json);
         let response = llm
-            .analyze(&prompt)
+            .analyze_structured(system, &user)
             .await
             .map_err(MemoryError::ConsolidationFailed)?;
 
@@ -229,9 +229,9 @@ impl ConcentrationEngine {
         let existing_l4_json = serde_json::to_string_pretty(&existing_l4)?;
 
         // 调用 LLM
-        let prompt = prompts::build_concentration_step3_prompt(&l3_json, &existing_l4_json);
+        let (system, user) = prompts::build_concentration_step3_split(&l3_json, &existing_l4_json);
         let response = llm
-            .analyze(&prompt)
+            .analyze_structured(system, &user)
             .await
             .map_err(MemoryError::ConsolidationFailed)?;
 
@@ -258,13 +258,13 @@ impl ConcentrationEngine {
         let existing_eval_json = serde_json::to_string_pretty(&existing_eval)?;
 
         // 调用 LLM
-        let prompt = prompts::build_concentration_step4_prompt(
+        let (system, user) = prompts::build_concentration_step4_split(
             conversation_json,
             &existing_profile,
             &existing_eval_json,
         );
         let response = llm
-            .analyze(&prompt)
+            .analyze_structured(system, &user)
             .await
             .map_err(MemoryError::ConsolidationFailed)?;
 
