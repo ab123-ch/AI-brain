@@ -403,8 +403,14 @@ temperature = 0.5
     #[test]
     fn brain_providers_fallback_to_default() {
         let config = LlmConfig::default_config();
-        assert_eq!(config.provider_for_brain("main"), config.llm.default_provider);
-        assert_eq!(config.provider_for_brain("unknown"), config.llm.default_provider);
+        assert_eq!(
+            config.provider_for_brain("main"),
+            config.llm.default_provider
+        );
+        assert_eq!(
+            config.provider_for_brain("unknown"),
+            config.llm.default_provider
+        );
     }
 
     #[test]

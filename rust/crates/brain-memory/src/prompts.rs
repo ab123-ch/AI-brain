@@ -1108,17 +1108,15 @@ pub fn build_concentration_step1_split(
 
 /// 构建第二步拆分 prompt（返回 system, user）
 pub fn build_concentration_step2_split(l2_data: &str, existing_l3: &str) -> (&'static str, String) {
-    let user = format!(
-        "# 输入数据\n\nL2 任务摘要数据：\n{l2_data}\n\n现有 L3 经验数据：\n{existing_l3}"
-    );
+    let user =
+        format!("# 输入数据\n\nL2 任务摘要数据：\n{l2_data}\n\n现有 L3 经验数据：\n{existing_l3}");
     (CONCENTRATION_STEP2_SYSTEM, user)
 }
 
 /// 构建第三步拆分 prompt（返回 system, user）
 pub fn build_concentration_step3_split(l3_data: &str, existing_l4: &str) -> (&'static str, String) {
-    let user = format!(
-        "# 输入数据\n\nL3 经验数据：\n{l3_data}\n\n现有 L4 潜意识数据：\n{existing_l4}"
-    );
+    let user =
+        format!("# 输入数据\n\nL3 经验数据：\n{l3_data}\n\n现有 L4 潜意识数据：\n{existing_l4}");
     (CONCENTRATION_STEP3_SYSTEM, user)
 }
 

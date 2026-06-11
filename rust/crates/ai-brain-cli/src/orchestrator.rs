@@ -1759,7 +1759,9 @@ impl Orchestrator {
                 (dir, sid)
             };
 
-            let llm = LlmConfig::load_default().ok().and_then(|c| Self::create_analyzer_llm_with_config(&c));
+            let llm = LlmConfig::load_default()
+                .ok()
+                .and_then(|c| Self::create_analyzer_llm_with_config(&c));
             let _ = tokio::spawn(async move {
                 if let Some(llm) = llm {
                     let config = PyramidMemoryBrainConfig {
@@ -1820,7 +1822,9 @@ impl Orchestrator {
             (dir, sid)
         };
 
-        let llm = LlmConfig::load_default().ok().and_then(|c| Self::create_analyzer_llm_with_config(&c));
+        let llm = LlmConfig::load_default()
+            .ok()
+            .and_then(|c| Self::create_analyzer_llm_with_config(&c));
         if let Some(llm) = llm {
             tracing::info!("正在执行四步浓缩（关闭时强制触发）...");
             let config = PyramidMemoryBrainConfig {

@@ -171,7 +171,8 @@ impl ConcentrationEngine {
         let existing_json = serde_json::to_string_pretty(&existing_index)?;
 
         // 调用 LLM
-        let (system, user) = prompts::build_concentration_step1_split(conversation_json, &existing_json);
+        let (system, user) =
+            prompts::build_concentration_step1_split(conversation_json, &existing_json);
         let response = llm
             .analyze_structured(system, &user)
             .await
