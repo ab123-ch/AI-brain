@@ -137,15 +137,44 @@ impl AnalyzerLlm {
                 .map_err(|e| e.to_string())
         })
     }
+
+    fn complete_structured(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        let mut messages = vec![];
+        if !system.is_empty() {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(user));
+        let request = ChatRequest {
+            model: Some(self.model.clone()),
+            messages,
+            max_tokens: Some(self.max_tokens),
+            temperature: Some(self.temperature),
+            tools: None,
+            tool_choice: None,
+        };
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .complete(request)
+                .await
+                .map(|r| r.text())
+                .map_err(|e| e.to_string())
+        })
+    }
 }
 
 // 同时实现新版浓缩引擎的 AnalysisLlm trait
 impl brain_memory::concentration::AnalysisLlm for AnalyzerLlm {
-    fn analyze(
+    fn analyze_structured(
         &self,
-        prompt: &str,
+        system: &str,
+        user: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
-        self.complete(prompt)
+        self.complete_structured(system, user)
     }
 }
 
