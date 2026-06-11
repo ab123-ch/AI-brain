@@ -256,11 +256,16 @@ pub struct SystemStatus {
 impl Orchestrator {
     /// 初始化所有组件并启动副脑任务
     pub async fn new() -> Result<Self, String> {
+        // 0. 统一加载 LLM 配置（后续全部复用，不再重复读盘）
+        let llm_config = LlmConfig::load_default().map_err(|e| {
+            format!("LLM 配置加载失败: {e}\n请检查 ~/.config/ai-brain/config.toml 或设置 ZHIPU_API_KEY 环境变量")
+        })?;
+
         // 1. 三通道消息总线
         let bus = Arc::new(BrainBus::new(64, 64, 64));
 
         // 2. 感知脑（LLM 不可用直接报错，不降级）
-        let sensory_llm_result = create_sensory_llm()?;
+        let sensory_llm_result = create_sensory_llm(&llm_config)?;
         let model_name = sensory_llm_result.model_name.clone();
         let sensory = SensoryBrain::new("glm-4.7", bus.clone(), sensory_llm_result.provider);
 
@@ -268,15 +273,13 @@ impl Orchestrator {
         let (memory, mut reasoning, mut motor, validation, evaluation) = create_sub_brains()?;
 
         // 4. 注入 LLM 到需要慢思考的副脑
-        if let Ok(config) = LlmConfig::load_default() {
-            if let Ok(client) = config.create_brain_client("reasoning") {
-                let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
-                reasoning.set_llm(llm.clone());
-                motor.set_llm(llm);
-                tracing::info!("推理脑+执行脑已注入 LLM");
-            }
-            // 记忆脑不再需要 set_llm（浓缩引擎在需要时动态创建 LLM）
+        if let Ok(client) = llm_config.create_brain_client("reasoning") {
+            let llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
+            reasoning.set_llm(llm.clone());
+            motor.set_llm(llm);
+            tracing::info!("推理脑+执行脑已注入 LLM");
         }
+        // 记忆脑不再需要 set_llm（浓缩引擎在需要时动态创建 LLM）
 
         // 4.0 提前包装记忆脑 Arc<Mutex>（评估脑和后续都需要）
         let memory = Arc::new(Mutex::new(memory));
@@ -285,15 +288,11 @@ impl Orchestrator {
         let eval_tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
             crate::real_tool_executor::RealToolExecutor::with_memory(Some(memory.clone())),
         );
-        let mut eval_brain = if let Ok(config) = LlmConfig::load_default() {
-            if let Ok(client) = config.create_brain_client("eval") {
-                Some(EvalBrain::with_verification(
-                    Arc::from(client),
-                    eval_tool_executor,
-                ))
-            } else {
-                None
-            }
+        let mut eval_brain = if let Ok(client) = llm_config.create_brain_client("eval") {
+            Some(EvalBrain::with_verification(
+                Arc::from(client),
+                eval_tool_executor,
+            ))
         } else {
             None
         };
@@ -311,9 +310,8 @@ impl Orchestrator {
         }
 
         // 4.2 初始化 Hook 系统（eval_gate 纯规则判断）
-        let hooks_config: HooksConfig = LlmConfig::load_default()
-            .ok()
-            .and_then(|c| c.hooks)
+        let hooks_config: HooksConfig = llm_config
+            .hooks
             .as_ref()
             .map(HooksConfig::from_toml_value)
             .unwrap_or_default();
@@ -414,7 +412,7 @@ impl Orchestrator {
 
         // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册 + dispatch）
         let (v2_brain, plugin_mgr, skill_catalog, mcp_pool) =
-            create_v2_main_brain(Some(Arc::clone(&memory)), dispatch.clone());
+            create_v2_main_brain(&llm_config, Some(Arc::clone(&memory)), dispatch.clone());
 
         // 12.0 评估脑接入统一 SkillCatalog
         if let Some(ref mut eb) = eval_brain {
@@ -584,7 +582,7 @@ impl Orchestrator {
             }
 
             // 2) 后台跑四步浓缩（更新金字塔记忆，fire-and-forget）
-            let llm = Self::create_analyzer_llm_from_config();
+            let llm = Self::create_analyzer_llm_with_config(&llm_config);
             drop(tokio::spawn(async move {
                 if let Some(llm) = llm {
                     let config = PyramidMemoryBrainConfig {
@@ -1761,7 +1759,7 @@ impl Orchestrator {
                 (dir, sid)
             };
 
-            let llm = self.create_analyzer_llm();
+            let llm = LlmConfig::load_default().ok().and_then(|c| Self::create_analyzer_llm_with_config(&c));
             let _ = tokio::spawn(async move {
                 if let Some(llm) = llm {
                     let config = PyramidMemoryBrainConfig {
@@ -1822,7 +1820,7 @@ impl Orchestrator {
             (dir, sid)
         };
 
-        let llm = self.create_analyzer_llm();
+        let llm = LlmConfig::load_default().ok().and_then(|c| Self::create_analyzer_llm_with_config(&c));
         if let Some(llm) = llm {
             tracing::info!("正在执行四步浓缩（关闭时强制触发）...");
             let config = PyramidMemoryBrainConfig {
@@ -1842,18 +1840,8 @@ impl Orchestrator {
         }
     }
 
-    /// 创建四步分析用的 LLM 客户端（静态版本，供 new() 中使用）
-    fn create_analyzer_llm_from_config() -> Option<AnalyzerLlm> {
-        let config = LlmConfig::load_default().ok()?;
-        let client: Box<dyn brain_llm::LlmProvider> = config.create_brain_client("memory").ok()?;
-        let model = config.model_for_brain("memory").to_string();
-        let (mt, temp) = config.params_for_brain("memory");
-        Some(AnalyzerLlm::new(Arc::from(client), model, mt, temp))
-    }
-
-    /// 创建四步分析用的 LLM 客户端
-    fn create_analyzer_llm(&self) -> Option<AnalyzerLlm> {
-        let config = LlmConfig::load_default().ok()?;
+    /// 创建四步分析用的 LLM 客户端（统一方法，接受外部配置避免重复读盘）
+    fn create_analyzer_llm_with_config(config: &LlmConfig) -> Option<AnalyzerLlm> {
         let client: Box<dyn brain_llm::LlmProvider> = config.create_brain_client("memory").ok()?;
         let model = config.model_for_brain("memory").to_string();
         let (mt, temp) = config.params_for_brain("memory");
@@ -2081,10 +2069,7 @@ struct LlmResult {
 }
 
 /// 创建感知脑 LLM（不降级，失败直接报错）
-fn create_sensory_llm() -> Result<LlmResult, String> {
-    let config = LlmConfig::load_default().map_err(|e| {
-        format!("LLM 配置加载失败: {e}\n请检查 ~/.config/ai-brain/config.toml 或设置 ZHIPU_API_KEY 环境变量")
-    })?;
+fn create_sensory_llm(config: &LlmConfig) -> Result<LlmResult, String> {
     let client = config
         .create_brain_client("sensory")
         .map_err(|e| format!("LLM 客户端创建失败: {e}\n请检查 ZHIPU_API_KEY 是否已设置"))?;
@@ -2106,6 +2091,7 @@ fn try_create_llm_client(brain_name: &str) -> Option<Arc<dyn brain_llm::LlmProvi
 ///
 /// LLM 不可用时返回 `Arc<Mutex<None>>`
 fn create_v2_main_brain(
+    llm_config: &LlmConfig,
     memory_brain: Option<Arc<Mutex<PyramidMemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
 ) -> (
@@ -2114,9 +2100,9 @@ fn create_v2_main_brain(
     Arc<SkillCatalog>,
     Arc<McpClientPool>,
 ) {
-    let client = match try_create_llm_client("sensory") {
-        Some(c) => c,
-        None => {
+    let client = match llm_config.create_brain_client("sensory") {
+        Ok(c) => Arc::from(c) as Arc<dyn brain_llm::LlmProvider>,
+        Err(_) => {
             tracing::warn!("v2 MainBrain: LLM 不可用，跳过创建（回声模式）");
             return (
                 Arc::new(Mutex::new(None)),
@@ -2197,9 +2183,7 @@ fn create_v2_main_brain(
     );
 
     let brain_config = BrainConfig::default();
-    let (main_mt, main_temp) = LlmConfig::load_default()
-        .map(|c| c.params_for_brain("main"))
-        .unwrap_or((32768, 0.7));
+    let (main_mt, main_temp) = llm_config.params_for_brain("main");
     let mut brain = MainBrain::new(client, tool_executor, brain_config, main_mt, main_temp);
 
     // 注册所有 MVP 工具（bash、read_file、write_file、edit_file、glob、grep）
