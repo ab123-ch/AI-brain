@@ -29,6 +29,9 @@ pub struct LlmSection {
     /// 每个脑独立的生成参数（max_tokens / temperature），未配置的脑走 defaults
     #[serde(default)]
     pub brain_params: HashMap<String, BrainParams>,
+    /// 每脑独立厂商映射（未配置的脑走 default_provider）
+    #[serde(default)]
+    pub brain_providers: HashMap<String, String>,
     #[serde(default)]
     pub defaults: LlmDefaults,
 }
@@ -115,6 +118,14 @@ impl LlmConfig {
             .map_or(&self.llm.default_model, |s| s.as_str())
     }
 
+    /// 获取某个副脑应使用的 provider 名
+    pub fn provider_for_brain(&self, brain_name: &str) -> &str {
+        self.llm
+            .brain_providers
+            .get(brain_name)
+            .map_or(&self.llm.default_provider, |s| s.as_str())
+    }
+
     /// 获取某个脑的生成参数（max_tokens, temperature）
     ///
     /// 优先查 brain_params 中该脑的独立配置，未配置则走 defaults
@@ -160,7 +171,7 @@ impl LlmConfig {
     /// 如果副脑不需要 LLM（不在 brain_models 中且不在 defaults 中），返回 None
     pub fn create_brain_client(&self, brain_name: &str) -> Result<Box<dyn LlmProvider>> {
         let model = self.model_for_brain(brain_name);
-        let provider_name = &self.llm.default_provider;
+        let provider_name = self.provider_for_brain(brain_name);
         let api_key = self.resolve_api_key(provider_name)?;
         let (max_tokens, temperature) = self.params_for_brain(brain_name);
 
@@ -168,7 +179,7 @@ impl LlmConfig {
             .llm
             .providers
             .get(provider_name)
-            .ok_or_else(|| LlmError::ProviderNotFound(provider_name.clone()))?;
+            .ok_or_else(|| LlmError::ProviderNotFound(provider_name.to_string()))?;
 
         let client = OpenAiCompatClient::new(
             provider_config.api_base.clone(),
@@ -258,6 +269,7 @@ impl LlmConfig {
                 providers,
                 brain_models,
                 brain_params,
+                brain_providers: HashMap::new(),
                 defaults: LlmDefaults::default(),
             },
             brain: BrainSection::default(),
@@ -365,5 +377,72 @@ temperature = 0.5
         let key = config.resolve_api_key("zhipu").unwrap();
         assert_eq!(key, "env-key");
         std::env::remove_var("TEST_PRIORITY_KEY");
+    }
+
+    #[test]
+    fn brain_providers_fallback_to_default() {
+        let config = LlmConfig::default_config();
+        assert_eq!(config.provider_for_brain("main"), config.llm.default_provider);
+        assert_eq!(config.provider_for_brain("unknown"), config.llm.default_provider);
+    }
+
+    #[test]
+    fn brain_providers_per_brain_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[llm]
+default_provider = "xiaomi"
+default_model = "mimo-7b"
+
+[llm.providers.xiaomi]
+api_base = "https://xiaomi.example.com/v1"
+api_key_env = "XIAOMI_API_KEY"
+
+[llm.providers.deepseek]
+api_base = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[llm.brain_providers]
+main = "xiaomi"
+eval = "deepseek"
+"#,
+        )
+        .unwrap();
+
+        let config = LlmConfig::load(&path).unwrap();
+        assert_eq!(config.provider_for_brain("main"), "xiaomi");
+        assert_eq!(config.provider_for_brain("eval"), "deepseek");
+        assert_eq!(config.provider_for_brain("memory"), "xiaomi");
+        assert_eq!(config.provider_for_brain("unknown"), "xiaomi");
+    }
+
+    #[test]
+    fn load_config_without_brain_providers_is_backward_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[llm]
+default_provider = "zhipu"
+default_model = "glm-4.7"
+
+[llm.providers.zhipu]
+api_base = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+
+[llm.brain_models]
+reasoning = "glm-5.1"
+"#,
+        )
+        .unwrap();
+
+        let config = LlmConfig::load(&path).unwrap();
+        assert!(config.llm.brain_providers.is_empty());
+        assert_eq!(config.provider_for_brain("main"), "zhipu");
+        assert_eq!(config.provider_for_brain("eval"), "zhipu");
     }
 }
