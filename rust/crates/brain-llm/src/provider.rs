@@ -174,3 +174,38 @@ pub trait LlmProvider: Send + Sync {
         })
     }
 }
+
+/// 统一的上下文构建入口
+///
+/// 将稳定的 system 指令模板与变化的 user 数据分离，
+/// 最大化 KV Cache 前缀命中率。
+pub fn build_context_messages(system: &str, user: &str) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(2);
+    if !system.is_empty() {
+        messages.push(ChatMessage::system(system));
+    }
+    messages.push(ChatMessage::user(user));
+    messages
+}
+
+#[cfg(test)]
+mod context_builder_tests {
+    use super::*;
+
+    #[test]
+    fn build_context_messages_both() {
+        let msgs = build_context_messages("你是助手", "你好");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, MessageRole::System);
+        assert_eq!(msgs[1].role, MessageRole::User);
+        assert_eq!(msgs[0].text_content(), "你是助手");
+        assert_eq!(msgs[1].text_content(), "你好");
+    }
+
+    #[test]
+    fn build_context_messages_empty_system() {
+        let msgs = build_context_messages("", "你好");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, MessageRole::User);
+    }
+}
