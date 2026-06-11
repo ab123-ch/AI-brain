@@ -196,6 +196,22 @@ impl LlmConfig {
     pub fn default_config() -> Self {
         let mut providers = HashMap::new();
         providers.insert(
+            "xiaomi".into(),
+            ProviderConfig {
+                api_base: "https://xiaomi-llm.example.com/v1".into(),
+                api_key_env: "XIAOMI_API_KEY".into(),
+                api_key: None,
+            },
+        );
+        providers.insert(
+            "deepseek".into(),
+            ProviderConfig {
+                api_base: "https://api.deepseek.com/v1".into(),
+                api_key_env: "DEEPSEEK_API_KEY".into(),
+                api_key: None,
+            },
+        );
+        providers.insert(
             "zhipu".into(),
             ProviderConfig {
                 api_base: "https://open.bigmodel.cn/api/paas/v4".into(),
@@ -204,12 +220,19 @@ impl LlmConfig {
             },
         );
 
+        let mut brain_providers = HashMap::new();
+        brain_providers.insert("main".into(), "xiaomi".into());
+        brain_providers.insert("memory".into(), "xiaomi".into());
+        brain_providers.insert("eval".into(), "deepseek".into());
+        brain_providers.insert("evolver".into(), "xiaomi".into());
+
         let mut brain_models = HashMap::new();
-        brain_models.insert("sensory".into(), "glm-4.7".into());
-        brain_models.insert("reasoning".into(), "glm-5.1".into());
-        brain_models.insert("memory".into(), "glm-4.7".into());
-        brain_models.insert("motor".into(), "glm-5.1".into());
-        brain_models.insert("validation".into(), "glm-5-turbo".into());
+        brain_models.insert("main".into(), "mimo-7b".into());
+        brain_models.insert("sensory".into(), "mimo-7b".into());
+        brain_models.insert("reasoning".into(), "mimo-7b".into());
+        brain_models.insert("memory".into(), "mimo-7b".into());
+        brain_models.insert("eval".into(), "deepseek-chat".into());
+        brain_models.insert("evolver".into(), "mimo-7b".into());
 
         let mut brain_params = HashMap::new();
         brain_params.insert(
@@ -264,12 +287,12 @@ impl LlmConfig {
 
         Self {
             llm: LlmSection {
-                default_provider: "zhipu".into(),
-                default_model: "glm-4.7".into(),
+                default_provider: "xiaomi".into(),
+                default_model: "mimo-7b".into(),
                 providers,
                 brain_models,
                 brain_params,
-                brain_providers: HashMap::new(),
+                brain_providers,
                 defaults: LlmDefaults::default(),
             },
             brain: BrainSection::default(),
@@ -291,13 +314,12 @@ mod tests {
     #[test]
     fn default_config_loads() {
         let config = LlmConfig::default_config();
-        assert_eq!(config.llm.default_provider, "zhipu");
-        assert_eq!(config.llm.default_model, "glm-4.7");
-        assert_eq!(config.model_for_brain("reasoning"), "glm-5.1");
-        assert_eq!(config.model_for_brain("motor"), "glm-5.1");
-        assert_eq!(config.model_for_brain("validation"), "glm-5-turbo");
-        // 未配置的副脑走 default
-        assert_eq!(config.model_for_brain("unknown"), "glm-4.7");
+        assert_eq!(config.llm.default_provider, "xiaomi");
+        assert_eq!(config.llm.default_model, "mimo-7b");
+        assert!(config.llm.brain_providers.contains_key("main"));
+        assert_eq!(config.provider_for_brain("eval"), "deepseek");
+        assert_eq!(config.model_for_brain("main"), "mimo-7b");
+        assert_eq!(config.model_for_brain("eval"), "deepseek-chat");
     }
 
     #[test]
@@ -342,39 +364,38 @@ temperature = 0.5
     #[test]
     fn load_default_returns_default_when_no_file() {
         let config = LlmConfig::load_default().unwrap();
-        assert_eq!(config.llm.default_provider, "zhipu");
+        assert_eq!(config.llm.default_provider, "xiaomi");
     }
 
     #[test]
     fn resolve_api_key_from_env() {
         let config = LlmConfig::default_config();
-        std::env::set_var("ZHIPU_API_KEY", "test-key-123");
-        let key = config.resolve_api_key("zhipu").unwrap();
+        std::env::set_var("XIAOMI_API_KEY", "test-key-123");
+        let key = config.resolve_api_key("xiaomi").unwrap();
         assert_eq!(key, "test-key-123");
-        std::env::remove_var("ZHIPU_API_KEY");
+        std::env::remove_var("XIAOMI_API_KEY");
     }
 
     #[test]
     fn resolve_api_key_direct_config() {
         let mut config = LlmConfig::default_config();
-        // 直接设置 api_key
-        if let Some(provider) = config.llm.providers.get_mut("zhipu") {
+        if let Some(provider) = config.llm.providers.get_mut("xiaomi") {
             provider.api_key = Some("direct-key".into());
             provider.api_key_env = "NONEXISTENT_VAR".into();
         }
-        let key = config.resolve_api_key("zhipu").unwrap();
+        let key = config.resolve_api_key("xiaomi").unwrap();
         assert_eq!(key, "direct-key");
     }
 
     #[test]
     fn resolve_api_key_env_priority_over_direct() {
         let mut config = LlmConfig::default_config();
-        if let Some(provider) = config.llm.providers.get_mut("zhipu") {
+        if let Some(provider) = config.llm.providers.get_mut("xiaomi") {
             provider.api_key = Some("direct-key".into());
             provider.api_key_env = "TEST_PRIORITY_KEY".into();
         }
         std::env::set_var("TEST_PRIORITY_KEY", "env-key");
-        let key = config.resolve_api_key("zhipu").unwrap();
+        let key = config.resolve_api_key("xiaomi").unwrap();
         assert_eq!(key, "env-key");
         std::env::remove_var("TEST_PRIORITY_KEY");
     }

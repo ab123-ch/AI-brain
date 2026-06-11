@@ -10,34 +10,46 @@ const CONFIG_TEMPLATE: &str = r#"# AI Brain 配置文件
 # 首次运行时自动生成，修改后重启生效
 
 [llm]
-default_provider = "zhipu"
-default_model = "glm-4.7"
+default_provider = "xiaomi"
+default_model = "mimo-7b"
 
-[llm.providers.zhipu]
-api_base = "https://open.bigmodel.cn/api/paas/v4"
+# ── 厂商配置 ──────────────────────────────────────
+[llm.providers.xiaomi]
+api_base = "https://xiaomi-llm.example.com/v1"
 # 优先从环境变量读取 API Key（安全）
-api_key_env = "ZHIPU_API_KEY"
+api_key_env = "XIAOMI_API_KEY"
 # 也可以直接配置（不推荐提交到版本库）
 # api_key = "your-api-key-here"
 
+[llm.providers.deepseek]
+api_base = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[llm.providers.zhipu]
+api_base = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+
+# ── 每脑独立厂商（未配置的脑走 default_provider）────
+[llm.brain_providers]
+main = "xiaomi"
+memory = "xiaomi"
+eval = "deepseek"
+evolver = "xiaomi"
+
 [llm.brain_models]
-# 感知脑 — 轻量解析，用快速模型
-sensory = "glm-4.7"
-# 推理脑 — 需要强逻辑，用大模型
-reasoning = "glm-5.1"
-# 记忆脑 — 关键词提取/摘要，轻量即可
-memory = "glm-4.7"
-# 执行脑 — 工具选择需要推理，用大模型
-motor = "glm-5.1"
-# 校验脑 — Agent 场景，用快速模型
-validation = "glm-5-turbo"
+main = "mimo-7b"
+sensory = "mimo-7b"
+reasoning = "mimo-7b"
+memory = "mimo-7b"
+eval = "deepseek-chat"
+evolver = "mimo-7b"
 
 [llm.defaults]
 max_tokens = 4096
 temperature = 0.7
 
 # 每个脑的独立生成参数（未配置的脑走 defaults）
-# max_tokens = 单次输出的 token 上限（推理模型的 thinking 也算在内，要留够余量）
+# max_tokens = 单次输出的 token 上限
 [llm.brain_params.main]
 max_tokens = 32768
 temperature = 0.7
@@ -112,11 +124,11 @@ pub fn print_first_run_guide() {
     eprintln!("  要使用 AI Brain，需要配置 LLM API Key:");
     eprintln!();
     eprintln!("    方式1（推荐）：设置环境变量");
-    eprintln!("      export ZHIPU_API_KEY=your-key");
+    eprintln!("      export XIAOMI_API_KEY=your-key");
     eprintln!();
     eprintln!("    方式2：编辑配置文件");
     eprintln!("      vi ~/.ai-brain/config.toml");
-    eprintln!("      在 [llm.providers.zhipu] 下添加 api_key = \"your-key\"");
+    eprintln!("      在 [llm.providers.xiaomi] 下添加 api_key = \"your-key\"");
     eprintln!();
     eprintln!("  配置完成后重新运行 ai-brain 即可。");
     eprintln!("========================================");
