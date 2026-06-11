@@ -67,6 +67,53 @@ pub enum CompactionError {
     Timeout(u64),
 }
 
+/// 压缩系统指令（稳定模板，KV Cache 可命中）
+const COMPACT_SYSTEM_PROMPT: &str = r#"你是一个对话历史压缩专家。请将对话历史压缩成一个结构化的决策链路摘要。
+
+## 压缩要求
+
+**保留重点**：
+1. **用户目标** — 用户最初想要什么，需求是否有变化
+2. **用户反馈和指令** — 重点保留：
+   - 用户的纠正："这个不对，应该要 xxxxx"
+   - 用户的认可和改进建议："这个对了，但是可以 xxxx"
+   - 用户的新需求/指令："很好，继续下一个需求，需求：xxxx"
+   - 用户表达的偏好、标准、风格要求
+3. **执行步骤** — 按时间顺序，做了哪些关键操作
+4. **决策转折点** — 遇到了什么问题，如何调整方案的
+5. **最终结果** — 得到了什么结论，完成了什么
+6. **关键上下文** — 重要的文件路径、代码位置、配置信息
+
+**丢弃内容**：
+- 完整的代码输出、grep 结果、文件内容
+- 中间过程的详细日志
+- 重复的信息、确认性对话
+- 工具调用的原始返回（只保留从中得出的结论）
+
+## 输出格式
+
+```
+## 用户目标
+[一句话描述用户的核心需求]
+
+## 用户反馈和指令
+- [纠正] "这个不对，应该要 xxxxx"
+- [认可+改进] "这个对了，但是可以 xxxx"
+
+## 执行过程
+1. [第一步操作] → [结果/发现]
+
+## 关键决策
+- [遇到的问题] → [采取的解决方案] → [原因]
+
+## 最终结论
+[完成情况、核心成果、待办事项（如有）]
+
+## 关键上下文
+- 文件：[重要文件路径和修改内容]
+- 配置：[关键配置项]
+```"#;
+
 /// 阈值压缩器
 pub struct ThresholdCompressor {
     config: ThresholdCompactionConfig,
@@ -161,6 +208,15 @@ impl ThresholdCompressor {
         )
     }
 
+    /// 构建拆分后的 prompt（system 稳定 + user 变化）
+    pub(crate) fn build_decision_chain_split(
+        &self,
+        messages: &[ConversationMessage],
+    ) -> (&'static str, String) {
+        let user = self.format_messages_for_prompt(messages);
+        (COMPACT_SYSTEM_PROMPT, user)
+    }
+
     /// 格式化消息用于 prompt
     pub(crate) fn format_messages_for_prompt(&self, messages: &[ConversationMessage]) -> String {
         messages
@@ -207,13 +263,13 @@ impl ThresholdCompressor {
         // 2. 分割消息：旧消息 vs 最近 N 轮
         let (old_messages, recent_messages) = self.split_messages(messages);
 
-        // 3. 构建决策链路保留 prompt
-        let prompt = self.build_decision_chain_prompt(old_messages);
+        // 3. 构建拆分 prompt（system 稳定 + user 变化）
+        let (system, user) = self.build_decision_chain_split(old_messages);
 
         // 4. 调用 LLM（带超时）
         let request = brain_llm::ChatRequest {
             model: None,
-            messages: vec![brain_llm::ChatMessage::user(prompt)],
+            messages: brain_llm::build_context_messages(system, &user),
             max_tokens: Some(self.config.max_summary_tokens),
             temperature: None,
             tools: None,
