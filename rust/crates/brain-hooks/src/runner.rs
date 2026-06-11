@@ -113,7 +113,10 @@ impl HookRunner {
             HookHandlerConfig::Builtin { name } => match name.as_str() {
                 "eval_gate" => {
                     let user_input = input.user_input.clone().unwrap_or_default();
-                    Some(builtins::run_eval_gate(&user_input))
+                    let mode = self.config.eval_gate.mode;
+                    // 从 ai_output 中解析工具名列表（由 Orchestrator 以 __tool_names:...__ 前缀注入）
+                    let tool_names = extract_tool_names(input.ai_output.as_deref());
+                    Some(builtins::run_eval_gate(&user_input, mode, &tool_names))
                 }
                 _ => {
                     warn!(builtin = %name, "Unknown builtin handler");
@@ -163,6 +166,29 @@ impl HookRunner {
         .await
         .ok()? // JoinError → None
     }
+}
+
+/// 从 ai_output 中提取工具名列表
+///
+/// Orchestrator 在 ai_output 前缀注入 `__tool_names:Edit,Write,Bash__\n`
+/// 本函数解析该前缀并返回工具名列表
+fn extract_tool_names(ai_output: Option<&str>) -> Vec<String> {
+    let output = match ai_output {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    if let Some(rest) = output.strip_prefix("__tool_names:") {
+        if let Some(end) = rest.find("__") {
+            return rest[..end]
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+        }
+    }
+
+    Vec::new()
 }
 
 /// 构建 JSON payload
@@ -360,7 +386,7 @@ fn parse_hook_output(stdout: &str, default_decision: HookDecision) -> HookOutput
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EvalGateConfig;
+    use crate::config::{EvalGateConfig, EvalGateMode};
     use crate::types::HookEvent;
 
     fn make_input(event: HookEvent) -> HookInput {
@@ -430,7 +456,10 @@ mod tests {
     async fn test_allow_command() {
         let config = HooksConfig {
             enabled: true,
-            eval_gate: EvalGateConfig { enabled: false },
+            eval_gate: EvalGateConfig {
+                enabled: false,
+                mode: EvalGateMode::OnFileEdit,
+            },
             post_query: vec![HookHandlerConfig::Command {
                 command: "echo '{\"decision\":\"allow\"}'".to_string(),
                 matcher: None,

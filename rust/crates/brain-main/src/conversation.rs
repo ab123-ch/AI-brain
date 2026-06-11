@@ -1,6 +1,13 @@
 use brain_core::types::{BrainState, ConversationMessage, MessageRole};
 use brain_llm::{ChatMessage, MessageRole as LlmRole};
 
+/// 用于从外部恢复会话历史的消息结构（WebSession 存储 → MainBrain 恢复）
+#[derive(Debug, Clone)]
+pub struct ChatMessageRestore {
+    pub role: String,
+    pub content: String,
+}
+
 /// 对话历史管理
 ///
 /// 维护完整的对话消息列表，支持 token 估算和上下文重建。
@@ -124,6 +131,30 @@ impl ConversationHistory {
     /// 清空所有对话历史
     pub fn clear(&mut self) {
         self.messages.clear();
+    }
+
+    /// 从外部消息列表恢复历史（用于会话切换/重启后恢复上下文）
+    ///
+    /// 清空当前历史，将提供的历史消息按 user/assistant 角色恢复。
+    /// 忽略非 user/assistant 角色的消息（如 system/tool）以保持简洁。
+    pub fn restore_from_chat_messages(&mut self, msgs: &[ChatMessageRestore]) {
+        self.messages.clear();
+        self.tracked_prompt_tokens = 0;
+
+        for msg in msgs {
+            let conv_msg = match msg.role.as_str() {
+                "user" => ConversationMessage::user(&msg.content),
+                "assistant" => ConversationMessage::assistant(&msg.content),
+                // 跳过 system/tool 等角色
+                _ => continue,
+            };
+            self.messages.push(conv_msg);
+        }
+
+        tracing::info!(
+            "会话历史恢复完成: {} 条消息 (user+assistant)",
+            self.messages.len()
+        );
     }
 
     /// 自动截断 — 保留最近 N 条消息（R-P0-1）

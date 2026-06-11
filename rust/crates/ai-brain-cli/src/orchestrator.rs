@@ -37,6 +37,7 @@ use brain_hooks::config::HooksConfig;
 use brain_hooks::runner::HookRunner;
 use brain_hooks::types::{HookEvent, HookInput};
 use brain_llm::{ChatMessage, ChatRequest, LlmConfig};
+use brain_main::conversation::ChatMessageRestore;
 use brain_main::main_brain::MainBrain;
 use brain_master::MasterBrain;
 use brain_mcp::config::load_mcp_servers;
@@ -727,6 +728,14 @@ impl Orchestrator {
         Arc::clone(&self.memory_brain)
     }
 
+    /// 恢复会话历史到 MainBrain（Web 重启/会话切换后使用）
+    pub async fn restore_session_history(&self, msgs: Vec<ChatMessageRestore>) {
+        let mut guard = self.v2_brain.lock().await;
+        if let Some(ref mut brain) = *guard {
+            brain.restore_history(msgs);
+        }
+    }
+
     /// 系统状态结构体（TUI 用）
     pub fn status_structured(&self) -> SystemStatus {
         let (context_usage, cumulative_prompt, cumulative_completion, cumulative_cache_read) = self
@@ -832,6 +841,21 @@ impl Orchestrator {
                         .ok()
                         .map(|o| o.answer.clone())
                         .unwrap_or_default();
+
+                    // 提取 turns 中的工具名列表，供 eval_gate 判断文件修改
+                    let tool_names_csv = result
+                        .as_ref()
+                        .ok()
+                        .map(|o| {
+                            o.turns
+                                .iter()
+                                .filter(|t| matches!(t.role, brain_core::types::TurnRole::ToolCall))
+                                .filter_map(|t| t.tool_call.as_ref().map(|tc| tc.tool_name.clone()))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+
                     let hook_input = HookInput {
                         event: HookEvent::PostQuery,
                         session_id: String::new(),
@@ -841,7 +865,13 @@ impl Orchestrator {
                         tool_output: None,
                         is_error: false,
                         user_input: Some(input_owned.clone()),
-                        ai_output: Some(ai_answer),
+                        ai_output: Some(if tool_names_csv.is_empty() {
+                            ai_answer
+                        } else {
+                            // 将工具名列表注入 ai_output，供 eval_gate builtin 解析
+                            // 格式: "__tool_names:Edit,Write,Bash__\n{actual_answer}"
+                            format!("__tool_names:{}__\n{}", tool_names_csv, ai_answer)
+                        }),
                     };
                     let hook_outputs = this.hook_runner.run(&hook_input).await;
                     let should_eval = hook_outputs.iter().any(|o| o.trigger_eval);

@@ -5,7 +5,7 @@ use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{MainBrainOutput, ProgressEvent, TurnRecord, TurnRole, TurnUsage};
 use brain_llm::{ChatMessage, LlmProvider, ToolDefinition};
 
-use crate::conversation::ConversationHistory;
+use crate::conversation::{ChatMessageRestore, ConversationHistory};
 use crate::error::{MainBrainError, Result};
 use crate::prompts;
 use crate::tool_loop;
@@ -82,6 +82,11 @@ impl MainBrain {
     pub fn register_tools(&mut self, tools: Vec<ToolDefinition>) {
         tracing::info!("主脑注册 {} 个工具", tools.len());
         self.tools = tools;
+    }
+
+    /// 从外部消息恢复对话历史（Web 会话切换/重启后恢复上下文）
+    pub fn restore_history(&mut self, msgs: Vec<ChatMessageRestore>) {
+        self.history.restore_from_chat_messages(&msgs);
     }
 
     /// 处理一轮用户输入

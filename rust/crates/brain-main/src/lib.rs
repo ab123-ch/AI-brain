@@ -1,4 +1,4 @@
-pub(crate) mod conversation;
+pub mod conversation;
 pub(crate) mod error;
 pub mod main_brain;
 pub mod prompts;

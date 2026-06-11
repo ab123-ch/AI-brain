@@ -46,7 +46,7 @@ enum Commands {
     },
     /// 启动 Web UI
     Web {
-        #[arg(long, default_value = "0.0.0.0:8080")]
+        #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
     /// v2 路径集成测试（3 轮对话，验证 eval_gate + 评估脑）

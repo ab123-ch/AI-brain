@@ -427,6 +427,14 @@ body {
 #send-btn:hover { opacity: 0.85; }
 #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+#send-btn.stop-mode {
+    background: var(--error);
+}
+
+#send-btn.stop-mode:hover {
+    opacity: 0.9;
+}
+
 /* ── Modal (AskUser) ──────────────────────────────────────────── */
 .modal {
     position: fixed;

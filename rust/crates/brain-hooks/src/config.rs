@@ -58,11 +58,36 @@ pub struct EvalGateConfig {
     /// 是否启用评估脑自决策（纯规则判断，不调 LLM）
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// 评估触发模式
+    /// - "always":      所有非 trivial 查询都触发评估（旧行为）
+    /// - "on_file_edit": 仅当主脑调用了文件修改工具（Edit/Write/Bash 含文件操作）时触发（默认）
+    /// - "never":        从不触发评估
+    #[serde(default = "default_eval_mode")]
+    pub mode: EvalGateMode,
+}
+
+/// 评估触发模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvalGateMode {
+    #[serde(rename = "always")]
+    Always,
+    #[serde(rename = "on_file_edit")]
+    OnFileEdit,
+    #[serde(rename = "never")]
+    Never,
+}
+
+fn default_eval_mode() -> EvalGateMode {
+    EvalGateMode::OnFileEdit
 }
 
 impl Default for EvalGateConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            mode: default_eval_mode(),
+        }
     }
 }
 

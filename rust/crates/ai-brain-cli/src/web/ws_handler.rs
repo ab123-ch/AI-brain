@@ -26,6 +26,7 @@ use crate::orchestrator::Orchestrator;
 use crate::web::progress_adapter::{ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent};
 use crate::web::session_manager::SessionManager;
 use brain_core::types::ProgressEvent;
+use brain_main::conversation::ChatMessageRestore;
 
 // ─── AppState ────────────────────────────────────────────────────────
 
@@ -92,6 +93,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut query_rx: Option<tokio::sync::mpsc::Receiver<ProgressEvent>> = None;
     let mut assistant_text = String::new();
     let mut query_session_id: Option<String> = None;
+    let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
+    let mut history_restored_session: Option<String> = None; // 已恢复历史的会话 ID
 
     // 心跳定时器 — 定期发送 Ping 防止连接因空闲被中间代理/浏览器断开
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
@@ -127,15 +130,57 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     sessions.push_message("user", &input);
                                     sessions.active().id.clone()
                                 };
-                                query_session_id = Some(current_id);
+                                query_session_id = Some(current_id.clone());
+
+                                // 首次查询或会话切换时，恢复历史到 MainBrain
+                                if history_restored_session.as_ref() != Some(&current_id) {
+                                    let restore_msgs = {
+                                        let sessions = state.sessions.lock().await;
+                                        sessions.active().messages.iter().map(|m| ChatMessageRestore {
+                                            role: m.role.clone(),
+                                            content: m.content.clone(),
+                                        }).collect::<Vec<_>>()
+                                    };
+                                    // 移除刚 push 的用户消息（会在 process_input 中重新添加）
+                                    let restore_msgs = if restore_msgs.last().map(|m| m.role.as_str()) == Some("user") {
+                                        &restore_msgs[..restore_msgs.len().saturating_sub(1)]
+                                    } else {
+                                        &restore_msgs[..]
+                                    };
+                                    let restore_owned = restore_msgs.to_vec();
+                                    state.orch.restore_session_history(restore_owned).await;
+                                    history_restored_session = Some(current_id.clone());
+                                    info!("已恢复会话 {} 的历史到 MainBrain", current_id);
+                                }
 
                                 // 启动流式查询
-                                let (rx, _, _) = state.orch.query_streaming(&input);
+                                let (rx, _, cancel) = state.orch.query_streaming(&input);
                                 query_rx = Some(rx);
+                                cancel_token = Some(cancel);
                                 assistant_text.clear();
                             }
                             Ok(client_msg) => {
-                                handle_client_message(&mut sender, &state, client_msg).await;
+                                // Cancel 消息需要在 select! 循环中直接处理（访问 cancel_token）
+                                if let ClientMessage::Cancel = client_msg {
+                                    if let Some(ref ct) = cancel_token {
+                                        ct.cancel();
+                                        info!("已取消当前查询 (CancellationToken)");
+                                    }
+                                    // 将已收集的 assistant 回复记录到会话
+                                    if !assistant_text.is_empty() {
+                                        let mut sessions = state.sessions.lock().await;
+                                        if let Some(ref sid) = query_session_id {
+                                            sessions.push_message_to(sid, "assistant", &assistant_text);
+                                        }
+                                    }
+                                    query_rx = None;
+                                    query_session_id = None;
+                                    cancel_token = None;
+                                    assistant_text.clear();
+                                    send_event(&mut sender, WebProgressEvent::Done).await.ok();
+                                } else {
+                                    handle_client_message(&mut sender, &state, client_msg, &mut history_restored_session).await;
+                                }
                             }
                             Err(e) => {
                                 warn!("解析客户端消息失败: {e}, 原始: {text}");
@@ -194,6 +239,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                         query_rx = None;
                         query_session_id = None;
+                        cancel_token = None;
                         assistant_text.clear();
                     }
                 }
@@ -275,25 +321,14 @@ async fn handle_client_message(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     state: &Arc<AppState>,
     msg: ClientMessage,
+    history_restored_session: &mut Option<String>,
 ) {
     match msg {
-        ClientMessage::Query { .. } => {
+        ClientMessage::Query { .. } | ClientMessage::Cancel => {
             // 已在 handle_socket 的 select! 中直接处理
         }
         ClientMessage::Heartbeat => {
             // 应用层心跳 — 浏览器无法发送原生 Ping，用 JSON 消息替代
-            // 无需回复，仅用于保持连接活跃
-        }
-        ClientMessage::Cancel => {
-            // MVP: 暂空实现
-            send_event(
-                sender,
-                WebProgressEvent::Error {
-                    message: "Cancel 功能尚未实现".into(),
-                },
-            )
-            .await
-            .ok();
         }
         ClientMessage::AskResponse { .. } => {
             // MVP: 暂空实现
@@ -309,8 +344,12 @@ async fn handle_client_message(
         ClientMessage::SwitchPersona { persona_id } => {
             handle_switch_persona(sender, state, persona_id).await
         }
-        ClientMessage::NewSession => handle_new_session(sender, state).await,
+        ClientMessage::NewSession => {
+            *history_restored_session = None; // 新会话需要重新恢复历史
+            handle_new_session(sender, state).await
+        }
         ClientMessage::SwitchSession { session_id } => {
+            *history_restored_session = None; // 切换会话需要重新恢复历史
             handle_switch_session(sender, state, session_id).await
         }
         ClientMessage::DeleteSession { session_id } => {

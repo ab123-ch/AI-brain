@@ -10,6 +10,8 @@ let currentThinkingEl = null;
 let currentToolGroup = null;
 let currentSpinnerEl = null;
 let activeSessionId = null;
+let isGenerating = false; // 是否正在生成回复
+let isComposing = false;  // IME 组合态标记（中文输入法）
 
 // ── Typewriter State ──────────────────────────────────────────
 let thinkingFullContent = '';
@@ -146,7 +148,9 @@ function handleServerMessage(data) {
         case 'done':
             finalizeStreaming();
             removeSpinner();
+            isGenerating = false;
             setInputEnabled(true);
+            updateSendButton();
             break;
 
         case 'session_list':
@@ -169,7 +173,9 @@ function handleServerMessage(data) {
         case 'error':
             addSystemMessage(`错误: ${data.message}`);
             removeSpinner();
+            isGenerating = false;
             setInputEnabled(true);
+            updateSendButton();
             break;
 
         default:
@@ -383,9 +389,20 @@ function addUserMessage(text) {
 
 function setInputEnabled(enabled) {
     $input.disabled = !enabled;
-    $sendBtn.disabled = !enabled;
     if (enabled) {
         $input.focus();
+    }
+}
+
+function updateSendButton() {
+    if (isGenerating) {
+        $sendBtn.classList.add('stop-mode');
+        $sendBtn.innerHTML = '&#9632;'; // ■ 停止图标
+        $sendBtn.title = '停止生成 (Esc / Ctrl+C)';
+    } else {
+        $sendBtn.classList.remove('stop-mode');
+        $sendBtn.innerHTML = '&#10148;'; // ➤ 发送图标
+        $sendBtn.title = '发送';
     }
 }
 
@@ -495,6 +512,17 @@ function showAskModal(question, options) {
     $askModal.classList.remove('hidden');
 }
 
+// ── Stop / Cancel ───────────────────────────────────────────────
+function stopGenerating() {
+    if (!isGenerating) return;
+    send('cancel');
+    isGenerating = false;
+    removeSpinner();
+    addSystemMessage('已停止生成');
+    finalizeStreaming();
+    setInputEnabled(true);
+}
+
 // ── Submit Query ────────────────────────────────────────────────
 function submitQuery() {
     const text = $input.value.trim();
@@ -504,7 +532,9 @@ function submitQuery() {
     send('query', { input: text });
     $input.value = '';
     $input.style.height = 'auto';
-    setInputEnabled(false);
+    isGenerating = true;
+    setInputEnabled(true); // 不禁用输入框，只切换按钮状态
+    updateSendButton();
 
     // Reset streaming state
     currentStreamingEl = null;
@@ -514,9 +544,48 @@ function submitQuery() {
 }
 
 // ── Event Bindings ──────────────────────────────────────────────
+
+// IME 组合态：中文输入法开始组合时不触发提交
+$input.addEventListener('compositionstart', () => {
+    isComposing = true;
+});
+
+$input.addEventListener('compositionend', () => {
+    isComposing = false;
+});
+
 $input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
+        // 正在 IME 组合态（如中文候选窗），不拦截，让输入法处理确认
+        if (isComposing) return;
         e.preventDefault();
+        if (isGenerating) return; // 生成中不重复提交
+        submitQuery();
+    }
+    // 生成中 ESC 停止
+    if (e.key === 'Escape' && isGenerating) {
+        e.preventDefault();
+        stopGenerating();
+    }
+});
+
+// 全局快捷键：生成中 Ctrl+C 停止
+document.addEventListener('keydown', (e) => {
+    if (isGenerating && e.ctrlKey && e.key === 'c') {
+        // 仅在输入框无选区时拦截，避免影响正常复制
+        const sel = window.getSelection();
+        if (!sel || sel.toString().length === 0) {
+            e.preventDefault();
+            stopGenerating();
+        }
+    }
+});
+
+// 发送按钮：根据状态切换发送/停止
+$sendBtn.addEventListener('click', () => {
+    if (isGenerating) {
+        stopGenerating();
+    } else {
         submitQuery();
     }
 });
@@ -526,8 +595,6 @@ $input.addEventListener('input', () => {
     $input.style.height = 'auto';
     $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
 });
-
-$sendBtn.addEventListener('click', submitQuery);
 
 $personaSelect.addEventListener('change', () => {
     send('switch_persona', { persona_id: $personaSelect.value });
