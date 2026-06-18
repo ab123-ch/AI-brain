@@ -5,6 +5,7 @@
 //!   2. `stream_openai_incremental()` — true incremental via `bytes_stream`
 
 use crate::error::{LlmError, Result};
+use crate::gemini::gemini_tool_call_id;
 use crate::types::{FinishReason, StreamEvent, TokenUsage};
 
 // ---------------------------------------------------------------------------
@@ -116,6 +117,130 @@ pub fn parse_single_sse_data(data: &str) -> Option<Vec<StreamEvent>> {
     } else {
         Some(events)
     }
+}
+
+/// Parse one Gemini SSE data payload into unified stream events.
+pub fn parse_single_gemini_data(data: &str) -> Result<Vec<StreamEvent>> {
+    let mut call_sequence = 0;
+    let mut has_tool_use = false;
+    parse_gemini_data(data, &mut call_sequence, &mut has_tool_use)
+}
+
+fn parse_gemini_data(
+    data: &str,
+    call_sequence: &mut usize,
+    has_tool_use: &mut bool,
+) -> Result<Vec<StreamEvent>> {
+    let data = data.trim().strip_prefix("data: ").unwrap_or(data.trim());
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|e| LlmError::StreamError(format!("Gemini SSE JSON 解析失败: {e}")))?;
+    let mut events = Vec::new();
+
+    let first_candidate = value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|candidates| candidates.first());
+
+    if let Some(parts) = first_candidate
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                if part
+                    .get("thought")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    events.push(StreamEvent::ThinkingDelta {
+                        content: text.to_string(),
+                    });
+                } else {
+                    events.push(StreamEvent::TextDelta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+
+            if let Some(function_call) = part.get("functionCall") {
+                if let Some(name) = function_call
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    *call_sequence += 1;
+                    let id = gemini_tool_call_id(
+                        *call_sequence,
+                        part.get("thoughtSignature")
+                            .and_then(serde_json::Value::as_str),
+                    );
+                    let args = function_call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    events.push(StreamEvent::ToolCallStart {
+                        id: id.clone(),
+                        name: name.to_string(),
+                    });
+                    events.push(StreamEvent::ToolCallDelta {
+                        tool_use_id: id,
+                        delta: args.to_string(),
+                    });
+                    *has_tool_use = true;
+                }
+            }
+        }
+    }
+
+    let finish = first_candidate
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(serde_json::Value::as_str);
+    let usage = value.get("usageMetadata");
+    if finish.is_some() || usage.is_some() {
+        let finish_reason = finish.map(|reason| match reason {
+            "MAX_TOKENS" => FinishReason::MaxTokens,
+            "STOP" if *has_tool_use => FinishReason::ToolUse,
+            "STOP" => FinishReason::EndTurn,
+            _ if *has_tool_use => FinishReason::ToolUse,
+            _ => FinishReason::EndTurn,
+        });
+        let usage = usage.map(|metadata| TokenUsage {
+            prompt_tokens: metadata
+                .get("promptTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            completion_tokens: metadata
+                .get("candidatesTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            total_tokens: metadata
+                .get("totalTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        });
+        events.push(StreamEvent::Done {
+            finish_reason,
+            usage,
+        });
+    }
+
+    Ok(events)
+}
+
+fn parse_gemini_sse_body(full: &str) -> Result<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    let mut call_sequence = 0;
+    let mut has_tool_use = false;
+    for data in extract_all_sse_data(full) {
+        events.extend(parse_gemini_data(
+            &data,
+            &mut call_sequence,
+            &mut has_tool_use,
+        )?);
+    }
+    Ok(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +502,118 @@ pub async fn stream_openai_incremental(
     Ok(rx)
 }
 
+/// Perform a Gemini streaming request and collect all SSE events.
+pub async fn stream_gemini(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    body: &serde_json::Value,
+) -> Result<Vec<StreamEvent>> {
+    let mut request = client.post(url);
+    for (name, value) in headers {
+        request = request.header(*name, value);
+    }
+    let response = request
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| LlmError::RequestFailed(format!("Gemini 流式请求失败: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(LlmError::ApiError {
+            status: status.as_u16(),
+            message: response.text().await.unwrap_or_default(),
+        });
+    }
+
+    let full = response
+        .text()
+        .await
+        .map_err(|e| LlmError::StreamError(format!("读取 Gemini 流式响应失败: {e}")))?;
+    parse_gemini_sse_body(&full)
+}
+
+/// Perform a Gemini streaming request and emit events incrementally.
+pub async fn stream_gemini_incremental(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    body: &serde_json::Value,
+) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+    use futures::StreamExt;
+
+    let mut request = client.post(url);
+    for (name, value) in headers {
+        request = request.header(*name, value);
+    }
+    let response = request
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| LlmError::RequestFailed(format!("Gemini 流式请求失败: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(LlmError::ApiError {
+            status: status.as_u16(),
+            message: response.text().await.unwrap_or_default(),
+        });
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(async move {
+        let mut buffer = Vec::with_capacity(4096);
+        let mut stream = response.bytes_stream();
+        let mut call_sequence = 0;
+        let mut has_tool_use = false;
+        while let Some(chunk) = stream.next().await {
+            let Ok(bytes) = chunk else {
+                break;
+            };
+            buffer.extend_from_slice(&bytes);
+            while let Some(data) = extract_sse_frame(&mut buffer) {
+                let events = parse_gemini_data(&data, &mut call_sequence, &mut has_tool_use);
+                let Ok(events) = events else {
+                    tracing::warn!("Gemini SSE 帧解析失败");
+                    continue;
+                };
+                for event in events {
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if !buffer.is_empty() {
+            let remaining = String::from_utf8_lossy(&buffer);
+            for data in extract_all_sse_data(&remaining) {
+                let events = parse_gemini_data(&data, &mut call_sequence, &mut has_tool_use);
+                let Ok(events) = events else {
+                    tracing::warn!("Gemini SSE 尾帧解析失败");
+                    continue;
+                };
+                for event in events {
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Ok(rx)
+}
+
+fn extract_all_sse_data(full: &str) -> Vec<String> {
+    full.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("data: ")
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +706,91 @@ data: [DONE]
         if let Some(StreamEvent::Done { usage, .. }) = done_event {
             assert_eq!(usage.as_ref().unwrap().total_tokens, 15);
         }
+    }
+
+    #[test]
+    fn parse_gemini_sse_text_delta() {
+        let frame = r#"data: {"candidates":[{"content":{"parts":[{"text":"你好"}]}}]}"#;
+        let events = parse_single_gemini_data(frame).unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::TextDelta { text }) if text == "你好"
+        ));
+    }
+
+    #[test]
+    fn parse_gemini_sse_thinking_delta() {
+        let frame =
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"思考","thought":true}]}}]}"#;
+        let events = parse_single_gemini_data(frame).unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::ThinkingDelta { content }) if content == "思考"
+        ));
+    }
+
+    #[test]
+    fn parse_gemini_sse_function_call() {
+        let frame = r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"北京"}}}]}}]}"#;
+        let events = parse_single_gemini_data(frame).unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, StreamEvent::ToolCallStart { name, .. } if name == "get_weather")
+        ));
+        assert!(events.iter().any(|event| {
+            matches!(event, StreamEvent::ToolCallDelta { delta, .. } if delta.contains("北京"))
+        }));
+    }
+
+    #[test]
+    fn parse_gemini_sse_done_with_usage() {
+        let frame = r#"data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#;
+        let events = parse_single_gemini_data(frame).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done {
+                finish_reason: Some(FinishReason::EndTurn),
+                usage: Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_gemini_sse_tracks_tool_use_across_frames() {
+        let body = r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"北京"}},"thoughtSignature":"sig-a"}]}}]}
+
+data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"totalTokenCount":15}}
+
+"#;
+        let events = parse_gemini_sse_body(body).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done {
+                finish_reason: Some(FinishReason::ToolUse),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_gemini_sse_preserves_signature_and_unique_call_ids() {
+        let body = r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"first","args":{}},"thoughtSignature":"sig-a"},{"functionCall":{"name":"second","args":{}}}]}}]}
+
+"#;
+        let events = parse_gemini_sse_body(body).unwrap();
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallStart { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids[0].contains("__gemini_thought_"));
     }
 }

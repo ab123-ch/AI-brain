@@ -107,6 +107,7 @@ impl TokenUsage {
 
     /// Cache hit rate: what fraction of total input tokens came from cache.
     /// Returns None if total input is zero.
+    #[allow(clippy::cast_precision_loss)]
     pub fn cache_hit_rate(&self) -> Option<f64> {
         let total = self.total_input_tokens();
         if total == 0 {

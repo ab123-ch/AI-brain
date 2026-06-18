@@ -4,8 +4,26 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LlmError, Result};
+use crate::gemini::GeminiClient;
 use crate::openai_compat::OpenAiCompatClient;
 use crate::provider::LlmProvider;
+
+/// Provider 协议类型，决定路由到哪个 Client
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    #[default]
+    OpenAi,
+    Gemini,
+}
+
+/// 全局代理配置段
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProxySection {
+    /// 全局默认代理地址，不配则全程不走代理
+    #[serde(default)]
+    pub default: Option<String>,
+}
 
 /// LLM 层完整配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +31,9 @@ pub struct LlmConfig {
     pub llm: LlmSection,
     #[serde(default)]
     pub brain: BrainSection,
+    /// 全局代理配置
+    #[serde(default)]
+    pub proxy: ProxySection,
     /// Hook 系统配置（原始 toml::Value，由 ai-brain-cli 层解析为 brain-hooks::HooksConfig）
     #[serde(default)]
     pub hooks: Option<toml::Value>,
@@ -52,6 +73,24 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 协议类型，缺省 openai（向后兼容旧配置）
+    #[serde(default)]
+    pub kind: ProviderKind,
+    /// 代理设置：None=跟随全局，Some("none")=关闭，Some(url)=独立地址，Some("")=视为无代理
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            api_base: String::new(),
+            api_key_env: String::new(),
+            api_key: None,
+            kind: ProviderKind::OpenAi,
+            proxy: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +205,24 @@ impl LlmConfig {
         ))
     }
 
+    /// 解析某 provider 最终使用的代理地址
+    ///
+    /// 优先级：provider.proxy（"none"/空串=关闭，url=独立）> proxy.default（全局）
+    pub fn resolve_proxy(&self, provider_name: &str) -> Result<Option<String>> {
+        let provider = self
+            .llm
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| LlmError::ProviderNotFound(provider_name.to_string()))?;
+
+        Ok(match &provider.proxy {
+            Some(s) if s == "none" => None,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.clone()),
+            None => self.proxy.default.clone(),
+        })
+    }
+
     /// 为某个副脑构建 LLM 客户端
     ///
     /// 如果副脑不需要 LLM（不在 brain_models 中且不在 defaults 中），返回 None
@@ -181,44 +238,32 @@ impl LlmConfig {
             .get(provider_name)
             .ok_or_else(|| LlmError::ProviderNotFound(provider_name.to_string()))?;
 
-        let client = OpenAiCompatClient::new(
-            provider_config.api_base.clone(),
-            api_key,
-            model.to_string(),
-            max_tokens,
-            temperature,
-        );
-
-        Ok(Box::new(client))
+        let proxy_url = self.resolve_proxy(provider_name)?;
+        match provider_config.kind {
+            ProviderKind::OpenAi => Ok(Box::new(
+                OpenAiCompatClient::new(
+                    provider_config.api_base.clone(),
+                    api_key,
+                    model.to_string(),
+                    max_tokens,
+                    temperature,
+                )
+                .with_proxy(proxy_url),
+            )),
+            ProviderKind::Gemini => Ok(Box::new(GeminiClient::try_new(
+                provider_config.api_base.clone(),
+                api_key,
+                model.to_string(),
+                max_tokens,
+                temperature,
+                proxy_url,
+            )?)),
+        }
     }
 
     /// 生成默认配置（用于首次运行）
     pub fn default_config() -> Self {
-        let mut providers = HashMap::new();
-        providers.insert(
-            "xiaomi".into(),
-            ProviderConfig {
-                api_base: "https://xiaomi-llm.example.com/v1".into(),
-                api_key_env: "XIAOMI_API_KEY".into(),
-                api_key: None,
-            },
-        );
-        providers.insert(
-            "deepseek".into(),
-            ProviderConfig {
-                api_base: "https://api.deepseek.com/v1".into(),
-                api_key_env: "DEEPSEEK_API_KEY".into(),
-                api_key: None,
-            },
-        );
-        providers.insert(
-            "zhipu".into(),
-            ProviderConfig {
-                api_base: "https://open.bigmodel.cn/api/paas/v4".into(),
-                api_key_env: "ZHIPU_API_KEY".into(),
-                api_key: None,
-            },
-        );
+        let providers = Self::default_providers();
 
         let mut brain_providers = HashMap::new();
         brain_providers.insert("main".into(), "xiaomi".into());
@@ -296,8 +341,48 @@ impl LlmConfig {
                 defaults: LlmDefaults::default(),
             },
             brain: BrainSection::default(),
+            proxy: ProxySection::default(),
             hooks: None,
         }
+    }
+
+    /// 默认 provider 列表（含 gemini 示例）
+    fn default_providers() -> HashMap<String, ProviderConfig> {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "xiaomi".into(),
+            ProviderConfig {
+                api_base: "https://xiaomi-llm.example.com/v1".into(),
+                api_key_env: "XIAOMI_API_KEY".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "deepseek".into(),
+            ProviderConfig {
+                api_base: "https://api.deepseek.com/v1".into(),
+                api_key_env: "DEEPSEEK_API_KEY".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "zhipu".into(),
+            ProviderConfig {
+                api_base: "https://open.bigmodel.cn/api/paas/v4".into(),
+                api_key_env: "ZHIPU_API_KEY".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "gemini".into(),
+            ProviderConfig {
+                api_base: "https://generativelanguage.googleapis.com/v1beta".into(),
+                api_key_env: "GEMINI_API_KEY".into(),
+                kind: ProviderKind::Gemini,
+                ..Default::default()
+            },
+        );
+        providers
     }
 }
 
@@ -471,5 +556,148 @@ reasoning = "glm-5.1"
         assert!(config.llm.brain_providers.is_empty());
         assert_eq!(config.provider_for_brain("main"), "zhipu");
         assert_eq!(config.provider_for_brain("eval"), "zhipu");
+    }
+
+    // ===== T1: ProviderKind + resolve_proxy（正常/边界/异常）=====
+
+    #[test]
+    fn provider_kind_defaults_to_openai_for_old_config() {
+        let toml = r#"
+[llm]
+default_provider = "x"
+default_model = "m"
+
+[llm.providers.x]
+api_base = "https://x.example.com/v1"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = LlmConfig::load(&path).unwrap();
+        let pc = cfg.llm.providers.get("x").unwrap();
+        assert_eq!(pc.kind, ProviderKind::OpenAi);
+        assert!(pc.proxy.is_none());
+    }
+
+    #[test]
+    fn provider_kind_gemini_parsed() {
+        let toml = r#"
+[llm]
+default_provider = "g"
+default_model = "gemini-2.5-flash"
+
+[llm.providers.g]
+api_base = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+kind = "gemini"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = LlmConfig::load(&path).unwrap();
+        let pc = cfg.llm.providers.get("g").unwrap();
+        assert_eq!(pc.kind, ProviderKind::Gemini);
+    }
+
+    #[test]
+    fn resolve_proxy_follows_global_default() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.proxy.default = Some("http://127.0.0.1:7890".into());
+        assert_eq!(
+            cfg.resolve_proxy("xiaomi").unwrap(),
+            Some("http://127.0.0.1:7890".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_custom_overrides_global() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.proxy.default = Some("http://127.0.0.1:7890".into());
+        if let Some(p) = cfg.llm.providers.get_mut("xiaomi") {
+            p.proxy = Some("http://127.0.0.1:1080".into());
+        }
+        assert_eq!(
+            cfg.resolve_proxy("xiaomi").unwrap(),
+            Some("http://127.0.0.1:1080".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_none_when_no_global() {
+        let cfg = LlmConfig::default_config();
+        assert_eq!(cfg.resolve_proxy("xiaomi").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_proxy_none_disables_global() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.proxy.default = Some("http://127.0.0.1:7890".into());
+        if let Some(p) = cfg.llm.providers.get_mut("xiaomi") {
+            p.proxy = Some("none".into());
+        }
+        assert_eq!(cfg.resolve_proxy("xiaomi").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_proxy_empty_string_treated_as_none() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.proxy.default = Some("http://127.0.0.1:7890".into());
+        if let Some(p) = cfg.llm.providers.get_mut("xiaomi") {
+            p.proxy = Some(String::new());
+        }
+        assert_eq!(cfg.resolve_proxy("xiaomi").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_proxy_provider_not_found_errors() {
+        let cfg = LlmConfig::default_config();
+        assert!(cfg.resolve_proxy("nonexistent").is_err());
+    }
+
+    #[test]
+    fn create_brain_client_routes_gemini_kind() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.llm.default_provider = "gemini".into();
+        cfg.llm.default_model = "gemini-2.5-flash".into();
+        cfg.llm
+            .brain_providers
+            .insert("main".into(), "gemini".into());
+        cfg.llm.brain_models.remove("main");
+        cfg.llm.providers.get_mut("gemini").unwrap().api_key = Some("fake-key".into());
+
+        let client = cfg.create_brain_client("main").unwrap();
+        assert_eq!(client.model(), "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn create_brain_client_routes_openai_by_default() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.llm.providers.get_mut("xiaomi").unwrap().api_key = Some("fake-key".into());
+        let client = cfg.create_brain_client("main").unwrap();
+        assert_eq!(client.model(), "mimo-7b");
+    }
+
+    #[test]
+    fn create_brain_client_injects_proxy_into_gemini() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.proxy.default = Some("http://127.0.0.1:7890".into());
+        cfg.llm.default_provider = "gemini".into();
+        cfg.llm
+            .brain_providers
+            .insert("main".into(), "gemini".into());
+        cfg.llm.providers.get_mut("gemini").unwrap().api_key = Some("fake-key".into());
+        assert!(cfg.create_brain_client("main").is_ok());
+    }
+
+    #[test]
+    fn create_brain_client_rejects_invalid_gemini_proxy() {
+        let mut cfg = LlmConfig::default_config();
+        cfg.proxy.default = Some("not-a-url".into());
+        cfg.llm.default_provider = "gemini".into();
+        cfg.llm
+            .brain_providers
+            .insert("main".into(), "gemini".into());
+        cfg.llm.providers.get_mut("gemini").unwrap().api_key = Some("fake-key".into());
+        assert!(cfg.create_brain_client("main").is_err());
     }
 }

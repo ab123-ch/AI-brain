@@ -268,7 +268,11 @@ impl Orchestrator {
         // 2. 感知脑（LLM 不可用直接报错，不降级）
         let sensory_llm_result = create_sensory_llm(&llm_config)?;
         let model_name = sensory_llm_result.model_name.clone();
-        let sensory = SensoryBrain::new("glm-4.7", bus.clone(), sensory_llm_result.provider);
+        let sensory = SensoryBrain::new(
+            &sensory_llm_result.model_name,
+            bus.clone(),
+            sensory_llm_result.provider,
+        );
 
         // 3. 创建各副脑
         let (memory, mut reasoning, mut motor, validation, evaluation) = create_sub_brains()?;
@@ -2134,10 +2138,10 @@ fn create_v2_main_brain(
     Arc<SkillCatalog>,
     Arc<McpClientPool>,
 ) {
-    let client = match llm_config.create_brain_client("sensory") {
+    let client = match llm_config.create_brain_client("main") {
         Ok(c) => Arc::from(c) as Arc<dyn brain_llm::LlmProvider>,
-        Err(_) => {
-            tracing::warn!("v2 MainBrain: LLM 不可用，跳过创建（回声模式）");
+        Err(error) => {
+            tracing::warn!("v2 MainBrain: 主脑 LLM 不可用，跳过创建（回声模式）: {error}");
             return (
                 Arc::new(Mutex::new(None)),
                 None,
@@ -2218,6 +2222,11 @@ fn create_v2_main_brain(
 
     let brain_config = BrainConfig::default();
     let (main_mt, main_temp) = llm_config.params_for_brain("main");
+    tracing::info!(
+        "v2 MainBrain: provider={}, model={}",
+        llm_config.provider_for_brain("main"),
+        llm_config.model_for_brain("main")
+    );
     let mut brain = MainBrain::new(client, tool_executor, brain_config, main_mt, main_temp);
 
     // 注册所有 MVP 工具（bash、read_file、write_file、edit_file、glob、grep）

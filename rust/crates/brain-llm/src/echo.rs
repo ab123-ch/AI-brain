@@ -45,7 +45,7 @@ impl LlmProvider for EchoLlmProvider {
                 .iter()
                 .rev()
                 .find(|m| matches!(m.role, crate::provider::MessageRole::User))
-                .map(|m| m.text_content())
+                .map(super::provider::ChatMessage::text_content)
                 .unwrap_or_default();
 
             let echo_text = if last_user_msg.is_empty() {
@@ -79,7 +79,7 @@ impl LlmProvider for EchoLlmProvider {
                 .iter()
                 .rev()
                 .find(|m| matches!(m.role, crate::provider::MessageRole::User))
-                .map(|m| m.text_content())
+                .map(super::provider::ChatMessage::text_content)
                 .unwrap_or_default();
 
             Ok(vec![
@@ -116,7 +116,7 @@ impl LlmProvider for EchoLlmProvider {
                 .iter()
                 .rev()
                 .find(|m| matches!(m.role, crate::provider::MessageRole::User))
-                .map(|m| m.text_content())
+                .map(super::provider::ChatMessage::text_content)
                 .unwrap_or_default();
 
             let (tx, rx) = tokio::sync::mpsc::channel(4);

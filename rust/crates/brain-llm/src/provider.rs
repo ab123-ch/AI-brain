@@ -127,7 +127,7 @@ impl ChatResponse {
 
     /// Check if the response contains any tool calls.
     pub fn has_tool_calls(&self) -> bool {
-        self.content.iter().any(|b| b.is_tool_use())
+        self.content.iter().any(ContentBlock::is_tool_use)
     }
 }
 

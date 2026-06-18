@@ -16,6 +16,7 @@ brain-motor = { path = "../brain-motor" }
 brain-validation = { path = "../brain-validation" }
 brain-evaluation = { path = "../brain-evaluation" }
 brain-llm = { path = "../brain-llm" }
+tools = { path = "../tools" }
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"

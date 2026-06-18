@@ -131,6 +131,7 @@ struct ApiFunction {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
 struct ApiUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -169,8 +170,47 @@ impl OpenAiCompatClient {
     }
 
     /// 设置重试配置
+    #[must_use]
     pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
+        self
+    }
+
+    /// Inject an HTTP proxy. Invalid proxy settings keep the existing direct client.
+    #[must_use]
+    pub fn with_proxy(mut self, proxy_url: Option<String>) -> Self {
+        let Some(url) = proxy_url else {
+            return self;
+        };
+        let parsed = match reqwest::Url::parse(&url) {
+            Ok(parsed) if parsed.scheme() == "http" => parsed,
+            Ok(parsed) => {
+                tracing::warn!(
+                    "不支持的代理协议 '{}'，OpenAI 兼容客户端回退直连",
+                    parsed.scheme()
+                );
+                return self;
+            }
+            Err(error) => {
+                tracing::warn!("无效代理地址 '{url}'，OpenAI 兼容客户端回退直连: {error}");
+                return self;
+            }
+        };
+        let Ok(proxy) = reqwest::Proxy::all(parsed.as_str()) else {
+            tracing::warn!("代理配置无法应用，OpenAI 兼容客户端回退直连: {url}");
+            return self;
+        };
+        match reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(300))
+            .proxy(proxy)
+            .build()
+        {
+            Ok(client) => self.client = client,
+            Err(error) => {
+                tracing::warn!("代理 client 构造失败，OpenAI 兼容客户端回退直连: {error}");
+            }
+        }
         self
     }
 
@@ -477,16 +517,12 @@ fn extract_thinking_and_text(text: &str) -> (Option<String>, String) {
 
     let re = regex::Regex::new(r"(?s)<think(?:ing)?[^>]*>(.*?)</think(?:ing)?\s*>").unwrap();
 
-    loop {
-        if let Some(caps) = re.captures(&remaining) {
-            let thinking_content = caps[1].trim();
-            if !thinking_content.is_empty() {
-                thinking_parts.push(thinking_content.to_string());
-            }
-            remaining = remaining.replace(&caps[0], "");
-        } else {
-            break;
+    while let Some(caps) = re.captures(&remaining) {
+        let thinking_content = caps[1].trim();
+        if !thinking_content.is_empty() {
+            thinking_parts.push(thinking_content.to_string());
         }
+        remaining = remaining.replace(&caps[0], "");
     }
 
     // Handle unclosed <think...> at end of text
@@ -521,6 +557,7 @@ impl LlmProvider for OpenAiCompatClient {
         &self.model
     }
 
+    #[allow(clippy::too_many_lines)]
     fn complete(
         &self,
         request: ChatRequest,
@@ -714,6 +751,24 @@ mod tests {
     }
 
     #[test]
+    fn with_proxy_http_url_succeeds() {
+        let client = make_client().with_proxy(Some("http://127.0.0.1:7890".into()));
+        assert_eq!(client.model(), "glm-4.7");
+    }
+
+    #[test]
+    fn with_proxy_none_keeps_direct() {
+        let client = make_client().with_proxy(None);
+        assert_eq!(client.model(), "glm-4.7");
+    }
+
+    #[test]
+    fn with_proxy_invalid_url_falls_back_to_direct() {
+        let client = make_client().with_proxy(Some("not-a-url".into()));
+        assert_eq!(client.model(), "glm-4.7");
+    }
+
+    #[test]
     fn chat_url_construction() {
         let client = make_client();
         assert_eq!(
@@ -869,7 +924,7 @@ mod tests {
         let api_resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let resp = OpenAiCompatClient::parse_response(api_resp, "fallback".into());
         assert_eq!(resp.text(), "The actual answer");
-        assert!(resp.content.iter().any(|b| b.is_thinking()));
+        assert!(resp.content.iter().any(ContentBlock::is_thinking));
     }
 
     #[test]
@@ -887,6 +942,6 @@ mod tests {
         let api_resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let resp = OpenAiCompatClient::parse_response(api_resp, "fallback".into());
         assert_eq!(resp.text(), "The answer");
-        assert!(resp.content.iter().any(|b| b.is_thinking()));
+        assert!(resp.content.iter().any(ContentBlock::is_thinking));
     }
 }

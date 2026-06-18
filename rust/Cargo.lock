@@ -381,6 +381,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tools",
  "tracing",
 ]
 

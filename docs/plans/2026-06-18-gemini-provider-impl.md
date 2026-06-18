@@ -8,6 +8,16 @@
 
 **Tech Stack:** Rust, reqwest 0.12, serde, tokio, 现有 `brain-llm` crate。
 
+## 实施状态（2026-06-18）
+
+- Tasks 1–10：已实现。
+- Task 11：已新增 `#[ignore]` 真实 API 测试，尚未使用真实 `GEMINI_API_KEY` 执行。
+- `cargo test -p brain-llm --lib`：80 passed。
+- `cargo test -p brain-integration-tests --test gemini_real`：编译通过，5 ignored。
+- `cargo clippy -p brain-llm --all-targets -- -D warnings`：通过。
+- Workspace 全量 fmt/test 仍受仓库其他 crate 既有问题影响，详见本次开发记录。
+- 已补充 Gemini 3 `thoughtSignature` 原样回传兼容：签名可逆编码在内部 opaque tool-call ID 中，上层契约不变。
+
 **验证命令（每个任务结束运行）:**
 - 单 crate: `cargo test -p brain-llm`
 - 全量: `cargo fmt && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
@@ -2248,6 +2258,14 @@ git commit -m "test(brain-integration-tests): Gemini 真实 API 端到端验证�
 - [ ] `cargo fmt` 无变更
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` 无 warning
 - [ ] `cargo test --workspace` 全绿（brain-integration-tests 按既有约定除外）
+
+## 后续审查修复（2026-06-18）
+
+- Gemini 配置代理改用 fallible `GeminiClient::try_new`，无效代理返回配置错误，不再 panic。
+- 保留并回传 Gemini 3 function-call `thoughtSignature`，支持多步和并行工具调用。
+- Gemini SSE 在跨帧收到 function call 与 STOP 时，正确映射为 `FinishReason::ToolUse`。
+- Gemini SSE 工具调用 ID 在同一流内保持递增唯一。
+- 工具声明改用 Gemini REST 的 `parametersJsonSchema`，完整保留智脑工具的 JSON Schema；避免 `parameters` OpenAPI 子集拒绝 `additionalProperties` 和联合类型。
 - [ ] brain-llm 新增测试 ≥ 25 个
 - [ ] 上层 crate（brain-main/brain-memory/brain-eval/ai-brain-cli）零改动
 - [ ] MEMORY.md 更新
