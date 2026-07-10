@@ -97,6 +97,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut query_session_id: Option<String> = None;
     let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
     let mut history_restored_session: Option<String> = None; // 已恢复历史的会话 ID
+    let mut runtime_trace_rx = state.orch.subscribe_runtime_trace();
 
     // 心跳定时器 — 定期发送 Ping 防止连接因空闲被中间代理/浏览器断开
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
@@ -110,6 +111,29 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 if sender.send(Message::Ping(vec![].into())).await.is_err() {
                     warn!("心跳 Ping 发送失败，连接可能已断开");
                     break;
+                }
+            }
+
+            exchange = runtime_trace_rx.recv() => {
+                match exchange {
+                    Ok(exchange) => {
+                        if send_event(
+                            &mut sender,
+                            WebProgressEvent::BrainCommunication { exchange },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("WebSocket 通信轨迹落后，跳过 {skipped} 条事件");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("运行时通信轨迹通道已关闭");
+                        break;
+                    }
                 }
             }
 

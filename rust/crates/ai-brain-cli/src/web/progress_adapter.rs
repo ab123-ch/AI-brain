@@ -5,6 +5,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_trace::RuntimeExchange;
+
 // ─── 辅助结构体 ──────────────────────────────────────────────────────
 
 /// 会话信息
@@ -60,12 +62,18 @@ pub enum WebProgressEvent {
     ThinkingDelta {
         content: String,
     },
+    IntermediateConclusion {
+        brain: String,
+        content: String,
+    },
     ToolStart {
+        call_id: String,
         brain: String,
         tool_name: String,
         input: String,
     },
     ToolDone {
+        call_id: String,
         brain: String,
         tool_name: String,
         duration_ms: u64,
@@ -97,6 +105,11 @@ pub enum WebProgressEvent {
         multi_select: bool,
     },
     Done,
+
+    /// Full request/result communication emitted outside the query channel.
+    BrainCommunication {
+        exchange: RuntimeExchange,
+    },
 
     // ── WebSocket 控制消息 ──
     /// 会话列表
@@ -151,22 +164,32 @@ impl WebProgressEvent {
             ProgressEvent::ThinkingDelta { content } => WebProgressEvent::ThinkingDelta {
                 content: content.clone(),
             },
+            ProgressEvent::IntermediateConclusion { brain, content } => {
+                WebProgressEvent::IntermediateConclusion {
+                    brain: brain.clone(),
+                    content: content.clone(),
+                }
+            }
             ProgressEvent::ToolStart {
+                call_id,
                 brain,
                 tool_name,
                 input,
             } => WebProgressEvent::ToolStart {
+                call_id: call_id.clone(),
                 brain: brain.clone(),
                 tool_name: tool_name.clone(),
                 input: input.clone(),
             },
             ProgressEvent::ToolDone {
+                call_id,
                 brain,
                 tool_name,
                 duration_ms,
                 output_preview,
                 is_error,
             } => WebProgressEvent::ToolDone {
+                call_id: call_id.clone(),
                 brain: brain.clone(),
                 tool_name: tool_name.clone(),
                 duration_ms: *duration_ms,
@@ -187,9 +210,10 @@ impl WebProgressEvent {
                     feedback: feedback.clone(),
                 }
             }
-            // EvaluationDetail 包含 BrainHealthReport / SlimInstruction，
-            // 结构复杂且前端暂不需要，跳过
-            ProgressEvent::EvaluationDetail { .. } => return None,
+            // 两类后台详情暂不进入 Web UI。
+            ProgressEvent::EvaluationDetail { .. } | ProgressEvent::BacklogEntryDetected { .. } => {
+                return None
+            }
             ProgressEvent::Evaluating => WebProgressEvent::Evaluating,
             ProgressEvent::LlmRetry {
                 attempt,
@@ -200,8 +224,6 @@ impl WebProgressEvent {
                 max_attempts: *max_attempts,
                 error: error.clone(),
             },
-            // Backlog 条目是后台事件，Web UI 不需要展示
-            ProgressEvent::BacklogEntryDetected { .. } => return None,
             // AskUser 去掉 response_tx，前端通过 WebSocket 消息回复
             ProgressEvent::AskUser {
                 question,
@@ -221,6 +243,7 @@ impl WebProgressEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_trace::{ExchangeKind, ExchangePhase, ExchangeStatus};
 
     #[test]
     fn serialize_connecting() {
@@ -285,6 +308,41 @@ mod tests {
     }
 
     #[test]
+    fn from_progress_intermediate_conclusion() {
+        let event = brain_core::types::ProgressEvent::IntermediateConclusion {
+            brain: "main".into(),
+            content: "已了解文件结构，现在继续检查调用方。".into(),
+        };
+        let web = WebProgressEvent::from_progress(&event).unwrap();
+        let json = serde_json::to_value(web).unwrap();
+        assert_eq!(json["type"], "intermediate_conclusion");
+        assert_eq!(json["brain"], "main");
+        assert_eq!(json["content"], "已了解文件结构，现在继续检查调用方。");
+    }
+
+    #[test]
+    fn brain_communication_keeps_full_content() {
+        let event = WebProgressEvent::BrainCommunication {
+            exchange: RuntimeExchange::new(
+                "exchange-1",
+                "main",
+                "主脑",
+                "agent:1",
+                "子代理",
+                ExchangeKind::Delegation,
+                ExchangePhase::Request,
+                "检查实现",
+                "完整任务内容，不应截断",
+                ExchangeStatus::Running,
+                None,
+            ),
+        };
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["type"], "brain_communication");
+        assert_eq!(json["exchange"]["content"], "完整任务内容，不应截断");
+    }
+
+    #[test]
     fn from_progress_evaluation_detail_skipped() {
         let pe = brain_core::types::ProgressEvent::EvaluationDetail {
             score: 0.9,
@@ -321,6 +379,7 @@ mod tests {
     #[test]
     fn roundtrip_deserialize() {
         let event = WebProgressEvent::ToolDone {
+            call_id: "call-1".into(),
             brain: "eval".into(),
             tool_name: "check".into(),
             duration_ms: 123,

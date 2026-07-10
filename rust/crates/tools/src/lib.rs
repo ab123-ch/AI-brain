@@ -1272,6 +1272,8 @@ struct AgentOutput {
     completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
 }
 
 /// Agent 子代理执行结果（从子代理线程通过 channel 发送回来）
@@ -1954,6 +1956,7 @@ where
         started_at: Some(created_at),
         completed_at: None,
         error: None,
+        result: None,
     };
     write_agent_manifest(&manifest)?;
 
@@ -1989,6 +1992,7 @@ where
         status: agent_done.status,
         completed_at: Some(iso8601_now()),
         error: agent_done.error,
+        result: agent_done.final_text,
         ..manifest
     };
     Ok(AgentLaunch {
@@ -2325,6 +2329,7 @@ fn persist_agent_terminal_state(
     next_manifest.status = status.to_string();
     next_manifest.completed_at = Some(iso8601_now());
     next_manifest.error = error;
+    next_manifest.result = result.map(str::to_string);
     write_agent_manifest(&next_manifest)
 }
 
@@ -4738,12 +4743,14 @@ mod tests {
             },
         )
         .expect("completed agent should succeed");
+        assert_eq!(completed.result.as_deref(), Some("Finished successfully"));
 
         let completed_manifest = std::fs::read_to_string(&completed.manifest_file)
             .expect("completed manifest should exist");
         let completed_output =
             std::fs::read_to_string(&completed.output_file).expect("completed output should exist");
         assert!(completed_manifest.contains("\"status\": \"completed\""));
+        assert!(completed_manifest.contains("Finished successfully"));
         assert!(completed_output.contains("Finished successfully"));
 
         let failed = execute_agent_with_spawn(

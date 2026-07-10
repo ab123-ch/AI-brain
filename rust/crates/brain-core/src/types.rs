@@ -737,12 +737,19 @@ pub enum ProgressEvent {
     ThinkingDelta {
         content: String,
     },
+    /// A concise, user-facing checkpoint between reasoning and execution steps.
+    IntermediateConclusion {
+        brain: String,
+        content: String,
+    },
     ToolStart {
+        call_id: String,
         brain: String,
         tool_name: String,
         input: String,
     },
     ToolDone {
+        call_id: String,
         brain: String,
         tool_name: String,
         duration_ms: u64,

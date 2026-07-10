@@ -164,6 +164,17 @@ impl MainBrain {
                     model: self.llm.model().into(),
                 })
                 .await;
+            let _ = tx
+                .send(ProgressEvent::Thinking {
+                    brain: "main".into(),
+                })
+                .await;
+            let _ = tx
+                .send(ProgressEvent::IntermediateConclusion {
+                    brain: "main".into(),
+                    content: "已接收任务，正在判断所需上下文和执行步骤。".into(),
+                })
+                .await;
         }
 
         // ── 4. 跑 tool_loop（支持上下文溢出时压缩 + 重入）──
@@ -438,6 +449,17 @@ impl MainBrain {
                 .send(ProgressEvent::Connecting {
                     brain: "main".into(),
                     model: llm.model().into(),
+                })
+                .await;
+            let _ = tx
+                .send(ProgressEvent::Thinking {
+                    brain: "main".into(),
+                })
+                .await;
+            let _ = tx
+                .send(ProgressEvent::IntermediateConclusion {
+                    brain: "main".into(),
+                    content: "已接收任务，正在判断所需上下文和执行步骤。".into(),
                 })
                 .await;
 

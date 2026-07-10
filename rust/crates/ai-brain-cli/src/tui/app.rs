@@ -1092,6 +1092,7 @@ impl App {
                             self.pending_ask_response = Some(response_tx.0);
                             // 显示 ToolStart 行（和 handle_event 中 ToolStart 一样）
                             self.output.handle_event(&ProgressEvent::ToolStart {
+                                call_id: "ask-user".into(),
                                 brain: "main".into(),
                                 tool_name: "AskUserQuestion".into(),
                                 input: serde_json::to_string(&serde_json::json!({

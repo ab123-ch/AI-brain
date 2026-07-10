@@ -71,6 +71,7 @@ impl SessionLogger {
                 brain,
                 tool_name,
                 input,
+                ..
             } => {
                 let name = brain_display_name(brain);
                 let ts = Self::timestamp();
@@ -84,6 +85,7 @@ impl SessionLogger {
                 duration_ms,
                 output_preview,
                 is_error,
+                ..
             } => {
                 let name = brain_display_name(brain);
                 let status = if *is_error { "FAIL" } else { "OK" };
@@ -106,6 +108,11 @@ impl SessionLogger {
                 let name = brain_display_name(brain);
                 let ts = Self::timestamp();
                 self.log_raw(&format!("[{ts}] CONNECT | {name} | {model}\n"));
+            }
+            ProgressEvent::IntermediateConclusion { brain, content } => {
+                let name = brain_display_name(brain);
+                let ts = Self::timestamp();
+                self.log_raw(&format!("[{ts}] CHECKPOINT | {name} | {content}\n"));
             }
             ProgressEvent::EvaluationStart => {
                 let ts = Self::timestamp();

@@ -24,6 +24,49 @@ fn truncate_tool_output_for_log(s: &str, max: usize) -> String {
     format!("{truncated}... [共{}字, 截断显示]", s.chars().count())
 }
 
+fn tool_subject(input: &serde_json::Value) -> String {
+    [
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "description",
+        "command",
+    ]
+    .iter()
+    .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+    .map(|value| truncate_tool_output_for_log(value, 100))
+    .unwrap_or_default()
+}
+
+fn before_tool_conclusion(name: &str, input: &serde_json::Value) -> String {
+    let subject = tool_subject(input);
+    match name {
+        "read_file" => format!("需要查看 {subject}，确认其中的实现细节。"),
+        "glob_search" | "grep_search" => {
+            format!("需要检索 {subject}，定位相关文件和调用关系。")
+        }
+        "write_file" | "edit_file" => format!("已确认修改方向，开始更新 {subject}。"),
+        "Agent" => format!("需要把「{subject}」交给对应子代理独立处理。"),
+        _ if subject.is_empty() => format!("需要调用 {name} 获取下一步所需信息。"),
+        _ => format!("需要通过 {name} 处理 {subject}。"),
+    }
+}
+
+fn after_tool_conclusion(name: &str, input: &serde_json::Value, is_error: bool) -> String {
+    if is_error {
+        return format!("{name} 调用失败，正在调整后续方案。");
+    }
+    let subject = tool_subject(input);
+    match name {
+        "read_file" => format!("已了解 {subject} 的主要内容，现在继续核对关联实现。"),
+        "glob_search" | "grep_search" => "已取得检索结果，现在继续检查关键文件。".into(),
+        "write_file" | "edit_file" => format!("已完成 {subject} 的修改，现在继续验证结果。"),
+        "Agent" => "子代理任务已有进展，主脑将继续整合返回信息。".into(),
+        _ => format!("已完成 {name}，现在继续下一步。"),
+    }
+}
+
 /// 估算输入 token 数（当 API 不返回 usage 信息时使用）
 ///
 /// 中文通常 1 字 ≈ 1.5 token，英文约 4 字符 ≈ 1 token。
@@ -551,6 +594,7 @@ async fn execute_tool_calls(
                 send_progress(
                     progress_tx,
                     ProgressEvent::ToolDone {
+                        call_id: id.clone(),
                         brain: "main".into(),
                         tool_name: name.clone(),
                         duration_ms: 0,
@@ -616,6 +660,7 @@ async fn execute_tool_calls(
                 send_progress(
                     progress_tx,
                     ProgressEvent::ToolDone {
+                        call_id: id.clone(),
                         brain: "main".into(),
                         tool_name: name.clone(),
                         duration_ms,
@@ -667,6 +712,7 @@ async fn execute_tool_calls(
                     send_progress(
                         progress_tx,
                         ProgressEvent::ToolDone {
+                            call_id: id.clone(),
                             brain: "main".into(),
                             tool_name: name.clone(),
                             duration_ms: 0,
@@ -683,7 +729,16 @@ async fn execute_tool_calls(
             let input_str = serde_json::to_string(input).unwrap_or_default();
             send_progress(
                 progress_tx,
+                ProgressEvent::IntermediateConclusion {
+                    brain: "main".into(),
+                    content: before_tool_conclusion(name, input),
+                },
+            )
+            .await;
+            send_progress(
+                progress_tx,
                 ProgressEvent::ToolStart {
+                    call_id: id.clone(),
                     brain: "main".into(),
                     tool_name: name.clone(),
                     input: input_str,
@@ -726,11 +781,20 @@ async fn execute_tool_calls(
             send_progress(
                 progress_tx,
                 ProgressEvent::ToolDone {
+                    call_id: id.clone(),
                     brain: "main".into(),
                     tool_name: name.clone(),
                     duration_ms,
                     output_preview: result.output.clone(),
                     is_error: result.is_error,
+                },
+            )
+            .await;
+            send_progress(
+                progress_tx,
+                ProgressEvent::IntermediateConclusion {
+                    brain: "main".into(),
+                    content: after_tool_conclusion(name, input, result.is_error),
                 },
             )
             .await;

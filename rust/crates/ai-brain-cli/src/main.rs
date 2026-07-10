@@ -6,6 +6,7 @@ mod llm_usage_logger;
 mod orchestrator;
 mod real_tool_executor;
 mod repl;
+mod runtime_trace;
 mod tui;
 mod web;
 

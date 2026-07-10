@@ -355,6 +355,7 @@ async fn eval_tool_loop(
                 let input_str = serde_json::to_string(&input).unwrap_or_default();
                 if let Some(tx) = progress_tx {
                     let _ = tx.try_send(ProgressEvent::ToolStart {
+                        call_id: id.clone(),
                         brain: "eval".into(),
                         tool_name: name.clone(),
                         input: input_str,
@@ -376,10 +377,11 @@ async fn eval_tool_loop(
                 // 发送 ToolDone 事件
                 if let Some(tx) = progress_tx {
                     let _ = tx.try_send(ProgressEvent::ToolDone {
+                        call_id: id.clone(),
                         brain: "eval".into(),
                         tool_name: name.clone(),
                         duration_ms,
-                        output_preview: result.output.chars().take(500).collect(),
+                        output_preview: result.output.clone(),
                         is_error: result.is_error,
                     });
                 }

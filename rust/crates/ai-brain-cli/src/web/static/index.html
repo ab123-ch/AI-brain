@@ -3,14 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,">
     <title>智脑 AI</title>
     <link rel="stylesheet" href="/style.css">
 </head>
 <body>
     <header id="header">
         <div class="header-left">
-            <button id="sidebar-toggle" class="icon-btn mobile-only">&#9776;</button>
-            <h1>&#129504; 智脑</h1>
+            <button id="sidebar-toggle" class="icon-btn mobile-only" title="打开会话列表" aria-label="打开会话列表"><i data-lucide="menu"></i></button>
+            <h1>智脑</h1>
         </div>
         <div class="header-center">
             <select id="persona-select"><option>加载中...</option></select>
@@ -20,8 +21,8 @@
             </div>
         </div>
         <div class="header-right">
-            <button id="thinking-toggle" class="icon-btn" title="切换思考内容">&#128173;</button>
-            <button id="new-session-btn" class="icon-btn" title="新建会话">+</button>
+            <button id="thinking-toggle" class="icon-btn" title="展开全部思考" aria-label="展开全部思考" aria-pressed="false"><i data-lucide="brain-circuit"></i></button>
+            <button id="new-session-btn" class="icon-btn" title="新建会话" aria-label="新建会话"><i data-lucide="plus"></i></button>
         </div>
     </header>
     <div id="main">
@@ -32,24 +33,111 @@
             <div id="messages"></div>
             <div id="input-area">
                 <textarea id="input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
-                <button id="send-btn">&#10148;</button>
+                <button id="send-btn" title="发送" aria-label="发送"><i data-lucide="send-horizontal"></i></button>
             </div>
         </main>
         <main id="cockpit-area" class="view-panel">
-            <section class="cockpit-header">
-                <div>
+            <section class="cockpit-topbar">
+                <div class="cockpit-title">
                     <h2>智脑驾驶舱</h2>
                     <p id="cockpit-summary">等待任务进入...</p>
                 </div>
-                <button id="cockpit-reset" class="small-btn">清空轨迹</button>
+                <div class="cockpit-actions">
+                    <div id="cockpit-connection" class="connection-pill offline">
+                        <span></span>
+                        <strong>连接中</strong>
+                    </div>
+                    <button id="cockpit-reset" class="small-btn"><i data-lucide="trash-2"></i><span>清空轨迹</span></button>
+                </div>
             </section>
-            <section id="brain-map">
-                <svg id="brain-links" aria-hidden="true"></svg>
-                <div id="brain-nodes"></div>
+
+            <section class="cockpit-metrics" aria-label="驾驶舱指标">
+                <div class="metric-tile">
+                    <span>工作脑区</span>
+                    <strong id="metric-active-brains">0</strong>
+                    <small>active brains</small>
+                </div>
+                <div class="metric-tile">
+                    <span>工具调用</span>
+                    <strong id="metric-tools">0</strong>
+                    <small>tool calls</small>
+                </div>
+                <div class="metric-tile">
+                    <span>记忆注入</span>
+                    <strong id="metric-memory">0</strong>
+                    <small>memory refs</small>
+                </div>
+                <div class="metric-tile">
+                    <span>图谱读取</span>
+                    <strong id="metric-graph-reads">0</strong>
+                    <small>graph reads</small>
+                </div>
+                <div class="metric-tile">
+                    <span>图谱写入</span>
+                    <strong id="metric-graph-writes">0</strong>
+                    <small>graph writes</small>
+                </div>
+                <div class="metric-tile">
+                    <span>异常/重试</span>
+                    <strong id="metric-errors">0</strong>
+                    <small>errors & retries</small>
+                </div>
             </section>
-            <section id="brain-events">
-                <h3>实时事件</h3>
-                <div id="brain-event-list"></div>
+
+            <section class="cockpit-grid">
+                <section class="cockpit-panel cockpit-map-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <h3>脑区拓扑</h3>
+                            <p>主脑、记忆脑、评估脑与子代理的实时工作关系</p>
+                        </div>
+                        <span id="cockpit-runtime">空闲</span>
+                    </div>
+                    <div id="brain-map">
+                        <svg id="brain-links" aria-hidden="true"></svg>
+                        <div id="brain-nodes"></div>
+                    </div>
+                </section>
+
+                <section class="cockpit-panel cockpit-comms-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <h3>通信详情</h3>
+                            <p>完整任务原文、脑区响应与子代理最终结果</p>
+                        </div>
+                    </div>
+                    <div id="communication-list"></div>
+                </section>
+
+                <section class="cockpit-panel cockpit-agents-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <h3>代理状态</h3>
+                            <p>模型连接、人格、会话与工具执行状态</p>
+                        </div>
+                    </div>
+                    <div id="agent-status-list"></div>
+                </section>
+
+                <section class="cockpit-panel cockpit-memory-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <h3>记忆 / 图谱 I/O</h3>
+                            <p>记忆脑召回、知识图谱读取与写入轨迹</p>
+                        </div>
+                    </div>
+                    <div id="memory-graph-list"></div>
+                </section>
+
+                <section class="cockpit-panel cockpit-events-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <h3>实时事件</h3>
+                            <p>最近的运行轨迹和错误提示</p>
+                        </div>
+                    </div>
+                    <div id="brain-event-list"></div>
+                </section>
             </section>
         </main>
     </div>
@@ -59,6 +147,7 @@
             <div id="ask-options"></div>
         </div>
     </div>
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
     <script src="/app.js"></script>

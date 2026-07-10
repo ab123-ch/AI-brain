@@ -140,6 +140,12 @@ impl OutputArea {
                     self.streaming_thinking.push('\n');
                 }
             }
+            ProgressEvent::IntermediateConclusion { brain, content } => {
+                let name = brain_display_name(brain);
+                self.flush_streaming();
+                self.lines
+                    .push(OutputLine::System(format!("{name}: {content}")));
+            }
             ProgressEvent::ToolStart { tool_name, .. } => {
                 self.flush_streaming();
                 self.tool_count += 1;

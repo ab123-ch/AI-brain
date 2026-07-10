@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::llm_usage_logger;
+use crate::runtime_trace::{ExchangeKind, ExchangePhase, ExchangeStatus, RuntimeExchange};
 
 /// 按字符数安全截断 UTF-8 字符串（不会在多字节字符中间切割）
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
@@ -52,7 +53,8 @@ use brain_sensory::SensoryBrain;
 use brain_validation::validation_brain::ValidationConfig;
 use brain_validation::ValidationBrain;
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
+use uuid::Uuid;
 
 // ─── LLM 适配器 ──────────────────────────────────────────────────
 
@@ -229,6 +231,8 @@ pub struct Orchestrator {
     dispatch: brain_dispatch::TokioDispatch,
     /// dispatch_loop 输出通道（主脑消费异步通知）
     dispatch_output_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<brain_dispatch::MainLoopMessage>>>,
+    /// Full runtime exchanges for WebSocket cockpit subscribers.
+    runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
     /// 插件管理器
     #[allow(dead_code)] // Task 8 会使用
     plugin_mgr: Option<PluginManager>,
@@ -400,6 +404,7 @@ impl Orchestrator {
         let dispatch = brain_dispatch::TokioDispatch::new(256);
         let (dispatch_output_tx, dispatch_output_rx) =
             tokio::sync::mpsc::channel::<brain_dispatch::MainLoopMessage>(64);
+        let (runtime_trace_tx, _) = broadcast::channel::<RuntimeExchange>(256);
 
         // 启动 dispatch loop
         {
@@ -416,8 +421,12 @@ impl Orchestrator {
         }
 
         // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册 + dispatch）
-        let (v2_brain, plugin_mgr, skill_catalog, mcp_pool) =
-            create_v2_main_brain(&llm_config, Some(Arc::clone(&memory)), dispatch.clone());
+        let (v2_brain, plugin_mgr, skill_catalog, mcp_pool) = create_v2_main_brain(
+            &llm_config,
+            Some(Arc::clone(&memory)),
+            dispatch.clone(),
+            runtime_trace_tx.clone(),
+        );
 
         // 12.0 评估脑接入统一 SkillCatalog
         if let Some(ref mut eb) = eval_brain {
@@ -627,6 +636,7 @@ impl Orchestrator {
             v2_brain,
             dispatch,
             dispatch_output_rx: Arc::new(Mutex::new(dispatch_output_rx)),
+            runtime_trace_tx,
             plugin_mgr,
             skill_catalog,
             mcp_pool,
@@ -732,6 +742,10 @@ impl Orchestrator {
         Arc::clone(&self.memory_brain)
     }
 
+    pub fn subscribe_runtime_trace(&self) -> broadcast::Receiver<RuntimeExchange> {
+        self.runtime_trace_tx.subscribe()
+    }
+
     /// 恢复会话历史到 MainBrain（Web 重启/会话切换后使用）
     pub async fn restore_session_history(&self, msgs: Vec<ChatMessageRestore>) {
         let mut guard = self.v2_brain.lock().await;
@@ -817,13 +831,74 @@ impl Orchestrator {
                 if let Some(ref mut brain) = *guard {
                     tracing::info!("使用 v2 MainBrain (带工具) 处理查询");
 
-                    // 发送记忆召回提示
-                    let _ = tx
-                        .send(ProgressEvent::MemoryInjected {
-                            count: 0,
-                            preview: "正在检索相关记忆上下文".to_string(),
-                        })
-                        .await;
+                    let memory_exchange_id = format!("memory-{}", Uuid::new_v4());
+                    let _ = this.runtime_trace_tx.send(RuntimeExchange::new(
+                        &memory_exchange_id,
+                        "main",
+                        "主脑",
+                        "memory",
+                        "记忆脑",
+                        ExchangeKind::Memory,
+                        ExchangePhase::Request,
+                        "召回任务相关记忆",
+                        &input_owned,
+                        ExchangeStatus::Running,
+                        None,
+                    ));
+                    let recalled_memories = {
+                        let mem = this.memory_brain.lock().await;
+                        mem.recall_for_context(&input_owned, 3)
+                    };
+                    let memory_context = recalled_memories
+                        .iter()
+                        .map(|entry| entry.content.trim())
+                        .filter(|content| !content.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if memory_context.is_empty() {
+                        let _ = this.runtime_trace_tx.send(RuntimeExchange::new(
+                            &memory_exchange_id,
+                            "memory",
+                            "记忆脑",
+                            "main",
+                            "主脑",
+                            ExchangeKind::Memory,
+                            ExchangePhase::Response,
+                            "未找到相关记忆",
+                            "本次召回没有返回可注入的历史上下文。",
+                            ExchangeStatus::Empty,
+                            None,
+                        ));
+                    } else {
+                        let memory_count = recalled_memories.len();
+                        let preview = truncate_chars(&memory_context, 120).to_string();
+                        let _ = this.runtime_trace_tx.send(RuntimeExchange::new(
+                            &memory_exchange_id,
+                            "memory",
+                            "记忆脑",
+                            "main",
+                            "主脑",
+                            ExchangeKind::Memory,
+                            ExchangePhase::Response,
+                            "返回相关记忆上下文",
+                            &memory_context,
+                            ExchangeStatus::Completed,
+                            None,
+                        ));
+                        brain.push_memory_context(&memory_context);
+                        let _ = tx
+                            .send(ProgressEvent::MemoryInjected {
+                                count: memory_count,
+                                preview,
+                            })
+                            .await;
+                        let _ = tx
+                            .send(ProgressEvent::IntermediateConclusion {
+                                brain: "main".into(),
+                                content: "已了解相关历史上下文，现在继续分析当前任务。".into(),
+                            })
+                            .await;
+                    }
 
                     // --- 1. 主脑首次处理 ---
                     let mut result = brain
@@ -913,7 +988,31 @@ impl Orchestrator {
                                     break;
                                 }
 
+                                let eval_exchange_id = format!("evaluation-{}", Uuid::new_v4());
+                                let _ = this.runtime_trace_tx.send(RuntimeExchange::new(
+                                    &eval_exchange_id,
+                                    "main",
+                                    "主脑",
+                                    "eval",
+                                    "评估脑",
+                                    ExchangeKind::Evaluation,
+                                    ExchangePhase::Request,
+                                    format!("第 {} 次回答评估", attempt + 1),
+                                    format!(
+                                        "用户任务:\n{}\n\n待评估回答:\n{}",
+                                        input_owned, answer
+                                    ),
+                                    ExchangeStatus::Running,
+                                    None,
+                                ));
+                                let _ = tx.send(ProgressEvent::EvaluationStart).await;
                                 let _ = tx.send(ProgressEvent::Evaluating).await;
+                                let _ = tx
+                                    .send(ProgressEvent::IntermediateConclusion {
+                                        brain: "main".into(),
+                                        content: "已形成阶段性回答，正在交给评估脑核验。".into(),
+                                    })
+                                    .await;
 
                                 match eb
                                     .evaluate(
@@ -927,6 +1026,27 @@ impl Orchestrator {
                                     .await
                                 {
                                     Ok(eval_result) => {
+                                        let _ = this.runtime_trace_tx.send(RuntimeExchange::new(
+                                            &eval_exchange_id,
+                                            "eval",
+                                            "评估脑",
+                                            "main",
+                                            "主脑",
+                                            ExchangeKind::Evaluation,
+                                            ExchangePhase::Response,
+                                            if eval_result.passed {
+                                                "评估通过"
+                                            } else {
+                                                "评估反馈"
+                                            },
+                                            &eval_result.feedback,
+                                            if eval_result.passed {
+                                                ExchangeStatus::Completed
+                                            } else {
+                                                ExchangeStatus::Failed
+                                            },
+                                            None,
+                                        ));
                                         tracing::info!(
                                             "v2 评估脑完成(第{}次): passed={}, feedback={}",
                                             attempt + 1,
@@ -937,6 +1057,17 @@ impl Orchestrator {
                                             .send(ProgressEvent::EvaluationResult {
                                                 passed: eval_result.passed,
                                                 feedback: eval_result.feedback.clone(),
+                                            })
+                                            .await;
+                                        let _ = tx
+                                            .send(ProgressEvent::IntermediateConclusion {
+                                                brain: "main".into(),
+                                                content: if eval_result.passed {
+                                                    "评估已通过，正在整理最终回复。".into()
+                                                } else {
+                                                    "评估发现需要调整的内容，主脑将继续修正。"
+                                                        .into()
+                                                },
                                             })
                                             .await;
 
@@ -1036,6 +1167,19 @@ impl Orchestrator {
                                         }
                                     }
                                     Err(e) => {
+                                        let _ = this.runtime_trace_tx.send(RuntimeExchange::new(
+                                            &eval_exchange_id,
+                                            "eval",
+                                            "评估脑",
+                                            "main",
+                                            "主脑",
+                                            ExchangeKind::Evaluation,
+                                            ExchangePhase::Response,
+                                            "评估执行失败",
+                                            e.to_string(),
+                                            ExchangeStatus::Failed,
+                                            None,
+                                        ));
                                         tracing::warn!("v2 评估脑评估失败: {e}");
                                         break;
                                     }
@@ -2132,6 +2276,7 @@ fn create_v2_main_brain(
     llm_config: &LlmConfig,
     memory_brain: Option<Arc<Mutex<PyramidMemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
+    runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
 ) -> (
     Arc<Mutex<Option<MainBrain>>>,
     Option<PluginManager>,
@@ -2217,7 +2362,8 @@ fn create_v2_main_brain(
     let tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
         crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch)
             .with_skill_catalog(skill_catalog.clone())
-            .with_mcp_pool(mcp_pool.clone()),
+            .with_mcp_pool(mcp_pool.clone())
+            .with_runtime_trace_sender(runtime_trace_tx),
     );
 
     let brain_config = BrainConfig::default();

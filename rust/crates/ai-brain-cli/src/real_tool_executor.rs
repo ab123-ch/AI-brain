@@ -11,6 +11,9 @@ use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
 use brain_plugin::SkillCatalog;
+use uuid::Uuid;
+
+use crate::runtime_trace::{ExchangeKind, ExchangePhase, ExchangeStatus, RuntimeExchange};
 
 /// Production tool executor that delegates to `tools::execute_tool` for built-in tools
 /// and handles `search_memory` directly via PyramidMemoryBrain.
@@ -25,6 +28,8 @@ pub struct RealToolExecutor {
     skill_catalog: Option<Arc<SkillCatalog>>,
     /// MCP client pool for external tool routing (mcp__server__tool)
     mcp_pool: Option<Arc<McpClientPool>>,
+    /// Live brain/sub-agent exchanges consumed by WebSocket clients.
+    runtime_trace_tx: Option<tokio::sync::broadcast::Sender<RuntimeExchange>>,
 }
 
 impl RealToolExecutor {
@@ -50,6 +55,7 @@ impl RealToolExecutor {
             dispatch: None,
             skill_catalog: None,
             mcp_pool: None,
+            runtime_trace_tx: None,
         }
     }
 
@@ -81,6 +87,14 @@ impl RealToolExecutor {
         self.mcp_pool = Some(pool);
         self
     }
+
+    pub fn with_runtime_trace_sender(
+        mut self,
+        sender: tokio::sync::broadcast::Sender<RuntimeExchange>,
+    ) -> Self {
+        self.runtime_trace_tx = Some(sender);
+        self
+    }
 }
 
 impl Default for RealToolExecutor {
@@ -90,8 +104,9 @@ impl Default for RealToolExecutor {
 }
 
 fn spawn_agent_completion_notifier(
-    dispatch: brain_dispatch::TokioDispatch,
+    dispatch: Option<brain_dispatch::TokioDispatch>,
     completion_rx: std::sync::mpsc::Receiver<tools::AgentCompletion>,
+    trace: Option<AgentTracePublisher>,
 ) {
     std::thread::spawn(move || {
         let Ok(completion) = completion_rx.recv() else {
@@ -103,15 +118,141 @@ fn spawn_agent_completion_notifier(
             "failed" => brain_dispatch::AgentStatus::Failed,
             _ => brain_dispatch::AgentStatus::Running,
         };
-        dispatch.inject_sync(
-            completion.agent_id,
-            completion.name,
-            status,
-            completion.output,
-            completion.error,
-            completion.duration_ms,
-        );
+        if let Some(trace) = trace {
+            trace.publish_response(
+                &completion.agent_id,
+                &completion.name,
+                &completion.status,
+                &completion.output,
+                completion.error.as_deref(),
+                completion.duration_ms,
+            );
+        }
+        if let Some(dispatch) = dispatch {
+            dispatch.inject_sync(
+                completion.agent_id,
+                completion.name,
+                status,
+                completion.output,
+                completion.error,
+                completion.duration_ms,
+            );
+        }
     });
+}
+
+#[derive(Debug, Clone)]
+struct AgentTraceRequest {
+    description: String,
+    prompt: String,
+    subagent_type: String,
+    requested_name: Option<String>,
+}
+
+impl AgentTraceRequest {
+    fn from_input(input: &serde_json::Value) -> Self {
+        Self {
+            description: input
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("子代理任务")
+                .to_string(),
+            prompt: input
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            subagent_type: input
+                .get("subagent_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("general-purpose")
+                .to_string(),
+            requested_name: input
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AgentTracePublisher {
+    sender: tokio::sync::broadcast::Sender<RuntimeExchange>,
+    request: AgentTraceRequest,
+    exchange_id: String,
+}
+
+impl AgentTracePublisher {
+    fn participant(&self, actual_name: &str) -> (String, String) {
+        let is_novel = self.request.subagent_type.eq_ignore_ascii_case("novel")
+            || self.request.subagent_type.contains("小说");
+        let prefix = if is_novel { "novel" } else { "agent" };
+        let role = if is_novel { "小说脑" } else { "子代理" };
+        let name = if actual_name.trim().is_empty() {
+            self.request
+                .requested_name
+                .as_deref()
+                .unwrap_or(&self.request.subagent_type)
+        } else {
+            actual_name
+        };
+        (
+            format!("{prefix}:{}", self.exchange_id),
+            format!("{role} · {name}"),
+        )
+    }
+
+    fn publish_request(&self) {
+        let (participant, label) = self.participant("");
+        let _ = self.sender.send(RuntimeExchange::new(
+            &self.exchange_id,
+            "main",
+            "主脑",
+            participant,
+            label,
+            ExchangeKind::Delegation,
+            ExchangePhase::Request,
+            &self.request.description,
+            &self.request.prompt,
+            ExchangeStatus::Running,
+            None,
+        ));
+    }
+
+    fn publish_response(
+        &self,
+        _agent_id: &str,
+        actual_name: &str,
+        status: &str,
+        output: &str,
+        error: Option<&str>,
+        duration_ms: u64,
+    ) {
+        let (participant, label) = self.participant(actual_name);
+        let failed = status.eq_ignore_ascii_case("failed") || error.is_some();
+        let content = if output.is_empty() {
+            error.unwrap_or("子代理未返回正文")
+        } else {
+            output
+        };
+        let _ = self.sender.send(RuntimeExchange::new(
+            &self.exchange_id,
+            participant,
+            label,
+            "main",
+            "主脑",
+            ExchangeKind::Delegation,
+            ExchangePhase::Response,
+            format!("{} · 最终结果", self.request.description),
+            content,
+            if failed {
+                ExchangeStatus::Failed
+            } else {
+                ExchangeStatus::Completed
+            },
+            Some(duration_ms),
+        ));
+    }
 }
 
 impl ToolExecutor for RealToolExecutor {
@@ -324,8 +465,19 @@ impl ToolExecutor for RealToolExecutor {
 
         if name == "Agent" {
             let dispatch = self.dispatch.clone();
+            let trace = self
+                .runtime_trace_tx
+                .clone()
+                .map(|sender| AgentTracePublisher {
+                    sender,
+                    request: AgentTraceRequest::from_input(&input),
+                    exchange_id: format!("delegation-{}", Uuid::new_v4()),
+                });
             return Box::pin(async move {
                 let start = std::time::Instant::now();
+                if let Some(trace) = &trace {
+                    trace.publish_request();
+                }
                 let result = tokio::task::spawn_blocking(move || {
                     tools::execute_agent_tool_with_completion(&input)
                 })
@@ -334,24 +486,65 @@ impl ToolExecutor for RealToolExecutor {
 
                 match result {
                     Ok(launch) => {
-                        if let (Some(dispatch), Some(completion_rx)) =
-                            (dispatch, launch.completion_rx)
-                        {
-                            spawn_agent_completion_notifier(dispatch, completion_rx);
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let manifest =
+                            serde_json::from_str::<serde_json::Value>(&launch.output_json)
+                                .unwrap_or(serde_json::Value::Null);
+                        let agent_id = manifest
+                            .get("agentId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown-agent");
+                        let agent_name = manifest
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(completion_rx) = launch.completion_rx {
+                            spawn_agent_completion_notifier(dispatch, completion_rx, trace);
+                        } else if let Some(trace) = &trace {
+                            let status = manifest
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("completed");
+                            let output = manifest
+                                .get("result")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            let error = manifest.get("error").and_then(serde_json::Value::as_str);
+                            trace.publish_response(
+                                agent_id,
+                                agent_name,
+                                status,
+                                output,
+                                error,
+                                duration_ms,
+                            );
                         }
                         ToolExecutionResult {
                             tool_name: tool_name_owned,
                             output: launch.output_json,
                             is_error: false,
-                            duration_ms: start.elapsed().as_millis() as u64,
+                            duration_ms,
                         }
                     }
-                    Err(e) => ToolExecutionResult {
-                        tool_name: tool_name_owned,
-                        output: e,
-                        is_error: true,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    },
+                    Err(e) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        if let Some(trace) = &trace {
+                            trace.publish_response(
+                                "unknown-agent",
+                                "",
+                                "failed",
+                                "",
+                                Some(&e),
+                                duration_ms,
+                            );
+                        }
+                        ToolExecutionResult {
+                            tool_name: tool_name_owned,
+                            output: e,
+                            is_error: true,
+                            duration_ms,
+                        }
+                    }
                 }
             });
         }
@@ -451,6 +644,40 @@ mod tests {
         assert!(!defs.is_empty());
     }
 
+    #[test]
+    fn agent_trace_pairs_full_request_and_response() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+        let trace = AgentTracePublisher {
+            sender,
+            request: AgentTraceRequest {
+                description: "续写第三章".into(),
+                prompt: "这是交给小说脑的完整任务正文".into(),
+                subagent_type: "Novel".into(),
+                requested_name: Some("chapter-writer".into()),
+            },
+            exchange_id: "delegation-test".into(),
+        };
+
+        trace.publish_request();
+        trace.publish_response(
+            "agent-1",
+            "chapter-writer",
+            "completed",
+            "这是小说脑返回的完整最终结果",
+            None,
+            42,
+        );
+
+        let request = receiver.try_recv().unwrap();
+        let response = receiver.try_recv().unwrap();
+        assert_eq!(request.exchange_id, response.exchange_id);
+        assert_eq!(request.content, "这是交给小说脑的完整任务正文");
+        assert_eq!(response.content, "这是小说脑返回的完整最终结果");
+        assert_eq!(request.phase, ExchangePhase::Request);
+        assert_eq!(response.phase, ExchangePhase::Response);
+        assert!(request.receiver.starts_with("novel:"));
+    }
+
     #[tokio::test]
     async fn agent_completion_notifier_waits_for_real_completion() {
         let dispatch = brain_dispatch::TokioDispatch::new(8);
@@ -463,7 +690,7 @@ mod tests {
         };
 
         let (completion_tx, completion_rx) = std::sync::mpsc::channel();
-        spawn_agent_completion_notifier(dispatch.clone(), completion_rx);
+        spawn_agent_completion_notifier(Some(dispatch.clone()), completion_rx, None);
 
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), output_rx.recv())
