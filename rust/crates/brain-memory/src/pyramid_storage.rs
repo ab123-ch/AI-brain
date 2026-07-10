@@ -38,6 +38,11 @@ impl PyramidStorage {
         &self.persona_id
     }
 
+    /// 获取存储根目录
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
     // === 金字塔根目录 ===
 
     /// 人格金字塔根目录: `personas/{persona_id}/pyramid/`

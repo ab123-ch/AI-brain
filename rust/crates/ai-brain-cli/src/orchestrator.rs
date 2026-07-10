@@ -599,9 +599,11 @@ impl Orchestrator {
             let llm = Self::create_analyzer_llm_with_config(&llm_config);
             drop(tokio::spawn(async move {
                 if let Some(llm) = llm {
+                    let graph_db_path = Some(base_for_analysis.join("graph").join("graph.db"));
                     let config = PyramidMemoryBrainConfig {
                         base_dir: base_for_analysis,
                         session_id: sess_id,
+                        graph_db_path,
                     };
                     if let Ok(brain) = PyramidMemoryBrain::new(config) {
                         let report = brain.concentrate(&llm).await;
@@ -1942,9 +1944,11 @@ impl Orchestrator {
                 .and_then(|c| Self::create_analyzer_llm_with_config(&c));
             let _ = tokio::spawn(async move {
                 if let Some(llm) = llm {
+                    let graph_db_path = Some(base_dir.join("graph").join("graph.db"));
                     let config = PyramidMemoryBrainConfig {
                         base_dir,
                         session_id,
+                        graph_db_path,
                     };
                     if let Ok(brain) = PyramidMemoryBrain::new(config) {
                         let report = brain.concentrate(&llm).await;
@@ -2005,9 +2009,11 @@ impl Orchestrator {
             .and_then(|c| Self::create_analyzer_llm_with_config(&c));
         if let Some(llm) = llm {
             tracing::info!("正在执行四步浓缩（关闭时强制触发）...");
+            let graph_db_path = Some(base_dir.join("graph").join("graph.db"));
             let config = PyramidMemoryBrainConfig {
                 base_dir,
                 session_id,
+                graph_db_path,
             };
             if let Ok(brain) = PyramidMemoryBrain::new(config) {
                 let report = brain.concentrate(&llm).await;

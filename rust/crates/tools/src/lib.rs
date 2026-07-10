@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,6 +8,11 @@ use api::{
     max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
+};
+use brain_graph::{
+    id::gen_node_id,
+    schema::{Edge, EdgeKind, GraphType, Node, NodeKind, TraceDirection},
+    store::{CatalogQuery, GraphStore, TraceQuery},
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -717,6 +722,154 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             }),
             required_permission: PermissionMode::ReadOnly,
         },
+        ToolSpec {
+            name: "graph_search_catalog",
+            description: "Search the native knowledge graph catalog with low context cost. Returns node IDs, titles, types, matched keywords, scores, and hints only.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional path to the SQLite graph database file. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "query": { "type": "string", "description": "Keyword query. Multiple words may be separated by spaces." },
+                    "graph_type": { "type": "string", "enum": ["Memory", "Code", "Novel", "Video"], "default": "Memory" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "graph_get_node_detail",
+            description: "Load one native knowledge graph node with compact upstream/downstream neighbors and unresolved source refs.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional path to the SQLite graph database file. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "node_id": { "type": "string" }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "graph_trace_memory",
+            description: "Trace relationships from one native knowledge graph node using upstream, downstream, or both directions with depth and result limits.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional path to the SQLite graph database file. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "root_id": { "type": "string" },
+                    "direction": { "type": "string", "enum": ["upstream", "downstream", "both"], "default": "both" },
+                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                },
+                "required": ["root_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "graph_list_domains",
+            description: "List active native knowledge graph domains with node counts, edge counts, and last update timestamps.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional path to the SQLite graph database file. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "graph_add_memory",
+            description: "Add or update a catalog-facing memory node in the native knowledge graph. Use for concise summaries and references, not full raw transcript text.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional graph DB path. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "title": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "keywords": { "type": "array", "items": { "type": "string" } },
+                    "catalog_type": { "type": "string", "default": "memory" },
+                    "importance": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.7 },
+                    "source_refs": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "graph_add_concept",
+            description: "Add or update a concept node in the native knowledge graph.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional graph DB path. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "name": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "graph_type": { "type": "string", "enum": ["Memory", "Code", "Novel", "Video"], "default": "Memory" },
+                    "aliases": { "type": "array", "items": { "type": "string" } },
+                    "importance": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.7 }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "graph_add_code_node",
+            description: "Add or update a code node in the native knowledge graph for a file, module, function, class, or symbol.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional graph DB path. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "path": { "type": "string" },
+                    "symbol": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "code_kind": { "type": "string", "description": "file, module, function, class, variable, etc." },
+                    "importance": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.7 }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "graph_index_code_workspace",
+            description: "Index Rust source files in a workspace into the native Code graph with stable file/module nodes and Contains edges.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional graph DB path. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "root": { "type": "string", "description": "Workspace root to scan. Defaults to the current directory." },
+                    "max_files": { "type": "integer", "minimum": 1, "maximum": 5000, "default": 1000 }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "graph_link_nodes",
+            description: "Link two existing native knowledge graph nodes with a typed edge. Both nodes must exist and share the same graph_type.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db_path": { "type": "string", "description": "Optional graph DB path. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
+                    "src": { "type": "string" },
+                    "dst": { "type": "string" },
+                    "edge_kind": { "type": "string", "enum": ["MentionedIn", "RelatedTo", "SimilarTo", "CausedBy", "DependsOn", "DerivedFrom", "Calls", "Contains", "Imports", "Defines", "Invokes"] },
+                    "weight": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.7 },
+                    "props": { "type": "object" }
+                },
+                "required": ["src", "dst", "edge_kind"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
     ]
 }
 
@@ -758,6 +911,32 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
+        }
+        "graph_search_catalog" => {
+            from_value::<GraphSearchCatalogInput>(input).and_then(run_graph_search_catalog)
+        }
+        "graph_get_node_detail" => {
+            from_value::<GraphGetNodeDetailInput>(input).and_then(run_graph_get_node_detail)
+        }
+        "graph_trace_memory" => {
+            from_value::<GraphTraceMemoryInput>(input).and_then(run_graph_trace_memory)
+        }
+        "graph_list_domains" => {
+            from_value::<GraphListDomainsInput>(input).and_then(run_graph_list_domains)
+        }
+        "graph_add_memory" => {
+            from_value::<GraphAddMemoryInput>(input).and_then(run_graph_add_memory)
+        }
+        "graph_add_concept" => {
+            from_value::<GraphAddConceptInput>(input).and_then(run_graph_add_concept)
+        }
+        "graph_add_code_node" => {
+            from_value::<GraphAddCodeNodeInput>(input).and_then(run_graph_add_code_node)
+        }
+        "graph_index_code_workspace" => from_value::<GraphIndexCodeWorkspaceInput>(input)
+            .and_then(run_graph_index_code_workspace),
+        "graph_link_nodes" => {
+            from_value::<GraphLinkNodesInput>(input).and_then(run_graph_link_nodes)
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -845,6 +1024,658 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
         "action": input.action,
         "permitted": true,
         "message": "Testing permission tool stub"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_search_catalog(input: GraphSearchCatalogInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    let mut query = CatalogQuery::new(split_keywords(&input.query));
+    query.graph_type = input
+        .graph_type
+        .as_deref()
+        .map(parse_graph_type)
+        .transpose()?
+        .or(Some(GraphType::Memory));
+    query.limit = input.limit.unwrap_or(10).min(50);
+    to_pretty_json(
+        store
+            .search_catalog(&query)
+            .map_err(|error| error.to_string())?,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_get_node_detail(input: GraphGetNodeDetailInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    to_pretty_json(
+        store
+            .get_node_detail(&input.node_id)
+            .map_err(|error| error.to_string())?,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_trace_memory(input: GraphTraceMemoryInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    let mut query = TraceQuery::new(input.root_id);
+    query.direction = input
+        .direction
+        .as_deref()
+        .map(parse_trace_direction)
+        .transpose()?
+        .unwrap_or(TraceDirection::Both);
+    query.max_depth = input.max_depth.unwrap_or(2).min(10);
+    query.limit = input.limit.unwrap_or(20).min(100);
+    to_pretty_json(
+        store
+            .trace_memory(&query)
+            .map_err(|error| error.to_string())?,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_list_domains(input: GraphListDomainsInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    to_pretty_json(store.list_domains().map_err(|error| error.to_string())?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_add_memory(input: GraphAddMemoryInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    let title = required_non_empty("title", &input.title)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut props = HashMap::from([
+        ("layer".into(), json!("catalog_entry")),
+        ("catalog_title".into(), json!(title)),
+        (
+            "catalog_type".into(),
+            json!(input.catalog_type.unwrap_or_else(|| "memory".to_string())),
+        ),
+    ]);
+    if let Some(summary) = optional_non_empty(input.summary) {
+        props.insert("summary".into(), json!(summary));
+    }
+    if let Some(keywords) = clean_string_list(input.keywords) {
+        props.insert("catalog_keywords".into(), json!(keywords));
+    }
+    if let Some(refs) = input.source_refs.filter(|refs| !refs.is_empty()) {
+        props.insert("source_refs".into(), json!(refs));
+    }
+    let node = Node {
+        id: gen_node_id(GraphType::Memory, NodeKind::Memory),
+        kind: NodeKind::Memory,
+        graph_type: GraphType::Memory,
+        props,
+        importance: bounded_score(input.importance.unwrap_or(0.7), "importance")?,
+        created_at: now,
+        last_accessed: now,
+        superseded: false,
+    };
+    store
+        .upsert_node(&node)
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "status": "ok",
+        "node_id": node.id,
+        "node": node
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_add_concept(input: GraphAddConceptInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    let name = required_non_empty("name", &input.name)?;
+    let graph_type = input
+        .graph_type
+        .as_deref()
+        .map(parse_graph_type)
+        .transpose()?
+        .unwrap_or(GraphType::Memory);
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut props = HashMap::from([
+        ("name".into(), json!(name)),
+        ("catalog_title".into(), json!(name)),
+        ("catalog_type".into(), json!("concept")),
+    ]);
+    if let Some(summary) = optional_non_empty(input.summary) {
+        props.insert("summary".into(), json!(summary));
+    }
+    if let Some(aliases) = clean_string_list(input.aliases) {
+        props.insert("aliases".into(), json!(aliases));
+    }
+    let node = Node {
+        id: gen_node_id(graph_type.clone(), NodeKind::Concept),
+        kind: NodeKind::Concept,
+        graph_type,
+        props,
+        importance: bounded_score(input.importance.unwrap_or(0.7), "importance")?,
+        created_at: now,
+        last_accessed: now,
+        superseded: false,
+    };
+    store
+        .upsert_node(&node)
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "status": "ok",
+        "node_id": node.id,
+        "node": node
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_add_code_node(input: GraphAddCodeNodeInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    let path = required_non_empty("path", &input.path)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let title = input
+        .symbol
+        .as_deref()
+        .filter(|symbol| !symbol.trim().is_empty())
+        .map_or_else(|| path.to_string(), |symbol| format!("{path}::{symbol}"));
+    let mut props = HashMap::from([
+        ("path".into(), json!(path)),
+        ("catalog_title".into(), json!(title)),
+        ("catalog_type".into(), json!("code")),
+    ]);
+    if let Some(symbol) = optional_non_empty(input.symbol) {
+        props.insert("symbol".into(), json!(symbol));
+    }
+    if let Some(summary) = optional_non_empty(input.summary) {
+        props.insert("summary".into(), json!(summary));
+    }
+    if let Some(code_kind) = optional_non_empty(input.code_kind) {
+        props.insert("code_kind".into(), json!(code_kind));
+    }
+    let node = Node {
+        id: gen_node_id(GraphType::Code, NodeKind::Code),
+        kind: NodeKind::Code,
+        graph_type: GraphType::Code,
+        props,
+        importance: bounded_score(input.importance.unwrap_or(0.7), "importance")?,
+        created_at: now,
+        last_accessed: now,
+        superseded: false,
+    };
+    store
+        .upsert_node(&node)
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "status": "ok",
+        "node_id": node.id,
+        "node": node
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_index_code_workspace(input: GraphIndexCodeWorkspaceInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let root = input
+        .root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let root = fs::canonicalize(&root).map_err(|error| {
+        format!(
+            "cannot resolve code workspace root `{}`: {error}",
+            root.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "code workspace root is not a directory: {}",
+            root.display()
+        ));
+    }
+
+    let max_files = input.max_files.unwrap_or(1000).min(5000);
+    let mut files = Vec::new();
+    collect_rust_files(&root, &mut files, max_files)?;
+    files.sort();
+
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut indexed_modules = BTreeSet::new();
+    let mut indexed_edges = BTreeSet::new();
+    let mut symbols_indexed = 0usize;
+
+    upsert_code_module_node(&store, "", now)?;
+    indexed_modules.insert(String::new());
+
+    for file in &files {
+        let rel = relative_slash_path(&root, file)?;
+        let module_rel = file
+            .parent()
+            .and_then(|parent| parent.strip_prefix(&root).ok())
+            .map(path_to_slash)
+            .unwrap_or_default();
+        ensure_code_module_path(
+            &store,
+            &module_rel,
+            now,
+            &mut indexed_modules,
+            &mut indexed_edges,
+        )?;
+        upsert_code_file_node(&store, &rel, now)?;
+
+        let module_id = stable_code_module_node_id(&module_rel);
+        let file_id = stable_code_file_node_id(&rel);
+        insert_code_contains_edge(&store, &module_id, &file_id, now)?;
+        indexed_edges.insert((module_id, file_id.clone(), "Contains".to_string()));
+
+        let source = fs::read_to_string(file)
+            .map_err(|error| format!("cannot read source file `{}`: {error}", file.display()))?;
+        for symbol in parse_rust_symbols(&source) {
+            upsert_code_symbol_node(&store, &rel, &symbol, now)?;
+            let symbol_id = stable_code_symbol_node_id(&rel, &symbol.kind, &symbol.name);
+            insert_code_defines_edge(&store, &file_id, &symbol_id, now)?;
+            indexed_edges.insert((file_id.clone(), symbol_id, "Defines".to_string()));
+            symbols_indexed += 1;
+        }
+    }
+
+    to_pretty_json(json!({
+        "status": "ok",
+        "db_path": db_path,
+        "root": root,
+        "files_indexed": files.len(),
+        "modules_indexed": indexed_modules.len(),
+        "symbols_indexed": symbols_indexed,
+        "edges_indexed": indexed_edges.len(),
+        "truncated": files.len() >= max_files,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustSymbol {
+    kind: String,
+    name: String,
+    line: usize,
+}
+
+fn parse_rust_symbols(source: &str) -> Vec<RustSymbol> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            parse_rust_symbol_line(line).map(|mut symbol| {
+                symbol.line = idx + 1;
+                symbol
+            })
+        })
+        .collect()
+}
+
+fn parse_rust_symbol_line(line: &str) -> Option<RustSymbol> {
+    let line = line.split("//").next().unwrap_or_default().trim();
+    if line.is_empty() || line.starts_with('#') || line.starts_with("use ") {
+        return None;
+    }
+
+    let mut tokens = line.split_whitespace().collect::<Vec<_>>();
+    while tokens.first().is_some_and(|token| {
+        token.starts_with("pub") || matches!(*token, "async" | "unsafe" | "const")
+    }) {
+        tokens.remove(0);
+    }
+    let first = *tokens.first()?;
+
+    match first {
+        "fn" => symbol_after_keyword(&tokens, "function"),
+        "struct" => symbol_after_keyword(&tokens, "struct"),
+        "enum" => symbol_after_keyword(&tokens, "enum"),
+        "trait" => symbol_after_keyword(&tokens, "trait"),
+        "mod" => symbol_after_keyword(&tokens, "module"),
+        "impl" => parse_impl_symbol(&tokens),
+        _ => None,
+    }
+}
+
+fn symbol_after_keyword(tokens: &[&str], kind: &str) -> Option<RustSymbol> {
+    let raw_name = tokens.get(1)?;
+    let name = clean_rust_identifier(raw_name)?;
+    Some(RustSymbol {
+        kind: kind.to_string(),
+        name,
+        line: 0,
+    })
+}
+
+fn parse_impl_symbol(tokens: &[&str]) -> Option<RustSymbol> {
+    let after_impl = tokens.get(1..)?;
+    let name = if let Some(for_idx) = after_impl.iter().position(|token| *token == "for") {
+        clean_rust_identifier(after_impl.get(for_idx + 1)?)?
+    } else {
+        clean_rust_identifier(after_impl.first()?)?
+    };
+    Some(RustSymbol {
+        kind: "impl".to_string(),
+        name,
+        line: 0,
+    })
+}
+
+fn clean_rust_identifier(value: &str) -> Option<String> {
+    let value = value.trim_start_matches("r#");
+    let ident = value
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
+}
+
+fn collect_rust_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    max_files: usize,
+) -> Result<(), String> {
+    if files.len() >= max_files {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| format!("cannot read directory `{}`: {error}", root.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        if files.len() >= max_files {
+            break;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            if should_skip_code_index_dir(&path) {
+                continue;
+            }
+            collect_rust_files(&path, files, max_files)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_code_index_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == "target" || name == "node_modules" || name == ".git" || name.starts_with('.')
+}
+
+fn ensure_code_module_path(
+    store: &GraphStore,
+    module_rel: &str,
+    now: i64,
+    indexed_modules: &mut BTreeSet<String>,
+    indexed_edges: &mut BTreeSet<(String, String, String)>,
+) -> Result<(), String> {
+    let mut current = String::new();
+    let mut parent = String::new();
+    for part in module_rel.split('/').filter(|part| !part.is_empty()) {
+        current = if current.is_empty() {
+            part.to_string()
+        } else {
+            format!("{current}/{part}")
+        };
+        if indexed_modules.insert(current.clone()) {
+            upsert_code_module_node(store, &current, now)?;
+        }
+        let parent_id = stable_code_module_node_id(&parent);
+        let child_id = stable_code_module_node_id(&current);
+        insert_code_contains_edge(store, &parent_id, &child_id, now)?;
+        indexed_edges.insert((parent_id, child_id, "Contains".to_string()));
+        parent = current.clone();
+    }
+    Ok(())
+}
+
+fn upsert_code_module_node(store: &GraphStore, module_rel: &str, now: i64) -> Result<(), String> {
+    let title = if module_rel.is_empty() {
+        "workspace".to_string()
+    } else {
+        format!("module:{module_rel}")
+    };
+    let keywords = if module_rel.is_empty() {
+        vec![
+            "workspace".to_string(),
+            "rust".to_string(),
+            "module".to_string(),
+        ]
+    } else {
+        vec![
+            module_rel.to_string(),
+            module_rel
+                .rsplit('/')
+                .next()
+                .unwrap_or(module_rel)
+                .to_string(),
+            "rust".to_string(),
+            "module".to_string(),
+        ]
+    };
+    let node = Node {
+        id: stable_code_module_node_id(module_rel),
+        kind: NodeKind::Code,
+        graph_type: GraphType::Code,
+        props: HashMap::from([
+            ("path".into(), json!(module_rel)),
+            ("catalog_title".into(), json!(title)),
+            ("catalog_keywords".into(), json!(keywords)),
+            ("catalog_type".into(), json!("code_module")),
+            ("code_kind".into(), json!("module")),
+        ]),
+        importance: if module_rel.is_empty() { 0.8 } else { 0.6 },
+        created_at: now,
+        last_accessed: now,
+        superseded: false,
+    };
+    store.upsert_node(&node).map_err(|error| error.to_string())
+}
+
+fn upsert_code_file_node(store: &GraphStore, rel: &str, now: i64) -> Result<(), String> {
+    let file_name = Path::new(rel)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(rel);
+    let stem = Path::new(rel)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file_name);
+    let node = Node {
+        id: stable_code_file_node_id(rel),
+        kind: NodeKind::Code,
+        graph_type: GraphType::Code,
+        props: HashMap::from([
+            ("path".into(), json!(rel)),
+            ("catalog_title".into(), json!(rel)),
+            (
+                "catalog_keywords".into(),
+                json!(vec![
+                    rel.to_string(),
+                    file_name.to_string(),
+                    stem.to_string(),
+                    "rust".to_string(),
+                    "file".to_string(),
+                ]),
+            ),
+            ("catalog_type".into(), json!("code_file")),
+            ("code_kind".into(), json!("file")),
+        ]),
+        importance: 0.7,
+        created_at: now,
+        last_accessed: now,
+        superseded: false,
+    };
+    store.upsert_node(&node).map_err(|error| error.to_string())
+}
+
+fn upsert_code_symbol_node(
+    store: &GraphStore,
+    rel: &str,
+    symbol: &RustSymbol,
+    now: i64,
+) -> Result<(), String> {
+    let title = format!("{rel}::{}", symbol.name);
+    let node = Node {
+        id: stable_code_symbol_node_id(rel, &symbol.kind, &symbol.name),
+        kind: NodeKind::Code,
+        graph_type: GraphType::Code,
+        props: HashMap::from([
+            ("path".into(), json!(rel)),
+            ("symbol".into(), json!(&symbol.name)),
+            ("line".into(), json!(symbol.line)),
+            ("catalog_title".into(), json!(title)),
+            (
+                "catalog_keywords".into(),
+                json!(vec![
+                    rel.to_string(),
+                    symbol.name.clone(),
+                    symbol.kind.clone(),
+                    "rust".to_string(),
+                    "symbol".to_string(),
+                ]),
+            ),
+            ("catalog_type".into(), json!("code_symbol")),
+            ("code_kind".into(), json!(&symbol.kind)),
+        ]),
+        importance: 0.75,
+        created_at: now,
+        last_accessed: now,
+        superseded: false,
+    };
+    store.upsert_node(&node).map_err(|error| error.to_string())
+}
+
+fn insert_code_contains_edge(
+    store: &GraphStore,
+    src: &str,
+    dst: &str,
+    now: i64,
+) -> Result<(), String> {
+    store
+        .insert_edge(&Edge {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            kind: EdgeKind::Contains,
+            props: HashMap::from([("reason".into(), json!("code_workspace_index"))]),
+            created_at: now,
+            weight: 0.8,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn insert_code_defines_edge(
+    store: &GraphStore,
+    src: &str,
+    dst: &str,
+    now: i64,
+) -> Result<(), String> {
+    store
+        .insert_edge(&Edge {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            kind: EdgeKind::Defines,
+            props: HashMap::from([("reason".into(), json!("rust_symbol_index"))]),
+            created_at: now,
+            weight: 0.8,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn relative_slash_path(root: &Path, path: &Path) -> Result<String, String> {
+    path.strip_prefix(root)
+        .map(path_to_slash)
+        .map_err(|error| error.to_string())
+}
+
+fn path_to_slash(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn stable_code_module_node_id(module_rel: &str) -> String {
+    stable_code_node_id("module", module_rel)
+}
+
+fn stable_code_file_node_id(rel: &str) -> String {
+    stable_code_node_id("file", rel)
+}
+
+fn stable_code_symbol_node_id(rel: &str, kind: &str, name: &str) -> String {
+    stable_code_node_id("symbol", &format!("{rel}_{kind}_{name}"))
+}
+
+fn stable_code_node_id(kind: &str, value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let stable = sanitized.trim_matches('_');
+    let suffix = if stable.is_empty() { "root" } else { stable };
+    format!("code_code_{kind}_{suffix}")
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_graph_link_nodes(input: GraphLinkNodesInput) -> Result<String, String> {
+    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+    let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
+    let src = required_non_empty("src", &input.src)?;
+    let dst = required_non_empty("dst", &input.dst)?;
+    let src_node = store
+        .get_node(src)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("source node not found: {src}"))?;
+    let dst_node = store
+        .get_node(dst)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("destination node not found: {dst}"))?;
+    if src_node.graph_type != dst_node.graph_type {
+        return Err(format!(
+            "graph_type mismatch: src={:?}, dst={:?}",
+            src_node.graph_type, dst_node.graph_type
+        ));
+    }
+    let props = match input.props {
+        Some(Value::Object(map)) => map.into_iter().collect(),
+        Some(_) => return Err("props must be a JSON object".into()),
+        None => HashMap::new(),
+    };
+    let edge = Edge {
+        src: src.to_string(),
+        dst: dst.to_string(),
+        kind: parse_edge_kind(&input.edge_kind)?,
+        props,
+        created_at: chrono::Utc::now().timestamp_millis(),
+        weight: bounded_score(input.weight.unwrap_or(0.7), "weight")?,
+    };
+    store
+        .insert_edge(&edge)
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "status": "ok",
+        "edge": edge
     }))
 }
 fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
@@ -1218,6 +2049,184 @@ struct McpToolInput {
 #[derive(Debug, Deserialize)]
 struct TestingPermissionInput {
     action: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphSearchCatalogInput {
+    db_path: Option<String>,
+    query: String,
+    graph_type: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphGetNodeDetailInput {
+    db_path: Option<String>,
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphTraceMemoryInput {
+    db_path: Option<String>,
+    root_id: String,
+    direction: Option<String>,
+    max_depth: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphListDomainsInput {
+    db_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphAddMemoryInput {
+    db_path: Option<String>,
+    title: String,
+    summary: Option<String>,
+    keywords: Option<Vec<String>>,
+    catalog_type: Option<String>,
+    importance: Option<f64>,
+    source_refs: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphAddConceptInput {
+    db_path: Option<String>,
+    name: String,
+    summary: Option<String>,
+    graph_type: Option<String>,
+    aliases: Option<Vec<String>>,
+    importance: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphAddCodeNodeInput {
+    db_path: Option<String>,
+    path: String,
+    symbol: Option<String>,
+    summary: Option<String>,
+    code_kind: Option<String>,
+    importance: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphIndexCodeWorkspaceInput {
+    db_path: Option<String>,
+    root: Option<String>,
+    max_files: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphLinkNodesInput {
+    db_path: Option<String>,
+    src: String,
+    dst: String,
+    edge_kind: String,
+    weight: Option<f64>,
+    props: Option<Value>,
+}
+
+fn resolve_graph_db_path(input_path: Option<&str>) -> Result<PathBuf, String> {
+    let path = if let Some(path) = input_path.filter(|path| !path.trim().is_empty()) {
+        PathBuf::from(path)
+    } else if let Some(path) = std::env::var_os("AI_BRAIN_GRAPH_DB").filter(|path| !path.is_empty())
+    {
+        PathBuf::from(path)
+    } else {
+        default_graph_db_path()?
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    Ok(path)
+}
+
+fn default_graph_db_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| "cannot resolve graph db path: HOME/USERPROFILE not set".to_string())?;
+    Ok(PathBuf::from(home)
+        .join(".ai-brain")
+        .join("graph")
+        .join("graph.db"))
+}
+
+fn split_keywords(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn parse_graph_type(value: &str) -> Result<GraphType, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "memory" => Ok(GraphType::Memory),
+        "code" => Ok(GraphType::Code),
+        "novel" => Ok(GraphType::Novel),
+        "video" => Ok(GraphType::Video),
+        other => Err(format!("unsupported graph_type: {other}")),
+    }
+}
+
+fn parse_trace_direction(value: &str) -> Result<TraceDirection, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "upstream" => Ok(TraceDirection::Upstream),
+        "downstream" => Ok(TraceDirection::Downstream),
+        "both" => Ok(TraceDirection::Both),
+        other => Err(format!("unsupported trace direction: {other}")),
+    }
+}
+
+fn parse_edge_kind(value: &str) -> Result<EdgeKind, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mentionedin" | "mentioned_in" => Ok(EdgeKind::MentionedIn),
+        "relatedto" | "related_to" => Ok(EdgeKind::RelatedTo),
+        "similarto" | "similar_to" => Ok(EdgeKind::SimilarTo),
+        "causedby" | "caused_by" => Ok(EdgeKind::CausedBy),
+        "dependson" | "depends_on" => Ok(EdgeKind::DependsOn),
+        "derivedfrom" | "derived_from" => Ok(EdgeKind::DerivedFrom),
+        "calls" => Ok(EdgeKind::Calls),
+        "contains" => Ok(EdgeKind::Contains),
+        "imports" => Ok(EdgeKind::Imports),
+        "defines" => Ok(EdgeKind::Defines),
+        "invokes" => Ok(EdgeKind::Invokes),
+        other => Err(format!("unsupported edge_kind: {other}")),
+    }
+}
+
+fn required_non_empty<'a>(field: &str, value: &'a str) -> Result<&'a str, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("{field} must not be empty"))
+    } else {
+        Ok(trimmed)
+    }
+}
+
+fn optional_non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn clean_string_list(values: Option<Vec<String>>) -> Option<Vec<String>> {
+    let cleaned = values?
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn bounded_score(value: f64, field: &str) -> Result<f64, String> {
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{field} must be between 0.0 and 1.0"))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -4144,6 +5153,11 @@ mod tests {
         ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
+    use brain_graph::{
+        id::gen_node_id,
+        schema::{Edge, EdgeKind, GraphType, Node, NodeKind},
+        store::GraphStore,
+    };
     use runtime::{
         ApiClient, ApiRequest, AssistantEvent, ConversationMessage, ConversationRuntime,
         RuntimeError, Session,
@@ -4161,6 +5175,45 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn graph_node(title: &str, keywords: &[&str], importance: f64) -> Node {
+        let now = chrono::Utc::now().timestamp_millis();
+        Node {
+            id: gen_node_id(GraphType::Memory, NodeKind::Memory),
+            kind: NodeKind::Memory,
+            graph_type: GraphType::Memory,
+            props: BTreeMap::from([
+                ("catalog_title".to_string(), json!(title)),
+                ("catalog_keywords".to_string(), json!(keywords)),
+                ("catalog_type".to_string(), json!("business_logic")),
+            ])
+            .into_iter()
+            .collect(),
+            importance,
+            created_at: now,
+            last_accessed: now,
+            superseded: false,
+        }
+    }
+
+    fn seed_graph_db(path: &PathBuf) -> (Node, Node) {
+        let store = GraphStore::open(path).expect("open graph store");
+        let root = graph_node("红冲资费推送 BMS 异步调用", &["红冲", "BMS"], 0.9);
+        let upstream = graph_node("红冲资费生成逻辑解释", &["红冲", "资费"], 0.8);
+        store.upsert_node(&root).expect("insert root");
+        store.upsert_node(&upstream).expect("insert upstream");
+        store
+            .insert_edge(&Edge {
+                src: upstream.id.clone(),
+                dst: root.id.clone(),
+                kind: EdgeKind::DependsOn,
+                props: Default::default(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+                weight: 0.8,
+            })
+            .expect("insert edge");
+        (root, upstream)
     }
 
     #[test]
@@ -4186,12 +5239,280 @@ mod tests {
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
+        assert!(names.contains(&"graph_search_catalog"));
+        assert!(names.contains(&"graph_get_node_detail"));
+        assert!(names.contains(&"graph_trace_memory"));
+        assert!(names.contains(&"graph_list_domains"));
+        assert!(names.contains(&"graph_add_memory"));
+        assert!(names.contains(&"graph_add_concept"));
+        assert!(names.contains(&"graph_add_code_node"));
+        assert!(names.contains(&"graph_index_code_workspace"));
+        assert!(names.contains(&"graph_link_nodes"));
     }
 
     #[test]
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn graph_tools_execute_against_sqlite_store() {
+        let db_path = temp_path("graph-tools.db");
+        let (root, _upstream) = seed_graph_db(&db_path);
+        let root_id = root.id.clone();
+        let db_path_string = db_path.display().to_string();
+
+        let catalog = execute_tool(
+            "graph_search_catalog",
+            &json!({
+                "db_path": db_path_string,
+                "query": "红冲 BMS",
+                "graph_type": "Memory",
+                "limit": 5
+            }),
+        )
+        .expect("graph_search_catalog should succeed");
+        let catalog_json: serde_json::Value =
+            serde_json::from_str(&catalog).expect("catalog output json");
+        assert_eq!(catalog_json["status"], "ok");
+        assert_eq!(
+            catalog_json["data"]["entries"][0]["title"],
+            "红冲资费推送 BMS 异步调用"
+        );
+
+        let detail = execute_tool(
+            "graph_get_node_detail",
+            &json!({
+                "db_path": db_path_string,
+                "node_id": root_id
+            }),
+        )
+        .expect("graph_get_node_detail should succeed");
+        let detail_json: serde_json::Value =
+            serde_json::from_str(&detail).expect("detail output json");
+        assert_eq!(detail_json["status"], "ok");
+        assert_eq!(detail_json["data"]["upstream"].as_array().unwrap().len(), 1);
+
+        let trace = execute_tool(
+            "graph_trace_memory",
+            &json!({
+                "db_path": db_path_string,
+                "root_id": root_id,
+                "direction": "upstream",
+                "max_depth": 1,
+                "limit": 5
+            }),
+        )
+        .expect("graph_trace_memory should succeed");
+        let trace_json: serde_json::Value =
+            serde_json::from_str(&trace).expect("trace output json");
+        assert_eq!(trace_json["status"], "ok");
+        assert_eq!(trace_json["data"]["steps"].as_array().unwrap().len(), 1);
+
+        let domains = execute_tool(
+            "graph_list_domains",
+            &json!({
+                "db_path": db_path_string
+            }),
+        )
+        .expect("graph_list_domains should succeed");
+        let domains_json: serde_json::Value =
+            serde_json::from_str(&domains).expect("domains output json");
+        assert_eq!(domains_json.as_array().unwrap()[0]["node_count"], 2);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn graph_write_tools_create_and_link_nodes() {
+        let db_path = temp_path("graph-write-tools.db");
+        let db_path_string = db_path.display().to_string();
+
+        let memory = execute_tool(
+            "graph_add_memory",
+            &json!({
+                "db_path": db_path_string,
+                "title": "红冲资费生成逻辑解释",
+                "summary": "解释红冲资费如何生成。",
+                "keywords": ["红冲", "资费"],
+                "catalog_type": "business_logic",
+                "importance": 0.9
+            }),
+        )
+        .expect("graph_add_memory should succeed");
+        let memory_json: serde_json::Value =
+            serde_json::from_str(&memory).expect("memory output json");
+        let memory_id = memory_json["node_id"].as_str().unwrap().to_string();
+
+        let concept = execute_tool(
+            "graph_add_concept",
+            &json!({
+                "db_path": db_path_string,
+                "name": "红冲",
+                "summary": "退款冲正相关业务概念",
+                "aliases": ["冲正"],
+                "importance": 0.8
+            }),
+        )
+        .expect("graph_add_concept should succeed");
+        let concept_json: serde_json::Value =
+            serde_json::from_str(&concept).expect("concept output json");
+        let concept_id = concept_json["node_id"].as_str().unwrap().to_string();
+
+        let code = execute_tool(
+            "graph_add_code_node",
+            &json!({
+                "db_path": db_path_string,
+                "path": "src/billing/reversal.rs",
+                "symbol": "build_reversal_fee",
+                "summary": "生成红冲资费",
+                "code_kind": "function"
+            }),
+        )
+        .expect("graph_add_code_node should succeed");
+        let code_json: serde_json::Value = serde_json::from_str(&code).expect("code output json");
+        assert!(code_json["node_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("code_code_"));
+
+        let link = execute_tool(
+            "graph_link_nodes",
+            &json!({
+                "db_path": db_path_string,
+                "src": concept_id,
+                "dst": memory_id,
+                "edge_kind": "MentionedIn",
+                "weight": 0.75
+            }),
+        )
+        .expect("graph_link_nodes should succeed");
+        let link_json: serde_json::Value = serde_json::from_str(&link).expect("link output json");
+        assert_eq!(link_json["status"], "ok");
+
+        let detail = execute_tool(
+            "graph_get_node_detail",
+            &json!({
+                "db_path": db_path_string,
+                "node_id": memory_id
+            }),
+        )
+        .expect("graph_get_node_detail should succeed");
+        let detail_json: serde_json::Value =
+            serde_json::from_str(&detail).expect("detail output json");
+        assert_eq!(detail_json["status"], "ok");
+        assert_eq!(detail_json["data"]["upstream"].as_array().unwrap().len(), 1);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn graph_index_code_workspace_indexes_rust_files() {
+        let root = temp_path("code-workspace");
+        let src_dir = root.join("src");
+        let foo_dir = src_dir.join("foo");
+        fs::create_dir_all(&foo_dir).expect("create test workspace");
+        fs::write(src_dir.join("lib.rs"), "pub mod foo;\n").expect("write lib");
+        fs::write(foo_dir.join("mod.rs"), "pub fn run() {}\n").expect("write module");
+        fs::create_dir_all(root.join("target")).expect("create target");
+        fs::write(root.join("target").join("ignored.rs"), "fn ignored() {}\n")
+            .expect("write ignored");
+
+        let db_path = temp_path("graph-code-index.db");
+        let db_path_string = db_path.display().to_string();
+        let root_string = root.display().to_string();
+
+        let indexed = execute_tool(
+            "graph_index_code_workspace",
+            &json!({
+                "db_path": db_path_string,
+                "root": root_string,
+                "max_files": 10
+            }),
+        )
+        .expect("graph_index_code_workspace should succeed");
+        let indexed_json: serde_json::Value =
+            serde_json::from_str(&indexed).expect("index output json");
+        assert_eq!(indexed_json["status"], "ok");
+        assert_eq!(indexed_json["files_indexed"], 2);
+        assert_eq!(indexed_json["symbols_indexed"], 2);
+        assert_eq!(indexed_json["truncated"], false);
+
+        let catalog = execute_tool(
+            "graph_search_catalog",
+            &json!({
+                "db_path": db_path_string,
+                "query": "foo",
+                "graph_type": "Code",
+                "limit": 10
+            }),
+        )
+        .expect("graph_search_catalog should succeed");
+        let catalog_json: serde_json::Value =
+            serde_json::from_str(&catalog).expect("catalog output json");
+        assert_eq!(catalog_json["status"], "ok");
+        assert!(catalog_json["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["node_id"] == "code_code_module_src_foo"));
+
+        let detail = execute_tool(
+            "graph_get_node_detail",
+            &json!({
+                "db_path": db_path_string,
+                "node_id": "code_code_module_src"
+            }),
+        )
+        .expect("graph_get_node_detail should succeed");
+        let detail_json: serde_json::Value =
+            serde_json::from_str(&detail).expect("detail output json");
+        assert_eq!(detail_json["status"], "ok");
+        assert!(detail_json["data"]["downstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|neighbor| neighbor["node_id"] == "code_code_file_src_lib_rs"));
+
+        let run_catalog = execute_tool(
+            "graph_search_catalog",
+            &json!({
+                "db_path": db_path_string,
+                "query": "run",
+                "graph_type": "Code",
+                "limit": 10
+            }),
+        )
+        .expect("graph_search_catalog should succeed");
+        let run_catalog_json: serde_json::Value =
+            serde_json::from_str(&run_catalog).expect("catalog output json");
+        assert_eq!(run_catalog_json["status"], "ok");
+        assert!(run_catalog_json["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["node_id"] == "code_code_symbol_src_foo_mod_rs_function_run"));
+
+        let file_detail = execute_tool(
+            "graph_get_node_detail",
+            &json!({
+                "db_path": db_path_string,
+                "node_id": "code_code_file_src_foo_mod_rs"
+            }),
+        )
+        .expect("graph_get_node_detail should succeed");
+        let file_detail_json: serde_json::Value =
+            serde_json::from_str(&file_detail).expect("detail output json");
+        assert_eq!(file_detail_json["status"], "ok");
+        assert!(file_detail_json["data"]["downstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|neighbor| neighbor["node_id"] == "code_code_symbol_src_foo_mod_rs_function_run"));
+
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

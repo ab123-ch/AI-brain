@@ -147,6 +147,90 @@ pub struct DomainInfo {
     pub description: String,
 }
 
+/// Catalog-first search result item.
+///
+/// This is the low-context discovery surface for broad keywords. It avoids
+/// returning summaries, full props, edge lists, or source text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub node_id: String,
+    pub title: String,
+    pub catalog_type: Option<String>,
+    pub matched_keywords: Vec<String>,
+    pub score: f64,
+    pub hint: Option<String>,
+}
+
+/// Catalog search response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSearchResult {
+    pub entries: Vec<CatalogEntry>,
+    pub total_found: usize,
+    pub truncated: bool,
+}
+
+/// Direction of a directly connected neighbor relative to the center node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NeighborDirection {
+    Upstream,
+    Downstream,
+}
+
+/// Compact neighbor returned by `get_node_detail`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeighborSummary {
+    pub node_id: String,
+    pub kind: NodeKind,
+    pub graph_type: GraphType,
+    pub title: String,
+    pub edge_kind: EdgeKind,
+    pub direction: NeighborDirection,
+    pub weight: f64,
+}
+
+/// Detail view for one selected node.
+///
+/// Source references are returned as unresolved JSON values. Resolving them to
+/// raw memory paragraphs belongs to the memory layer, not this storage crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeDetail {
+    pub center: Node,
+    pub upstream: Vec<NeighborSummary>,
+    pub downstream: Vec<NeighborSummary>,
+    pub source_refs: Vec<Value>,
+}
+
+/// Trace direction for relationship traversal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraceDirection {
+    Upstream,
+    Downstream,
+    Both,
+}
+
+/// One compact step in a memory trace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceStep {
+    pub depth: usize,
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub title: String,
+    pub kind: NodeKind,
+    pub graph_type: GraphType,
+    pub edge_kind: EdgeKind,
+    pub direction: NeighborDirection,
+    pub weight: f64,
+}
+
+/// Budget-limited trace result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceResult {
+    pub root: Node,
+    pub steps: Vec<TraceStep>,
+    pub truncated: bool,
+    pub max_depth: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,11 +3,15 @@
 //! 基于 per-persona 金字塔存储的新 MemoryBrain。
 //! 逐步替代旧 MemoryBrain，保持对外接口兼容。
 
-use std::path::Path;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use brain_core::types::{BrainId, KnowledgeSource, MemoryEntry, MemoryLayer, TurnRecord};
+use brain_graph::error::ToolResult;
+use brain_graph::schema::{Edge, EdgeKind, GraphType, Node, NodeKind};
+use brain_graph::store::{CatalogQuery, GraphStore};
+use serde_json::json;
 
 use crate::abstract_layer::AbstractLayer;
 use crate::concentration::{ConcentrationEngine, ConcentrationReport};
@@ -19,6 +23,464 @@ use crate::pyramid_storage::PyramidStorage;
 use crate::raw_pool::RawPool;
 use crate::subconscious_pool::SubconsciousPool;
 use crate::summary_pool::SummaryPool;
+
+use crate::pyramid_types::TaskSummary;
+
+fn task_summary_to_graph_node(storage: &PyramidStorage, task: &TaskSummary) -> Node {
+    let source_refs = task_summary_source_refs(storage, task);
+    let mut props = HashMap::from([
+        ("layer".into(), json!("task_summary")),
+        ("task_id".into(), json!(&task.task_id)),
+        ("task_type".into(), json!(format!("{:?}", task.task_type))),
+        ("task_name".into(), json!(&task.task_name)),
+        ("catalog_title".into(), json!(&task.task_name)),
+        ("catalog_keywords".into(), json!(&task.tags)),
+        ("catalog_type".into(), json!("task_summary")),
+        ("summary".into(), json!(&task.summary)),
+        ("l1_refs".into(), json!(&task.l1_refs)),
+        ("source_refs".into(), json!(source_refs)),
+    ]);
+    props.insert(
+        "catalog_hint".into(),
+        json!(format!("L2 task summary: {}", task.task_id)),
+    );
+
+    Node {
+        id: stable_l2_graph_node_id(&task.task_id),
+        kind: NodeKind::Memory,
+        graph_type: GraphType::Memory,
+        props,
+        importance: task.importance.clamp(0.0, 1.0),
+        created_at: task.created_at.timestamp_millis(),
+        last_accessed: task.updated_at.timestamp_millis(),
+        superseded: false,
+    }
+}
+
+fn task_summary_source_refs(
+    storage: &PyramidStorage,
+    task: &TaskSummary,
+) -> Vec<serde_json::Value> {
+    task.l1_refs
+        .iter()
+        .map(|reference| {
+            let file = storage.l1_session_path(&reference.session);
+            let relative_file = file
+                .strip_prefix(storage.base_dir())
+                .map(path_to_slash)
+                .unwrap_or_else(|_| path_to_slash(&file));
+            let mut line_numbers = reference
+                .paragraphs
+                .iter()
+                .map(|paragraph| paragraph + 1)
+                .collect::<Vec<_>>();
+            line_numbers.sort_unstable();
+            let line_start = line_numbers.first().copied();
+            let line_end = line_numbers.last().copied();
+
+            json!({
+                "type": "l1_jsonl",
+                "session": reference.session,
+                "file": relative_file,
+                "paragraphs": reference.paragraphs,
+                "line_start": line_start,
+                "line_end": line_end,
+            })
+        })
+        .collect()
+}
+
+fn path_to_slash(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn task_summary_graph_edges(tasks: &[TaskSummary]) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for (left_idx, left) in tasks.iter().enumerate() {
+        for right in tasks.iter().skip(left_idx + 1) {
+            let shared_tags = shared_normalized_values(&left.tags, &right.tags);
+            let shared_sessions = shared_l1_sessions(left, right);
+
+            if !shared_tags.is_empty() {
+                edges.push(task_summary_edge(
+                    left,
+                    right,
+                    EdgeKind::SimilarTo,
+                    HashMap::from([
+                        ("reason".into(), json!("shared_tags")),
+                        ("shared_tags".into(), json!(shared_tags)),
+                    ]),
+                    edge_weight(shared_tags.len()),
+                ));
+            }
+
+            if !shared_sessions.is_empty() {
+                edges.push(task_summary_edge(
+                    left,
+                    right,
+                    EdgeKind::RelatedTo,
+                    HashMap::from([
+                        ("reason".into(), json!("shared_l1_sessions")),
+                        ("shared_l1_sessions".into(), json!(shared_sessions)),
+                    ]),
+                    edge_weight(shared_sessions.len()),
+                ));
+            }
+        }
+    }
+    edges
+}
+
+fn task_summary_edge(
+    left: &TaskSummary,
+    right: &TaskSummary,
+    kind: EdgeKind,
+    props: HashMap<String, serde_json::Value>,
+    weight: f64,
+) -> Edge {
+    let left_id = stable_l2_graph_node_id(&left.task_id);
+    let right_id = stable_l2_graph_node_id(&right.task_id);
+    let (src, dst) = if left_id <= right_id {
+        (left_id, right_id)
+    } else {
+        (right_id, left_id)
+    };
+    Edge {
+        src,
+        dst,
+        kind,
+        props,
+        created_at: chrono::Utc::now().timestamp_millis(),
+        weight,
+    }
+}
+
+fn shared_normalized_values(left: &[String], right: &[String]) -> Vec<String> {
+    let right_values = right
+        .iter()
+        .filter_map(|value| normalize_non_empty(value))
+        .collect::<HashSet<_>>();
+    let mut shared = left
+        .iter()
+        .filter_map(|value| normalize_non_empty(value))
+        .filter(|value| right_values.contains(value))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    shared.sort();
+    shared
+}
+
+fn shared_l1_sessions(left: &TaskSummary, right: &TaskSummary) -> Vec<String> {
+    let left_sessions = left
+        .l1_refs
+        .iter()
+        .filter_map(|reference| normalize_non_empty(&reference.session))
+        .collect::<Vec<_>>();
+    let right_sessions = right
+        .l1_refs
+        .iter()
+        .filter_map(|reference| normalize_non_empty(&reference.session))
+        .collect::<Vec<_>>();
+    shared_normalized_values(&left_sessions, &right_sessions)
+}
+
+fn normalize_non_empty(value: &str) -> Option<String> {
+    let normalized = value.trim().to_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn edge_weight(shared_count: usize) -> f64 {
+    match shared_count {
+        0 => 0.5,
+        1 => 0.6,
+        2 => 0.7,
+        3 => 0.8,
+        4 => 0.9,
+        _ => 1.0,
+    }
+}
+
+fn stable_l2_graph_node_id(task_id: &str) -> String {
+    let sanitized = task_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let stable = sanitized.trim_matches('_');
+    let suffix = if stable.is_empty() { "unknown" } else { stable };
+    format!("memory_memory_l2_{suffix}")
+}
+
+fn has_explicit_memory_recall_intent(query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+    [
+        "之前",
+        "上次",
+        "以前",
+        "历史",
+        "记得",
+        "回忆",
+        "当时",
+        "刚才",
+        "曾经",
+        "过去",
+        "查记忆",
+        "从记忆",
+        "历史记录",
+        "之前说",
+        "上次说",
+        "我们之前",
+        "我们上次",
+        "我们当时",
+        "怎么处理过",
+        "以前怎么",
+        "之前怎么",
+    ]
+    .iter()
+    .any(|needle| query.contains(needle))
+}
+
+fn graph_recall_keywords(query: &str) -> Vec<String> {
+    let mut keywords = Vec::new();
+    let mut current_ascii = String::new();
+    let mut chinese = String::new();
+
+    for ch in query.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            current_ascii.push(ch.to_ascii_lowercase());
+        } else {
+            if current_ascii.len() >= 2 {
+                keywords.push(std::mem::take(&mut current_ascii));
+            } else {
+                current_ascii.clear();
+            }
+            if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+                chinese.push(ch);
+            } else if !ch.is_whitespace() {
+                chinese.push(' ');
+            }
+        }
+    }
+    if current_ascii.len() >= 2 {
+        keywords.push(current_ascii);
+    }
+
+    let stop_words = [
+        "之前",
+        "上次",
+        "以前",
+        "历史",
+        "记得",
+        "回忆",
+        "当时",
+        "刚才",
+        "曾经",
+        "过去",
+        "我们",
+        "这个",
+        "那个",
+        "一下",
+        "怎么",
+        "什么",
+        "有没有",
+    ];
+    let chars = chinese.chars().collect::<Vec<_>>();
+    for width in 2..=4 {
+        if chars.len() < width {
+            continue;
+        }
+        for window in chars.windows(width) {
+            let token = window.iter().collect::<String>().trim().to_string();
+            if token.chars().count() >= 2
+                && !token.contains(' ')
+                && !stop_words.iter().any(|stop| token == *stop)
+            {
+                keywords.push(token);
+            }
+        }
+    }
+
+    keywords.sort();
+    keywords.dedup();
+    keywords.truncate(80);
+    keywords
+}
+
+fn string_prop(props: &HashMap<String, serde_json::Value>, key: &str) -> Option<String> {
+    props
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_memory_source_refs(
+    storage: &PyramidStorage,
+    raw_pool: &RawPool,
+    refs: &[serde_json::Value],
+) -> Vec<String> {
+    let mut snippets = Vec::new();
+    let mut resolved_legacy_refs = HashSet::new();
+    for reference in refs.iter().take(6) {
+        if let Some(file_snippets) = resolve_file_line_ref(storage, reference) {
+            if let Some(key) = legacy_ref_key(reference) {
+                resolved_legacy_refs.insert(key);
+            }
+            snippets.extend(file_snippets);
+            continue;
+        }
+
+        let Some(session) = reference.get("session").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if legacy_ref_key(reference).is_some_and(|key| resolved_legacy_refs.contains(&key)) {
+            continue;
+        }
+        let Ok(turns) = raw_pool.read_session(session) else {
+            continue;
+        };
+        let paragraph_indexes = reference
+            .get("paragraphs")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .filter_map(|idx| usize::try_from(idx).ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|items| !items.is_empty())
+            .unwrap_or_else(|| (0..turns.len().min(4)).collect());
+
+        for idx in paragraph_indexes.into_iter().take(4) {
+            let Some(turn) = turns.get(idx) else {
+                continue;
+            };
+            let mut content = format!(
+                "- session={session}, paragraph={idx}, role={}: {}",
+                turn.role,
+                truncate_owned(&turn.content, 260)
+            );
+            if let Some(tool_output) = &turn.tool_output {
+                content.push_str(&format!(
+                    "\n  tool_output: {}",
+                    truncate_owned(tool_output, 220)
+                ));
+            }
+            snippets.push(content);
+        }
+    }
+    snippets
+}
+
+fn legacy_ref_key(reference: &serde_json::Value) -> Option<String> {
+    let session = reference
+        .get("session")
+        .and_then(serde_json::Value::as_str)?;
+    let paragraphs = reference
+        .get("paragraphs")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|idx| idx.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    Some(format!("{session}:{paragraphs}"))
+}
+
+fn resolve_file_line_ref(
+    storage: &PyramidStorage,
+    reference: &serde_json::Value,
+) -> Option<Vec<String>> {
+    let file = reference.get("file").and_then(serde_json::Value::as_str)?;
+    let line_start = reference
+        .get("line_start")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| usize::try_from(line).ok())?;
+    let line_end = reference
+        .get("line_end")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| usize::try_from(line).ok())
+        .unwrap_or(line_start);
+    if line_start == 0 {
+        return None;
+    }
+
+    let file_path = {
+        let path = PathBuf::from(file);
+        if path.is_absolute() {
+            path
+        } else {
+            storage.base_dir().join(path)
+        }
+    };
+    let content = std::fs::read_to_string(&file_path).ok()?;
+    let mut snippets = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        if line_no < line_start || line_no > line_end {
+            continue;
+        }
+        snippets.push(format!(
+            "- file={}, line={line_no}: {}",
+            file,
+            format_memory_jsonl_line(line)
+        ));
+    }
+    if snippets.is_empty() {
+        None
+    } else {
+        Some(snippets)
+    }
+}
+
+fn format_memory_jsonl_line(line: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return truncate_owned(line, 320);
+    };
+    let role = value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Unknown");
+    let content = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(line);
+    let mut formatted = format!("role={role}: {}", truncate_owned(content, 260));
+    if let Some(tool_output) = value.get("tool_output").and_then(serde_json::Value::as_str) {
+        formatted.push_str(&format!(
+            "\n  tool_output: {}",
+            truncate_owned(tool_output, 220)
+        ));
+    }
+    formatted
+}
+
+fn truncate_owned(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect::<String>() + "..."
+}
 
 /// 金字塔版记忆脑
 pub struct PyramidMemoryBrain {
@@ -35,6 +497,8 @@ pub struct PyramidMemoryBrainConfig {
     pub base_dir: PathBuf,
     /// 当前会话 ID
     pub session_id: String,
+    /// 原生知识图谱 SQLite 路径。None 表示禁用自动镜像。
+    pub graph_db_path: Option<PathBuf>,
 }
 
 impl Default for PyramidMemoryBrainConfig {
@@ -42,8 +506,10 @@ impl Default for PyramidMemoryBrainConfig {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| "/tmp".into());
+        let base_dir = PathBuf::from(home).join(".ai-brain");
         Self {
-            base_dir: PathBuf::from(home).join(".ai-brain"),
+            graph_db_path: Some(base_dir.join("graph").join("graph.db")),
+            base_dir,
             session_id: format!("sess-{}", chrono::Utc::now().timestamp()),
         }
     }
@@ -93,7 +559,118 @@ impl PyramidMemoryBrain {
         llm: &dyn crate::concentration::AnalysisLlm,
     ) -> ConcentrationReport {
         let engine = ConcentrationEngine::new(self.storage.clone(), self.config.session_id.clone());
-        engine.run(llm).await
+        let mut report = engine.run(llm).await;
+        if report.step1_tasks > 0 {
+            match self.mirror_l2_to_graph() {
+                Ok(count) => tracing::info!("L2 摘要已镜像到原生图谱: {count} 个节点"),
+                Err(error) => {
+                    tracing::warn!("L2 摘要镜像到原生图谱失败: {error}");
+                    report.errors.push(format!("graph_mirror_l2: {error}"));
+                }
+            }
+        }
+        report
+    }
+
+    /// 将当前 L2 摘要池镜像到原生知识图谱。
+    ///
+    /// 这是 best-effort 索引层同步：不写入 L1 原文，只写任务摘要、标签和 L1 引用。
+    pub fn mirror_l2_to_graph(&self) -> Result<usize> {
+        let Some(db_path) = &self.config.graph_db_path else {
+            return Ok(0);
+        };
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let graph = GraphStore::open(db_path).map_err(|error| {
+            crate::error::MemoryError::Io(std::io::Error::other(error.to_string()))
+        })?;
+        let summary_pool = SummaryPool::new(self.storage.clone());
+        let tasks = summary_pool.load_all()?;
+        for task in &tasks {
+            let node = task_summary_to_graph_node(&self.storage, task);
+            graph.upsert_node(&node).map_err(|error| {
+                crate::error::MemoryError::Io(std::io::Error::other(error.to_string()))
+            })?;
+        }
+        for edge in task_summary_graph_edges(&tasks) {
+            graph.insert_edge(&edge).map_err(|error| {
+                crate::error::MemoryError::Io(std::io::Error::other(error.to_string()))
+            })?;
+        }
+        Ok(tasks.len())
+    }
+
+    /// 显式记忆意图召回。
+    ///
+    /// 只有用户输入包含“之前/上次/记得/历史”等明确历史意图时才查图谱，避免普通问题被弱相关记忆污染。
+    pub fn recall_graph_memory_context(&self, query: &str, limit: usize) -> Result<Option<String>> {
+        if !has_explicit_memory_recall_intent(query) {
+            return Ok(None);
+        }
+        let Some(db_path) = &self.config.graph_db_path else {
+            return Ok(None);
+        };
+        if !db_path.exists() {
+            return Ok(None);
+        }
+
+        let keywords = graph_recall_keywords(query);
+        if keywords.is_empty() {
+            return Ok(None);
+        }
+
+        let graph = GraphStore::open(db_path).map_err(|error| {
+            crate::error::MemoryError::Io(std::io::Error::other(error.to_string()))
+        })?;
+        let mut catalog_query = CatalogQuery::new(keywords);
+        catalog_query.graph_type = Some(GraphType::Memory);
+        catalog_query.limit = limit.clamp(1, 5);
+
+        let ToolResult::Ok { data } = graph.search_catalog(&catalog_query).map_err(|error| {
+            crate::error::MemoryError::Io(std::io::Error::other(error.to_string()))
+        })?
+        else {
+            return Ok(None);
+        };
+
+        let raw_pool = RawPool::new(self.storage.clone());
+        let mut sections = Vec::new();
+        for (idx, entry) in data.entries.iter().take(limit).enumerate() {
+            let ToolResult::Ok { data: detail } =
+                graph.get_node_detail(&entry.node_id).map_err(|error| {
+                    crate::error::MemoryError::Io(std::io::Error::other(error.to_string()))
+                })?
+            else {
+                continue;
+            };
+
+            let summary = string_prop(&detail.center.props, "summary")
+                .unwrap_or_else(|| "无摘要".to_string());
+            let snippets =
+                resolve_memory_source_refs(&self.storage, &raw_pool, &detail.source_refs);
+            let snippet_text = if snippets.is_empty() {
+                "未能读取到原始片段；请把该图谱节点只当作候选摘要。".to_string()
+            } else {
+                snippets.join("\n")
+            };
+            sections.push(format!(
+                "{}. {}\n摘要：{}\n来源片段：\n{}",
+                idx + 1,
+                entry.title,
+                truncate_owned(&summary, 240),
+                truncate_owned(&snippet_text, 900),
+            ));
+        }
+
+        if sections.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(format!(
+            "[历史记忆召回]\n用户输入包含明确历史/记忆意图。以下内容来自长期记忆图谱与原始记忆片段；只在与当前问题确实相关时使用，不要把候选记忆当作必然事实。\n\n{}",
+            sections.join("\n\n")
+        )))
     }
 
     /// 自动注入上下文（潜意识 + 画像 + injectable 经验）
@@ -437,10 +1014,16 @@ pub struct PyramidMemoryStats {
 mod tests {
     use super::*;
     use crate::persona_types::PersonaConfig;
+    use crate::pyramid_types::{L1Ref, TaskSummary, TaskType};
+    use brain_graph::error::ToolResult;
+    use brain_graph::schema::{EdgeKind, TraceDirection};
+    use brain_graph::store::{CatalogQuery, TraceQuery};
 
     fn make_brain(tmp: &tempfile::TempDir) -> PyramidMemoryBrain {
+        let base_dir = tmp.path().to_path_buf();
         let config = PyramidMemoryBrainConfig {
-            base_dir: tmp.path().to_path_buf(),
+            graph_db_path: Some(base_dir.join("graph").join("graph.db")),
+            base_dir,
             session_id: "sess-test".into(),
         };
         PyramidMemoryBrain::new(config).unwrap()
@@ -477,6 +1060,177 @@ mod tests {
         let pool = RawPool::new(brain.storage().clone());
         let turns = pool.read_session("sess-test").unwrap();
         assert_eq!(turns.len(), 2);
+    }
+
+    #[test]
+    fn mirror_l2_to_graph_writes_catalog_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brain = make_brain(&tmp);
+        let now = chrono::Utc::now();
+        let task = TaskSummary {
+            task_id: "task-001".into(),
+            task_type: TaskType::Coding,
+            task_name: "红冲资费生成逻辑".into(),
+            summary: "解释红冲资费生成的关键上下文".into(),
+            l1_refs: vec![L1Ref {
+                session: "sess-test".into(),
+                paragraphs: vec![0, 1],
+            }],
+            tags: vec!["红冲".into(), "资费".into()],
+            importance: 0.9,
+            created_at: now,
+            updated_at: now,
+        };
+
+        SummaryPool::new(brain.storage().clone())
+            .regenerate(vec![task])
+            .unwrap();
+
+        let mirrored = brain.mirror_l2_to_graph().unwrap();
+        assert_eq!(mirrored, 1);
+
+        let db_path = brain.config().graph_db_path.as_ref().unwrap();
+        let graph = GraphStore::open(db_path).unwrap();
+        let result = graph
+            .search_catalog(&CatalogQuery::new(vec!["红冲".into()]))
+            .unwrap();
+
+        let ToolResult::Ok { data } = result else {
+            panic!("expected graph search to succeed");
+        };
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].title, "红冲资费生成逻辑");
+        assert_eq!(data.entries[0].node_id, "memory_memory_l2_task-001");
+
+        let ToolResult::Ok { data: detail } =
+            graph.get_node_detail("memory_memory_l2_task-001").unwrap()
+        else {
+            panic!("expected graph detail to succeed");
+        };
+        assert!(detail
+            .source_refs
+            .iter()
+            .any(|source_ref| source_ref["file"]
+                == "personas/default/pyramid/l1-raw/sess-test.jsonl"
+                && source_ref["line_start"] == 1
+                && source_ref["line_end"] == 2));
+    }
+
+    #[test]
+    fn mirror_l2_to_graph_links_related_summaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brain = make_brain(&tmp);
+        let now = chrono::Utc::now();
+        let first = TaskSummary {
+            task_id: "task-a".into(),
+            task_type: TaskType::Coding,
+            task_name: "图谱目录检索".into(),
+            summary: "实现图谱目录检索能力".into(),
+            l1_refs: vec![L1Ref {
+                session: "sess-shared".into(),
+                paragraphs: vec![0],
+            }],
+            tags: vec!["图谱".into(), "检索".into()],
+            importance: 0.8,
+            created_at: now,
+            updated_at: now,
+        };
+        let second = TaskSummary {
+            task_id: "task-b".into(),
+            task_type: TaskType::Coding,
+            task_name: "图谱追踪查询".into(),
+            summary: "实现图谱追踪能力".into(),
+            l1_refs: vec![L1Ref {
+                session: "sess-shared".into(),
+                paragraphs: vec![1],
+            }],
+            tags: vec!["图谱".into(), "追踪".into()],
+            importance: 0.7,
+            created_at: now,
+            updated_at: now,
+        };
+
+        SummaryPool::new(brain.storage().clone())
+            .regenerate(vec![first, second])
+            .unwrap();
+
+        let mirrored = brain.mirror_l2_to_graph().unwrap();
+        assert_eq!(mirrored, 2);
+
+        let db_path = brain.config().graph_db_path.as_ref().unwrap();
+        let graph = GraphStore::open(db_path).unwrap();
+        let mut query = TraceQuery::new("memory_memory_l2_task-a");
+        query.direction = TraceDirection::Both;
+        let result = graph.trace_memory(&query).unwrap();
+
+        let ToolResult::Ok { data } = result else {
+            panic!("expected graph trace to succeed");
+        };
+        assert!(data
+            .steps
+            .iter()
+            .any(|step| step.to_node_id == "memory_memory_l2_task-b"
+                && step.edge_kind == EdgeKind::SimilarTo));
+        assert!(data
+            .steps
+            .iter()
+            .any(|step| step.to_node_id == "memory_memory_l2_task-b"
+                && step.edge_kind == EdgeKind::RelatedTo));
+    }
+
+    #[test]
+    fn graph_memory_recall_requires_explicit_intent_and_reads_l1_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brain = make_brain(&tmp);
+        brain
+            .store_turn(
+                "User",
+                "之前我们讨论过红冲资费生成逻辑，入口在 billing 模块。",
+                None,
+            )
+            .unwrap();
+        brain
+            .store_turn(
+                "Assistant",
+                "当时结论是先查订单，再生成红冲资费明细。",
+                None,
+            )
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let task = TaskSummary {
+            task_id: "task-recall".into(),
+            task_type: TaskType::Coding,
+            task_name: "红冲资费生成逻辑".into(),
+            summary: "记录红冲资费生成逻辑的历史讨论。".into(),
+            l1_refs: vec![L1Ref {
+                session: "sess-test".into(),
+                paragraphs: vec![0, 1],
+            }],
+            tags: vec!["红冲".into(), "资费".into()],
+            importance: 0.9,
+            created_at: now,
+            updated_at: now,
+        };
+        SummaryPool::new(brain.storage().clone())
+            .regenerate(vec![task])
+            .unwrap();
+        brain.mirror_l2_to_graph().unwrap();
+
+        let no_intent = brain
+            .recall_graph_memory_context("红冲资费生成逻辑怎么做", 3)
+            .unwrap();
+        assert!(no_intent.is_none());
+
+        let recalled = brain
+            .recall_graph_memory_context("之前红冲资费生成逻辑怎么处理的", 3)
+            .unwrap()
+            .expect("explicit memory query should recall context");
+        assert!(recalled.contains("[历史记忆召回]"));
+        assert!(recalled.contains("红冲资费生成逻辑"));
+        assert!(recalled.contains("l1-raw/sess-test.jsonl"));
+        assert!(recalled.contains("line=1"));
+        assert!(recalled.contains("先查订单"));
     }
 
     #[test]

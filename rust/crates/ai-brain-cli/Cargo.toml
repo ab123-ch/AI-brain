@@ -50,6 +50,7 @@ uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 
 [dev-dependencies]
+brain-graph = { path = "../brain-graph" }
 tempfile = "3"
 
 [lints]

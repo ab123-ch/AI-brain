@@ -4,6 +4,7 @@
 //! as opposed to `StubToolExecutor` which is only for tests.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use brain_core::tool_executor::ToolExecutor;
@@ -28,6 +29,8 @@ pub struct RealToolExecutor {
     skill_catalog: Option<Arc<SkillCatalog>>,
     /// MCP client pool for external tool routing (mcp__server__tool)
     mcp_pool: Option<Arc<McpClientPool>>,
+    /// Default SQLite path injected for graph_* tools.
+    graph_db_path: Option<PathBuf>,
     /// Live brain/sub-agent exchanges consumed by WebSocket clients.
     runtime_trace_tx: Option<tokio::sync::broadcast::Sender<RuntimeExchange>>,
 }
@@ -55,6 +58,7 @@ impl RealToolExecutor {
             dispatch: None,
             skill_catalog: None,
             mcp_pool: None,
+            graph_db_path: default_graph_db_path(),
             runtime_trace_tx: None,
         }
     }
@@ -85,6 +89,12 @@ impl RealToolExecutor {
     /// Attach an McpClientPool for external MCP tool routing.
     pub fn with_mcp_pool(mut self, pool: Arc<McpClientPool>) -> Self {
         self.mcp_pool = Some(pool);
+        self
+    }
+
+    /// Override the graph database path injected into graph_* tools.
+    pub fn with_graph_db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.graph_db_path = Some(path.into());
         self
     }
 
@@ -261,8 +271,11 @@ impl ToolExecutor for RealToolExecutor {
         tool_call: &ToolCall,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + '_>> {
         let name = tool_call.tool_name.clone();
-        let input = tool_call.input.clone();
+        let mut input = tool_call.input.clone();
         let tool_name_owned = tool_call.tool_name.clone();
+        if is_graph_tool(&name) {
+            inject_graph_db_path(&mut input, self.graph_db_path.as_ref());
+        }
 
         // special-case: search_memory 由 PyramidMemoryBrain 处理
         if name == "search_memory" {
@@ -577,6 +590,56 @@ impl ToolExecutor for RealToolExecutor {
     }
 }
 
+fn is_graph_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "graph_search_catalog"
+            | "graph_get_node_detail"
+            | "graph_trace_memory"
+            | "graph_list_domains"
+            | "graph_add_memory"
+            | "graph_add_concept"
+            | "graph_add_code_node"
+            | "graph_index_code_workspace"
+            | "graph_link_nodes"
+    )
+}
+
+fn inject_graph_db_path(input: &mut serde_json::Value, graph_db_path: Option<&PathBuf>) {
+    let Some(path) = graph_db_path else {
+        return;
+    };
+    let serde_json::Value::Object(object) = input else {
+        return;
+    };
+    if object
+        .get("db_path")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+    object.insert(
+        "db_path".into(),
+        serde_json::Value::String(path.display().to_string()),
+    );
+}
+
+fn default_graph_db_path() -> Option<PathBuf> {
+    std::env::var_os("AI_BRAIN_GRAPH_DB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| {
+                    PathBuf::from(home)
+                        .join(".ai-brain")
+                        .join("graph")
+                        .join("graph.db")
+                })
+        })
+}
+
 /// Convert tools crate `ToolSpec` to brain-llm `ToolDefinition` for register_tools().
 pub fn mvp_tool_definitions() -> Vec<brain_llm::ToolDefinition> {
     tools::mvp_tool_specs()
@@ -592,7 +655,27 @@ pub fn mvp_tool_definitions() -> Vec<brain_llm::ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain_graph::{
+        id::gen_node_id,
+        schema::{GraphType, Node, NodeKind},
+        store::GraphStore,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
+
+    fn graph_node(title: &str) -> Node {
+        let now = chrono::Utc::now().timestamp_millis();
+        Node {
+            id: gen_node_id(GraphType::Memory, NodeKind::Memory),
+            kind: NodeKind::Memory,
+            graph_type: GraphType::Memory,
+            props: HashMap::from([("catalog_title".into(), json!(title))]),
+            importance: 0.8,
+            created_at: now,
+            last_accessed: now,
+            superseded: false,
+        }
+    }
 
     #[test]
     fn real_executor_lists_mvp_tools() {
@@ -636,6 +719,34 @@ mod tests {
         };
         let result = exec.execute(&call).await;
         assert!(result.is_error, "未知工具应返回错误");
+    }
+
+    #[tokio::test]
+    async fn real_executor_injects_graph_db_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let store = GraphStore::open(&db_path).unwrap();
+        store
+            .upsert_node(&graph_node("红冲资费生成逻辑解释"))
+            .unwrap();
+
+        let exec = RealToolExecutor::new().with_graph_db_path(db_path);
+        let call = ToolCall {
+            tool_name: "graph_list_domains".into(),
+            input: json!({}),
+            validated: false,
+            validation_id: None,
+        };
+
+        let result = exec.execute(&call).await;
+
+        assert!(
+            !result.is_error,
+            "graph_list_domains should run: {}",
+            result.output
+        );
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output.as_array().unwrap()[0]["node_count"], 1);
     }
 
     #[test]

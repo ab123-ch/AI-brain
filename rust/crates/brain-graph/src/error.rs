@@ -25,10 +25,16 @@ pub enum BrainGraphError {
     #[error("SQLite 错误: {0}")]
     Sqlite(rusqlite::Error),
 
+    /// JSON 序列化/反序列化错误
+    #[error("JSON 错误: {0}")]
+    Json(serde_json::Error),
+
     /// 无效输入
     #[error("无效输入: {0}")]
     InvalidInput(String),
 }
+
+pub type Result<T> = std::result::Result<T, BrainGraphError>;
 
 /// 错误分类（用于 ToolResult::Err）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +81,12 @@ impl From<rusqlite::Error> for BrainGraphError {
             },
             _ => BrainGraphError::Sqlite(e),
         }
+    }
+}
+
+impl From<serde_json::Error> for BrainGraphError {
+    fn from(e: serde_json::Error) -> Self {
+        BrainGraphError::Json(e)
     }
 }
 
