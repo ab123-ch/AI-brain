@@ -270,6 +270,7 @@ impl LlmConfig {
         brain_providers.insert("memory".into(), "xiaomi".into());
         brain_providers.insert("eval".into(), "deepseek".into());
         brain_providers.insert("evolver".into(), "xiaomi".into());
+        brain_providers.insert("novel".into(), "xiaomi".into());
 
         let mut brain_models = HashMap::new();
         brain_models.insert("main".into(), "mimo-7b".into());
@@ -278,6 +279,7 @@ impl LlmConfig {
         brain_models.insert("memory".into(), "mimo-7b".into());
         brain_models.insert("eval".into(), "deepseek-chat".into());
         brain_models.insert("evolver".into(), "mimo-7b".into());
+        brain_models.insert("novel".into(), "mimo-7b".into());
 
         let mut brain_params = HashMap::new();
         brain_params.insert(
@@ -306,6 +308,13 @@ impl LlmConfig {
             BrainParams {
                 max_tokens: 16384,
                 temperature: 0.3,
+            },
+        );
+        brain_params.insert(
+            "novel".into(),
+            BrainParams {
+                max_tokens: 32768,
+                temperature: 0.9,
             },
         );
         brain_params.insert(
@@ -374,6 +383,14 @@ impl LlmConfig {
             },
         );
         providers.insert(
+            "kimi".into(),
+            ProviderConfig {
+                api_base: "https://api.moonshot.ai/v1".into(),
+                api_key_env: "MOONSHOT_API_KEY".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert(
             "gemini".into(),
             ProviderConfig {
                 api_base: "https://generativelanguage.googleapis.com/v1beta".into(),
@@ -402,9 +419,25 @@ mod tests {
         assert_eq!(config.llm.default_provider, "xiaomi");
         assert_eq!(config.llm.default_model, "mimo-7b");
         assert!(config.llm.brain_providers.contains_key("main"));
+        assert!(config.llm.brain_providers.contains_key("novel"));
+        assert!(config.llm.brain_models.contains_key("novel"));
         assert_eq!(config.provider_for_brain("eval"), "deepseek");
+        assert_eq!(config.provider_for_brain("novel"), "xiaomi");
         assert_eq!(config.model_for_brain("main"), "mimo-7b");
         assert_eq!(config.model_for_brain("eval"), "deepseek-chat");
+        assert_eq!(config.model_for_brain("novel"), "mimo-7b");
+        let (novel_max_tokens, novel_temperature) = config.params_for_brain("novel");
+        assert_eq!(novel_max_tokens, 32768);
+        assert!((novel_temperature - 0.9).abs() < f64::EPSILON);
+
+        let kimi = config
+            .llm
+            .providers
+            .get("kimi")
+            .expect("默认配置应包含 Kimi provider");
+        assert_eq!(kimi.api_base, "https://api.moonshot.ai/v1");
+        assert_eq!(kimi.api_key_env, "MOONSHOT_API_KEY");
+        assert_eq!(kimi.kind, ProviderKind::OpenAi);
     }
 
     #[test]
@@ -448,7 +481,24 @@ temperature = 0.5
 
     #[test]
     fn load_default_returns_default_when_no_file() {
+        let original_home = std::env::var_os("HOME");
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        let dir = tempfile::tempdir().unwrap();
+
+        std::env::set_var("HOME", dir.path());
+        std::env::remove_var("USERPROFILE");
+
         let config = LlmConfig::load_default().unwrap();
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
         assert_eq!(config.llm.default_provider, "xiaomi");
     }
 

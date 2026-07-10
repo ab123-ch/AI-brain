@@ -413,14 +413,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
 The sub-agent runs in an isolated session with its own tools and returns results when done. \
 Use this when the task benefits from focused, independent work (e.g., codebase exploration, \
 code review, verification, research). Do NOT use for simple lookups — use read_file/grep/glob directly. \
-Available subagent_type values: 'Explore' (read-only research), 'general-purpose' (full tool access). \
+Available subagent_type values: 'Explore' (read-only research), 'Plan', 'Verification', \
+'Novel' (creative writing only; main brain supplies all context and handles files), \
+'general-purpose' (full tool access). \
 The sub-agent inherits your model and API credentials automatically — do NOT research how to launch it, just call this tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "description": "Short description of what the agent will do" },
                     "prompt": { "type": "string", "description": "Detailed instructions for the agent" },
-                    "subagent_type": { "type": "string", "description": "Agent type: 'Explore' for read-only research, 'general-purpose' for full access. Defaults to 'general-purpose'." },
+                    "subagent_type": { "type": "string", "description": "Agent type: 'Explore', 'Plan', 'Verification', 'Novel', or 'general-purpose'. Novel is for outline/chapter/body/continuation writing only; main brain handles files. Defaults to 'general-purpose'." },
                     "name": { "type": "string", "description": "Optional short name for the agent" },
                     "model": { "type": "string", "description": "Optional model override (leave empty to use default)" },
                     "run_in_background": { "type": "boolean", "description": "Set to true to run this agent in the background. You will be automatically notified when it completes.", "default": false }
@@ -905,6 +907,51 @@ fn run_agent(input: AgentInput) -> Result<String, String> {
     to_pretty_json(execute_agent(input)?)
 }
 
+pub struct AgentToolLaunch {
+    pub output_json: String,
+    pub completion_rx: Option<std::sync::mpsc::Receiver<AgentCompletion>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentCompletion {
+    pub agent_id: String,
+    pub name: String,
+    pub status: String,
+    pub output: String,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
+pub fn execute_agent_tool_with_completion(input: &Value) -> Result<AgentToolLaunch, String> {
+    let input = from_value::<AgentInput>(input)?;
+    let launch = execute_agent_launch_with_spawn(input, spawn_agent_job)?;
+    let output_json = to_pretty_json(launch.manifest.clone())?;
+    let completion_rx = launch.completion_rx.map(|rx| {
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let manifest = launch.manifest.clone();
+        std::thread::spawn(move || {
+            let completion = match rx.recv() {
+                Ok(done) => AgentCompletion::from_done(&manifest, done),
+                Err(_) => AgentCompletion {
+                    agent_id: manifest.agent_id.clone(),
+                    name: manifest.name.clone(),
+                    status: "failed".into(),
+                    output: String::new(),
+                    error: Some("sub-agent channel closed unexpectedly".into()),
+                    duration_ms: 0,
+                },
+            };
+            let _ = completion_tx.send(completion);
+        });
+        completion_rx
+    });
+
+    Ok(AgentToolLaunch {
+        output_json,
+        completion_rx,
+    })
+}
+
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
@@ -1233,6 +1280,24 @@ pub(crate) struct AgentDone {
     final_text: Option<String>,
     error: Option<String>,
     duration_ms: u64,
+}
+
+impl AgentCompletion {
+    fn from_done(manifest: &AgentOutput, done: AgentDone) -> Self {
+        Self {
+            agent_id: manifest.agent_id.clone(),
+            name: manifest.name.clone(),
+            status: done.status,
+            output: done.final_text.unwrap_or_default(),
+            error: done.error,
+            duration_ms: done.duration_ms,
+        }
+    }
+}
+
+struct AgentLaunch {
+    manifest: AgentOutput,
+    completion_rx: Option<std::sync::mpsc::Receiver<AgentDone>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1828,6 +1893,13 @@ fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOu
 where
     F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
 {
+    execute_agent_launch_with_spawn(input, spawn_fn).map(|launch| launch.manifest)
+}
+
+fn execute_agent_launch_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentLaunch, String>
+where
+    F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
+{
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
@@ -1841,7 +1913,7 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
+    let model = resolve_agent_model(input.model.as_deref(), &normalized_subagent_type);
     let agent_name = input
         .name
         .as_deref()
@@ -1900,8 +1972,11 @@ where
 
     if input.run_in_background {
         // 异步模式：立即返回 "running" manifest，不等待完成
-        // 子代理完成后由调用者通过回调或轮询获取结果
-        return Ok(manifest);
+        // 子代理完成后由调用者通过 completion_rx 获取结果
+        return Ok(AgentLaunch {
+            manifest,
+            completion_rx: Some(result_rx),
+        });
     }
 
     // 同步模式：阻塞等待子代理完成
@@ -1916,7 +1991,10 @@ where
         error: agent_done.error,
         ..manifest
     };
-    Ok(final_manifest)
+    Ok(AgentLaunch {
+        manifest: final_manifest,
+        completion_rx: None,
+    })
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String> {
@@ -2060,7 +2138,7 @@ fn build_agent_runtime(
         .manifest
         .model
         .clone()
-        .unwrap_or_else(|| resolve_agent_model(None));
+        .unwrap_or_else(|| resolve_agent_model(None, "general-purpose"));
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let tool_executor = SubagentToolExecutor::new(allowed_tools);
@@ -2078,6 +2156,22 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     // 子代理用轻量级系统提示词，不加载完整主脑 prompt（避免 60 万+ 字符撑爆弱模型上下文）
     let os = std::env::consts::OS;
     let today = current_date_str();
+    if subagent_type == "Novel" {
+        let prompt = format!(
+            "你是小说副脑（Novel sub-agent），专门负责长篇小说创作与文本生成。\n\
+             当前日期: {today}\n\
+             操作系统: {os}\n\
+             工作目录: {}\n\n\
+             职责边界:\n\
+             - 只根据主脑提供的剧情、世界观、人设、前文提要、风格要求和用户目标进行创作。\n\
+             - 可以创作大纲、卷纲、章纲、正文、续写、桥段、人物小传、设定补充、爽点设计和改写方案。\n\
+             - 不要读取文件、不要修改文件、不要联网搜索、不要调用外部工具；需要的素材必须由主脑提供。\n\
+             - 不要向用户提问；若信息不足，先基于主脑提供的内容做合理创作假设，并在输出末尾简短列出假设。\n\
+             - 输出应直接可用，保持叙事连贯、人物动机一致、节奏明确，并遵守主脑给出的字数、风格和结构要求。",
+            cwd.display()
+        );
+        return Ok(vec![prompt]);
+    }
     let prompt = format!(
         "You are a background sub-agent of type `{subagent_type}`.\n\
          Current date: {today}\n\
@@ -2093,7 +2187,7 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     Ok(vec![prompt])
 }
 
-fn resolve_agent_model(model: Option<&str>) -> String {
+fn resolve_agent_model(model: Option<&str>, subagent_type: &str) -> String {
     // 优先使用调用者指定的模型，否则从子代理配置或主脑配置中获取
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         return m.to_string();
@@ -2106,7 +2200,11 @@ fn resolve_agent_model(model: Option<&str>) -> String {
     }
     // 尝试从主脑配置获取 subagent brain model
     if let Ok(llm_config) = brain_llm::config::LlmConfig::load_default() {
-        let m = llm_config.model_for_brain("subagent").to_string();
+        let brain_name = match subagent_type {
+            "Novel" => "novel",
+            _ => "subagent",
+        };
+        let m = llm_config.model_for_brain(brain_name).to_string();
         if !m.is_empty() {
             return m;
         }
@@ -2153,6 +2251,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "SendUserMessage",
             "PowerShell",
         ],
+        "Novel" => vec![],
         "claw-guide" => vec![
             "read_file",
             "glob_search",
@@ -2286,7 +2385,7 @@ struct ProviderRuntimeClient {
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
-    fn new(_model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
         // 1. 加载主脑 LLM 配置（失败时使用默认配置，不阻断子代理启动）
         let llm_config = LlmConfig::load_default().unwrap_or_else(|e| {
             tracing::warn!("[子代理] 主脑配置加载失败，使用默认配置: {e}");
@@ -2300,13 +2399,13 @@ impl ProviderRuntimeClient {
 
         // 3. 模型优先级：subagent.json 配置 > brain_models.subagent > 主脑默认
         //    子代理需要 tool calling 支持，默认模型不一定兼容
-        let subagent_brain_model = llm_config.model_for_brain("subagent").to_string();
         let model = subagent_config
             .model
             .as_deref()
             .filter(|m| !m.is_empty())
             .map(str::to_string)
-            .unwrap_or(subagent_brain_model);
+            .or_else(|| (!model.trim().is_empty()).then(|| model.trim().to_string()))
+            .unwrap_or_else(|| llm_config.model_for_brain("subagent").to_string());
         tracing::debug!("[子代理] 使用模型: {model}");
 
         // 4. 提供商选择：多策略匹配
@@ -2952,11 +3051,20 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
     if trimmed.is_empty() {
         return String::from("general-purpose");
     }
+    if matches!(
+        trimmed,
+        "小说" | "小说副脑" | "写作" | "创作" | "网文" | "正文" | "续写"
+    ) {
+        return String::from("Novel");
+    }
 
     match canonical_tool_token(trimmed).as_str() {
         "general" | "generalpurpose" | "generalpurposeagent" => String::from("general-purpose"),
         "explore" | "explorer" | "exploreagent" => String::from("Explore"),
         "plan" | "planagent" => String::from("Plan"),
+        "novel" | "novelagent" | "fiction" | "fictionwriter" | "writer" | "writing" => {
+            String::from("Novel")
+        }
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
@@ -4024,8 +4132,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
-        execute_tool, final_assistant_text, mvp_tool_specs, permission_mode_from_plugin,
+        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
+        execute_agent_launch_with_spawn, execute_agent_with_spawn, execute_tool,
+        final_assistant_text, mvp_tool_specs, normalize_subagent_type, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, AgentDone, AgentInput, AgentJob,
         ProviderRuntimeClient, SubagentToolExecutor,
     };
@@ -4707,6 +4816,54 @@ mod tests {
     }
 
     #[test]
+    fn background_agent_launch_returns_completion_receiver() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-background-receiver");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+
+        let launch = execute_agent_launch_with_spawn(
+            AgentInput {
+                description: "Run in background".to_string(),
+                prompt: "Do the background work".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("background-task".to_string()),
+                model: None,
+                run_in_background: true,
+            },
+            |_job| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    tx.send(AgentDone {
+                        status: "completed".into(),
+                        final_text: Some("Finished later".into()),
+                        error: None,
+                        duration_ms: 25,
+                    })
+                    .expect("send AgentDone");
+                });
+                Ok(rx)
+            },
+        )
+        .expect("background launch should succeed");
+
+        assert_eq!(launch.manifest.status, "running");
+        let completion_rx = launch
+            .completion_rx
+            .expect("background launch should keep completion receiver");
+        let done = completion_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("completion should arrive");
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.final_text.as_deref(), Some("Finished later"));
+
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn agent_tool_subset_mapping_is_expected() {
         let general = allowed_tools_for_subagent("general-purpose");
         assert!(general.contains("bash"));
@@ -4727,6 +4884,24 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
+
+        let novel = allowed_tools_for_subagent("Novel");
+        assert!(novel.is_empty(), "小说副脑不应直接读取、修改文件或调用工具");
+        assert_eq!(normalize_subagent_type(Some("novel")), "Novel");
+        assert_eq!(normalize_subagent_type(Some("小说")), "Novel");
+        assert_eq!(normalize_subagent_type(Some("写作")), "Novel");
+    }
+
+    #[test]
+    fn novel_subagent_prompt_is_creative_only() {
+        let prompt = build_agent_system_prompt("Novel")
+            .expect("Novel prompt should build")
+            .join("\n");
+
+        assert!(prompt.contains("小说副脑"));
+        assert!(prompt.contains("不要读取文件"));
+        assert!(prompt.contains("不要修改文件"));
+        assert!(prompt.contains("主脑提供"));
     }
 
     #[derive(Debug)]

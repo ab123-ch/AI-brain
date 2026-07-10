@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{ContentBlock, FinishReason, TokenUsage, ToolChoice, ToolDefinition};
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// 消息角色
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -20,6 +25,9 @@ pub enum MessageRole {
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: Vec<ContentBlock>,
+    /// Kimi Partial Mode：assistant 前缀消息可要求模型续写该前缀。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial: bool,
 }
 
 impl ChatMessage {
@@ -28,6 +36,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::System,
             content: vec![ContentBlock::text(content)],
+            partial: false,
         }
     }
 
@@ -36,6 +45,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::User,
             content: vec![ContentBlock::text(content)],
+            partial: false,
         }
     }
 
@@ -44,7 +54,13 @@ impl ChatMessage {
         Self {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::text(content)],
+            partial: false,
         }
+    }
+
+    /// Assistant prefix message for Kimi Partial Mode.
+    pub fn assistant_partial(content: impl Into<String>) -> Self {
+        Self::assistant(content).with_partial(true)
     }
 
     /// User message from a tool result block.
@@ -60,6 +76,7 @@ impl ChatMessage {
                 content: output.into(),
                 is_error,
             }],
+            partial: false,
         }
     }
 
@@ -68,7 +85,15 @@ impl ChatMessage {
         Self {
             role: MessageRole::Assistant,
             content: blocks,
+            partial: false,
         }
+    }
+
+    /// Mark this assistant message as a partial prefix for compatible providers.
+    #[must_use]
+    pub fn with_partial(mut self, partial: bool) -> Self {
+        self.partial = partial;
+        self
     }
 
     /// Extract all text from this message's content blocks.

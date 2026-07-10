@@ -162,7 +162,7 @@ impl OpenAiCompatClient {
             temperature,
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(300))
+                .timeout(std::time::Duration::from_mins(5))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             retry_config: RetryConfig::default(),
@@ -202,7 +202,7 @@ impl OpenAiCompatClient {
         };
         match reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_mins(5))
             .proxy(proxy)
             .build()
         {
@@ -217,6 +217,15 @@ impl OpenAiCompatClient {
     fn chat_url(&self) -> String {
         let base = self.api_base.trim_end_matches('/');
         format!("{base}/chat/completions")
+    }
+
+    fn maybe_insert_partial(
+        msg: &ChatMessage,
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        if msg.role == MessageRole::Assistant && msg.partial {
+            obj.insert("partial".into(), serde_json::json!(true));
+        }
     }
 
     /// Convert our ChatMessage into OpenAI-compatible JSON values.
@@ -273,6 +282,7 @@ impl OpenAiCompatClient {
             if let Some(rc) = reasoning_content {
                 obj.insert("reasoning_content".into(), serde_json::json!(rc));
             }
+            Self::maybe_insert_partial(msg, &mut obj);
             vec![serde_json::Value::Object(obj)]
         } else if has_tool_result {
             msg.content
@@ -307,13 +317,15 @@ impl OpenAiCompatClient {
             if let Some(rc) = thinking {
                 obj.insert("reasoning_content".into(), serde_json::json!(rc));
             }
+            Self::maybe_insert_partial(msg, &mut obj);
             vec![serde_json::Value::Object(obj)]
         } else {
             let text: String = msg.text_content();
-            vec![serde_json::json!({
-                "role": role,
-                "content": text
-            })]
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".into(), serde_json::json!(role));
+            obj.insert("content".into(), serde_json::json!(text));
+            Self::maybe_insert_partial(msg, &mut obj);
+            vec![serde_json::Value::Object(obj)]
         }
     }
 
@@ -453,15 +465,13 @@ impl OpenAiCompatClient {
 
         if let Some(content) = &msg.content {
             match content {
-                serde_json::Value::String(s) => {
-                    if !s.is_empty() {
-                        let (thinking, text) = extract_thinking_and_text(s);
-                        if let Some(t) = thinking {
-                            blocks.push(ContentBlock::thinking(t));
-                        }
-                        if !text.is_empty() {
-                            blocks.push(ContentBlock::text(text));
-                        }
+                serde_json::Value::String(s) if !s.is_empty() => {
+                    let (thinking, text) = extract_thinking_and_text(s);
+                    if let Some(t) = thinking {
+                        blocks.push(ContentBlock::thinking(t));
+                    }
+                    if !text.is_empty() {
+                        blocks.push(ContentBlock::text(text));
                     }
                 }
                 serde_json::Value::Array(parts) => {
@@ -799,6 +809,17 @@ mod tests {
         assert_eq!(api_msgs.len(), 1);
         assert_eq!(api_msgs[0]["role"], "user");
         assert_eq!(api_msgs[0]["content"], "hello");
+    }
+
+    #[test]
+    fn message_to_api_assistant_partial() {
+        let msg = ChatMessage::assistant("你好，").with_partial(true);
+        let api_msgs = OpenAiCompatClient::message_to_api(&msg);
+
+        assert_eq!(api_msgs.len(), 1);
+        assert_eq!(api_msgs[0]["role"], "assistant");
+        assert_eq!(api_msgs[0]["content"], "你好，");
+        assert_eq!(api_msgs[0]["partial"], true);
     }
 
     #[test]

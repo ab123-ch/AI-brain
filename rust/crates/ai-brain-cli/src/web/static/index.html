@@ -14,6 +14,10 @@
         </div>
         <div class="header-center">
             <select id="persona-select"><option>加载中...</option></select>
+            <div class="view-switch">
+                <button id="chat-tab" class="view-tab active">聊天</button>
+                <button id="cockpit-tab" class="view-tab">驾驶舱</button>
+            </div>
         </div>
         <div class="header-right">
             <button id="thinking-toggle" class="icon-btn" title="切换思考内容">&#128173;</button>
@@ -24,12 +28,29 @@
         <aside id="sidebar">
             <div id="session-list"></div>
         </aside>
-        <main id="chat-area">
+        <main id="chat-area" class="view-panel active">
             <div id="messages"></div>
             <div id="input-area">
                 <textarea id="input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
                 <button id="send-btn">&#10148;</button>
             </div>
+        </main>
+        <main id="cockpit-area" class="view-panel">
+            <section class="cockpit-header">
+                <div>
+                    <h2>智脑驾驶舱</h2>
+                    <p id="cockpit-summary">等待任务进入...</p>
+                </div>
+                <button id="cockpit-reset" class="small-btn">清空轨迹</button>
+            </section>
+            <section id="brain-map">
+                <svg id="brain-links" aria-hidden="true"></svg>
+                <div id="brain-nodes"></div>
+            </section>
+            <section id="brain-events">
+                <h3>实时事件</h3>
+                <div id="brain-event-list"></div>
+            </section>
         </main>
     </div>
     <div id="ask-modal" class="modal hidden">

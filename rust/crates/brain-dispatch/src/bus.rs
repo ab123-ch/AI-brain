@@ -71,8 +71,18 @@ impl TokioDispatch {
             // Wait for the next event
             match rx.recv().await {
                 Some(pe) => {
-                    // Handle this event
-                    self.handle_event(pe.event, &output_tx).await;
+                    let mut batch = vec![pe];
+                    while let Ok(pe) = rx.try_recv() {
+                        batch.push(pe);
+                    }
+                    batch.sort_by(|a, b| {
+                        a.priority
+                            .cmp(&b.priority)
+                            .then_with(|| a.enqueued_at.cmp(&b.enqueued_at))
+                    });
+                    for pe in batch {
+                        self.handle_event(pe.event, &output_tx).await;
+                    }
                 }
                 None => {
                     tracing::info!("dispatch_loop: queue channel closed");

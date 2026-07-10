@@ -140,6 +140,7 @@ impl SessionManager {
             role: role.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
+            hidden: false,
         };
 
         let session = self.sessions.get_mut(&self.active_id).unwrap();
@@ -147,7 +148,11 @@ impl SessionManager {
 
         // 若是第一条用户消息且标题是默认的，自动更新标题
         if session.title == "New Session" {
-            if let Some(first_user) = session.messages.iter().find(|m| m.role == "user") {
+            if let Some(first_user) = session
+                .messages
+                .iter()
+                .find(|m| m.role == "user" && !m.hidden)
+            {
                 let truncated: String = first_user.content.chars().take(30).collect();
                 if first_user.content.chars().count() > 30 {
                     session.title = format!("{truncated}...");
@@ -171,6 +176,7 @@ impl SessionManager {
             role: role.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
+            hidden: false,
         };
 
         if let Some(session) = self.sessions.get_mut(session_id) {
@@ -178,7 +184,11 @@ impl SessionManager {
 
             // 若是第一条用户消息且标题是默认的，自动更新标题
             if session.title == "New Session" {
-                if let Some(first_user) = session.messages.iter().find(|m| m.role == "user") {
+                if let Some(first_user) = session
+                    .messages
+                    .iter()
+                    .find(|m| m.role == "user" && !m.hidden)
+                {
                     let truncated: String = first_user.content.chars().take(30).collect();
                     if first_user.content.chars().count() > 30 {
                         session.title = format!("{truncated}...");
@@ -192,6 +202,58 @@ impl SessionManager {
                 Self::persist_to_disk(&self.persist_dir, s);
             }
         }
+    }
+
+    /// 返回当前活跃会话的可见消息。
+    pub fn active_visible_messages(&self) -> Vec<ChatMessage> {
+        self.active()
+            .messages
+            .iter()
+            .filter(|m| !m.hidden)
+            .cloned()
+            .collect()
+    }
+
+    /// 隐藏当前活跃会话中某条可见消息所属的一整轮。
+    ///
+    /// 这里不会删除消息内容，只设置 hidden=true 并持久化。轮次按 user 消息切分：
+    /// 从本条消息往前找到最近 user，再隐藏到下一个 user 之前的所有消息。
+    pub fn hide_turn_by_visible_index(&mut self, visible_index: usize) -> Option<Vec<ChatMessage>> {
+        let active_id = self.active_id.clone();
+        let session = self.sessions.get_mut(&active_id)?;
+        let raw_index = session
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.hidden)
+            .nth(visible_index)
+            .map(|(idx, _)| idx)?;
+
+        let mut start = raw_index;
+        while start > 0 && session.messages[start].role != "user" {
+            start -= 1;
+        }
+        if session.messages[start].role != "user" {
+            start = raw_index;
+        }
+
+        let mut end = start + 1;
+        while end < session.messages.len() && session.messages[end].role != "user" {
+            end += 1;
+        }
+
+        for msg in &mut session.messages[start..end] {
+            msg.hidden = true;
+        }
+
+        let visible = session
+            .messages
+            .iter()
+            .filter(|m| !m.hidden)
+            .cloned()
+            .collect::<Vec<_>>();
+        Self::persist_to_disk(&self.persist_dir, session);
+        Some(visible)
     }
 
     // ─── 私有辅助方法 ───────────────────────────────────────────────
@@ -391,6 +453,26 @@ mod tests {
 
         // 标题应自动更新为第一条用户消息内容
         assert!(mgr.active().title.contains("Hello"));
+    }
+
+    #[test]
+    fn hide_turn_hides_whole_visible_turn_but_keeps_messages() {
+        let tmp = TempDir::new("test_session_hide_turn");
+        let mut mgr = SessionManager::new(tmp.path());
+
+        mgr.push_message("user", "第一轮");
+        mgr.push_message("assistant", "第一轮回复");
+        mgr.push_message("user", "第二轮");
+        mgr.push_message("assistant", "第二轮回复");
+
+        let visible = mgr.hide_turn_by_visible_index(1).unwrap();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].content, "第二轮");
+        assert_eq!(visible[1].content, "第二轮回复");
+        assert_eq!(mgr.active().messages.len(), 4);
+        assert!(mgr.active().messages[0].hidden);
+        assert!(mgr.active().messages[1].hidden);
+        assert!(!mgr.active().messages[2].hidden);
     }
 
     #[test]

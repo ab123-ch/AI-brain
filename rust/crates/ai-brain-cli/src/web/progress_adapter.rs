@@ -22,6 +22,11 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
+    /// 是否从当前 Web 会话窗口隐藏。
+    ///
+    /// 隐藏不会删除磁盘中的历史内容；后续恢复给模型的上下文会跳过隐藏消息。
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// 人格信息
@@ -100,6 +105,11 @@ pub enum WebProgressEvent {
     },
     /// 会话切换确认
     SessionSwitched {
+        session_id: String,
+        messages: Vec<ChatMessage>,
+    },
+    /// 当前会话消息发生变化（例如隐藏一整轮历史）
+    SessionMessagesUpdated {
         session_id: String,
         messages: Vec<ChatMessage>,
     },

@@ -56,6 +56,30 @@ body {
 
 .header-center { flex: 1; justify-content: center; }
 
+.view-switch {
+    display: flex;
+    gap: 4px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 2px;
+}
+
+.view-tab {
+    background: transparent;
+    border: 0;
+    color: var(--text-secondary);
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.view-tab.active {
+    background: var(--accent);
+    color: #fff;
+}
+
 #persona-select {
     background: var(--bg-primary);
     color: var(--text-primary);
@@ -135,9 +159,18 @@ body {
 .session-item.active .session-meta { color: rgba(255,255,255,0.7); }
 
 /* ── Chat Area ────────────────────────────────────────────────── */
+.view-panel {
+    flex: 1;
+    display: none;
+    overflow: hidden;
+}
+
+.view-panel.active {
+    display: flex;
+}
+
 #chat-area {
     flex: 1;
-    display: flex;
     flex-direction: column;
     overflow: hidden;
 }
@@ -153,12 +186,40 @@ body {
 
 /* ── Message Bubbles ──────────────────────────────────────────── */
 .msg {
+    position: relative;
     max-width: 75%;
     padding: 10px 14px;
     border-radius: var(--radius);
     line-height: 1.5;
     font-size: 14px;
     word-wrap: break-word;
+}
+
+.msg-delete {
+    position: absolute;
+    top: -7px;
+    right: -7px;
+    width: 20px;
+    height: 20px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    line-height: 1;
+}
+
+.msg:hover .msg-delete {
+    display: flex;
+}
+
+.msg-delete:hover {
+    background: var(--error);
+    color: #fff;
 }
 
 .msg.user {
@@ -379,6 +440,179 @@ body {
     to { transform: rotate(360deg); }
 }
 
+/* ── Cockpit ─────────────────────────────────────────────────── */
+#cockpit-area {
+    flex-direction: column;
+    padding: 16px;
+    gap: 14px;
+    overflow-y: auto;
+}
+
+.cockpit-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+}
+
+.cockpit-header h2 {
+    font-size: 18px;
+    margin-bottom: 4px;
+}
+
+.cockpit-header p {
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+.small-btn {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.small-btn:hover {
+    background: var(--border);
+}
+
+#brain-map {
+    position: relative;
+    min-height: 340px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.02);
+    overflow: hidden;
+}
+
+#brain-links {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 1;
+}
+
+#brain-nodes {
+    position: relative;
+    z-index: 2;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(180px, 1fr));
+    gap: 18px;
+    padding: 28px;
+}
+
+.brain-node {
+    min-height: 112px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+    padding: 14px;
+}
+
+.brain-node.active {
+    border-color: var(--warning);
+    box-shadow: 0 0 0 1px rgba(255, 152, 0, 0.25);
+}
+
+.brain-node.done {
+    border-color: rgba(76, 175, 80, 0.55);
+}
+
+.brain-node.error {
+    border-color: rgba(244, 67, 54, 0.7);
+}
+
+.brain-node-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 8px;
+}
+
+.brain-node-status {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    font-size: 12px;
+    margin-bottom: 10px;
+}
+
+.brain-node.active .brain-node-status {
+    background: rgba(255, 152, 0, 0.15);
+    color: var(--warning);
+}
+
+.brain-node-detail {
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.brain-link {
+    stroke: var(--text-secondary);
+    stroke-width: 1.5;
+    opacity: 0.45;
+}
+
+.brain-link.active {
+    stroke: var(--warning);
+    stroke-width: 2.5;
+    opacity: 0.95;
+}
+
+.brain-link-label {
+    fill: var(--text-primary);
+    font-size: 12px;
+    text-anchor: middle;
+    paint-order: stroke;
+    stroke: var(--bg-chat);
+    stroke-width: 4px;
+}
+
+#brain-events {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+    overflow: hidden;
+}
+
+#brain-events h3 {
+    font-size: 14px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+#brain-event-list {
+    display: flex;
+    flex-direction: column;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.brain-event {
+    display: flex;
+    gap: 10px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+}
+
+.brain-event span {
+    color: var(--text-secondary);
+    flex: 0 0 72px;
+}
+
+.brain-event p {
+    color: var(--text-primary);
+    line-height: 1.4;
+}
+
 /* ── Input Area ───────────────────────────────────────────────── */
 #input-area {
     display: flex;
@@ -501,6 +735,23 @@ body {
     .msg { max-width: 95%; }
     .tool-group { max-width: 95%; }
     .thinking-block { max-width: 95%; }
+
+    .header-center {
+        justify-content: flex-end;
+    }
+
+    .view-switch {
+        display: none;
+    }
+
+    #brain-nodes {
+        grid-template-columns: 1fr;
+        padding: 16px;
+    }
+
+    #brain-map {
+        min-height: 560px;
+    }
 }
 
 /* ── Scrollbar ────────────────────────────────────────────────── */
