@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::web::progress_adapter::ChatMessage;
+use crate::runtime_trace::{ExchangePhase, RuntimeExchange};
+use crate::web::progress_adapter::{ChatExchange, ChatMessage};
 
 // ─── WebSession ─────────────────────────────────────────────────────
 
@@ -141,6 +142,7 @@ impl SessionManager {
             content: content.to_string(),
             timestamp: Utc::now(),
             hidden: false,
+            exchange: None,
         };
 
         let session = self.sessions.get_mut(&self.active_id).unwrap();
@@ -177,6 +179,7 @@ impl SessionManager {
             content: content.to_string(),
             timestamp: Utc::now(),
             hidden: false,
+            exchange: None,
         };
 
         if let Some(session) = self.sessions.get_mut(session_id) {
@@ -202,6 +205,51 @@ impl SessionManager {
                 Self::persist_to_disk(&self.persist_dir, s);
             }
         }
+    }
+
+    /// Insert or update one paired runtime exchange in a specific chat session.
+    pub fn upsert_exchange_to(&mut self, session_id: &str, exchange: RuntimeExchange) -> bool {
+        let exchange_id = exchange.exchange_id.clone();
+        let phase = exchange.phase;
+        let timestamp = exchange.occurred_at;
+        let title = exchange.title.clone();
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+
+        if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+            message.role == "brain_communication"
+                && message
+                    .exchange
+                    .as_ref()
+                    .is_some_and(|stored| stored.exchange_id == exchange_id)
+        }) {
+            let stored = message.exchange.as_mut().expect("exchange record exists");
+            match phase {
+                ExchangePhase::Request => stored.request = Some(exchange),
+                ExchangePhase::Response => stored.response = Some(exchange),
+            }
+        } else {
+            let mut stored = ChatExchange {
+                exchange_id,
+                request: None,
+                response: None,
+            };
+            match phase {
+                ExchangePhase::Request => stored.request = Some(exchange),
+                ExchangePhase::Response => stored.response = Some(exchange),
+            }
+            session.messages.push(ChatMessage {
+                role: "brain_communication".into(),
+                content: title,
+                timestamp,
+                hidden: false,
+                exchange: Some(stored),
+            });
+        }
+
+        Self::persist_to_disk(&self.persist_dir, session);
+        true
     }
 
     /// 返回当前活跃会话的可见消息。
@@ -504,6 +552,95 @@ mod tests {
         assert_eq!(mgr2.active().id, id);
         assert_eq!(mgr2.active().messages.len(), 1);
         assert_eq!(mgr2.active().messages[0].content, "persist test");
+    }
+
+    #[test]
+    fn exchange_request_and_response_pair_and_persist() {
+        use crate::runtime_trace::{ExchangeKind, ExchangeStatus};
+
+        let tmp = TempDir::new("test_session_exchange");
+        let session_id = {
+            let mut mgr = SessionManager::new(tmp.path());
+            let session_id = mgr.active().id.clone();
+            let request = RuntimeExchange::new(
+                "delegation-1",
+                "main",
+                "主脑",
+                "novel:1",
+                "小说脑",
+                ExchangeKind::Delegation,
+                ExchangePhase::Request,
+                "设计章节",
+                "完整任务原文",
+                ExchangeStatus::Running,
+                None,
+            );
+            let response = RuntimeExchange::new(
+                "delegation-1",
+                "novel:1",
+                "小说脑",
+                "main",
+                "主脑",
+                ExchangeKind::Delegation,
+                ExchangePhase::Response,
+                "设计章节 · 最终结果",
+                "完整小说结果",
+                ExchangeStatus::Completed,
+                Some(42),
+            );
+
+            assert!(mgr.upsert_exchange_to(&session_id, request));
+            assert!(mgr.upsert_exchange_to(&session_id, response));
+            assert_eq!(mgr.active().messages.len(), 1);
+            let stored = mgr.active().messages[0].exchange.as_ref().unwrap();
+            assert_eq!(stored.request.as_ref().unwrap().content, "完整任务原文");
+            assert_eq!(stored.response.as_ref().unwrap().content, "完整小说结果");
+            session_id
+        };
+
+        let reloaded = SessionManager::new(tmp.path());
+        assert_eq!(reloaded.active().id, session_id);
+        let stored = reloaded.active().messages[0].exchange.as_ref().unwrap();
+        assert_eq!(stored.exchange_id, "delegation-1");
+        assert_eq!(stored.response.as_ref().unwrap().content, "完整小说结果");
+    }
+
+    #[test]
+    fn hiding_turn_also_hides_its_brain_exchange() {
+        use crate::runtime_trace::{ExchangeKind, ExchangeStatus};
+
+        let tmp = TempDir::new("test_session_hide_exchange");
+        let mut mgr = SessionManager::new(tmp.path());
+        let session_id = mgr.active().id.clone();
+        mgr.push_message("user", "请小说脑设计章节");
+        assert!(mgr.upsert_exchange_to(
+            &session_id,
+            RuntimeExchange::new(
+                "delegation-hide",
+                "main",
+                "主脑",
+                "novel:1",
+                "小说脑",
+                ExchangeKind::Delegation,
+                ExchangePhase::Request,
+                "设计章节",
+                "完整任务原文",
+                ExchangeStatus::Running,
+                None,
+            ),
+        ));
+        mgr.push_message("assistant", "小说脑正在处理");
+        mgr.push_message("user", "下一轮");
+        mgr.push_message("assistant", "下一轮回复");
+
+        let visible = mgr.hide_turn_by_visible_index(1).unwrap();
+
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].content, "下一轮");
+        assert_eq!(visible[1].content, "下一轮回复");
+        assert!(mgr.active().messages[..3]
+            .iter()
+            .all(|message| message.hidden));
     }
 
     #[test]

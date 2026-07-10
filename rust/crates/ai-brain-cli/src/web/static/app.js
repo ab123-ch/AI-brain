@@ -279,6 +279,7 @@ function handleServerMessage(data) {
 
         case 'session_switched':
             activeSessionId = data.session_id;
+            renderSessionList(sessionCache);
             updateActiveSessionTitle();
             renderMessages(data.messages);
             renderCockpit();
@@ -321,7 +322,6 @@ function handleServerMessage(data) {
 
 // ── Streaming Text (Typewriter) ─────────────────────────────────
 function appendStreamingText(text) {
-    currentToolGroup = null;
     if (!currentStreamingEl) {
         currentStreamingEl = document.createElement('div');
         currentStreamingEl.className = 'msg assistant';
@@ -377,7 +377,6 @@ function refreshIcons() {
 // ── Thinking (Typewriter) ───────────────────────────────────────
 function appendThinking(content) {
     if (!currentThinkingEl) {
-        currentToolGroup = null;
         const trace = createTraceDetails(
             'thinking-block reasoning-trace streaming',
             '主脑思考',
@@ -495,15 +494,51 @@ function addToolStart(callId, brain, toolName, input) {
     item.appendChild(header);
     item.appendChild(body);
 
-    if (!currentToolGroup) {
-        currentToolGroup = document.createElement('div');
-        currentToolGroup.className = 'tool-group';
-        $messages.appendChild(currentToolGroup);
-    }
-
-    currentToolGroup.appendChild(item);
+    const group = ensureToolGroup();
+    group.querySelector('.tool-group-body').appendChild(item);
     toolItems.set(stableId, item);
+    updateToolGroupSummary(group);
     scrollToBottom();
+}
+
+function ensureToolGroup() {
+    if (currentToolGroup) return currentToolGroup;
+
+    const group = document.createElement('details');
+    group.className = 'tool-group running';
+    const summary = document.createElement('summary');
+    summary.innerHTML = `
+        <span class="trace-chevron" aria-hidden="true"></span>
+        <i data-lucide="wrench" aria-hidden="true"></i>
+        <strong>工具调用</strong>
+        <span class="tool-group-count">0 次</span>
+        <span class="tool-group-state">运行中</span>
+    `;
+    const body = document.createElement('div');
+    body.className = 'tool-group-body';
+    group.append(summary, body);
+    $messages.appendChild(group);
+    currentToolGroup = group;
+    refreshIcons();
+    return group;
+}
+
+function updateToolGroupSummary(group) {
+    if (!group) return;
+    const items = Array.from(group.querySelectorAll('.tool-item'));
+    const running = items.filter((item) => item.classList.contains('running')).length;
+    const errors = items.filter((item) => item.classList.contains('error')).length;
+    const count = group.querySelector('.tool-group-count');
+    const state = group.querySelector('.tool-group-state');
+    if (count) count.textContent = `${items.length} 次`;
+    if (state) {
+        state.textContent = running > 0
+            ? `${running} 个运行中`
+            : (errors > 0 ? `${errors} 个失败` : '已完成');
+    }
+    group.classList.toggle('running', running > 0);
+    group.classList.toggle('has-error', errors > 0);
+    group.classList.toggle('done', items.length > 0 && running === 0 && errors === 0);
 }
 
 function createToolSection(label, content) {
@@ -544,6 +579,7 @@ function updateToolDone(callId, toolName, durationMs, output, isError) {
     item.classList.remove('running');
     item.classList.add(isError ? 'error' : 'done');
     if (isError) item.open = true;
+    updateToolGroupSummary(item.closest('.tool-group'));
 }
 
 // ── UI Helpers ──────────────────────────────────────────────────
@@ -800,7 +836,7 @@ function handleBrainCommunication(exchange) {
     );
 }
 
-function renderChatExchange(item) {
+function renderChatExchange(item, shouldScroll = true) {
     const request = item.request;
     const response = item.response;
     const primary = request || response;
@@ -816,7 +852,6 @@ function renderChatExchange(item) {
         details = document.createElement('details');
         details.dataset.exchangeId = exchangeId;
         chatExchangeItems.set(exchangeId, details);
-        currentToolGroup = null;
         $messages.appendChild(details);
     }
 
@@ -852,7 +887,7 @@ function renderChatExchange(item) {
     }
 
     details.append(summary, body);
-    if (isNew) scrollToBottom();
+    if (isNew && shouldScroll) scrollToBottom();
 }
 
 function participantRole(kind, label) {
@@ -1498,6 +1533,18 @@ function renderMessages(messages) {
             renderMarkdown(el, m.content);
             attachDeleteAction(el, index);
             $messages.appendChild(el);
+        } else if (m.role === 'brain_communication' && m.exchange) {
+            const request = m.exchange.request || null;
+            const response = m.exchange.response || null;
+            renderChatExchange({
+                id: `exchange-${m.exchange.exchange_id}`,
+                exchangeId: m.exchange.exchange_id,
+                synthetic: false,
+                kind: request?.kind || response?.kind || 'delegation',
+                request,
+                response,
+                updatedAt: Date.parse(response?.occurred_at || request?.occurred_at || m.timestamp) || 0,
+            }, false);
         } else {
             const el = addSystemMessage(m.content);
             attachDeleteAction(el, index);

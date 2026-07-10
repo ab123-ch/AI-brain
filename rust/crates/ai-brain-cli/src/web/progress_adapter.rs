@@ -29,6 +29,19 @@ pub struct ChatMessage {
     /// 隐藏不会删除磁盘中的历史内容；后续恢复给模型的上下文会跳过隐藏消息。
     #[serde(default)]
     pub hidden: bool,
+    /// Paired brain-to-brain request/result persisted with the chat turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange: Option<ChatExchange>,
+}
+
+/// Persisted request/result pair for one runtime exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatExchange {
+    pub exchange_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RuntimeExchange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<RuntimeExchange>,
 }
 
 /// 人格信息

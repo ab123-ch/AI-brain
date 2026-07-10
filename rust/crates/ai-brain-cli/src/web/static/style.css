@@ -379,7 +379,38 @@ details[open] > summary .trace-chevron::before { transform: rotate(90deg); }
 .tool-group {
     align-self: flex-start;
     width: min(860px, 92%);
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warning);
+    border-radius: 8px;
+    background: var(--bg-tool);
 }
+
+.tool-group.done { border-left-color: var(--success); }
+.tool-group.has-error { border-left-color: var(--error); }
+
+.tool-group > summary {
+    min-height: 42px;
+    display: grid;
+    grid-template-columns: 14px 18px auto auto 1fr;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    font-size: 12px;
+}
+
+.tool-group > summary::-webkit-details-marker { display: none; }
+.tool-group > summary svg { width: 16px; height: 16px; color: var(--accent); }
+.tool-group-count { color: var(--text-secondary); }
+.tool-group-state { justify-self: end; color: var(--text-secondary); }
+.tool-group.running .tool-group-state { color: var(--warning); }
+.tool-group.done .tool-group-state { color: var(--success); }
+.tool-group.has-error .tool-group-state { color: var(--error); }
+
+.tool-group-body { border-top: 1px solid var(--border); }
 
 .tool-item {
     width: 100%;
@@ -444,6 +475,15 @@ details[open] > summary .trace-chevron::before { transform: rotate(90deg); }
     word-break: break-word;
 }
 .tool-item.error { border-color: rgba(224, 100, 100, 0.55); }
+
+.tool-group .tool-item {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+
+.tool-group .tool-item + .tool-item { border-top: 1px solid var(--border); }
 
 /* ── Thinking Block ───────────────────────────────────────────── */
 .thinking-block {

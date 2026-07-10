@@ -6,6 +6,7 @@
 //!   3. 进入消息循环，路由客户端消息到 Orchestrator / SessionManager / PersonaManager
 //!   4. 将 ProgressEvent 转发为 WebProgressEvent 给前端
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use tracing::{error, info, warn};
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 use crate::orchestrator::Orchestrator;
+use crate::runtime_trace::ExchangePhase;
 use crate::web::progress_adapter::{PersonaInfo, SessionInfo, WebProgressEvent};
 use crate::web::session_manager::SessionManager;
 use brain_core::types::ProgressEvent;
@@ -98,6 +100,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
     let mut history_restored_session: Option<String> = None; // 已恢复历史的会话 ID
     let mut runtime_trace_rx = state.orch.subscribe_runtime_trace();
+    let mut exchange_sessions = HashMap::<String, String>::new();
 
     // 心跳定时器 — 定期发送 Ping 防止连接因空闲被中间代理/浏览器断开
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
@@ -117,6 +120,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             exchange = runtime_trace_rx.recv() => {
                 match exchange {
                     Ok(exchange) => {
+                        let exchange_id = exchange.exchange_id.clone();
+                        let exchange_phase = exchange.phase;
+                        let exchange_session_id = match exchange_phase {
+                            ExchangePhase::Request => {
+                                if let Some(session_id) = query_session_id.clone() {
+                                    exchange_sessions.insert(exchange_id.clone(), session_id.clone());
+                                    Some(session_id)
+                                } else {
+                                    None
+                                }
+                            }
+                            ExchangePhase::Response => exchange_sessions
+                                .get(&exchange_id)
+                                .cloned()
+                                .or_else(|| query_session_id.clone()),
+                        };
+                        if let Some(session_id) = exchange_session_id {
+                            let mut sessions = state.sessions.lock().await;
+                            if !sessions.upsert_exchange_to(&session_id, exchange.clone()) {
+                                warn!("通信轨迹对应的会话不存在: {session_id}");
+                            }
+                        }
                         if send_event(
                             &mut sender,
                             WebProgressEvent::BrainCommunication { exchange },
@@ -125,6 +150,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         .is_err()
                         {
                             break;
+                        }
+                        if exchange_phase == ExchangePhase::Response {
+                            exchange_sessions.remove(&exchange_id);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
