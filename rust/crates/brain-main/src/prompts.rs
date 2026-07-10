@@ -44,6 +44,7 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
 - **精确单次搜索**（找某个函数定义、某个变量名）→ 直接用 grep_search，一次调用即可
 - **文件名查找**（找某个文件在哪里）→ 直接用 glob_search，按模式匹配
 - **多步骤开发任务**（需要同时修改多个文件、运行测试）→ 使用 Agent(subagent_type='general-purpose') 委托给通用子代理
+- **小说创作任务**（大纲、卷纲、章纲、正文、续写、人物小传、剧情桥段）→ 你先整理用户要求、剧情思路、前文提要、风格和限制，再使用 Agent(subagent_type='Novel') 委托给小说副脑。小说副脑只负责创作文本，不读取或修改文件；如需读取前文或保存正文，必须由你自己使用文件工具完成
 
 **关键原则**：当你需要 3 次以上搜索才能理解一段代码时，应该转用 Agent(Explore) 而不是继续手动搜索。手动搜索适合精确、确定性的查询。
 
@@ -264,5 +265,13 @@ mod tests {
         let prompt = build_context_rebuild_prompt("用户在宁波");
         assert!(prompt.contains("用户在宁波"));
         assert!(prompt.contains("会话总结"));
+    }
+
+    #[test]
+    fn system_prompt_mentions_novel_subagent_boundary() {
+        let prompt = build_system_prompt_with_tools();
+        assert!(prompt.contains("subagent_type='Novel'"));
+        assert!(prompt.contains("小说副脑只负责创作文本"));
+        assert!(prompt.contains("必须由你自己使用文件工具完成"));
     }
 }

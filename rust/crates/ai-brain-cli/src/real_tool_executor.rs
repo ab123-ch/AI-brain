@@ -89,6 +89,31 @@ impl Default for RealToolExecutor {
     }
 }
 
+fn spawn_agent_completion_notifier(
+    dispatch: brain_dispatch::TokioDispatch,
+    completion_rx: std::sync::mpsc::Receiver<tools::AgentCompletion>,
+) {
+    std::thread::spawn(move || {
+        let Ok(completion) = completion_rx.recv() else {
+            tracing::warn!("后台子代理完成通道提前关闭，无法注入通知");
+            return;
+        };
+        let status = match completion.status.as_str() {
+            "completed" => brain_dispatch::AgentStatus::Completed,
+            "failed" => brain_dispatch::AgentStatus::Failed,
+            _ => brain_dispatch::AgentStatus::Running,
+        };
+        dispatch.inject_sync(
+            completion.agent_id,
+            completion.name,
+            status,
+            completion.output,
+            completion.error,
+            completion.duration_ms,
+        );
+    });
+}
+
 impl ToolExecutor for RealToolExecutor {
     fn execute(
         &self,
@@ -297,15 +322,42 @@ impl ToolExecutor for RealToolExecutor {
             });
         }
 
+        if name == "Agent" {
+            let dispatch = self.dispatch.clone();
+            return Box::pin(async move {
+                let start = std::time::Instant::now();
+                let result = tokio::task::spawn_blocking(move || {
+                    tools::execute_agent_tool_with_completion(&input)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
+
+                match result {
+                    Ok(launch) => {
+                        if let (Some(dispatch), Some(completion_rx)) =
+                            (dispatch, launch.completion_rx)
+                        {
+                            spawn_agent_completion_notifier(dispatch, completion_rx);
+                        }
+                        ToolExecutionResult {
+                            tool_name: tool_name_owned,
+                            output: launch.output_json,
+                            is_error: false,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        }
+                    }
+                    Err(e) => ToolExecutionResult {
+                        tool_name: tool_name_owned,
+                        output: e,
+                        is_error: true,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                }
+            });
+        }
+
         Box::pin(async move {
             let start = std::time::Instant::now();
-
-            // 检查是否是异步子代理 (run_in_background=true)
-            let is_async_agent = name == "Agent"
-                && input
-                    .get("run_in_background")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
 
             let result = tokio::task::spawn_blocking(move || tools::execute_tool(&name, &input))
                 .await
@@ -315,32 +367,6 @@ impl ToolExecutor for RealToolExecutor {
                 Ok(output) => (output, false),
                 Err(e) => (e, true),
             };
-
-            // 异步子代理完成后，通过 dispatch 注入通知
-            if is_async_agent && !is_error {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) {
-                    if let Some(dispatch) = &self.dispatch {
-                        let agent_id = parsed
-                            .get("agentId")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let agent_name = parsed
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        dispatch.inject_sync(
-                            agent_id,
-                            agent_name,
-                            brain_dispatch::AgentStatus::Completed,
-                            output.clone(),
-                            None,
-                            start.elapsed().as_millis() as u64,
-                        );
-                    }
-                }
-            }
 
             let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -423,5 +449,57 @@ mod tests {
     fn mvp_tool_definitions_not_empty() {
         let defs = mvp_tool_definitions();
         assert!(!defs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_completion_notifier_waits_for_real_completion() {
+        let dispatch = brain_dispatch::TokioDispatch::new(8);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+        let dispatch_loop = {
+            let dispatch = dispatch.clone();
+            tokio::spawn(async move {
+                dispatch.run_dispatch_loop(output_tx).await;
+            })
+        };
+
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        spawn_agent_completion_notifier(dispatch.clone(), completion_rx);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), output_rx.recv())
+                .await
+                .is_err(),
+            "通知不应在子代理真实完成前出现"
+        );
+
+        completion_tx
+            .send(tools::AgentCompletion {
+                agent_id: "agent-real-done".into(),
+                name: "real-done".into(),
+                status: "completed".into(),
+                output: "最终结果".into(),
+                error: None,
+                duration_ms: 42,
+            })
+            .expect("send completion");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), output_rx.recv())
+            .await
+            .expect("completion notification should arrive")
+            .expect("dispatch output channel open");
+        match msg {
+            brain_dispatch::MainLoopMessage::AgentNotification(result) => {
+                assert_eq!(result.agent_id, "agent-real-done");
+                assert_eq!(result.status, brain_dispatch::AgentStatus::Completed);
+                assert_eq!(result.output, "最终结果");
+                assert_eq!(result.duration_ms, 42);
+            }
+            brain_dispatch::MainLoopMessage::BrainTaskNotification { .. } => {
+                panic!("expected AgentNotification");
+            }
+        }
+
+        dispatch.shutdown().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), dispatch_loop).await;
     }
 }

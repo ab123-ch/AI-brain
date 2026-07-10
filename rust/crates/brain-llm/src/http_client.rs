@@ -21,7 +21,7 @@ impl SharedHttpClient {
     pub fn new(proxy_url: Option<&str>, retry_config: RetryConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(300));
+            .timeout(Duration::from_mins(5));
 
         if let Some(url) = proxy_url {
             let parsed = reqwest::Url::parse(url)

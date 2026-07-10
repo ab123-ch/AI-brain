@@ -35,6 +35,7 @@ main = "xiaomi"
 memory = "xiaomi"
 eval = "deepseek"
 evolver = "xiaomi"
+novel = "xiaomi"
 
 [llm.brain_models]
 main = "mimo-7b"
@@ -43,6 +44,7 @@ reasoning = "mimo-7b"
 memory = "mimo-7b"
 eval = "deepseek-chat"
 evolver = "mimo-7b"
+novel = "mimo-7b"
 
 [llm.defaults]
 max_tokens = 4096
@@ -65,6 +67,10 @@ temperature = 0.3
 [llm.brain_params.evolver]
 max_tokens = 16384
 temperature = 0.3
+
+[llm.brain_params.novel]
+max_tokens = 32768
+temperature = 0.9
 
 [llm.brain_params.sensory]
 max_tokens = 8192

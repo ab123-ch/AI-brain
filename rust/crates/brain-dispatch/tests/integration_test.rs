@@ -89,6 +89,59 @@ async fn dispatch_receives_brain_task_notification() {
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 }
 
+#[tokio::test]
+async fn dispatch_prioritizes_urgent_events_over_background_batch() {
+    let dispatch = brain_dispatch::TokioDispatch::new(64);
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(16);
+
+    dispatch
+        .inject(
+            brain_dispatch::DispatchEvent::AsyncAgentCompleted(brain_dispatch::AgentResult {
+                agent_id: "background-agent".into(),
+                status: brain_dispatch::AgentStatus::Completed,
+                output: "background".into(),
+                error: None,
+                duration_ms: 10,
+            }),
+            brain_dispatch::Priority::Background,
+        )
+        .await;
+    dispatch
+        .inject(
+            brain_dispatch::DispatchEvent::AsyncAgentCompleted(brain_dispatch::AgentResult {
+                agent_id: "urgent-agent".into(),
+                status: brain_dispatch::AgentStatus::Completed,
+                output: "urgent".into(),
+                error: None,
+                duration_ms: 5,
+            }),
+            brain_dispatch::Priority::Urgent,
+        )
+        .await;
+
+    let dispatch_clone = dispatch.clone();
+    let handle = tokio::spawn(async move {
+        dispatch_clone.run_dispatch_loop(output_tx).await;
+    });
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), output_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    match msg {
+        brain_dispatch::MainLoopMessage::AgentNotification(result) => {
+            assert_eq!(result.agent_id, "urgent-agent");
+        }
+        brain_dispatch::MainLoopMessage::BrainTaskNotification { .. } => {
+            panic!("expected AgentNotification");
+        }
+    }
+
+    dispatch.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
 #[test]
 fn inject_sync_works_from_std_thread() {
     let dispatch = brain_dispatch::TokioDispatch::new(64);

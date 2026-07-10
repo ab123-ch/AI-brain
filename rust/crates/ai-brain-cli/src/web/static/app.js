@@ -12,6 +12,7 @@ let currentSpinnerEl = null;
 let activeSessionId = null;
 let isGenerating = false; // 是否正在生成回复
 let isComposing = false;  // IME 组合态标记（中文输入法）
+let currentView = 'chat';
 
 // ── Typewriter State ──────────────────────────────────────────
 let thinkingFullContent = '';
@@ -32,6 +33,27 @@ const $thinkingToggle = document.getElementById('thinking-toggle');
 const $askModal = document.getElementById('ask-modal');
 const $askQuestion = document.getElementById('ask-question');
 const $askOptions = document.getElementById('ask-options');
+const $chatTab = document.getElementById('chat-tab');
+const $cockpitTab = document.getElementById('cockpit-tab');
+const $chatArea = document.getElementById('chat-area');
+const $cockpitArea = document.getElementById('cockpit-area');
+const $brainNodes = document.getElementById('brain-nodes');
+const $brainLinks = document.getElementById('brain-links');
+const $brainEventList = document.getElementById('brain-event-list');
+const $cockpitSummary = document.getElementById('cockpit-summary');
+const $cockpitReset = document.getElementById('cockpit-reset');
+
+// ── Cockpit State ───────────────────────────────────────────────
+const brainState = {
+    nodes: {
+        main: { label: '主脑', status: 'idle', detail: '待命', active: false },
+        memory: { label: '记忆脑', status: 'idle', detail: '待命', active: false },
+        eval: { label: '评估脑', status: 'idle', detail: '待命', active: false },
+        novel: { label: '小说脑', status: 'idle', detail: '待命', active: false },
+    },
+    links: [],
+    events: [],
+};
 
 // ── WebSocket ───────────────────────────────────────────────────
 function connect() {
@@ -93,16 +115,21 @@ function stopHeartbeat() {
 function handleServerMessage(data) {
     switch (data.type) {
         case 'connecting':
+            markBrain(data.brain, 'active', `连接模型 ${data.model}`);
+            addBrainEvent(`${displayBrainName(data.brain)} 连接 ${data.model}`);
             removeSpinner();
             currentSpinnerEl = addSystemMessage(`连接 ${data.brain} (${data.model})`);
             break;
 
         case 'thinking':
+            markBrain(data.brain, 'active', '思考中');
+            addBrainEvent(`${displayBrainName(data.brain)} 思考中`);
             removeSpinner();
             currentSpinnerEl = addSpinner(`${data.brain} 思考中...`);
             break;
 
         case 'text_delta':
+            markBrain('main', 'active', '输出回复');
             removeSpinner();
             appendStreamingText(data.text);
             break;
@@ -112,27 +139,37 @@ function handleServerMessage(data) {
             break;
 
         case 'tool_start':
+            trackToolStart(data.brain, data.tool_name, data.input);
             addToolStart(data.brain, data.tool_name, data.input);
             break;
 
         case 'tool_done':
+            trackToolDone(data.brain, data.tool_name, data.duration_ms, data.is_error);
             updateToolDone(data.tool_name, data.duration_ms, data.output_preview, data.is_error);
             break;
 
         case 'memory_injected':
+            markBrain('memory', 'active', `召回 ${data.count} 条记忆`);
+            setBrainLink('memory', 'main', `注入 ${data.count} 条记忆`);
+            addBrainEvent(`记忆脑向主脑注入 ${data.count} 条记忆`);
             addMemoryIndicator(data.count, data.preview);
             break;
 
         case 'evaluation_start':
+            markBrain('eval', 'active', '开始评估');
+            addBrainEvent('评估脑开始评估');
             addSystemMessage('评估脑开始评估...');
             break;
 
         case 'evaluation_result':
+            markBrain('eval', data.passed ? 'done' : 'error', data.feedback);
+            addBrainEvent(`评估脑完成: ${data.passed ? '通过' : '未通过'}`);
             const icon = data.passed ? '[PASS]' : '[FAIL]';
             addSystemMessage(`评估结果 ${icon}: ${data.feedback}`);
             break;
 
         case 'evaluating':
+            markBrain('eval', 'active', '评估中');
             removeSpinner();
             currentSpinnerEl = addSpinner('评估脑评估中...');
             break;
@@ -146,6 +183,7 @@ function handleServerMessage(data) {
             break;
 
         case 'done':
+            finishActiveBrains();
             finalizeStreaming();
             removeSpinner();
             isGenerating = false;
@@ -160,6 +198,12 @@ function handleServerMessage(data) {
         case 'session_switched':
             activeSessionId = data.session_id;
             renderMessages(data.messages);
+            break;
+
+        case 'session_messages_updated':
+            if (data.session_id === activeSessionId) {
+                renderMessages(data.messages);
+            }
             break;
 
         case 'persona_list':
@@ -379,12 +423,32 @@ function removeSpinner() {
     currentSpinnerEl = null;
 }
 
-function addUserMessage(text) {
+function addUserMessage(text, messageIndex = null) {
     const el = document.createElement('div');
     el.className = 'msg user';
     el.textContent = text;
+    attachDeleteAction(el, messageIndex);
     $messages.appendChild(el);
     scrollToBottom();
+}
+
+function attachDeleteAction(el, messageIndex) {
+    if (messageIndex === null || messageIndex === undefined) return;
+
+    const btn = document.createElement('button');
+    btn.className = 'msg-delete';
+    btn.type = 'button';
+    btn.title = '删除这一轮历史';
+    btn.textContent = '×';
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (isGenerating) {
+            addSystemMessage('生成中暂不能删除历史');
+            return;
+        }
+        send('delete_turn', { message_index: messageIndex });
+    });
+    el.appendChild(btn);
 }
 
 function setInputEnabled(enabled) {
@@ -422,6 +486,188 @@ function truncate(str, maxLen) {
     return str.length > maxLen ? str.substring(0, maxLen) + '...' : str;
 }
 
+// ── Cockpit ────────────────────────────────────────────────────
+function normalizeBrainKey(brain) {
+    const value = String(brain || '').toLowerCase();
+    if (value.includes('memory') || value.includes('记忆')) return 'memory';
+    if (value.includes('eval') || value.includes('评估')) return 'eval';
+    if (value.includes('novel') || value.includes('小说')) return 'novel';
+    if (value.includes('explore')) return 'explore';
+    if (value.includes('agent')) return 'agent';
+    return 'main';
+}
+
+function displayBrainName(brain) {
+    const key = normalizeBrainKey(brain);
+    ensureBrainNode(key);
+    return brainState.nodes[key].label;
+}
+
+function ensureBrainNode(key) {
+    if (!brainState.nodes[key]) {
+        const label = key === 'explore' ? '探索脑' : key === 'agent' ? '子代理' : key;
+        brainState.nodes[key] = { label, status: 'idle', detail: '待命', active: false };
+    }
+}
+
+function markBrain(brain, status, detail) {
+    const key = normalizeBrainKey(brain);
+    ensureBrainNode(key);
+    brainState.nodes[key].status = status;
+    brainState.nodes[key].detail = detail || '';
+    brainState.nodes[key].active = status === 'active';
+    renderCockpit();
+}
+
+function setBrainLink(from, to, label) {
+    const source = normalizeBrainKey(from);
+    const target = normalizeBrainKey(to);
+    ensureBrainNode(source);
+    ensureBrainNode(target);
+    const existing = brainState.links.find((l) => l.from === source && l.to === target);
+    if (existing) {
+        existing.label = label;
+        existing.active = true;
+    } else {
+        brainState.links.push({ from: source, to: target, label, active: true });
+    }
+    renderCockpit();
+}
+
+function addBrainEvent(text) {
+    const stamp = new Date().toLocaleTimeString();
+    brainState.events.unshift({ stamp, text });
+    brainState.events = brainState.events.slice(0, 30);
+    renderCockpit();
+}
+
+function finishActiveBrains() {
+    Object.values(brainState.nodes).forEach((node) => {
+        if (node.active) {
+            node.status = 'done';
+            node.active = false;
+            node.detail = node.detail || '完成';
+        }
+    });
+    brainState.links.forEach((link) => {
+        link.active = false;
+    });
+    renderCockpit();
+}
+
+function trackToolStart(brain, toolName, input) {
+    const owner = normalizeBrainKey(brain);
+    markBrain(owner, 'active', `调用 ${toolName}`);
+    addBrainEvent(`${displayBrainName(brain)} 调用工具 ${toolName}`);
+
+    if (toolName === 'Agent') {
+        const subagent = extractSubagentType(input);
+        const target = normalizeBrainKey(subagent || 'agent');
+        const label = target === 'novel' ? '发布小说任务' : '发布任务';
+        setBrainLink(owner, target, label);
+        markBrain(target, 'active', label);
+        addBrainEvent(`${displayBrainName(brain)} -> ${displayBrainName(target)}: ${label}`);
+    }
+}
+
+function trackToolDone(brain, toolName, durationMs, isError) {
+    const owner = normalizeBrainKey(brain);
+    markBrain(owner, isError ? 'error' : 'done', `${toolName} ${durationMs}ms`);
+    addBrainEvent(`${displayBrainName(brain)} 完成工具 ${toolName}`);
+}
+
+function extractSubagentType(input) {
+    if (!input) return null;
+    try {
+        const parsed = JSON.parse(input);
+        return parsed.subagent_type || parsed.subagentType || parsed.agent || null;
+    } catch (_) {
+        const match = String(input).match(/subagent[_-]?type["'\s:=]+([A-Za-z0-9_\-\u4e00-\u9fa5]+)/i);
+        return match ? match[1] : null;
+    }
+}
+
+function renderCockpit() {
+    if (!$brainNodes) return;
+
+    const activeNames = Object.values(brainState.nodes)
+        .filter((node) => node.active)
+        .map((node) => node.label);
+    $cockpitSummary.textContent = activeNames.length > 0
+        ? `${activeNames.join('、')} 正在工作`
+        : '所有脑处于待命或已完成状态';
+
+    $brainNodes.innerHTML = '';
+    Object.entries(brainState.nodes).forEach(([key, node]) => {
+        const card = document.createElement('div');
+        card.className = `brain-node ${node.status}`;
+        card.dataset.brain = key;
+        card.innerHTML = `
+            <div class="brain-node-title">${escapeHtml(node.label)}</div>
+            <div class="brain-node-status">${escapeHtml(statusText(node.status))}</div>
+            <div class="brain-node-detail">${escapeHtml(truncate(node.detail || '待命', 80))}</div>
+        `;
+        $brainNodes.appendChild(card);
+    });
+
+    $brainEventList.innerHTML = '';
+    brainState.events.forEach((event) => {
+        const row = document.createElement('div');
+        row.className = 'brain-event';
+        row.innerHTML = `<span>${escapeHtml(event.stamp)}</span><p>${escapeHtml(event.text)}</p>`;
+        $brainEventList.appendChild(row);
+    });
+
+    requestAnimationFrame(renderBrainLinks);
+}
+
+function renderBrainLinks() {
+    if (!$brainLinks || !$brainNodes) return;
+
+    const mapRect = document.getElementById('brain-map').getBoundingClientRect();
+    $brainLinks.setAttribute('viewBox', `0 0 ${mapRect.width} ${mapRect.height}`);
+    $brainLinks.innerHTML = '';
+
+    brainState.links.forEach((link) => {
+        const fromEl = $brainNodes.querySelector(`[data-brain="${link.from}"]`);
+        const toEl = $brainNodes.querySelector(`[data-brain="${link.to}"]`);
+        if (!fromEl || !toEl) return;
+
+        const fromRect = fromEl.getBoundingClientRect();
+        const toRect = toEl.getBoundingClientRect();
+        const x1 = fromRect.left + fromRect.width / 2 - mapRect.left;
+        const y1 = fromRect.top + fromRect.height / 2 - mapRect.top;
+        const x2 = toRect.left + toRect.width / 2 - mapRect.left;
+        const y2 = toRect.top + toRect.height / 2 - mapRect.top;
+        const mx = (x1 + x2) / 2;
+        const my = (y1 + y2) / 2;
+
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', x1);
+        line.setAttribute('y1', y1);
+        line.setAttribute('x2', x2);
+        line.setAttribute('y2', y2);
+        line.setAttribute('class', link.active ? 'brain-link active' : 'brain-link');
+        $brainLinks.appendChild(line);
+
+        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        label.setAttribute('x', mx);
+        label.setAttribute('y', my - 6);
+        label.setAttribute('class', 'brain-link-label');
+        label.textContent = link.label;
+        $brainLinks.appendChild(label);
+    });
+}
+
+function statusText(status) {
+    switch (status) {
+        case 'active': return '工作中';
+        case 'done': return '完成';
+        case 'error': return '异常';
+        default: return '待命';
+    }
+}
+
 // ── Session List ────────────────────────────────────────────────
 function renderSessionList(sessions) {
     $sessionList.innerHTML = '';
@@ -445,16 +691,18 @@ function renderMessages(messages) {
         showWelcome();
         return;
     }
-    messages.forEach((m) => {
+    messages.forEach((m, index) => {
         if (m.role === 'user') {
-            addUserMessage(m.content);
+            addUserMessage(m.content, index);
         } else if (m.role === 'assistant') {
             const el = document.createElement('div');
             el.className = 'msg assistant';
             renderMarkdown(el, m.content);
+            attachDeleteAction(el, index);
             $messages.appendChild(el);
         } else {
-            addSystemMessage(m.content);
+            const el = addSystemMessage(m.content);
+            attachDeleteAction(el, index);
         }
     });
     scrollToBottom();
@@ -604,6 +852,25 @@ $newSessionBtn.addEventListener('click', () => {
     send('new_session');
 });
 
+$chatTab.addEventListener('click', () => {
+    switchView('chat');
+});
+
+$cockpitTab.addEventListener('click', () => {
+    switchView('cockpit');
+});
+
+$cockpitReset.addEventListener('click', () => {
+    brainState.links = [];
+    brainState.events = [];
+    Object.values(brainState.nodes).forEach((node) => {
+        node.status = 'idle';
+        node.detail = '待命';
+        node.active = false;
+    });
+    renderCockpit();
+});
+
 $sidebarToggle.addEventListener('click', () => {
     $sidebar.classList.toggle('open');
 });
@@ -633,6 +900,19 @@ $askModal.addEventListener('click', (e) => {
     }
 });
 
+function switchView(view) {
+    currentView = view;
+    const showCockpit = view === 'cockpit';
+    $chatArea.classList.toggle('active', !showCockpit);
+    $cockpitArea.classList.toggle('active', showCockpit);
+    $chatTab.classList.toggle('active', !showCockpit);
+    $cockpitTab.classList.toggle('active', showCockpit);
+    if (showCockpit) {
+        renderCockpit();
+    }
+}
+
 // ── Init ────────────────────────────────────────────────────────
 connect();
+renderCockpit();
 $input.focus();

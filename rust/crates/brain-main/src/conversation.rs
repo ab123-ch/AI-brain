@@ -276,6 +276,7 @@ impl ConversationHistory {
                 ChatMessage {
                     role,
                     content: m.content.clone(),
+                    partial: false,
                 }
             })
             .collect()

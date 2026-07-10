@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 use crate::orchestrator::Orchestrator;
-use crate::web::progress_adapter::{ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent};
+use crate::web::progress_adapter::{PersonaInfo, SessionInfo, WebProgressEvent};
 use crate::web::session_manager::SessionManager;
 use brain_core::types::ProgressEvent;
 use brain_main::conversation::ChatMessageRestore;
@@ -56,6 +56,8 @@ enum ClientMessage {
     SwitchSession { session_id: String },
     /// 删除会话
     DeleteSession { session_id: String },
+    /// 删除当前会话窗口中的一整轮历史（仅隐藏 UI/上下文，不删除历史文件内容）
+    DeleteTurn { message_index: usize },
     /// 应用层心跳（浏览器无法发送原生 Ping 帧）
     Heartbeat,
 }
@@ -136,7 +138,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 if history_restored_session.as_ref() != Some(&current_id) {
                                     let restore_msgs = {
                                         let sessions = state.sessions.lock().await;
-                                        sessions.active().messages.iter().map(|m| ChatMessageRestore {
+                                        sessions.active_visible_messages().iter().map(|m| ChatMessageRestore {
                                             role: m.role.clone(),
                                             content: m.content.clone(),
                                         }).collect::<Vec<_>>()
@@ -267,7 +269,7 @@ async fn send_initial_state(
                 id: s.id.clone(),
                 title: s.title.clone(),
                 created_at: s.created_at.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                message_count: s.messages.len(),
+                message_count: s.messages.iter().filter(|m| !m.hidden).count(),
             })
             .collect();
         send_event(sender, WebProgressEvent::SessionList { sessions: list }).await?;
@@ -281,7 +283,7 @@ async fn send_initial_state(
             sender,
             WebProgressEvent::SessionSwitched {
                 session_id: active.id.clone(),
-                messages: active.messages.clone(),
+                messages: sessions.active_visible_messages(),
             },
         )
         .await?;
@@ -355,6 +357,10 @@ async fn handle_client_message(
         ClientMessage::DeleteSession { session_id } => {
             handle_delete_session(sender, state, session_id).await
         }
+        ClientMessage::DeleteTurn { message_index } => {
+            *history_restored_session = None; // 下次查询必须按隐藏后的窗口重建上下文
+            handle_delete_turn(sender, state, message_index).await
+        }
     }
 }
 
@@ -401,7 +407,7 @@ async fn handle_new_session(
     let (new_id, new_messages) = {
         let mut sessions = state.sessions.lock().await;
         let new_session = sessions.create("New Session".to_string());
-        (new_session.id.clone(), new_session.messages.clone())
+        (new_session.id.clone(), sessions.active_visible_messages())
     };
 
     // 推送更新后的会话列表
@@ -427,7 +433,10 @@ async fn handle_switch_session(
     let result = {
         let mut sessions = state.sessions.lock().await;
         match sessions.switch(&session_id) {
-            Some(s) => Some((s.id.clone(), s.messages.clone())),
+            Some(s) => Some((
+                s.id.clone(),
+                s.messages.iter().filter(|m| !m.hidden).cloned().collect(),
+            )),
             None => None,
         }
     };
@@ -449,6 +458,46 @@ async fn handle_switch_session(
                 sender,
                 WebProgressEvent::Error {
                     message: format!("会话不存在: {session_id}"),
+                },
+            )
+            .await
+            .ok();
+        }
+    }
+}
+
+/// 删除当前会话窗口中的一整轮历史。
+async fn handle_delete_turn(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    state: &Arc<AppState>,
+    message_index: usize,
+) {
+    let result = {
+        let mut sessions = state.sessions.lock().await;
+        let session_id = sessions.active().id.clone();
+        sessions
+            .hide_turn_by_visible_index(message_index)
+            .map(|messages| (session_id, messages))
+    };
+
+    match result {
+        Some((session_id, messages)) => {
+            send_session_list(sender, state).await.ok();
+            send_event(
+                sender,
+                WebProgressEvent::SessionMessagesUpdated {
+                    session_id,
+                    messages,
+                },
+            )
+            .await
+            .ok();
+        }
+        None => {
+            send_event(
+                sender,
+                WebProgressEvent::Error {
+                    message: format!("无法删除第 {message_index} 条历史消息"),
                 },
             )
             .await
@@ -519,7 +568,7 @@ async fn send_session_list(
             id: s.id.clone(),
             title: s.title.clone(),
             created_at: s.created_at.parse().unwrap_or_else(|_| chrono::Utc::now()),
-            message_count: s.messages.len(),
+            message_count: s.messages.iter().filter(|m| !m.hidden).count(),
         })
         .collect();
     send_event(sender, WebProgressEvent::SessionList { sessions: list }).await
