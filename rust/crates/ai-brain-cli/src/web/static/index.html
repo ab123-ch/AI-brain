@@ -109,6 +109,18 @@
                     <div id="communication-list"></div>
                 </section>
 
+                <section class="cockpit-panel cockpit-conclusions-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <h3>各脑结论</h3>
+                            <p>按脑区筛选阶段结论与最终返回</p>
+                        </div>
+                        <span id="conclusion-count">0 条</span>
+                    </div>
+                    <div id="conclusion-tabs" class="conclusion-tabs" role="tablist" aria-label="按脑区筛选结论"></div>
+                    <div id="conclusion-list" class="conclusion-list"></div>
+                </section>
+
                 <section class="cockpit-panel cockpit-agents-panel">
                     <div class="panel-heading">
                         <div>
@@ -141,6 +153,26 @@
             </section>
         </main>
     </div>
+    <div id="preview-backdrop" class="preview-backdrop hidden"></div>
+    <aside id="markdown-preview" class="markdown-preview" aria-hidden="true" aria-label="Markdown 内容预览">
+        <header class="preview-header">
+            <div>
+                <span id="preview-source">智脑内容</span>
+                <h2 id="preview-title">内容预览</h2>
+            </div>
+            <button id="preview-close" class="icon-btn" type="button" title="关闭预览" aria-label="关闭预览"><i data-lucide="x"></i></button>
+        </header>
+        <div id="preview-selection-tools" class="preview-selection-tools hidden">
+            <span id="preview-selection-info">已选择内容</span>
+            <button id="preview-quote" type="button"><i data-lucide="quote"></i><span>引用到消息框</span></button>
+        </div>
+        <div id="file-editor-toolbar" class="file-editor-toolbar hidden">
+            <span id="file-editor-status">已保存</span>
+            <button id="file-editor-quote" type="button" disabled><i data-lucide="quote"></i><span>引用选中内容</span></button>
+        </div>
+        <textarea id="file-editor-content" class="file-editor-content hidden" spellcheck="false" aria-label="文件内容编辑器"></textarea>
+        <div id="preview-content" class="preview-content markdown-body"></div>
+    </aside>
     <div id="ask-modal" class="modal hidden">
         <div class="modal-content">
             <p id="ask-question"></p>

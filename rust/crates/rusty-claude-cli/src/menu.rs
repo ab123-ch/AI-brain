@@ -183,10 +183,7 @@ impl MenuCategory {
 /// 2. Draws the menu panel
 /// 3. Processes keyboard events until the user selects or cancels
 /// 4. Restores the terminal state and returns
-pub fn show_menu(
-    stdout: &mut io::Stdout,
-    entries: Vec<MenuEntry>,
-) -> io::Result<Option<String>> {
+pub fn show_menu(stdout: &mut io::Stdout, entries: Vec<MenuEntry>) -> io::Result<Option<String>> {
     if entries.is_empty() {
         return Ok(None);
     }
@@ -210,18 +207,18 @@ pub fn show_menu(
     stdout.queue(cursor::Hide)?;
     let _ = draw_panel(stdout, left, top, menu_width, body_height, &state);
 
-    loop {
+    let result = loop {
         match event::read()? {
             Event::Key(KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: KeyModifiers::NONE,
+                ..
             }) => {
                 // Quit menu without selecting.
                 break Ok(None);
             }
             Event::Key(KeyEvent {
-                code: KeyCode::Esc,
-                ..
+                code: KeyCode::Esc, ..
             }) => {
                 break Ok(None);
             }
@@ -233,8 +230,7 @@ pub fn show_menu(
                 break Ok(text);
             }
             Event::Key(KeyEvent {
-                code: KeyCode::Up,
-                ..
+                code: KeyCode::Up, ..
             }) => {
                 state.move_up();
                 let _ = draw_panel(stdout, left, top, menu_width, body_height, &state);
@@ -272,8 +268,7 @@ pub fn show_menu(
                 let _ = draw_panel(stdout, left, top, menu_width, body_height, &state);
             }
             Event::Key(KeyEvent {
-                code: KeyCode::End,
-                ..
+                code: KeyCode::End, ..
             }) => {
                 state.selection = state.visible_count.saturating_sub(1);
                 let _ = draw_panel(stdout, left, top, menu_width, body_height, &state);
@@ -311,11 +306,12 @@ pub fn show_menu(
             }
             _ => {}
         }
-    }?;
+    };
 
     // Clean up.
     stdout.queue(cursor::Show)?;
-    stdout.flush()
+    stdout.flush()?;
+    result
 }
 
 // ── Drawing ───────────────────────────────────────────────────────────────
@@ -346,7 +342,8 @@ fn draw_panel(
     };
     // Right-align count badge
     let count_str = format!(" {} matches ", state.visible_count);
-    let remaining = content_width.saturating_sub(filter_display.len() as u16 + count_str.len() as u16 + 4);
+    let remaining =
+        content_width.saturating_sub(filter_display.len() as u16 + count_str.len() as u16 + 4);
     let padding = " ".repeat(remaining.max(1) as usize);
     stdout
         .queue(SetForegroundColor(Color::DarkGrey))?
@@ -375,7 +372,10 @@ fn draw_panel(
 
     // Clamp scroll so selection stays visible
     let scroll = if state.selection >= body_height as usize {
-        state.selection.saturating_sub(body_height as usize).saturating_add(1)
+        state
+            .selection
+            .saturating_sub(body_height as usize)
+            .saturating_add(1)
     } else {
         0
     };
@@ -432,7 +432,7 @@ fn draw_panel(
                 format!(" {}", desc_preview)
             };
             let consumed = display_label.len() + 2; // icon + space + label
-            let remaining = content_width as usize + 2; // inside padding
+            let remaining = (content_width as usize + 2) // inside padding
                 .saturating_sub(consumed + right_text.len() + 1);
             let padding = " ".repeat(remaining.max(1));
 

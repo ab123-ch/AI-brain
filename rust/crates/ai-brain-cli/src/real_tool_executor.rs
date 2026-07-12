@@ -10,6 +10,7 @@ use std::sync::Arc;
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
+use brain_memory::novel::{NovelMemoryDelta, NovelProject, NovelTaskType};
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
 use brain_plugin::SkillCatalog;
 use uuid::Uuid;
@@ -275,6 +276,45 @@ impl ToolExecutor for RealToolExecutor {
         let tool_name_owned = tool_call.tool_name.clone();
         if is_graph_tool(&name) {
             inject_graph_db_path(&mut input, self.graph_db_path.as_ref());
+        }
+
+        if matches!(
+            name.as_str(),
+            "novel_create_project"
+                | "novel_list_projects"
+                | "novel_recall_project"
+                | "novel_check_consistency"
+                | "novel_commit_delta"
+                | "novel_resolve_conflict"
+        ) {
+            let memory_brain = self.memory_brain.clone();
+            return Box::pin(async move {
+                let start = std::time::Instant::now();
+                let Some(memory_brain) = memory_brain else {
+                    return ToolExecutionResult {
+                        tool_name: tool_name_owned,
+                        output: format!("{name}: PyramidMemoryBrain not available"),
+                        is_error: true,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    };
+                };
+                let guard = memory_brain.lock().await;
+                let result = execute_novel_memory_tool(&guard, &name, &input);
+                match result {
+                    Ok(output) => ToolExecutionResult {
+                        tool_name: tool_name_owned,
+                        output,
+                        is_error: false,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                    Err(error) => ToolExecutionResult {
+                        tool_name: tool_name_owned,
+                        output: error,
+                        is_error: true,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                }
+            });
         }
 
         // special-case: search_memory 由 PyramidMemoryBrain 处理
@@ -590,6 +630,98 @@ impl ToolExecutor for RealToolExecutor {
     }
 }
 
+fn execute_novel_memory_tool(
+    memory: &PyramidMemoryBrain,
+    name: &str,
+    input: &serde_json::Value,
+) -> Result<String, String> {
+    match name {
+        "novel_create_project" => {
+            let project_id = required_string(input, "project_id")?;
+            let title = required_string(input, "title")?;
+            let mut project = NovelProject::new(project_id, title);
+            project.genres = input
+                .get("genres")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            project.target_platform = input
+                .get("target_platform")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            memory
+                .create_novel_project(&project)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&project).map_err(|error| error.to_string())
+        }
+        "novel_list_projects" => {
+            let projects = memory
+                .novel_memory_store()
+                .list_projects()
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&projects).map_err(|error| error.to_string())
+        }
+        "novel_recall_project" => {
+            let project_id = required_string(input, "project_id")?;
+            let task_type: NovelTaskType = serde_json::from_value(
+                input
+                    .get("task_type")
+                    .cloned()
+                    .ok_or_else(|| "缺少 task_type".to_string())?,
+            )
+            .map_err(|error| format!("无效 task_type: {error}"))?;
+            let pack = memory
+                .recall_novel_project(project_id, task_type)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())
+        }
+        "novel_check_consistency" => {
+            let report = memory
+                .check_novel_consistency(required_string(input, "project_id")?)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+        }
+        "novel_commit_delta" => {
+            let delta: NovelMemoryDelta = serde_json::from_value(
+                input
+                    .get("delta")
+                    .cloned()
+                    .ok_or_else(|| "缺少 delta".to_string())?,
+            )
+            .map_err(|error| format!("NovelMemoryDelta 格式错误: {error}"))?;
+            let report = memory
+                .commit_novel_delta(&delta)
+                .map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+        }
+        "novel_resolve_conflict" => {
+            memory
+                .resolve_novel_conflict(
+                    required_string(input, "project_id")?,
+                    required_string(input, "conflict_id")?,
+                    required_string(input, "resolution")?,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok("小说 Canon 冲突已标记为已处理".into())
+        }
+        _ => Err(format!("unsupported novel memory tool: {name}")),
+    }
+}
+
+fn required_string<'a>(input: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+    input
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("缺少或无效字段: {key}"))
+}
+
 fn is_graph_tool(name: &str) -> bool {
     matches!(
         name,
@@ -686,6 +818,53 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"bash"), "应包含 bash 工具");
         assert!(names.contains(&"read_file"), "应包含 read_file 工具");
+        assert!(names.contains(&"novel_create_project"));
+        assert!(names.contains(&"novel_list_projects"));
+        assert!(names.contains(&"novel_recall_project"));
+        assert!(names.contains(&"novel_check_consistency"));
+        assert!(names.contains(&"novel_commit_delta"));
+        assert!(names.contains(&"novel_resolve_conflict"));
+    }
+
+    #[tokio::test]
+    async fn novel_project_tools_create_and_recall_isolated_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = PyramidMemoryBrain::new(
+            brain_memory::pyramid_memory_brain::PyramidMemoryBrainConfig {
+                base_dir: dir.path().to_path_buf(),
+                session_id: "novel-tool-test".into(),
+                graph_db_path: Some(dir.path().join("graph.db")),
+            },
+        )
+        .unwrap();
+        let exec = RealToolExecutor::with_memory(Some(Arc::new(tokio::sync::Mutex::new(memory))));
+
+        let create = exec
+            .execute(&ToolCall {
+                tool_name: "novel_create_project".into(),
+                input: json!({
+                    "project_id": "dark-city",
+                    "title": "暗城",
+                    "genres": ["悬疑"],
+                    "target_platform": "起点"
+                }),
+                validated: false,
+                validation_id: None,
+            })
+            .await;
+        assert!(!create.is_error, "{}", create.output);
+
+        let recall = exec
+            .execute(&ToolCall {
+                tool_name: "novel_recall_project".into(),
+                input: json!({ "project_id": "dark-city", "task_type": "outline" }),
+                validated: false,
+                validation_id: None,
+            })
+            .await;
+        assert!(!recall.is_error, "{}", recall.output);
+        assert!(recall.output.contains("dark-city"));
+        assert!(recall.output.contains("暗城"));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 pub mod abstract_layer;
 pub mod concentration;
 pub mod error;
+pub mod novel;
 pub mod persona_manager;
 pub mod persona_types;
 pub mod profile_eval;

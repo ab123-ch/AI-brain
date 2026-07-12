@@ -44,7 +44,7 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
 - **精确单次搜索**（找某个函数定义、某个变量名）→ 直接用 grep_search，一次调用即可
 - **文件名查找**（找某个文件在哪里）→ 直接用 glob_search，按模式匹配
 - **多步骤开发任务**（需要同时修改多个文件、运行测试）→ 使用 Agent(subagent_type='general-purpose') 委托给通用子代理
-- **小说创作任务**（大纲、卷纲、章纲、正文、续写、人物小传、剧情桥段）→ 你先整理用户要求、剧情思路、前文提要、风格和限制，再使用 Agent(subagent_type='Novel') 委托给小说副脑。小说副脑只负责创作文本，不读取或修改文件；如需读取前文或保存正文，必须由你自己使用文件工具完成
+- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段）→ 一部长篇应有稳定的 project_id；先用 novel_list_projects 判断是否已有项目，没有时再用 novel_create_project 创建。每次委派前用 novel_recall_project 按任务阶段召回项目 Canon；章纲、正文和审稿还要调用 novel_check_consistency，把检查结果连同用户要求、已有剧情事实、资料路径、风格、平台和限制交给 Agent(subagent_type='Novel')。小说副脑负责必要的公开资料调研、剧情设计、创作、自审和润色；它可以读取你明确提供的前文路径，但不修改文件。你负责保存最终产物；只有文件保存成功后，才把小说脑返回的结构化 NovelMemoryDelta 用 novel_commit_delta 交给记忆脑。revision 或 Canon 冲突时不得静默覆盖，应保留冲突并重新审查；审查完成后用 novel_resolve_conflict 保存处理结论，事实变化仍须另交 Delta
 
 **关键原则**：当你需要 3 次以上搜索才能理解一段代码时，应该转用 Agent(Explore) 而不是继续手动搜索。手动搜索适合精确、确定性的查询。
 
@@ -271,7 +271,8 @@ mod tests {
     fn system_prompt_mentions_novel_subagent_boundary() {
         let prompt = build_system_prompt_with_tools();
         assert!(prompt.contains("subagent_type='Novel'"));
-        assert!(prompt.contains("小说副脑只负责创作文本"));
-        assert!(prompt.contains("必须由你自己使用文件工具完成"));
+        assert!(prompt.contains("novel_recall_project"));
+        assert!(prompt.contains("novel_commit_delta"));
+        assert!(prompt.contains("保存最终产物"));
     }
 }

@@ -11,8 +11,9 @@ use std::time::Duration;
 use ai_brain_cli::orchestrator::Orchestrator;
 use brain_core::types::ProgressEvent;
 
-#[tokio::main]
-async fn main() {
+#[tokio::test]
+#[ignore = "需要真实 LLM 配置和网络，手动执行"]
+async fn v2_real_llm_flow() {
     // 初始化日志
     tracing_subscriber::fmt().with_env_filter("info").init();
 
@@ -34,7 +35,6 @@ async fn main() {
         let (mut rx, handle, _cancel) = Arc::clone(&orch).query_streaming(query);
 
         // 收集进度事件
-        let mut events = Vec::new();
         let collect_handle = tokio::spawn(async move {
             let mut collected = Vec::new();
             loop {

@@ -13,7 +13,7 @@ use rustyline::{
     Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
 };
 
-use crate::menu::{MenuEntry, show_menu};
+use crate::menu::{show_menu, MenuEntry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -140,7 +140,7 @@ impl LineEditor {
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
-        self.read_line_with_menu(|_| Vec::new())
+        self.read_line_with_menu(Vec::new)
     }
 
     /// Read a line of input, opening the interactive slash menu if the user

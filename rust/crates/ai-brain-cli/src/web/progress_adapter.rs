@@ -18,6 +18,13 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModifiedFileInfo {
+    pub name: String,
+    pub path: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 聊天消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -118,6 +125,10 @@ pub enum WebProgressEvent {
         multi_select: bool,
     },
     Done,
+    /// 评估与重试完成后的唯一权威最终答案。
+    FinalAnswer {
+        content: String,
+    },
 
     /// Full request/result communication emitted outside the query channel.
     BrainCommunication {
@@ -133,6 +144,11 @@ pub enum WebProgressEvent {
     SessionSwitched {
         session_id: String,
         messages: Vec<ChatMessage>,
+        files: Vec<ModifiedFileInfo>,
+    },
+    SessionFilesUpdated {
+        session_id: String,
+        files: Vec<ModifiedFileInfo>,
     },
     /// 当前会话消息发生变化（例如隐藏一整轮历史）
     SessionMessagesUpdated {
@@ -283,6 +299,16 @@ mod tests {
         let event = WebProgressEvent::Done;
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(json, r#"{"type":"done"}"#);
+    }
+
+    #[test]
+    fn serialize_final_answer() {
+        let event = WebProgressEvent::FinalAnswer {
+            content: "# 最终结论\n正文".into(),
+        };
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["type"], "final_answer");
+        assert_eq!(json["content"], "# 最终结论\n正文");
     }
 
     #[test]

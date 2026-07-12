@@ -27,8 +27,17 @@ use crate::orchestrator::Orchestrator;
 use crate::runtime_trace::ExchangePhase;
 use crate::web::progress_adapter::{PersonaInfo, SessionInfo, WebProgressEvent};
 use crate::web::session_manager::SessionManager;
-use brain_core::types::ProgressEvent;
+use brain_core::types::{MainBrainOutput, ProgressEvent};
 use brain_main::conversation::ChatMessageRestore;
+
+fn extract_modified_file_path(input: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    ["path", "file_path", "filePath"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(|item| item.as_str()))
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+}
 
 // ─── AppState ────────────────────────────────────────────────────────
 
@@ -36,6 +45,7 @@ use brain_main::conversation::ChatMessageRestore;
 pub struct AppState {
     pub orch: Arc<Orchestrator>,
     pub sessions: Arc<Mutex<SessionManager>>,
+    pub workspace_root: std::path::PathBuf,
 }
 
 // ─── 客户端消息枚举 ──────────────────────────────────────────────────
@@ -95,12 +105,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket 客户端已连接");
 
     let mut query_rx: Option<tokio::sync::mpsc::Receiver<ProgressEvent>> = None;
+    let mut query_handle: Option<tokio::task::JoinHandle<Result<MainBrainOutput, String>>> = None;
     let mut assistant_text = String::new();
     let mut query_session_id: Option<String> = None;
     let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
     let mut history_restored_session: Option<String> = None; // 已恢复历史的会话 ID
     let mut runtime_trace_rx = state.orch.subscribe_runtime_trace();
     let mut exchange_sessions = HashMap::<String, String>::new();
+    let mut pending_modified_files = HashMap::<String, String>::new();
 
     // 心跳定时器 — 定期发送 Ping 防止连接因空闲被中间代理/浏览器断开
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
@@ -171,7 +183,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Query { input }) => {
-                                if query_rx.is_some() {
+                                if query_rx.is_some() || query_handle.is_some() {
                                     send_event(&mut sender, WebProgressEvent::Error {
                                         message: "当前有查询正在进行，请等待完成".into(),
                                     }).await.ok();
@@ -208,8 +220,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 }
 
                                 // 启动流式查询
-                                let (rx, _, cancel) = state.orch.query_streaming(&input);
+                                let (rx, handle, cancel) = state.orch.query_streaming(&input);
                                 query_rx = Some(rx);
+                                query_handle = Some(handle);
                                 cancel_token = Some(cancel);
                                 assistant_text.clear();
                             }
@@ -219,6 +232,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     if let Some(ref ct) = cancel_token {
                                         ct.cancel();
                                         info!("已取消当前查询 (CancellationToken)");
+                                    }
+                                    if let Some(handle) = query_handle.take() {
+                                        handle.abort();
                                     }
                                     // 将已收集的 assistant 回复记录到会话
                                     if !assistant_text.is_empty() {
@@ -274,9 +290,38 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             } => {
                 match maybe_event {
                     Some(event) => {
+                        match &event {
+                            ProgressEvent::ToolStart { call_id, tool_name, input, .. }
+                                if matches!(tool_name.as_str(), "write_file" | "edit_file" | "Write" | "Edit") =>
+                            {
+                                if let Some(path) = extract_modified_file_path(input) {
+                                    pending_modified_files.insert(call_id.clone(), path);
+                                }
+                            }
+                            ProgressEvent::ToolDone { call_id, is_error, .. } if !is_error => {
+                                if let (Some(path), Some(session_id)) = (
+                                    pending_modified_files.remove(call_id),
+                                    query_session_id.as_deref(),
+                                ) {
+                                    let files = state.sessions.lock().await
+                                        .record_modified_file_to(session_id, &path);
+                                    if send_event(&mut sender, WebProgressEvent::SessionFilesUpdated {
+                                        session_id: session_id.to_string(),
+                                        files,
+                                    }).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                         if let Some(web_event) = WebProgressEvent::from_progress(&event) {
                             if let WebProgressEvent::TextDelta { ref text } = web_event {
                                 assistant_text.push_str(text);
+                            }
+                            // Done 必须排在权威 FinalAnswer 之后，由 query_handle 分支发送。
+                            if matches!(web_event, WebProgressEvent::Done) {
+                                continue;
                             }
                             if send_event(&mut sender, web_event).await.is_err() {
                                 break;
@@ -284,18 +329,59 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                     None => {
-                        // 查询完成 — 将 assistant 回复记录到查询所属的会话
-                        if !assistant_text.is_empty() {
-                            let mut sessions = state.sessions.lock().await;
-                            if let Some(ref sid) = query_session_id {
-                                sessions.push_message_to(sid, "assistant", &assistant_text);
-                            }
-                        }
+                        // 最终答案和会话提交由 query_handle 分支统一处理。
                         query_rx = None;
-                        query_session_id = None;
-                        cancel_token = None;
-                        assistant_text.clear();
                     }
+                }
+            }
+
+            completed_query = async {
+                match &mut query_handle {
+                    Some(handle) => Some(handle.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                let session_id = query_session_id.take();
+                query_handle = None;
+                query_rx = None;
+                cancel_token = None;
+                match completed_query {
+                    Some(Ok(Ok(output))) => {
+                        let final_answer = output.answer;
+                        if let Some(ref sid) = session_id {
+                            let mut sessions = state.sessions.lock().await;
+                            sessions.push_message_to(sid, "assistant", &final_answer);
+                        }
+                        if send_event(
+                            &mut sender,
+                            WebProgressEvent::FinalAnswer { content: final_answer },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(Ok(Err(error))) => {
+                        send_event(&mut sender, WebProgressEvent::Error { message: error })
+                            .await
+                            .ok();
+                    }
+                    Some(Err(error)) if !error.is_cancelled() => {
+                        send_event(
+                            &mut sender,
+                            WebProgressEvent::Error {
+                                message: format!("查询任务异常结束: {error}"),
+                            },
+                        )
+                        .await
+                        .ok();
+                    }
+                    _ => {}
+                }
+                assistant_text.clear();
+                if send_event(&mut sender, WebProgressEvent::Done).await.is_err() {
+                    break;
                 }
             }
         }
@@ -336,6 +422,7 @@ async fn send_initial_state(
             WebProgressEvent::SessionSwitched {
                 session_id: active.id.clone(),
                 messages: sessions.active_visible_messages(),
+                files: active.modified_files.clone(),
             },
         )
         .await?;
@@ -456,10 +543,13 @@ async fn handle_new_session(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     state: &Arc<AppState>,
 ) {
-    let (new_id, new_messages) = {
+    let (new_id, new_messages, files) = {
         let mut sessions = state.sessions.lock().await;
-        let new_session = sessions.create("New Session".to_string());
-        (new_session.id.clone(), sessions.active_visible_messages())
+        let (new_id, files) = {
+            let new_session = sessions.create("New Session".to_string());
+            (new_session.id.clone(), new_session.modified_files.clone())
+        };
+        (new_id, sessions.active_visible_messages(), files)
     };
 
     // 推送更新后的会话列表
@@ -470,6 +560,7 @@ async fn handle_new_session(
         WebProgressEvent::SessionSwitched {
             session_id: new_id,
             messages: new_messages,
+            files,
         },
     )
     .await
@@ -488,18 +579,20 @@ async fn handle_switch_session(
             Some(s) => Some((
                 s.id.clone(),
                 s.messages.iter().filter(|m| !m.hidden).cloned().collect(),
+                s.modified_files.clone(),
             )),
             None => None,
         }
     };
 
     match result {
-        Some((id, messages)) => {
+        Some((id, messages, files)) => {
             send_event(
                 sender,
                 WebProgressEvent::SessionSwitched {
                     session_id: id,
                     messages,
+                    files,
                 },
             )
             .await

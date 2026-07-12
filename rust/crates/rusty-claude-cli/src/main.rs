@@ -31,10 +31,9 @@ use api::{
 };
 
 use commands::{
-    discover_definition_roots, discover_skill_roots, handle_agents_slash_command,
-    handle_mcp_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
-    load_agents_from_roots, load_skills_from_roots, render_slash_command_help,
-    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input, SlashCommand,
+    handle_agents_slash_command, handle_mcp_slash_command, handle_plugins_slash_command,
+    handle_skills_slash_command, render_slash_command_help, resume_supported_slash_commands,
+    slash_command_specs, validate_slash_command_input, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -1509,6 +1508,23 @@ fn run_resume_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
     }
+}
+
+fn build_slash_menu_entries() -> Vec<MenuEntry> {
+    slash_command_specs()
+        .iter()
+        .map(|spec| {
+            let command = format!("/{}", spec.name);
+            MenuEntry {
+                label: spec
+                    .argument_hint
+                    .map_or_else(|| command.clone(), |hint| format!("{command} {hint}")),
+                description: spec.summary.to_string(),
+                category: MenuCategory::SlashCommand,
+                insert_text: command,
+            }
+        })
+        .collect()
 }
 
 fn run_repl(
@@ -3455,6 +3471,9 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { thinking } => {
+                    lines.push(format!("[thinking] {thinking}"));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -5024,6 +5043,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Thinking { thinking } => InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),

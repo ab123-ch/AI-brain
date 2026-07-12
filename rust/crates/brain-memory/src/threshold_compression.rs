@@ -230,12 +230,22 @@ impl ThresholdCompressor {
                     _ => "系统",
                 };
                 let content = msg.text_content();
-                let content_str = if content.len() > 500 {
+                let content_chars = content.chars().count();
+                let content_str = if content_chars > 500 {
+                    let prefix: String = content.chars().take(200).collect();
+                    let suffix: String = content
+                        .chars()
+                        .rev()
+                        .take(200)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
                     format!(
                         "{}...[中间省略 {} 字符]...{}",
-                        &content[..200],
-                        content.len() - 400,
-                        &content[content.len() - 200..]
+                        prefix,
+                        content_chars - 400,
+                        suffix
                     )
                 } else {
                     content.to_string()
@@ -436,6 +446,19 @@ mod tests {
         assert!(formatted.contains("【用户】"));
         assert!(formatted.contains("【助手】"));
         assert!(formatted.contains("---"));
+    }
+
+    #[test]
+    fn test_format_messages_for_prompt_handles_multibyte_boundaries() {
+        let compressor = ThresholdCompressor::new(ThresholdCompactionConfig::default());
+        let content = format!("{}）{}", "中".repeat(404), "文".repeat(404));
+        let messages = vec![ConversationMessage::user(content)];
+
+        let formatted = compressor.format_messages_for_prompt(&messages);
+
+        assert!(formatted.contains("409"));
+        assert!(formatted.contains(&"中".repeat(200)));
+        assert!(formatted.ends_with(&"文".repeat(200)));
     }
 
     #[tokio::test]

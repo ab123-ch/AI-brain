@@ -15,6 +15,13 @@ let isGenerating = false; // 是否正在生成回复
 let isComposing = false;  // IME 组合态标记（中文输入法）
 let currentView = 'chat';
 let sessionCache = [];
+let sessionFiles = [];
+let currentTurnFiles = [];
+let turnFileBaseline = new Map();
+let openedLocalFile = null;
+let fileSaveTimer = null;
+let currentPreview = null;
+let currentPreviewSelection = null;
 const toolItems = new Map();
 const chatExchangeItems = new Map();
 const expandedCommunicationIds = new Set();
@@ -32,6 +39,10 @@ const $input = document.getElementById('input');
 const $sendBtn = document.getElementById('send-btn');
 const $personaSelect = document.getElementById('persona-select');
 const $sessionList = document.getElementById('session-list');
+const $fileEditorToolbar = document.getElementById('file-editor-toolbar');
+const $fileEditorStatus = document.getElementById('file-editor-status');
+const $fileEditorQuote = document.getElementById('file-editor-quote');
+const $fileEditorContent = document.getElementById('file-editor-content');
 const $sidebar = document.getElementById('sidebar');
 const $sidebarToggle = document.getElementById('sidebar-toggle');
 const $newSessionBtn = document.getElementById('new-session-btn');
@@ -57,8 +68,20 @@ const $metricGraphReads = document.getElementById('metric-graph-reads');
 const $metricGraphWrites = document.getElementById('metric-graph-writes');
 const $metricErrors = document.getElementById('metric-errors');
 const $communicationList = document.getElementById('communication-list');
+const $conclusionTabs = document.getElementById('conclusion-tabs');
+const $conclusionList = document.getElementById('conclusion-list');
+const $conclusionCount = document.getElementById('conclusion-count');
 const $agentStatusList = document.getElementById('agent-status-list');
 const $memoryGraphList = document.getElementById('memory-graph-list');
+const $markdownPreview = document.getElementById('markdown-preview');
+const $previewBackdrop = document.getElementById('preview-backdrop');
+const $previewClose = document.getElementById('preview-close');
+const $previewTitle = document.getElementById('preview-title');
+const $previewSource = document.getElementById('preview-source');
+const $previewContent = document.getElementById('preview-content');
+const $previewSelectionTools = document.getElementById('preview-selection-tools');
+const $previewSelectionInfo = document.getElementById('preview-selection-info');
+const $previewQuote = document.getElementById('preview-quote');
 
 // ── Cockpit State ───────────────────────────────────────────────
 const brainProfiles = {
@@ -78,6 +101,8 @@ const brainState = {
     links: [],
     events: [],
     communications: [],
+    conclusions: [],
+    conclusionBrain: 'all',
     memoryGraphOps: [],
     agents: {},
     metrics: {
@@ -270,6 +295,13 @@ function handleServerMessage(data) {
             updateSendButton();
             break;
 
+        case 'final_answer':
+            renderAuthoritativeFinalAnswer(data.content);
+            markBrain('main', 'done', '最终回复已送达');
+            updateAgentStatus('main', '已完成', '最终回复已展示');
+            addBrainEvent('主脑最终回复已送达');
+            break;
+
         case 'session_list':
             sessionCache = data.sessions || [];
             renderSessionList(data.sessions);
@@ -279,10 +311,21 @@ function handleServerMessage(data) {
 
         case 'session_switched':
             activeSessionId = data.session_id;
+            sessionFiles = data.files || [];
+            currentTurnFiles = [];
+            turnFileBaseline = new Map(sessionFiles.map((file) => [file.path, file.updated_at]));
             renderSessionList(sessionCache);
             updateActiveSessionTitle();
             renderMessages(data.messages);
             renderCockpit();
+            break;
+
+        case 'session_files_updated':
+            if (data.session_id === activeSessionId) {
+                const nextFiles = data.files || [];
+                currentTurnFiles = nextFiles.filter((file) => turnFileBaseline.get(file.path) !== file.updated_at);
+                sessionFiles = nextFiles;
+            }
             break;
 
         case 'session_messages_updated':
@@ -331,6 +374,13 @@ function appendStreamingText(text) {
 
     currentStreamingEl.dataset.rawText += text;
     renderMarkdown(currentStreamingEl, currentStreamingEl.dataset.rawText);
+    const streamingEl = currentStreamingEl;
+    attachPreviewAction(
+        streamingEl,
+        '主脑回复',
+        '主脑',
+        () => streamingEl.dataset.rawText || streamingEl.textContent || '',
+    );
     scrollToBottom();
 }
 
@@ -397,6 +447,7 @@ function appendThinking(content) {
 
 function addIntermediateConclusion(brain, content) {
     if (!content) return;
+    addBrainConclusion(brain, content, '阶段结论');
     const trace = createTraceDetails(
         'intermediate-block',
         `${displayBrainName(brain)} · 阶段结论`,
@@ -404,6 +455,12 @@ function addIntermediateConclusion(brain, content) {
         true,
     );
     trace.body.textContent = content;
+    attachPreviewAction(
+        trace.root,
+        `${displayBrainName(brain)} · 阶段结论`,
+        displayBrainName(brain),
+        content,
+    );
     $messages.appendChild(trace.root);
     scrollToBottom();
 }
@@ -590,6 +647,140 @@ function addSystemMessage(text) {
     $messages.appendChild(el);
     scrollToBottom();
     return el;
+}
+
+function renderAuthoritativeFinalAnswer(content) {
+    if (currentStreamingEl) {
+        currentStreamingEl.remove();
+        currentStreamingEl = null;
+    }
+    const el = document.createElement('div');
+    el.className = 'msg assistant final-answer';
+    el.dataset.rawText = content || '';
+    if (el.dataset.rawText) addBrainConclusion('main', el.dataset.rawText, '最终回复');
+    renderMarkdown(el, el.dataset.rawText);
+    attachPreviewAction(el, '主脑最终回复', '主脑', el.dataset.rawText);
+    appendModifiedFiles(el, currentTurnFiles);
+    $messages.appendChild(el);
+    scrollToBottom();
+}
+
+// ── Markdown Preview Drawer ───────────────────────────────────
+function createPreviewButton(title, source, content, metadata = {}) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'preview-trigger';
+    button.title = '在右侧预览 Markdown';
+    button.setAttribute('aria-label', `预览 ${title}`);
+    button.innerHTML = '<i data-lucide="panel-right-open" aria-hidden="true"></i><span>预览</span>';
+    button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const resolved = typeof content === 'function' ? content() : content;
+        openMarkdownPreview(title, source, resolved || '暂无内容', metadata);
+    });
+    return button;
+}
+
+function attachPreviewAction(element, title, source, content) {
+    element.classList.add('previewable');
+    element.querySelector(':scope > .preview-trigger')?.remove();
+    element.appendChild(createPreviewButton(title, source, content));
+    refreshIcons();
+}
+
+function openMarkdownPreview(title, source, content, metadata = {}) {
+    if (openedLocalFile && !$fileEditorContent.classList.contains('hidden')) {
+        clearTimeout(fileSaveTimer);
+        saveOpenedLocalFile();
+    }
+    openedLocalFile = null;
+    const rawContent = String(content || '');
+    currentPreview = buildPreviewMetadata(title, source, rawContent, metadata);
+    currentPreviewSelection = null;
+    $previewTitle.textContent = title || '内容预览';
+    $previewSource.textContent = source || '智脑内容';
+    renderMarkdown($previewContent, rawContent);
+    $previewContent.classList.remove('hidden');
+    $fileEditorToolbar.classList.add('hidden');
+    $fileEditorContent.classList.add('hidden');
+    $previewSelectionTools.classList.add('hidden');
+    $markdownPreview.classList.add('open');
+    $markdownPreview.setAttribute('aria-hidden', 'false');
+    $previewBackdrop.classList.remove('hidden');
+    document.body.classList.add('preview-open');
+    refreshIcons();
+}
+
+function closeMarkdownPreview() {
+    if (openedLocalFile && !$fileEditorContent.classList.contains('hidden')) {
+        clearTimeout(fileSaveTimer);
+        saveOpenedLocalFile();
+    }
+    $markdownPreview.classList.remove('open');
+    $markdownPreview.setAttribute('aria-hidden', 'true');
+    $previewBackdrop.classList.add('hidden');
+    document.body.classList.remove('preview-open');
+    currentPreview = null;
+    currentPreviewSelection = null;
+    openedLocalFile = null;
+}
+
+function buildPreviewMetadata(title, source, content, metadata = {}) {
+    const detectedPath = metadata.path || detectFilePath(content) || '';
+    const normalizedPath = detectedPath.replace(/^\\\\\?\\/, '');
+    const pathParts = normalizedPath.split(/[\\/]/);
+    return {
+        title: title || '内容预览',
+        source: source || '智脑内容',
+        content,
+        path: normalizedPath,
+        fileName: metadata.fileName || (normalizedPath ? pathParts[pathParts.length - 1] : ''),
+    };
+}
+
+function detectFilePath(content) {
+    const text = String(content || '');
+    const windowsPath = text.match(/(?:\\\\\?\\)?[A-Za-z]:\\[^\r\n`"<>|]+?\.[A-Za-z0-9]{1,10}/);
+    if (windowsPath) return windowsPath[0].trim();
+    const markdownPath = text.match(/`([^`\r\n]+\.[A-Za-z0-9]{1,10})`/);
+    return markdownPath ? markdownPath[1].trim() : '';
+}
+
+function updatePreviewSelection() {
+    if (!currentPreview || !$markdownPreview.classList.contains('open')) return;
+    const selection = window.getSelection();
+    const selectedText = selection?.toString().trim() || '';
+    if (!selectedText || !selection.rangeCount || !$previewContent.contains(selection.anchorNode)) {
+        currentPreviewSelection = null;
+        $previewSelectionTools.classList.add('hidden');
+        return;
+    }
+    const raw = currentPreview.content;
+    let index = raw.indexOf(selectedText);
+    if (index < 0) index = raw.indexOf(selectedText.replace(/\s+/g, ' '));
+    const startLine = index < 0 ? null : raw.slice(0, index).split('\n').length;
+    const endLine = startLine == null ? null : startLine + selectedText.split('\n').length - 1;
+    currentPreviewSelection = { text: selectedText, startLine, endLine };
+    const lineLabel = startLine == null ? '行号无法定位' : `第 ${startLine}${endLine > startLine ? `-${endLine}` : ''} 行`;
+    $previewSelectionInfo.textContent = `${lineLabel} · ${selectedText.length} 字符`;
+    $previewSelectionTools.classList.remove('hidden');
+}
+
+function quotePreviewSelection() {
+    if (!currentPreview || !currentPreviewSelection) return;
+    const { text, startLine, endLine } = currentPreviewSelection;
+    const lineLabel = startLine == null ? '未知' : (endLine > startLine ? `${startLine}-${endLine}` : `${startLine}`);
+    const fileName = currentPreview.fileName || currentPreview.title || '当前预览内容';
+    const filePath = currentPreview.path || `未提供（来源：${currentPreview.source}）`;
+    const quoted = text.split('\n').map((line) => `> ${line}`).join('\n');
+    const reference = `[引用文件: ${fileName} | 路径: ${filePath} | 行号: ${lineLabel}]\n${quoted}\n\n`;
+    const start = $input.selectionStart ?? $input.value.length;
+    const end = $input.selectionEnd ?? start;
+    $input.setRangeText(reference, start, end, 'end');
+    $input.dispatchEvent(new Event('input'));
+    switchView('chat');
+    $input.focus();
 }
 
 function addMemoryIndicator(count, preview) {
@@ -803,6 +994,9 @@ function handleBrainCommunication(exchange) {
         brainState.communications.unshift(record);
     }
     record[exchange.phase] = { ...exchange, sender, receiver };
+    if (exchange.phase === 'response' && exchange.content) {
+        addBrainConclusion(sender, exchange.content, exchange.title || '最终结果', `exchange-${exchange.exchange_id}`);
+    }
     record.updatedAt = Date.now();
     brainState.communications.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     brainState.communications = brainState.communications.slice(0, 40);
@@ -1057,6 +1251,7 @@ function renderCockpit() {
     });
 
     renderCommunicationList();
+    renderConclusionPanel();
     renderAgentStatusList();
     renderMemoryGraphList();
 
@@ -1290,6 +1485,84 @@ function renderCommunicationList() {
     });
 }
 
+function addBrainConclusion(brain, content, title = '结论', id = null, shouldRender = true) {
+    const brainKey = normalizeBrainKey(brain || 'main');
+    const conclusionId = id || `conclusion-${Date.now()}-${brainState.conclusions.length}`;
+    const existing = brainState.conclusions.find((item) => item.id === conclusionId);
+    const conclusion = {
+        id: conclusionId,
+        brain: brainKey,
+        title,
+        content: String(content || ''),
+        stamp: new Date().toLocaleTimeString(),
+        updatedAt: Date.now(),
+    };
+    if (existing) Object.assign(existing, conclusion);
+    else brainState.conclusions.unshift(conclusion);
+    brainState.conclusions.sort((a, b) => b.updatedAt - a.updatedAt);
+    brainState.conclusions = brainState.conclusions.slice(0, 100);
+    if (shouldRender) renderConclusionPanel();
+}
+
+function renderConclusionPanel() {
+    if (!$conclusionTabs || !$conclusionList) return;
+    const brains = [...new Set(brainState.conclusions.map((item) => item.brain))];
+    if (brainState.conclusionBrain !== 'all' && !brains.includes(brainState.conclusionBrain)) {
+        brainState.conclusionBrain = 'all';
+    }
+    $conclusionTabs.innerHTML = '';
+    [['all', '全部'], ...brains.map((brain) => [brain, displayBrainName(brain)])].forEach(([key, label]) => {
+        const count = key === 'all'
+            ? brainState.conclusions.length
+            : brainState.conclusions.filter((item) => item.brain === key).length;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `conclusion-tab${brainState.conclusionBrain === key ? ' active' : ''}`;
+        button.setAttribute('role', 'tab');
+        button.setAttribute('aria-selected', String(brainState.conclusionBrain === key));
+        button.innerHTML = `<span>${escapeHtml(label)}</span><em>${count}</em>`;
+        button.addEventListener('click', () => {
+            brainState.conclusionBrain = key;
+            renderConclusionPanel();
+        });
+        $conclusionTabs.appendChild(button);
+    });
+
+    const visible = brainState.conclusionBrain === 'all'
+        ? brainState.conclusions
+        : brainState.conclusions.filter((item) => item.brain === brainState.conclusionBrain);
+    if ($conclusionCount) $conclusionCount.textContent = `${visible.length} 条`;
+    $conclusionList.innerHTML = '';
+    if (!visible.length) {
+        const empty = document.createElement('div');
+        empty.className = 'communication-empty';
+        empty.textContent = '暂无脑区结论';
+        $conclusionList.appendChild(empty);
+        return;
+    }
+    visible.forEach((item) => {
+        const article = document.createElement('article');
+        article.className = 'conclusion-card';
+        const heading = document.createElement('header');
+        heading.innerHTML = `
+            <strong>${escapeHtml(displayBrainName(item.brain))}</strong>
+            <span>${escapeHtml(item.title)}</span>
+            <time>${escapeHtml(item.stamp)}</time>
+        `;
+        heading.appendChild(createPreviewButton(
+            `${displayBrainName(item.brain)} · ${item.title}`,
+            displayBrainName(item.brain),
+            item.content,
+        ));
+        const body = document.createElement('div');
+        body.className = 'conclusion-content markdown-body';
+        renderMarkdown(body, item.content);
+        article.append(heading, body);
+        $conclusionList.appendChild(article);
+    });
+    refreshIcons();
+}
+
 function renderSyntheticCommunication(item) {
     const row = document.createElement('div');
     row.className = `communication-row ${item.kind || 'info'}`;
@@ -1364,6 +1637,12 @@ function appendExchangePayload(container, label, exchange) {
         ${exchange.duration_ms == null ? '' : `<em>${escapeHtml(String(exchange.duration_ms))}ms</em>`}
     `;
     content.textContent = exchange.content || '无内容';
+    const preview = createPreviewButton(
+        `${exchange.sender_label} · ${label}`,
+        `${exchange.sender_label} → ${exchange.receiver_label}`,
+        exchange.content || '',
+    );
+    heading.appendChild(preview);
     section.append(heading, content);
     container.appendChild(section);
 }
@@ -1513,6 +1792,8 @@ function renderSessionList(sessions) {
 
 function renderMessages(messages) {
     $messages.innerHTML = '';
+    brainState.conclusions = [];
+    brainState.conclusionBrain = 'all';
     toolItems.clear();
     chatExchangeItems.clear();
     currentStreamingEl = null;
@@ -1524,6 +1805,7 @@ function renderMessages(messages) {
         showWelcome();
         return;
     }
+    let lastAssistant = null;
     messages.forEach((m, index) => {
         if (m.role === 'user') {
             addUserMessage(m.content, index);
@@ -1531,8 +1813,11 @@ function renderMessages(messages) {
             const el = document.createElement('div');
             el.className = 'msg assistant';
             renderMarkdown(el, m.content);
+            attachPreviewAction(el, '主脑历史回复', '主脑', m.content);
             attachDeleteAction(el, index);
             $messages.appendChild(el);
+            lastAssistant = el;
+            addBrainConclusion('main', m.content, '历史回复', `history-main-${index}`, false);
         } else if (m.role === 'brain_communication' && m.exchange) {
             const request = m.exchange.request || null;
             const response = m.exchange.response || null;
@@ -1545,12 +1830,114 @@ function renderMessages(messages) {
                 response,
                 updatedAt: Date.parse(response?.occurred_at || request?.occurred_at || m.timestamp) || 0,
             }, false);
+            if (response?.content) {
+                addBrainConclusion(
+                    response.sender || 'agent',
+                    response.content,
+                    response.title || '最终结果',
+                    `exchange-${m.exchange.exchange_id}`,
+                    false,
+                );
+            }
         } else {
             const el = addSystemMessage(m.content);
             attachDeleteAction(el, index);
         }
     });
+    if (lastAssistant) appendModifiedFiles(lastAssistant, sessionFiles);
+    renderConclusionPanel();
     scrollToBottom();
+}
+
+function appendModifiedFiles(container, files) {
+    container.querySelector(':scope > .modified-files')?.remove();
+    if (!files?.length) return;
+    const section = document.createElement('section');
+    section.className = 'modified-files';
+    const heading = document.createElement('div');
+    heading.className = 'modified-files-heading';
+    heading.innerHTML = `<strong>本次修改的文件</strong><span>${files.length} 个</span>`;
+    section.appendChild(heading);
+    files.forEach((file) => {
+        const link = document.createElement('a');
+        link.className = 'modified-file-link';
+        link.href = `/api/local-file?path=${encodeURIComponent(file.path)}`;
+        link.title = file.path;
+        link.innerHTML = `
+            <i data-lucide="file-text" aria-hidden="true"></i>
+            <span><strong>${escapeHtml(file.name)}</strong><small>${escapeHtml(file.path)}</small></span>
+        `;
+        link.addEventListener('click', async (event) => {
+            event.preventDefault();
+            await openLocalFileEditor(file);
+        });
+        section.appendChild(link);
+    });
+    container.appendChild(section);
+    refreshIcons();
+}
+
+async function openLocalFileEditor(file) {
+    try {
+        const response = await fetch(`/api/local-file?path=${encodeURIComponent(file.path)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '文件读取失败');
+        openedLocalFile = { name: data.name, path: data.path };
+        currentPreview = buildPreviewMetadata(data.name, data.path, data.content, {
+            fileName: data.name,
+            path: data.path,
+        });
+        $previewTitle.textContent = data.name;
+        $previewSource.textContent = data.path;
+        $fileEditorContent.value = data.content;
+        $fileEditorStatus.textContent = '已保存';
+        $fileEditorQuote.disabled = true;
+        $previewContent.classList.add('hidden');
+        $previewSelectionTools.classList.add('hidden');
+        $fileEditorToolbar.classList.remove('hidden');
+        $fileEditorContent.classList.remove('hidden');
+        $markdownPreview.classList.add('open');
+        $markdownPreview.setAttribute('aria-hidden', 'false');
+        $previewBackdrop.classList.remove('hidden');
+        document.body.classList.add('preview-open');
+        $fileEditorContent.focus();
+        refreshIcons();
+    } catch (error) {
+        addSystemMessage(`无法预览文件：${error.message}`);
+    }
+}
+
+async function saveOpenedLocalFile() {
+    if (!openedLocalFile) return;
+    $fileEditorStatus.textContent = '保存中...';
+    try {
+        const response = await fetch('/api/local-file', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: openedLocalFile.path, content: $fileEditorContent.value }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '保存失败');
+        $fileEditorStatus.textContent = `已保存 ${new Date().toLocaleTimeString()}`;
+    } catch (error) {
+        $fileEditorStatus.textContent = `保存失败：${error.message}`;
+    }
+}
+
+function quoteFileEditorSelection() {
+    if (!openedLocalFile) return;
+    const start = $fileEditorContent.selectionStart;
+    const end = $fileEditorContent.selectionEnd;
+    if (start === end) return;
+    const text = $fileEditorContent.value.slice(start, end);
+    const startLine = $fileEditorContent.value.slice(0, start).split('\n').length;
+    const endLine = startLine + text.split('\n').length - 1;
+    const lines = startLine === endLine ? `${startLine}` : `${startLine}-${endLine}`;
+    const quoted = text.split('\n').map((line) => `> ${line}`).join('\n');
+    const reference = `[引用文件: ${openedLocalFile.name} | 路径: ${openedLocalFile.path} | 行号: ${lines}]\n${quoted}\n\n`;
+    $input.setRangeText(reference, $input.selectionStart, $input.selectionEnd, 'end');
+    switchView('chat');
+    $input.focus();
 }
 
 // ── Persona List ────────────────────────────────────────────────
@@ -1620,6 +2007,9 @@ function stopGenerating() {
 function submitQuery() {
     const text = $input.value.trim();
     if (!text) return;
+
+    currentTurnFiles = [];
+    turnFileBaseline = new Map(sessionFiles.map((file) => [file.path, file.updated_at]));
 
     addUserMessage(text);
     brainState.activeSince = Date.now();
@@ -1715,6 +2105,8 @@ $cockpitReset.addEventListener('click', () => {
     brainState.links = [];
     brainState.events = [];
     brainState.communications = [];
+    brainState.conclusions = [];
+    brainState.conclusionBrain = 'all';
     brainState.memoryGraphOps = [];
     brainState.agents = {};
     brainState.metrics = {
@@ -1738,6 +2130,29 @@ $cockpitReset.addEventListener('click', () => {
 
 $sidebarToggle.addEventListener('click', () => {
     $sidebar.classList.toggle('open');
+});
+
+$previewClose.addEventListener('click', closeMarkdownPreview);
+$previewBackdrop.addEventListener('click', closeMarkdownPreview);
+$previewContent.addEventListener('mouseup', updatePreviewSelection);
+$previewContent.addEventListener('keyup', updatePreviewSelection);
+$previewQuote.addEventListener('click', quotePreviewSelection);
+$fileEditorContent.addEventListener('input', () => {
+    $fileEditorStatus.textContent = '有未保存修改...';
+    clearTimeout(fileSaveTimer);
+    fileSaveTimer = setTimeout(saveOpenedLocalFile, 600);
+});
+$fileEditorContent.addEventListener('select', () => {
+    $fileEditorQuote.disabled = $fileEditorContent.selectionStart === $fileEditorContent.selectionEnd;
+});
+$fileEditorContent.addEventListener('keyup', () => {
+    $fileEditorQuote.disabled = $fileEditorContent.selectionStart === $fileEditorContent.selectionEnd;
+});
+$fileEditorQuote.addEventListener('click', quoteFileEditorSelection);
+document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && $markdownPreview.classList.contains('open')) {
+        closeMarkdownPreview();
+    }
 });
 
 // Close sidebar when clicking outside on mobile

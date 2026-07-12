@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query as AxumQuery, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Json;
@@ -357,12 +358,19 @@ pub async fn serve_web(orch: Orchestrator, addr: &str) {
     let state = Arc::new(AppState {
         orch: Arc::new(orch),
         sessions,
+        workspace_root: std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
     });
 
     let app = Router::new()
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
         .route("/app.js", get(serve_js))
+        .route(
+            "/api/local-file",
+            get(serve_local_file).post(save_local_file),
+        )
         .route("/ws", get(ws_upgrade))
         .with_state(state);
 
@@ -401,4 +409,116 @@ async fn serve_js() -> impl IntoResponse {
         )],
         APP_JS,
     )
+}
+
+#[derive(Deserialize)]
+struct LocalFileQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct SaveLocalFileRequest {
+    path: String,
+    content: String,
+}
+
+async fn serve_local_file(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(query): AxumQuery<LocalFileQuery>,
+) -> axum::response::Response {
+    let requested = std::path::PathBuf::from(query.path.trim_start_matches(r"\\?\"));
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        state.workspace_root.join(requested)
+    };
+    let Ok(canonical) = std::fs::canonicalize(&requested) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "文件不存在"})),
+        )
+            .into_response();
+    };
+    if !canonical.starts_with(&state.workspace_root) || !canonical.is_file() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "只允许预览当前工作区文件"})),
+        )
+            .into_response();
+    }
+    let Ok(metadata) = std::fs::metadata(&canonical) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "无法读取文件信息"})),
+        )
+            .into_response();
+    };
+    if metadata.len() > 5 * 1024 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "文件超过 5MB，无法在线预览"})),
+        )
+            .into_response();
+    }
+    let Ok(content) = std::fs::read_to_string(&canonical) else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(serde_json::json!({"error": "当前仅支持文本文件预览"})),
+        )
+            .into_response();
+    };
+    let name = canonical
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("文件");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "name": name,
+            "path": canonical.to_string_lossy(),
+            "content": content,
+        })),
+    )
+        .into_response()
+}
+
+async fn save_local_file(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SaveLocalFileRequest>,
+) -> axum::response::Response {
+    if request.content.len() > 5 * 1024 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "文件超过 5MB"})),
+        )
+            .into_response();
+    }
+    let requested = std::path::PathBuf::from(request.path.trim_start_matches(r"\\?\"));
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        state.workspace_root.join(requested)
+    };
+    let Ok(canonical) = std::fs::canonicalize(requested) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "文件不存在"})),
+        )
+            .into_response();
+    };
+    if !canonical.starts_with(&state.workspace_root) || !canonical.is_file() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "只允许修改当前工作区文件"})),
+        )
+            .into_response();
+    }
+    match std::fs::write(canonical, request.content) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"saved": true}))).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("保存失败: {error}")})),
+        )
+            .into_response(),
+    }
 }

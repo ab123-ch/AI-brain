@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime_trace::{ExchangePhase, RuntimeExchange};
-use crate::web::progress_adapter::{ChatExchange, ChatMessage};
+use crate::web::progress_adapter::{ChatExchange, ChatMessage, ModifiedFileInfo};
 
 // ─── WebSession ─────────────────────────────────────────────────────
 
@@ -27,6 +27,8 @@ pub struct WebSession {
     pub messages: Vec<ChatMessage>,
     /// 当前人格 ID
     pub active_persona_id: String,
+    #[serde(default)]
+    pub modified_files: Vec<ModifiedFileInfo>,
 }
 
 // ─── SessionManager ─────────────────────────────────────────────────
@@ -126,6 +128,45 @@ impl SessionManager {
     /// 获取当前活跃会话的可变引用
     pub fn active_mut(&mut self) -> &mut WebSession {
         self.sessions.get_mut(&self.active_id).unwrap()
+    }
+
+    pub fn record_modified_file_to(
+        &mut self,
+        session_id: &str,
+        path: &str,
+    ) -> Vec<ModifiedFileInfo> {
+        let normalized = std::path::PathBuf::from(path);
+        let absolute = if normalized.is_absolute() {
+            normalized
+        } else {
+            std::env::current_dir().unwrap_or_default().join(normalized)
+        };
+        let display_path = absolute
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_string();
+        let name = absolute
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return Vec::new();
+        };
+        session
+            .modified_files
+            .retain(|file| file.path != display_path);
+        session.modified_files.insert(
+            0,
+            ModifiedFileInfo {
+                name,
+                path: display_path,
+                updated_at: Utc::now(),
+            },
+        );
+        session.modified_files.truncate(100);
+        Self::persist_to_disk(&self.persist_dir, session);
+        session.modified_files.clone()
     }
 
     /// 按创建时间倒序列出所有会话
@@ -320,6 +361,7 @@ impl SessionManager {
             created_at: Utc::now().to_rfc3339(),
             messages: Vec::new(),
             active_persona_id: String::new(),
+            modified_files: Vec::new(),
         }
     }
 

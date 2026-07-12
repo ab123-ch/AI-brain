@@ -1,15 +1,4 @@
-mod api_server;
-mod command;
-mod config_manager;
-mod init;
-mod llm_usage_logger;
-mod orchestrator;
-mod real_tool_executor;
-mod repl;
-mod runtime_trace;
-mod tui;
-mod web;
-
+use ai_brain_cli::{api_server, init, orchestrator, repl, tui};
 use clap::{Parser, Subcommand};
 use orchestrator::{format_output, Orchestrator};
 use std::io::IsTerminal;

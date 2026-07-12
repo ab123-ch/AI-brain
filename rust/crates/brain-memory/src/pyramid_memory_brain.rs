@@ -531,6 +531,56 @@ impl PyramidMemoryBrain {
         })
     }
 
+    /// 返回绑定到当前记忆根目录和图谱数据库的小说项目记忆存储。
+    #[must_use]
+    pub fn novel_memory_store(&self) -> crate::novel::NovelMemoryStore {
+        crate::novel::NovelMemoryStore::new(
+            self.config.base_dir.clone(),
+            self.config.graph_db_path.clone(),
+        )
+    }
+
+    /// 创建一个隔离的小说项目，并同步项目索引到 Novel 图谱。
+    pub fn create_novel_project(&self, project: &crate::novel::NovelProject) -> Result<()> {
+        self.novel_memory_store().create_project(project)
+    }
+
+    /// 按具体写作阶段构造项目级记忆包。
+    pub fn recall_novel_project(
+        &self,
+        project_id: &str,
+        task_type: crate::novel::NovelTaskType,
+    ) -> Result<crate::novel::NovelRecallPack> {
+        self.novel_memory_store().recall(project_id, task_type)
+    }
+
+    /// 校验并原子提交小说脑返回的结构化记忆变更集。
+    pub fn commit_novel_delta(
+        &self,
+        delta: &crate::novel::NovelMemoryDelta,
+    ) -> Result<crate::novel::CommitReport> {
+        self.novel_memory_store().commit_delta(delta)
+    }
+
+    /// 标记小说 Canon 冲突已审查；事实修改仍须通过新的 Delta 提交。
+    pub fn resolve_novel_conflict(
+        &self,
+        project_id: &str,
+        conflict_id: &str,
+        resolution: &str,
+    ) -> Result<()> {
+        self.novel_memory_store()
+            .resolve_conflict(project_id, conflict_id, resolution)
+    }
+
+    /// 在写作或审稿前检查人物状态、Canon 冲突和逾期伏笔。
+    pub fn check_novel_consistency(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::novel::ConsistencyReport> {
+        self.novel_memory_store().check_consistency(project_id)
+    }
+
     /// 存储对话轮次到 L1
     pub fn store_turn(&self, role: &str, content: &str, tool_output: Option<&str>) -> Result<()> {
         let pool = RawPool::new(self.storage.clone());

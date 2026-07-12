@@ -710,6 +710,88 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "novel_create_project",
+            description: "创建隔离的小说项目级记忆空间。开始一部长篇小说且尚无 project_id 时调用。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "稳定项目 ID，只能包含字母、数字、-、_" },
+                    "title": { "type": "string" },
+                    "genres": { "type": "array", "items": { "type": "string" } },
+                    "target_platform": { "type": "string" }
+                },
+                "required": ["project_id", "title"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "novel_list_projects",
+            description: "列出已有小说项目及其 project_id、当前卷章和 Canon revision，用于继续已有作品或避免重复建项目。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "novel_recall_project",
+            description: "按大纲、章纲、正文、审稿或润色阶段召回指定小说项目的 Canon、人物状态、时间线、伏笔与写作经验。委派 Novel 小说脑前调用。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"]
+                    }
+                },
+                "required": ["project_id", "task_type"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "novel_check_consistency",
+            description: "在章纲、正文或审稿前检查指定小说项目的未解决 Canon 冲突、重叠事实和逾期伏笔。",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "project_id": { "type": "string" } },
+                "required": ["project_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "novel_commit_delta",
+            description: "正文或规划文件成功保存后，校验并提交小说脑给出的 NovelMemoryDelta。revision 过期或 Canon 冲突时不会静默覆盖。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "delta": { "type": "object", "description": "符合 NovelMemoryDelta schema 的结构化变更集" }
+                },
+                "required": ["delta"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "novel_resolve_conflict",
+            description: "在主脑或用户审查后标记一条小说 Canon 冲突已处理。该工具只保存审计结论，不直接修改事实；事实变更仍通过 novel_commit_delta 提交。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" },
+                    "conflict_id": { "type": "string" },
+                    "resolution": { "type": "string" }
+                },
+                "required": ["project_id", "conflict_id", "resolution"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "list_recent_memories",
             description: "按时间列出最近的会话记忆（L2 会话总结）。适合用户说「刚刚」「昨天」「最近」「上次」等时间相关表述时使用。返回每条记忆的文件路径、时间范围、标签和摘要预览。如需查看完整内容，再用 read_file 工具读取对应路径。",
             input_schema: json!({
@@ -911,6 +993,14 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
+        }
+        "novel_create_project"
+        | "novel_list_projects"
+        | "novel_recall_project"
+        | "novel_check_consistency"
+        | "novel_commit_delta"
+        | "novel_resolve_conflict" => {
+            Err(format!("{name} is handled by RealToolExecutor directly"))
         }
         "graph_search_catalog" => {
             from_value::<GraphSearchCatalogInput>(input).and_then(run_graph_search_catalog)
@@ -3171,16 +3261,32 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     let today = current_date_str();
     if subagent_type == "Novel" {
         let prompt = format!(
-            "你是小说副脑（Novel sub-agent），专门负责长篇小说创作与文本生成。\n\
+            "你是小说副脑（Novel sub-agent），负责长篇小说从调研、设计、写作、审校到复盘的完整生产流程。\n\
              当前日期: {today}\n\
              操作系统: {os}\n\
              工作目录: {}\n\n\
-             职责边界:\n\
-             - 只根据主脑提供的剧情、世界观、人设、前文提要、风格要求和用户目标进行创作。\n\
-             - 可以创作大纲、卷纲、章纲、正文、续写、桥段、人物小传、设定补充、爽点设计和改写方案。\n\
-             - 不要读取文件、不要修改文件、不要联网搜索、不要调用外部工具；需要的素材必须由主脑提供。\n\
-             - 不要向用户提问；若信息不足，先基于主脑提供的内容做合理创作假设，并在输出末尾简短列出假设。\n\
-             - 输出应直接可用，保持叙事连贯、人物动机一致、节奏明确，并遵守主脑给出的字数、风格和结构要求。",
+             工作原则:\n\
+             - 主脑给出的剧情、世界观、人设、前文、风格、平台和限制是当前任务的最高约束；先识别任务属于大纲、卷纲、章纲、正文、审稿、润色或复盘。\n\
+             - 每次开始创作前，先检索 Novel 图谱中的项目设定、历史决策、读者反馈和已验证经验，避免人物、时间线、伏笔与既有内容冲突。\n\
+             - 需要市场或类型参考时，可检索起点、番茄等目标平台的同类型作品、榜单趋势、简介与公开试读；只提炼题材机制、节奏、冲突结构和读者期待，不照搬情节、角色、句子或专有设定。\n\
+             - 主脑提供了小说正文或本地资料路径时，按需读取；不要修改或保存文件，最终产物交由主脑落盘。\n\n\
+             标准流程（按任务裁剪，不机械展示内部过程）:\n\
+             1. 建立任务卡：明确目标产物、承接剧情、必须发生/禁止发生、字数、视角、风格、平台和验收标准。\n\
+             2. 召回与调研：查询 Novel 图谱；必要时查询目标平台或主脑指定作品，区分项目事实、外部参考和创作假设。\n\
+             3. 剧情设计：检查人物动机、因果链、冲突升级、信息释放、爽点/悬念、伏笔回收和章节钩子。\n\
+             4. 生成产物：大纲给出阶段目标与主线转折；章纲给出场景节拍、冲突、信息增量和章末钩子；正文严格承接章纲与前文。\n\
+             5. 独立审稿：完成后以编辑视角检查设定一致性、逻辑、节奏、人物、重复、AI腔、平台适配和原创性，并修正关键问题。\n\
+             6. 润色交付：在不改变剧情事实的前提下优化语言、动作、对话、感官细节和段落节奏。\n\
+             7. 记忆交接：末尾附可提交给 novel_commit_delta 的 NovelMemoryDelta JSON，只记录本轮新增的稳定设定、剧情状态、伏笔、风格偏好、有效方法及用户反馈；必须沿用召回包中的 project_id、branch_id，并把召回包 revision 写入 expected_revision。临时创意标为 draft，正文已落盘的事实才可标为 confirmed；完成卷章时同步填写 progress；没有新增时各变更数组为空。\n\n\
+             NovelMemoryDelta 最小结构:\n\
+             {{\"project_id\":\"...\",\"branch_id\":\"main\",\"expected_revision\":0,\"task_type\":\"outline|volume_outline|chapter_plan|body|continuation|review|polish|retrospective\",\"source_ref\":\"已保存文件路径\",\"progress\":{{\"current_volume\":null,\"current_chapter\":null}},\"proposed_facts\":[],\"state_changes\":[],\"plot_updates\":[],\"foreshadowing_updates\":[],\"feedback\":[],\"experience_candidates\":[]}}\n\
+             ProposedFact 结构:\n\
+             {{\"fact_id\":\"稳定且项目内唯一\",\"kind\":\"world_rule|character|character_state|location|organization|item|event|timeline|plot_thread|foreshadowing|outline|chapter_plan|chapter_summary|decision|feedback|writing_experience\",\"subject_key\":\"稳定业务键\",\"title\":\"...\",\"summary\":\"...\",\"data\":{{}},\"status\":\"draft|confirmed\",\"valid_from_chapter\":null,\"valid_to_chapter\":null,\"source_refs\":[],\"confidence\":0.0}}\n\n\
+             state_changes 元素为 {{\"fact\":ProposedFact,\"supersedes_fact_id\":\"旧事实ID或null\"}}；plot_updates 元素为 {{\"fact\":ProposedFact}}；foreshadowing_updates 元素为 {{\"fact\":ProposedFact,\"resolves_fact_id\":\"已回收伏笔ID或null\"}}；experience_candidates 元素为 {{\"fact\":ProposedFact,\"evidence_count\":1}}。\n\n\
+             输出要求:\n\
+             - 不要向用户提问；信息不足时做最小且可逆的创作假设，并明确标注。\n\
+             - 参考资料不可替代创作判断；无法检索时基于已有上下文继续，说明未验证项。\n\
+             - 最终产物必须直接可用，叙事连贯、人物动机一致、节奏明确，并遵守主脑给出的字数、风格和结构要求。",
             cwd.display()
         );
         return Ok(vec![prompt]);
@@ -3264,7 +3370,16 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "SendUserMessage",
             "PowerShell",
         ],
-        "Novel" => vec![],
+        "Novel" => vec![
+            "read_file",
+            "WebFetch",
+            "WebSearch",
+            "graph_search_catalog",
+            "graph_get_node_detail",
+            "graph_trace_memory",
+            "graph_list_domains",
+            "StructuredOutput",
+        ],
         "claw-guide" => vec![
             "read_file",
             "glob_search",
@@ -6214,22 +6329,40 @@ mod tests {
         assert!(!verification.contains("write_file"));
 
         let novel = allowed_tools_for_subagent("Novel");
-        assert!(novel.is_empty(), "小说副脑不应直接读取、修改文件或调用工具");
+        assert!(
+            novel.contains("read_file"),
+            "小说副脑应能读取主脑提供的前文"
+        );
+        assert!(novel.contains("WebSearch"), "小说副脑应能调研公开平台资料");
+        assert!(
+            novel.contains("graph_search_catalog"),
+            "小说副脑应先召回小说图谱记忆"
+        );
+        assert!(
+            !novel.contains("write_file"),
+            "小说副脑不应直接修改项目文件"
+        );
+        assert!(
+            !novel.contains("graph_add_memory"),
+            "记忆写入应由主脑和记忆脑统一处理"
+        );
         assert_eq!(normalize_subagent_type(Some("novel")), "Novel");
         assert_eq!(normalize_subagent_type(Some("小说")), "Novel");
         assert_eq!(normalize_subagent_type(Some("写作")), "Novel");
     }
 
     #[test]
-    fn novel_subagent_prompt_is_creative_only() {
+    fn novel_subagent_prompt_has_full_writing_workflow() {
         let prompt = build_agent_system_prompt("Novel")
             .expect("Novel prompt should build")
             .join("\n");
 
         assert!(prompt.contains("小说副脑"));
-        assert!(prompt.contains("不要读取文件"));
-        assert!(prompt.contains("不要修改文件"));
-        assert!(prompt.contains("主脑提供"));
+        assert!(prompt.contains("大纲、卷纲、章纲、正文、审稿、润色或复盘"));
+        assert!(prompt.contains("起点、番茄"));
+        assert!(prompt.contains("Novel 图谱"));
+        assert!(prompt.contains("独立审稿"));
+        assert!(prompt.contains("NovelMemoryDelta"));
     }
 
     #[derive(Debug)]

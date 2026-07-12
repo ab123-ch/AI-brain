@@ -24,8 +24,8 @@ fn sanitize_topic_name(topic: &str) -> String {
             }
         })
         .collect();
-    if sanitized.len() > 100 {
-        sanitized[..100].to_string()
+    if sanitized.chars().count() > 100 {
+        sanitized.chars().take(100).collect()
     } else {
         sanitized
     }
