@@ -802,6 +802,34 @@ mod tests {
     }
 
     #[test]
+    fn continuation_recall_includes_events_and_active_plot_threads() {
+        let dir = tempdir().unwrap();
+        let store = NovelMemoryStore::new(dir.path(), None);
+        store
+            .create_project(&NovelProject::new("dark-city", "暗城"))
+            .unwrap();
+        let mut event = fact("event-1", "event:old-port-fire", "旧港发生大火");
+        event.kind = NovelFactKind::Event;
+        let mut plot = fact("plot-1", "plot:missing-key", "铜钥匙仍未找到");
+        plot.kind = NovelFactKind::PlotThread;
+        store
+            .commit_delta(&delta("dark-city", 0, vec![event, plot]))
+            .unwrap();
+
+        let pack = store
+            .recall("dark-city", NovelTaskType::Continuation)
+            .unwrap();
+        assert!(pack
+            .facts
+            .iter()
+            .any(|fact| fact.kind == NovelFactKind::Event));
+        assert!(pack
+            .facts
+            .iter()
+            .any(|fact| fact.kind == NovelFactKind::PlotThread));
+    }
+
+    #[test]
     fn progress_is_committed_with_revision() {
         let dir = tempdir().unwrap();
         let store = NovelMemoryStore::new(dir.path(), None);

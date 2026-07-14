@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -16,6 +17,28 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
         .map(|(i, _)| i)
         .unwrap_or(s.len());
     &s[..boundary]
+}
+
+fn general_eval_enabled(config: &HooksConfig) -> bool {
+    config.enabled && config.eval_gate.enabled
+}
+
+const NOVEL_WRITING_SKILL_NAME: &str = "novel-writing-workflow";
+const NOVEL_WRITING_SKILL: &str =
+    include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
+
+fn install_builtin_skills(ai_brain_dir: &Path) -> Result<PathBuf, String> {
+    let root = ai_brain_dir.join("builtin-skills");
+    let skill_dir = root.join(NOVEL_WRITING_SKILL_NAME);
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::create_dir_all(&skill_dir)
+        .map_err(|error| format!("创建内置技能目录失败: {error}"))?;
+    let current = std::fs::read_to_string(&skill_path).ok();
+    if current.as_deref() != Some(NOVEL_WRITING_SKILL) {
+        std::fs::write(&skill_path, NOVEL_WRITING_SKILL)
+            .map_err(|error| format!("写入内置小说技能失败: {error}"))?;
+    }
+    Ok(root)
 }
 
 use brain_bus::BrainBus;
@@ -293,15 +316,26 @@ impl Orchestrator {
         // 4.0 提前包装记忆脑 Arc<Mutex>（评估脑和后续都需要）
         let memory = Arc::new(Mutex::new(memory));
 
-        // 4.1 创建 v2 评估脑（LLM 深度评估 + 只读工具验证）
+        // 4.1 先读取 Hook 配置；通用评估脑默认关闭，仅显式启用时才创建 LLM。
+        let hooks_config: HooksConfig = llm_config
+            .hooks
+            .as_ref()
+            .map(HooksConfig::from_toml_value)
+            .unwrap_or_default();
+        let eval_enabled = general_eval_enabled(&hooks_config);
+
         let eval_tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
             crate::real_tool_executor::RealToolExecutor::with_memory(Some(memory.clone())),
         );
-        let mut eval_brain = if let Ok(client) = llm_config.create_brain_client("eval") {
-            Some(EvalBrain::with_verification(
-                Arc::from(client),
-                eval_tool_executor,
-            ))
+        let mut eval_brain = if eval_enabled {
+            if let Ok(client) = llm_config.create_brain_client("eval") {
+                Some(EvalBrain::with_verification(
+                    Arc::from(client),
+                    eval_tool_executor,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -316,15 +350,11 @@ impl Orchestrator {
         }
         if eval_brain.is_some() {
             tracing::info!("v2 评估脑已创建（LLM 深度评估 + 只读工具验证）");
+        } else if !eval_enabled {
+            tracing::info!("v2 通用评估脑默认关闭；小说任务由小说脑自检和主脑复审");
         }
 
-        // 4.2 初始化 Hook 系统（eval_gate 纯规则判断）
-        let hooks_config: HooksConfig = llm_config
-            .hooks
-            .as_ref()
-            .map(HooksConfig::from_toml_value)
-            .unwrap_or_default();
-
+        // 4.2 初始化 Hook 系统（eval_gate 显式启用后才注册）
         let hook_runner = HookRunner::new(hooks_config);
 
         // 5. 主脑
@@ -682,8 +712,8 @@ impl Orchestrator {
             })
             .collect();
 
-        // 任务完成后自动评估 (task_completed=true)
-        if self.evaluation_brain.should_evaluate(&snapshots, 0, true) {
+        // 旧版上下文健康度诊断也服从通用评估脑开关；手动 evaluate 接口仍可用。
+        if self.eval_brain.is_some() && self.evaluation_brain.should_evaluate(&snapshots, 0, true) {
             let eval_result = self.evaluation_brain.evaluate(snapshots);
             tracing::info!(
                 "评估完成: 整体健康度 {:.1}%, 瘦身指令 {} 条",
@@ -776,7 +806,7 @@ impl Orchestrator {
         SystemStatus {
             model: self.model_name.clone(),
             query_count: self.query_count.load(std::sync::atomic::Ordering::Relaxed),
-            eval_enabled: true,
+            eval_enabled: self.eval_brain.is_some(),
             context_usage,
             cumulative_prompt_tokens: cumulative_prompt,
             cumulative_completion_tokens: cumulative_completion,
@@ -2340,6 +2370,10 @@ fn create_v2_main_brain(
             .join(".codex")
             .join("skills"),
     );
+    match install_builtin_skills(&ai_brain_dir) {
+        Ok(root) => skill_roots.push(root),
+        Err(error) => tracing::warn!("准备内置技能失败: {error}"),
+    }
 
     let skill_catalog = SkillCatalog::scan_all(&skill_roots).unwrap_or_else(|e| {
         tracing::warn!("扫描技能失败: {e}");
@@ -2430,6 +2464,44 @@ fn create_sub_brains() -> Result<
 mod tests {
     use super::*;
     use brain_core::types::TurnUsage;
+
+    #[test]
+    fn general_eval_brain_is_opt_in() {
+        let default_config = HooksConfig::default();
+        assert!(!general_eval_enabled(&default_config));
+
+        let mut enabled = HooksConfig::default();
+        enabled.eval_gate.enabled = true;
+        assert!(general_eval_enabled(&enabled));
+        enabled.enabled = false;
+        assert!(!general_eval_enabled(&enabled));
+    }
+
+    #[test]
+    fn builtin_novel_writing_skill_is_seeded_and_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = install_builtin_skills(dir.path()).unwrap();
+        let catalog = SkillCatalog::scan_all(&[root.clone()]).unwrap();
+        let skill = catalog
+            .resolve(NOVEL_WRITING_SKILL_NAME)
+            .expect("built-in Novel writing skill");
+        assert!(!skill.is_bootstrap);
+        assert!(skill.description.contains("小说创作"));
+        let body = catalog.load_content(skill).unwrap();
+        assert!(body.contains("## 主脑分支"));
+        assert!(body.contains("## 小说脑分支"));
+        let summary = catalog.summary_for_prompt();
+        assert!(summary.contains("<name>novel-writing-workflow</name>"));
+        assert!(summary.contains("在调用 Novel Agent 或写入小说文件前使用"));
+
+        let skill_path = root.join(NOVEL_WRITING_SKILL_NAME).join("SKILL.md");
+        std::fs::write(&skill_path, "stale").unwrap();
+        install_builtin_skills(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(skill_path).unwrap(),
+            NOVEL_WRITING_SKILL
+        );
+    }
 
     #[test]
     fn test_format_output() {

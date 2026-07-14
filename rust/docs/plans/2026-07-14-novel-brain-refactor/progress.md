@@ -1,0 +1,30 @@
+# Progress
+
+- Read the planning workflow and recovered the existing workspace state.
+- Preserved unrelated root planning files and remote-access edits.
+- Created a task-specific planning area for the Novel brain refactor.
+- Traced the sub-agent executor and confirmed Novel memory tools need an injected runtime context rather than an allowlist-only change.
+- Confirmed the EvalBrain is currently constructed before hook configuration is read and the UI status reports it as always enabled.
+- Added the structured `novel_context` Agent contract and runtime-injected memory/graph paths.
+- Added project-scoped Canon recall/consistency, exact-file read restrictions, and Novel-domain graph scoping for the sub-agent executor.
+- Added tagged Novel content/self-review/delta output rules and an explicit main-brain review gate.
+- Changed general EvalBrain construction and status reporting to opt-in behavior.
+- Added focused tests for scoped files, cross-project rejection, task-specific Canon recall, tagged self-review metadata, and main review prompt rules.
+- Updated cockpit/runtime delegation traces to include the structured `novel_context`, not only the short task prompt.
+- First targeted run passed all new behavior tests after replacing two stale prompt-string assertions.
+- Tightened self-review validation so incomplete checklists cannot be reported as valid.
+- Reviewed Cargo.lock and whitespace; only the intended package dependency was added and scoped diff checks pass.
+- Ran the full `tools` test suite: 46/50 passed. The four failures reproduce individually in code untouched by this refactor; all new Novel-focused tests pass.
+- `cargo fmt --all -- --check` and `git diff --check` pass.
+- Fixed the only new strict-Clippy warning (test module placement). Repository-wide strict Clippy remains blocked by existing warnings in unrelated modules, so changed-package checks are being isolated with `--no-deps`.
+- Final review closed a project-isolation gap in Novel graph tools: Catalog results are filtered by node `project_id`, detail/trace validate ownership and filter neighbors/steps, and the global domain-count tool is no longer exposed. The new cross-project regression test passes.
+- Re-ran all `tools` tests whose names contain `novel_`: 5/5 passed after the isolation fix, with no new warning in `tools`.
+- Gated the legacy v1 automatic context-health evaluation on the same opt-in state as the LLM EvalBrain; explicit manual evaluation remains available.
+- Tightened the Novel delegation contract so `canon_revision`, planned `output_path`, explicit `context_files`, constraint lists, and non-empty acceptance criteria cannot silently be omitted.
+- Re-ran the five Novel-focused `tools` tests after tightening the contract; all pass.
+- Final regression rerun: `brain-hooks` 28/28, `brain-main` 19/19, and `ai-brain-cli --lib --skip test_orchestrator_query` 185/185 passed; the skipped test requires a real external model.
+- Final memory/tools regression: `brain-memory` 190/190 passed; `tools` 47/47 passed with the four previously documented unrelated failures explicitly skipped. Several integration tests took nearly two minutes because they exercise real provider/sub-agent paths, but the run completed successfully.
+- Final format and whitespace checks pass. Strict `tools` Clippy identified both existing package warnings and a few structural warnings in the new code; the new dispatcher is being split without touching unrelated lint debt.
+- Refactored the new graph dispatcher into Catalog/detail/trace functions and changed runtime context plumbing to borrow. Strict `tools` Clippy now reports only ten pre-existing warnings outside the Novel refactor.
+- Aligned the main-brain prompt with runtime behavior: the general evaluator is explicitly described as off by default, and lack of evaluator feedback is not treated as review approval.
+- Final `cargo fmt --all -- --check` and `git diff --check` pass. All planned phases are complete; unrelated remote-access and root planning changes remain untouched.

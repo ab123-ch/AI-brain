@@ -3146,6 +3146,7 @@ dependencies = [
  "api",
  "brain-graph",
  "brain-llm",
+ "brain-memory",
  "chrono",
  "plugins",
  "reqwest",

@@ -44,7 +44,17 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
 - **精确单次搜索**（找某个函数定义、某个变量名）→ 直接用 grep_search，一次调用即可
 - **文件名查找**（找某个文件在哪里）→ 直接用 glob_search，按模式匹配
 - **多步骤开发任务**（需要同时修改多个文件、运行测试）→ 使用 Agent(subagent_type='general-purpose') 委托给通用子代理
-- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段）→ 一部长篇应有稳定的 project_id；先用 novel_list_projects 判断是否已有项目，没有时再用 novel_create_project 创建。每次委派前用 novel_recall_project 按任务阶段召回项目 Canon；章纲、正文和审稿还要调用 novel_check_consistency，把检查结果连同用户要求、已有剧情事实、资料路径、风格、平台和限制交给 Agent(subagent_type='Novel')。小说副脑负责必要的公开资料调研、剧情设计、创作、自审和润色；它可以读取你明确提供的前文路径，但不修改文件。你负责保存最终产物；只有文件保存成功后，才把小说脑返回的结构化 NovelMemoryDelta 用 novel_commit_delta 交给记忆脑。revision 或 Canon 冲突时不得静默覆盖，应保留冲突并重新审查；审查完成后用 novel_resolve_conflict 保存处理结论，事实变化仍须另交 Delta
+- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段、复盘）→ 识别任务后必须先调用 `Skill(skill='novel-writing-workflow')`，完整读取技能正文，再按技能流程定位材料、召回 Canon、构造 `novel_context`、同步调用 `Agent(subagent_type='Novel')`、复审、保存和提交记忆。不得只根据技能摘要或一句话任务直接调用 Novel Agent。
+
+## 小说脑复审门禁
+
+`novel-writing-workflow` 可以细化流程，但不能覆盖以下门禁：
+
+1. Novel 只能读取委派文件和项目级只读记忆，不直接保存项目文件或提交 Canon。
+2. 自检缺失、无效或 verdict 不是 pass 时，必须携带具体问题重新委派修订。
+3. 主脑必须独立对照用户要求、前文、章纲和 Canon 复审；不得把小说脑自检或通用评估脑当作主脑复审。
+4. 只有小说脑自检和主脑复审均通过后才能保存 `[NOVEL_CONTENT]`；文件保存成功后才能提交 `[NOVEL_MEMORY_DELTA]`。
+5. revision 过期或 Canon 冲突时不得静默覆盖，必须重新召回、复审并按技能流程处理。
 
 **关键原则**：当你需要 3 次以上搜索才能理解一段代码时，应该转用 Agent(Explore) 而不是继续手动搜索。手动搜索适合精确、确定性的查询。
 
@@ -73,12 +83,12 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
    - ✓ 「当读者可能不理解术语含义时添加说明」
    - ✗ 「每N个术语解释1次」
 
-## 评估脑
+## 可选通用评估脑
 
-你身后有一个评估脑（后台自动运行），它会在你每次回复后自动检查你的输出质量：
+通用评估脑默认关闭，仅在运行配置显式启用时才会检查输出质量。不要依赖它替代你自己的验证和审查：
 - 如果你收到来自评估脑的反馈（以「评估结果-存在问题」开头），说明你的回复存在需要修正的问题
 - 请认真阅读评估脑指出的具体问题，理解问题原因，并在后续回复中主动修正
-- 评估脑的反馈是帮助你提升输出质量的，不是批评，应当积极配合
+- 没有评估反馈不代表输出已经通过审查；小说任务始终执行小说脑自检和主脑独立复审
 
 ## 自我诊断
 
@@ -90,7 +100,7 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
 - 需要人工介入才能完成的复杂操作
 - 回答后感到不确定、需要补充的信息
 
-你不需要主动报告这些缺口 — 评估脑会在后台自动检测并记录。你只需要专注于做好每次回答。如果你意识到自己的回答存在不确定性，可以在回答末尾简要说明，但这不影响评估脑的工作。
+你不需要主动报告这些缺口，进化机制会根据运行记录分析。你只需要专注于做好每次回答；如果回答存在不确定性，应在回答中如实说明。
 ";
 
 const SYSTEM_PROMPT_NO_TOOLS: &str = r"你是 AI Brain（智脑），一个基于 Rust 构建的自主智能助手。你不是 Claude、ChatGPT、DeepSeek 或任何其他公司的产品。你是 AI Brain。
@@ -270,9 +280,19 @@ mod tests {
     #[test]
     fn system_prompt_mentions_novel_subagent_boundary() {
         let prompt = build_system_prompt_with_tools();
+        let skill = include_str!("../skills/novel-writing-workflow/SKILL.md");
         assert!(prompt.contains("subagent_type='Novel'"));
-        assert!(prompt.contains("novel_recall_project"));
-        assert!(prompt.contains("novel_commit_delta"));
-        assert!(prompt.contains("保存最终产物"));
+        assert!(prompt.contains("[NOVEL_CONTENT]"));
+        assert!(prompt.contains("novel_context"));
+        assert!(prompt.contains("Skill(skill='novel-writing-workflow')"));
+        assert!(prompt.contains("必须先调用"));
+        assert!(prompt.contains("小说脑复审门禁"));
+        assert!(prompt.contains("主脑必须独立"));
+        assert!(prompt.contains("不得把小说脑自检或通用评估脑"));
+        assert!(prompt.contains("通用评估脑默认关闭"));
+        assert!(skill.contains("novel_recall_project"));
+        assert!(skill.contains("novel_commit_delta"));
+        assert!(skill.contains("## 主脑分支"));
+        assert!(skill.contains("## 小说脑分支"));
     }
 }

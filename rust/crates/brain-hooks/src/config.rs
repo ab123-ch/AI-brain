@@ -56,12 +56,12 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalGateConfig {
     /// 是否启用评估脑自决策（纯规则判断，不调 LLM）
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
 
     /// 评估触发模式
     /// - "always":      所有非 trivial 查询都触发评估（旧行为）
-    /// - "on_file_edit": 仅当主脑调用了文件修改工具（Edit/Write/Bash 含文件操作）时触发（默认）
+    /// - "on_file_edit": 仅当主脑调用了文件修改工具（Edit/Write/Bash 含文件操作）时触发
     /// - "never":        从不触发评估
     #[serde(default = "default_eval_mode")]
     pub mode: EvalGateMode,
@@ -85,7 +85,8 @@ fn default_eval_mode() -> EvalGateMode {
 impl Default for EvalGateConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // 通用评估脑默认关闭；需要时可在配置中显式启用。
+            enabled: false,
             mode: default_eval_mode(),
         }
     }
@@ -106,5 +107,32 @@ impl HooksConfig {
             HookEvent::OnShutdown => &self.on_shutdown,
             HookEvent::SessionStart => &self.session_start,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_brain_is_opt_in_by_default() {
+        let config = HooksConfig::default();
+        assert!(config.enabled);
+        assert!(!config.eval_gate.enabled);
+        assert_eq!(config.eval_gate.mode, EvalGateMode::OnFileEdit);
+    }
+
+    #[test]
+    fn omitted_eval_enabled_stays_disabled_when_section_exists() {
+        let config: HooksConfig = toml::from_str(
+            r#"
+enabled = true
+
+[eval_gate]
+mode = "on_file_edit"
+"#,
+        )
+        .expect("valid hooks config");
+        assert!(!config.eval_gate.enabled);
     }
 }

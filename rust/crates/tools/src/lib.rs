@@ -10,10 +10,16 @@ use api::{
     ToolDefinition, ToolResultContentBlock,
 };
 use brain_graph::{
+    error::ToolResult as GraphToolResult,
     id::gen_node_id,
-    schema::{Edge, EdgeKind, GraphType, Node, NodeKind, TraceDirection},
+    schema::{
+        CatalogSearchResult, Edge, EdgeKind, GraphType, Node, NodeDetail, NodeKind, TraceDirection,
+        TraceResult,
+    },
     store::{CatalogQuery, GraphStore, TraceQuery},
 };
+use brain_memory::novel::{NovelMemoryStore, NovelTaskType};
+use brain_memory::pyramid_memory_brain::PyramidMemoryBrainConfig;
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
@@ -419,7 +425,7 @@ The sub-agent runs in an isolated session with its own tools and returns results
 Use this when the task benefits from focused, independent work (e.g., codebase exploration, \
 code review, verification, research). Do NOT use for simple lookups — use read_file/grep/glob directly. \
 Available subagent_type values: 'Explore' (read-only research), 'Plan', 'Verification', \
-'Novel' (creative writing only; main brain supplies all context and handles files), \
+'Novel' (outline, chapter, continuation, review, and polish; requires novel_context), \
 'general-purpose' (full tool access). \
 The sub-agent inherits your model and API credentials automatically — do NOT research how to launch it, just call this tool.",
             input_schema: json!({
@@ -427,10 +433,41 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                 "properties": {
                     "description": { "type": "string", "description": "Short description of what the agent will do" },
                     "prompt": { "type": "string", "description": "Detailed instructions for the agent" },
-                    "subagent_type": { "type": "string", "description": "Agent type: 'Explore', 'Plan', 'Verification', 'Novel', or 'general-purpose'. Novel is for outline/chapter/body/continuation writing only; main brain handles files. Defaults to 'general-purpose'." },
+                    "subagent_type": { "type": "string", "description": "Agent type: 'Explore', 'Plan', 'Verification', 'Novel', or 'general-purpose'. Novel handles outline, chapter, continuation, review, and polish using a required novel_context; the main brain handles discovery, persistence, and final review. Defaults to 'general-purpose'." },
                     "name": { "type": "string", "description": "Optional short name for the agent" },
                     "model": { "type": "string", "description": "Optional model override (leave empty to use default)" },
-                    "run_in_background": { "type": "boolean", "description": "Set to true to run this agent in the background. You will be automatically notified when it completes.", "default": false }
+                    "run_in_background": { "type": "boolean", "description": "Set to true to run this agent in the background. Novel agents must run synchronously so the main brain can review their result.", "default": false },
+                    "novel_context": {
+                        "type": "object",
+                        "description": "Required for Novel agents. A project-scoped navigation manifest prepared by the main brain.",
+                        "properties": {
+                            "project_id": { "type": "string", "minLength": 1 },
+                            "task_type": { "type": "string", "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"] },
+                            "target_chapter": { "type": "integer", "minimum": 1 },
+                            "canon_revision": { "type": "integer", "minimum": 0 },
+                            "output_path": { "type": "string", "minLength": 1, "description": "Planned path where the main brain will save the accepted artifact" },
+                            "context_files": {
+                                "type": "array",
+                                "description": "Exact files already located by the main brain. Novel read_file access is restricted to these paths.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "role": { "type": "string", "minLength": 1, "description": "For example previous_chapter, chapter_outline, volume_outline, style_guide, or draft" },
+                                        "path": { "type": "string", "minLength": 1 },
+                                        "description": { "type": "string" }
+                                    },
+                                    "required": ["role", "path"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "must_happen": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                            "must_not_change": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                            "acceptance_criteria": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+                            "allow_web_research": { "type": "boolean", "default": false }
+                        },
+                        "required": ["project_id", "task_type", "canon_revision", "output_path", "context_files", "must_happen", "must_not_change", "acceptance_criteria"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -1833,6 +1870,14 @@ pub struct AgentToolLaunch {
     pub completion_rx: Option<std::sync::mpsc::Receiver<AgentCompletion>>,
 }
 
+/// Runtime-owned paths injected into an isolated agent. These values are not
+/// exposed in the public Agent tool schema and cannot be supplied by the LLM.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRuntimeContext {
+    pub novel_memory_root: Option<PathBuf>,
+    pub graph_db_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentCompletion {
     pub agent_id: String,
@@ -1844,8 +1889,16 @@ pub struct AgentCompletion {
 }
 
 pub fn execute_agent_tool_with_completion(input: &Value) -> Result<AgentToolLaunch, String> {
+    execute_agent_tool_with_completion_and_context(input, &AgentRuntimeContext::default())
+}
+
+pub fn execute_agent_tool_with_completion_and_context(
+    input: &Value,
+    runtime_context: &AgentRuntimeContext,
+) -> Result<AgentToolLaunch, String> {
     let input = from_value::<AgentInput>(input)?;
-    let launch = execute_agent_launch_with_spawn(input, spawn_agent_job)?;
+    let launch =
+        execute_agent_launch_with_context_and_spawn(input, runtime_context, spawn_agent_job)?;
     let output_json = to_pretty_json(launch.manifest.clone())?;
     let completion_rx = launch.completion_rx.map(|rx| {
         let (completion_tx, completion_rx) = std::sync::mpsc::channel();
@@ -1983,7 +2036,7 @@ enum TodoStatus {
     Completed,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct AgentInput {
     description: String,
     prompt: String,
@@ -1992,6 +2045,31 @@ struct AgentInput {
     model: Option<String>,
     #[serde(default)]
     run_in_background: bool,
+    #[serde(default)]
+    novel_context: Option<NovelDelegationInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct NovelDelegationInput {
+    project_id: String,
+    task_type: String,
+    target_chapter: Option<u32>,
+    canon_revision: u64,
+    output_path: String,
+    context_files: Vec<NovelContextFile>,
+    must_happen: Vec<String>,
+    must_not_change: Vec<String>,
+    acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    allow_web_research: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct NovelContextFile {
+    role: String,
+    path: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2373,6 +2451,17 @@ struct AgentOutput {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<String>,
+    #[serde(rename = "requiresMainReview", default)]
+    requires_main_review: bool,
+    #[serde(rename = "novelSelfReview", skip_serializing_if = "Option::is_none")]
+    novel_self_review: Option<NovelSelfReviewMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NovelSelfReviewMetadata {
+    present: bool,
+    valid: bool,
+    verdict: Option<String>,
 }
 
 /// Agent 子代理执行结果（从子代理线程通过 channel 发送回来）
@@ -2407,6 +2496,15 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    novel_scope: Option<NovelToolScope>,
+}
+
+#[derive(Debug, Clone)]
+struct NovelToolScope {
+    project_id: String,
+    memory_root: PathBuf,
+    graph_db_path: Option<PathBuf>,
+    allowed_context_files: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2980,10 +3078,154 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
+const NOVEL_WRITING_WORKFLOW_SKILL: &str =
+    include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
+const NOVEL_SELF_REVIEW_CHECKS: &[&str] = &[
+    "outline_alignment",
+    "canon_consistency",
+    "character_consistency",
+    "timeline_consistency",
+    "plot_and_foreshadowing",
+    "style_and_repetition",
+];
 
 /// 动态获取当前日期字符串（YYYY-MM-DD）
 fn current_date_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn prepare_novel_delegation(
+    input: &AgentInput,
+    subagent_type: &str,
+    runtime_context: &AgentRuntimeContext,
+) -> Result<(Option<NovelToolScope>, Option<String>), String> {
+    if subagent_type != "Novel" {
+        return Ok((None, None));
+    }
+    if input.run_in_background {
+        return Err(
+            "Novel agents must run synchronously so the main brain can review the draft".into(),
+        );
+    }
+
+    let delegation = input
+        .novel_context
+        .as_ref()
+        .ok_or_else(|| "Novel agents require novel_context".to_string())?;
+    let project_id = required_non_empty("novel_context.project_id", &delegation.project_id)?;
+    let task_type_name = required_non_empty("novel_context.task_type", &delegation.task_type)?;
+    let _: NovelTaskType = serde_json::from_value(Value::String(task_type_name.to_string()))
+        .map_err(|error| format!("invalid novel_context.task_type: {error}"))?;
+    let output_path = required_non_empty("novel_context.output_path", &delegation.output_path)?;
+    validate_novel_contract_items("novel_context.must_happen", &delegation.must_happen)?;
+    validate_novel_contract_items("novel_context.must_not_change", &delegation.must_not_change)?;
+    validate_novel_contract_items(
+        "novel_context.acceptance_criteria",
+        &delegation.acceptance_criteria,
+    )?;
+    if delegation.acceptance_criteria.is_empty() {
+        return Err("novel_context.acceptance_criteria must not be empty".into());
+    }
+
+    let default_memory_config = PyramidMemoryBrainConfig::default();
+    let memory_root = runtime_context
+        .novel_memory_root
+        .clone()
+        .unwrap_or(default_memory_config.base_dir);
+    let graph_db_path = runtime_context
+        .graph_db_path
+        .clone()
+        .or(default_memory_config.graph_db_path);
+    let store = NovelMemoryStore::new(&memory_root, graph_db_path.clone());
+    let project = store
+        .load_project(project_id)
+        .map_err(|error| format!("cannot prepare Novel agent for `{project_id}`: {error}"))?;
+    if delegation.canon_revision != project.canon_revision {
+        return Err(format!(
+            "novel_context.canon_revision is stale: supplied={}, actual={}",
+            delegation.canon_revision, project.canon_revision
+        ));
+    }
+
+    let (allowed_context_files, rendered_files) =
+        prepare_novel_context_files(&delegation.context_files)?;
+
+    let manifest = json!({
+        "project_id": project.project_id,
+        "project_title": project.title,
+        "task_type": task_type_name,
+        "target_chapter": delegation.target_chapter,
+        "canon_revision": project.canon_revision,
+        "active_branch": project.active_branch,
+        "current_chapter": project.current_chapter,
+        "output_path": output_path,
+        "context_files": rendered_files,
+        "must_happen": delegation.must_happen,
+        "must_not_change": delegation.must_not_change,
+        "acceptance_criteria": delegation.acceptance_criteria,
+        "allow_web_research": delegation.allow_web_research,
+    });
+    let manifest = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+    let prompt_suffix = format!(
+        "# 小说委派清单（主脑已定位）\n\n{manifest}\n\n\
+         执行约束：\n\
+         - 先用 read_file 阅读清单中的必要文件；不要自行遍历目录。\n\
+         - 用 novel_recall_project 查询本项目完整结构化 Canon；写前调用 novel_check_consistency。\n\
+         - 只查询项目 `{project_id}`，图谱检索只使用 Novel 域并优先携带项目名或 project_id。\n\
+         - Web 调研仅在 allow_web_research=true 时使用。\n\
+         - 完成草稿后必须按系统要求输出自检报告，交由主脑独立复审。"
+    );
+
+    Ok((
+        Some(NovelToolScope {
+            project_id: project_id.to_string(),
+            memory_root,
+            graph_db_path,
+            allowed_context_files,
+        }),
+        Some(prompt_suffix),
+    ))
+}
+
+fn prepare_novel_context_files(
+    context_files: &[NovelContextFile],
+) -> Result<(BTreeSet<PathBuf>, Vec<Value>), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut allowed_context_files = BTreeSet::new();
+    let mut rendered_files = Vec::new();
+    for file in context_files {
+        let role = required_non_empty("novel_context.context_files[].role", &file.role)?;
+        let path = required_non_empty("novel_context.context_files[].path", &file.path)?;
+        let candidate = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            cwd.join(path)
+        };
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|error| format!("cannot open Novel context file `{path}`: {error}"))?;
+        if !canonical.is_file() {
+            return Err(format!(
+                "Novel context path is not a file: {}",
+                canonical.display()
+            ));
+        }
+        allowed_context_files.insert(canonical.clone());
+        rendered_files.push(json!({
+            "role": role,
+            "path": canonical.display().to_string(),
+            "description": file.description,
+        }));
+    }
+    Ok((allowed_context_files, rendered_files))
+}
+
+fn validate_novel_contract_items(field: &str, items: &[String]) -> Result<(), String> {
+    if items.iter().any(|item| item.trim().is_empty()) {
+        Err(format!("{field} must not contain empty items"))
+    } else {
+        Ok(())
+    }
 }
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
@@ -2998,6 +3240,17 @@ where
 }
 
 fn execute_agent_launch_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentLaunch, String>
+where
+    F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
+{
+    execute_agent_launch_with_context_and_spawn(input, &AgentRuntimeContext::default(), spawn_fn)
+}
+
+fn execute_agent_launch_with_context_and_spawn<F>(
+    input: AgentInput,
+    runtime_context: &AgentRuntimeContext,
+    spawn_fn: F,
+) -> Result<AgentLaunch, String>
 where
     F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
 {
@@ -3023,7 +3276,13 @@ where
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let (novel_scope, novel_manifest) =
+        prepare_novel_delegation(&input, &normalized_subagent_type, runtime_context)?;
+    let allowed_tools = allowed_tools_for_agent(&normalized_subagent_type, &input);
+    let agent_prompt = novel_manifest.map_or_else(
+        || input.prompt.clone(),
+        |manifest| format!("{}\n\n{}", input.prompt.trim(), manifest),
+    );
 
     let output_contents = format!(
         "# Agent Task
@@ -3038,10 +3297,11 @@ where
 
 {}
 ",
-        agent_id, agent_name, input.description, normalized_subagent_type, created_at, input.prompt
+        agent_id, agent_name, input.description, normalized_subagent_type, created_at, agent_prompt
     );
     std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
 
+    let requires_main_review = normalized_subagent_type == "Novel";
     let manifest = AgentOutput {
         agent_id,
         name: agent_name,
@@ -3056,15 +3316,18 @@ where
         completed_at: None,
         error: None,
         result: None,
+        requires_main_review,
+        novel_self_review: None,
     };
     write_agent_manifest(&manifest)?;
 
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
-        prompt: input.prompt,
+        prompt: agent_prompt,
         system_prompt,
         allowed_tools,
+        novel_scope,
     };
     let result_rx = spawn_fn(job).map_err(|error| {
         let err = format!("failed to spawn sub-agent: {error}");
@@ -3087,17 +3350,36 @@ where
         .map_err(|_| String::from("sub-agent channel closed unexpectedly (thread panicked?)"))?;
 
     // 构建最终 manifest
+    let novel_self_review = inspect_novel_self_review(
+        manifest.subagent_type.as_deref(),
+        agent_done.final_text.as_deref(),
+    );
     let final_manifest = AgentOutput {
         status: agent_done.status,
         completed_at: Some(iso8601_now()),
         error: agent_done.error,
         result: agent_done.final_text,
+        novel_self_review,
         ..manifest
     };
     Ok(AgentLaunch {
         manifest: final_manifest,
         completion_rx: None,
     })
+}
+
+fn allowed_tools_for_agent(subagent_type: &str, input: &AgentInput) -> BTreeSet<String> {
+    let mut allowed_tools = allowed_tools_for_subagent(subagent_type);
+    if subagent_type == "Novel"
+        && !input
+            .novel_context
+            .as_ref()
+            .is_some_and(|context| context.allow_web_research)
+    {
+        allowed_tools.remove("WebFetch");
+        allowed_tools.remove("WebSearch");
+    }
+    allowed_tools
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String> {
@@ -3244,7 +3526,8 @@ fn build_agent_runtime(
         .unwrap_or_else(|| resolve_agent_model(None, "general-purpose"));
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let tool_executor = SubagentToolExecutor::new(allowed_tools);
+    let tool_executor =
+        SubagentToolExecutor::with_novel_scope(allowed_tools, job.novel_scope.clone());
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
@@ -3261,33 +3544,19 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     let today = current_date_str();
     if subagent_type == "Novel" {
         let prompt = format!(
-            "你是小说副脑（Novel sub-agent），负责长篇小说从调研、设计、写作、审校到复盘的完整生产流程。\n\
+            "你是小说副脑（Novel sub-agent），只负责执行主脑委派的小说创作、审稿或润色任务。\n\
              当前日期: {today}\n\
              操作系统: {os}\n\
              工作目录: {}\n\n\
-             工作原则:\n\
-             - 主脑给出的剧情、世界观、人设、前文、风格、平台和限制是当前任务的最高约束；先识别任务属于大纲、卷纲、章纲、正文、审稿、润色或复盘。\n\
-             - 每次开始创作前，先检索 Novel 图谱中的项目设定、历史决策、读者反馈和已验证经验，避免人物、时间线、伏笔与既有内容冲突。\n\
-             - 需要市场或类型参考时，可检索起点、番茄等目标平台的同类型作品、榜单趋势、简介与公开试读；只提炼题材机制、节奏、冲突结构和读者期待，不照搬情节、角色、句子或专有设定。\n\
-             - 主脑提供了小说正文或本地资料路径时，按需读取；不要修改或保存文件，最终产物交由主脑落盘。\n\n\
-             标准流程（按任务裁剪，不机械展示内部过程）:\n\
-             1. 建立任务卡：明确目标产物、承接剧情、必须发生/禁止发生、字数、视角、风格、平台和验收标准。\n\
-             2. 召回与调研：查询 Novel 图谱；必要时查询目标平台或主脑指定作品，区分项目事实、外部参考和创作假设。\n\
-             3. 剧情设计：检查人物动机、因果链、冲突升级、信息释放、爽点/悬念、伏笔回收和章节钩子。\n\
-             4. 生成产物：大纲给出阶段目标与主线转折；章纲给出场景节拍、冲突、信息增量和章末钩子；正文严格承接章纲与前文。\n\
-             5. 独立审稿：完成后以编辑视角检查设定一致性、逻辑、节奏、人物、重复、AI腔、平台适配和原创性，并修正关键问题。\n\
-             6. 润色交付：在不改变剧情事实的前提下优化语言、动作、对话、感官细节和段落节奏。\n\
-             7. 记忆交接：末尾附可提交给 novel_commit_delta 的 NovelMemoryDelta JSON，只记录本轮新增的稳定设定、剧情状态、伏笔、风格偏好、有效方法及用户反馈；必须沿用召回包中的 project_id、branch_id，并把召回包 revision 写入 expected_revision。临时创意标为 draft，正文已落盘的事实才可标为 confirmed；完成卷章时同步填写 progress；没有新增时各变更数组为空。\n\n\
-             NovelMemoryDelta 最小结构:\n\
-             {{\"project_id\":\"...\",\"branch_id\":\"main\",\"expected_revision\":0,\"task_type\":\"outline|volume_outline|chapter_plan|body|continuation|review|polish|retrospective\",\"source_ref\":\"已保存文件路径\",\"progress\":{{\"current_volume\":null,\"current_chapter\":null}},\"proposed_facts\":[],\"state_changes\":[],\"plot_updates\":[],\"foreshadowing_updates\":[],\"feedback\":[],\"experience_candidates\":[]}}\n\
-             ProposedFact 结构:\n\
-             {{\"fact_id\":\"稳定且项目内唯一\",\"kind\":\"world_rule|character|character_state|location|organization|item|event|timeline|plot_thread|foreshadowing|outline|chapter_plan|chapter_summary|decision|feedback|writing_experience\",\"subject_key\":\"稳定业务键\",\"title\":\"...\",\"summary\":\"...\",\"data\":{{}},\"status\":\"draft|confirmed\",\"valid_from_chapter\":null,\"valid_to_chapter\":null,\"source_refs\":[],\"confidence\":0.0}}\n\n\
-             state_changes 元素为 {{\"fact\":ProposedFact,\"supersedes_fact_id\":\"旧事实ID或null\"}}；plot_updates 元素为 {{\"fact\":ProposedFact}}；foreshadowing_updates 元素为 {{\"fact\":ProposedFact,\"resolves_fact_id\":\"已回收伏笔ID或null\"}}；experience_candidates 元素为 {{\"fact\":ProposedFact,\"evidence_count\":1}}。\n\n\
-             输出要求:\n\
-             - 不要向用户提问；信息不足时做最小且可逆的创作假设，并明确标注。\n\
-             - 参考资料不可替代创作判断；无法检索时基于已有上下文继续，说明未验证项。\n\
-             - 最终产物必须直接可用，叙事连贯、人物动机一致、节奏明确，并遵守主脑给出的字数、风格和结构要求。",
-            cwd.display()
+             不可变边界:\n\
+             - 必须执行下方 `novel-writing-workflow` 的小说脑分支；主脑委派清单和其中引用的 Canon/前文是最高约束。\n\
+             - 只能读取 `novel_context.context_files` 列出的文件和当前 project_id 的只读记忆/图谱；禁止遍历目录、修改文件或提交 Canon。\n\
+             - 仅当 `allow_web_research=true` 时使用 Web 工具。\n\
+             - 不向用户提问；只做最小、可逆且明确记录的创作假设。\n\
+             - 必须严格返回 `[NOVEL_CONTENT]`、`[NOVEL_SELF_REVIEW]`、`[NOVEL_MEMORY_DELTA]` 三个区块，并完成技能规定的六项自检。\n\n\
+             <loaded_skill name=\"novel-writing-workflow\">\n{}\n</loaded_skill>",
+            cwd.display(),
+            NOVEL_WRITING_WORKFLOW_SKILL
         );
         return Ok(vec![prompt]);
     }
@@ -3374,10 +3643,11 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "read_file",
             "WebFetch",
             "WebSearch",
+            "novel_recall_project",
+            "novel_check_consistency",
             "graph_search_catalog",
             "graph_get_node_detail",
             "graph_trace_memory",
-            "graph_list_domains",
             "StructuredOutput",
         ],
         "claw-guide" => vec![
@@ -3454,7 +3724,83 @@ fn persist_agent_terminal_state(
     next_manifest.completed_at = Some(iso8601_now());
     next_manifest.error = error;
     next_manifest.result = result.map(str::to_string);
+    next_manifest.novel_self_review =
+        inspect_novel_self_review(manifest.subagent_type.as_deref(), result);
     write_agent_manifest(&next_manifest)
+}
+
+fn inspect_novel_self_review(
+    subagent_type: Option<&str>,
+    result: Option<&str>,
+) -> Option<NovelSelfReviewMetadata> {
+    if subagent_type != Some("Novel") {
+        return None;
+    }
+    let Some(result) = result else {
+        return Some(NovelSelfReviewMetadata {
+            present: false,
+            valid: false,
+            verdict: None,
+        });
+    };
+    let Some(review) = tagged_section(result, "[NOVEL_SELF_REVIEW]", "[/NOVEL_SELF_REVIEW]") else {
+        return Some(NovelSelfReviewMetadata {
+            present: false,
+            valid: false,
+            verdict: None,
+        });
+    };
+    let parsed = serde_json::from_str::<Value>(review.trim()).ok();
+    let verdict = parsed
+        .as_ref()
+        .and_then(|value| value.get("verdict"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase());
+    let issues = parsed
+        .as_ref()
+        .and_then(|value| value.get("issues"))
+        .and_then(Value::as_array);
+    let assumptions_are_array = parsed
+        .as_ref()
+        .and_then(|value| value.get("unverified_assumptions"))
+        .is_some_and(Value::is_array);
+    let checks = parsed
+        .as_ref()
+        .and_then(|value| value.get("checks"))
+        .and_then(Value::as_object);
+    let checks_valid = checks.is_some_and(|checks| {
+        NOVEL_SELF_REVIEW_CHECKS.iter().all(|key| {
+            checks
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|status| matches!(status, "pass" | "fail"))
+        })
+    });
+    let verdict_consistent = match verdict.as_deref() {
+        Some("pass") => {
+            issues.is_some_and(Vec::is_empty)
+                && checks.is_some_and(|checks| {
+                    NOVEL_SELF_REVIEW_CHECKS
+                        .iter()
+                        .all(|key| checks.get(*key).and_then(Value::as_str) == Some("pass"))
+                })
+        }
+        Some("needs_revision") => issues.is_some_and(|issues| !issues.is_empty()),
+        _ => false,
+    };
+    let valid = issues.is_some() && assumptions_are_array && checks_valid && verdict_consistent;
+    Some(NovelSelfReviewMetadata {
+        present: true,
+        valid,
+        verdict,
+    })
+}
+
+fn tagged_section<'a>(value: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let start_index = value.find(start)? + start.len();
+    let remainder = &value[start_index..];
+    let end_index = remainder.find(end)?;
+    Some(&remainder[..end_index])
 }
 
 fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
@@ -3809,11 +4155,26 @@ impl ApiClient for ProviderRuntimeClient {
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
+    novel_scope: Option<NovelToolScope>,
 }
 
 impl SubagentToolExecutor {
+    #[cfg(test)]
     fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self { allowed_tools }
+        Self {
+            allowed_tools,
+            novel_scope: None,
+        }
+    }
+
+    fn with_novel_scope(
+        allowed_tools: BTreeSet<String>,
+        novel_scope: Option<NovelToolScope>,
+    ) -> Self {
+        Self {
+            allowed_tools,
+            novel_scope,
+        }
     }
 }
 
@@ -3824,9 +4185,313 @@ impl ToolExecutor for SubagentToolExecutor {
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
-        let value = serde_json::from_str(input)
+        let value: Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        if let Some(scope) = &self.novel_scope {
+            match tool_name {
+                "read_file" => validate_novel_context_file(scope, &value)?,
+                "novel_recall_project" | "novel_check_consistency" => {
+                    return execute_scoped_novel_memory_tool(scope, tool_name, &value)
+                        .map_err(ToolError::new);
+                }
+                "graph_search_catalog" | "graph_get_node_detail" | "graph_trace_memory" => {
+                    return execute_scoped_novel_graph_tool(scope, tool_name, &value)
+                        .map_err(ToolError::new);
+                }
+                _ => {}
+            }
+        }
         execute_tool(tool_name, &value).map_err(ToolError::new)
+    }
+}
+
+fn validate_novel_context_file(scope: &NovelToolScope, input: &Value) -> Result<(), ToolError> {
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| ToolError::new("read_file.path is required"))?;
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        std::env::current_dir()
+            .map_err(|error| ToolError::new(error.to_string()))?
+            .join(path)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| ToolError::new(format!("cannot open context file `{path}`: {error}")))?;
+    if scope.allowed_context_files.contains(&canonical) {
+        Ok(())
+    } else {
+        Err(ToolError::new(format!(
+            "Novel read_file is limited to the main brain's context_files; denied `{}`",
+            canonical.display()
+        )))
+    }
+}
+
+fn execute_scoped_novel_memory_tool(
+    scope: &NovelToolScope,
+    tool_name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    let requested_project = input
+        .get("project_id")
+        .and_then(Value::as_str)
+        .filter(|project_id| !project_id.trim().is_empty())
+        .ok_or_else(|| format!("{tool_name}.project_id is required"))?;
+    if requested_project != scope.project_id {
+        return Err(format!(
+            "Novel agent is scoped to project `{}`, not `{requested_project}`",
+            scope.project_id
+        ));
+    }
+
+    let store = NovelMemoryStore::new(&scope.memory_root, scope.graph_db_path.clone());
+    match tool_name {
+        "novel_recall_project" => {
+            let task_type: NovelTaskType = serde_json::from_value(
+                input
+                    .get("task_type")
+                    .cloned()
+                    .ok_or_else(|| "novel_recall_project.task_type is required".to_string())?,
+            )
+            .map_err(|error| format!("invalid novel task_type: {error}"))?;
+            serde_json::to_string_pretty(
+                &store
+                    .recall(requested_project, task_type)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "novel_check_consistency" => serde_json::to_string_pretty(
+            &store
+                .check_consistency(requested_project)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        _ => Err(format!("unsupported scoped Novel tool: {tool_name}")),
+    }
+}
+
+fn execute_scoped_novel_graph_tool(
+    scope: &NovelToolScope,
+    tool_name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    let store = open_scoped_novel_graph(scope)?;
+    match tool_name {
+        "graph_search_catalog" => execute_scoped_novel_graph_catalog(scope, &store, input),
+        "graph_get_node_detail" => execute_scoped_novel_graph_detail(scope, &store, input),
+        "graph_trace_memory" => execute_scoped_novel_graph_trace(scope, &store, input),
+        _ => Err(format!("unsupported scoped Novel graph tool: {tool_name}")),
+    }
+}
+
+fn execute_scoped_novel_graph_catalog(
+    scope: &NovelToolScope,
+    store: &GraphStore,
+    input: &Value,
+) -> Result<String, String> {
+    let input = from_value::<GraphSearchCatalogInput>(input)?;
+    if input
+        .graph_type
+        .as_deref()
+        .map(parse_graph_type)
+        .transpose()?
+        .is_some_and(|graph_type| graph_type != GraphType::Novel)
+    {
+        return Err("Novel agents may only search the Novel graph domain".into());
+    }
+    let limit = input.limit.unwrap_or(10).min(50);
+    if limit == 0 {
+        return Err("graph_search_catalog.limit must be greater than zero".into());
+    }
+    let mut query = CatalogQuery::new(split_keywords(&input.query));
+    query.graph_type = Some(GraphType::Novel);
+    // Appending project_id to an OR-style keyword query is not isolation.
+    query.limit = usize::MAX;
+    let result = store
+        .search_catalog(&query)
+        .map_err(|error| error.to_string())?;
+    let scoped_result: GraphToolResult<CatalogSearchResult> = match result {
+        GraphToolResult::Ok { data } => {
+            let searched_matches = data.total_found;
+            let mut entries = Vec::new();
+            for entry in data.entries {
+                if graph_node_belongs_to_project(store, &entry.node_id, &scope.project_id)? {
+                    entries.push(entry);
+                }
+            }
+            let total_found = entries.len();
+            if total_found == 0 {
+                GraphToolResult::Empty {
+                    searched_nodes: searched_matches,
+                    searched_edges: 0,
+                    hint: Some(format!(
+                        "当前 Novel 项目 `{}` 未命中 catalog",
+                        scope.project_id
+                    )),
+                }
+            } else {
+                let truncated = total_found > limit;
+                entries.truncate(limit);
+                GraphToolResult::Ok {
+                    data: CatalogSearchResult {
+                        entries,
+                        total_found,
+                        truncated,
+                    },
+                }
+            }
+        }
+        GraphToolResult::Empty {
+            searched_nodes,
+            searched_edges,
+            hint,
+        } => GraphToolResult::Empty {
+            searched_nodes,
+            searched_edges,
+            hint,
+        },
+        GraphToolResult::Err { kind, message } => GraphToolResult::Err { kind, message },
+    };
+    to_pretty_json(scoped_result)
+}
+
+fn execute_scoped_novel_graph_detail(
+    scope: &NovelToolScope,
+    store: &GraphStore,
+    input: &Value,
+) -> Result<String, String> {
+    let input = from_value::<GraphGetNodeDetailInput>(input)?;
+    ensure_graph_node_in_project(store, &input.node_id, &scope.project_id)?;
+    let result = store
+        .get_node_detail(&input.node_id)
+        .map_err(|error| error.to_string())?;
+    let scoped_result: GraphToolResult<NodeDetail> = match result {
+        GraphToolResult::Ok { mut data } => {
+            let mut upstream = Vec::new();
+            for neighbor in data.upstream {
+                if graph_node_belongs_to_project(store, &neighbor.node_id, &scope.project_id)? {
+                    upstream.push(neighbor);
+                }
+            }
+            let mut downstream = Vec::new();
+            for neighbor in data.downstream {
+                if graph_node_belongs_to_project(store, &neighbor.node_id, &scope.project_id)? {
+                    downstream.push(neighbor);
+                }
+            }
+            data.upstream = upstream;
+            data.downstream = downstream;
+            GraphToolResult::Ok { data }
+        }
+        GraphToolResult::Empty {
+            searched_nodes,
+            searched_edges,
+            hint,
+        } => GraphToolResult::Empty {
+            searched_nodes,
+            searched_edges,
+            hint,
+        },
+        GraphToolResult::Err { kind, message } => GraphToolResult::Err { kind, message },
+    };
+    to_pretty_json(scoped_result)
+}
+
+fn execute_scoped_novel_graph_trace(
+    scope: &NovelToolScope,
+    store: &GraphStore,
+    input: &Value,
+) -> Result<String, String> {
+    let input = from_value::<GraphTraceMemoryInput>(input)?;
+    ensure_graph_node_in_project(store, &input.root_id, &scope.project_id)?;
+    let limit = input.limit.unwrap_or(20).min(100);
+    if limit == 0 {
+        return Err("graph_trace_memory.limit must be greater than zero".into());
+    }
+    let mut query = TraceQuery::new(input.root_id);
+    query.direction = input
+        .direction
+        .as_deref()
+        .map(parse_trace_direction)
+        .transpose()?
+        .unwrap_or(TraceDirection::Both);
+    query.max_depth = input.max_depth.unwrap_or(2).min(10);
+    query.limit = 100;
+    let result = store
+        .trace_memory(&query)
+        .map_err(|error| error.to_string())?;
+    let scoped_result: GraphToolResult<TraceResult> = match result {
+        GraphToolResult::Ok { mut data } => {
+            let mut steps = Vec::new();
+            for step in data.steps {
+                let from_is_scoped =
+                    graph_node_belongs_to_project(store, &step.from_node_id, &scope.project_id)?;
+                let to_is_scoped =
+                    graph_node_belongs_to_project(store, &step.to_node_id, &scope.project_id)?;
+                if from_is_scoped && to_is_scoped {
+                    steps.push(step);
+                }
+            }
+            data.truncated |= steps.len() > limit;
+            steps.truncate(limit);
+            data.steps = steps;
+            GraphToolResult::Ok { data }
+        }
+        GraphToolResult::Empty {
+            searched_nodes,
+            searched_edges,
+            hint,
+        } => GraphToolResult::Empty {
+            searched_nodes,
+            searched_edges,
+            hint,
+        },
+        GraphToolResult::Err { kind, message } => GraphToolResult::Err { kind, message },
+    };
+    to_pretty_json(scoped_result)
+}
+
+fn open_scoped_novel_graph(scope: &NovelToolScope) -> Result<GraphStore, String> {
+    let path = match &scope.graph_db_path {
+        Some(path) => path.clone(),
+        None => resolve_graph_db_path(None)?,
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    GraphStore::open(path).map_err(|error| error.to_string())
+}
+
+fn graph_node_belongs_to_project(
+    store: &GraphStore,
+    node_id: &str,
+    project_id: &str,
+) -> Result<bool, String> {
+    Ok(store
+        .get_node(node_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|node| {
+            node.graph_type == GraphType::Novel
+                && node.props.get("project_id").and_then(Value::as_str) == Some(project_id)
+        }))
+}
+
+fn ensure_graph_node_in_project(
+    store: &GraphStore,
+    node_id: &str,
+    project_id: &str,
+) -> Result<(), String> {
+    if graph_node_belongs_to_project(store, node_id, project_id)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "Novel graph node `{node_id}` is outside delegated project `{project_id}`"
+        ))
     }
 }
 
@@ -5262,9 +5927,11 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        execute_agent_launch_with_spawn, execute_agent_with_spawn, execute_tool,
-        final_assistant_text, mvp_tool_specs, normalize_subagent_type, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, AgentDone, AgentInput, AgentJob,
+        execute_agent_launch_with_context_and_spawn, execute_agent_launch_with_spawn,
+        execute_agent_with_spawn, execute_tool, final_assistant_text, inspect_novel_self_review,
+        mvp_tool_specs, normalize_subagent_type, permission_mode_from_plugin,
+        persist_agent_terminal_state, prepare_novel_delegation, push_output_block, AgentDone,
+        AgentInput, AgentJob, AgentRuntimeContext, NovelContextFile, NovelDelegationInput,
         ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
@@ -5275,7 +5942,7 @@ mod tests {
     };
     use runtime::{
         ApiClient, ApiRequest, AssistantEvent, ConversationMessage, ConversationRuntime,
-        RuntimeError, Session,
+        RuntimeError, Session, ToolExecutor as _,
     };
     use serde_json::json;
 
@@ -6075,6 +6742,7 @@ mod tests {
                 name: Some("ship-audit".to_string()),
                 model: None,
                 run_in_background: false,
+                novel_context: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -6159,6 +6827,7 @@ mod tests {
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
                 run_in_background: false,
+                novel_context: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -6197,6 +6866,7 @@ mod tests {
                 name: Some("fail-task".to_string()),
                 model: None,
                 run_in_background: false,
+                novel_context: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -6234,6 +6904,7 @@ mod tests {
                 name: Some("spawn-error".to_string()),
                 model: None,
                 run_in_background: false,
+                novel_context: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -6274,6 +6945,7 @@ mod tests {
                 name: Some("background-task".to_string()),
                 model: None,
                 run_in_background: true,
+                novel_context: None,
             },
             |_job| {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -6334,6 +7006,9 @@ mod tests {
             "小说副脑应能读取主脑提供的前文"
         );
         assert!(novel.contains("WebSearch"), "小说副脑应能调研公开平台资料");
+        assert!(novel.contains("novel_recall_project"));
+        assert!(novel.contains("novel_check_consistency"));
+        assert!(!novel.contains("graph_list_domains"));
         assert!(
             novel.contains("graph_search_catalog"),
             "小说副脑应先召回小说图谱记忆"
@@ -6352,17 +7027,279 @@ mod tests {
     }
 
     #[test]
-    fn novel_subagent_prompt_has_full_writing_workflow() {
+    fn novel_subagent_prompt_loads_shared_writing_skill() {
         let prompt = build_agent_system_prompt("Novel")
             .expect("Novel prompt should build")
             .join("\n");
 
         assert!(prompt.contains("小说副脑"));
-        assert!(prompt.contains("大纲、卷纲、章纲、正文、审稿、润色或复盘"));
-        assert!(prompt.contains("起点、番茄"));
-        assert!(prompt.contains("Novel 图谱"));
-        assert!(prompt.contains("独立审稿"));
+        assert!(prompt.contains("<loaded_skill name=\"novel-writing-workflow\">"));
+        assert!(prompt.contains("## 主脑分支"));
+        assert!(prompt.contains("## 小说脑分支"));
+        assert!(prompt.contains("novel_context.context_files"));
+        assert!(prompt.contains("allow_web_research=true"));
+        assert!(prompt.contains("novel_recall_project"));
         assert!(prompt.contains("NovelMemoryDelta"));
+        assert!(prompt.contains("[NOVEL_SELF_REVIEW]"));
+        assert!(prompt.contains("character_consistency"));
+    }
+
+    #[test]
+    fn novel_delegation_scopes_files_memory_and_self_review() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("novel-scope");
+        let agent_store = root.join("agents");
+        let context_path = root.join("chapter-3.md");
+        let denied_path = root.join("private-notes.md");
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(&context_path, "第三章完整正文").expect("write delegated context");
+        fs::write(&denied_path, "不应被小说脑读取").expect("write denied context");
+        let memory = brain_memory::novel::NovelMemoryStore::new(&root, None);
+        memory
+            .create_project(&brain_memory::novel::NovelProject::new(
+                "anyang-ghost",
+                "安阳妖鬼录",
+            ))
+            .expect("create novel project");
+        std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
+
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+        let launch = execute_agent_launch_with_context_and_spawn(
+            AgentInput {
+                description: "续写第四章".into(),
+                prompt: "承接第三章并完成第四章正文。".into(),
+                subagent_type: Some("Novel".into()),
+                name: Some("chapter-four".into()),
+                model: None,
+                run_in_background: false,
+                novel_context: Some(NovelDelegationInput {
+                    project_id: "anyang-ghost".into(),
+                    task_type: "continuation".into(),
+                    target_chapter: Some(4),
+                    canon_revision: 0,
+                    output_path: "正文/第四章.md".into(),
+                    context_files: vec![NovelContextFile {
+                        role: "previous_chapter".into(),
+                        path: context_path.display().to_string(),
+                        description: Some("承接前文".into()),
+                    }],
+                    must_happen: vec!["主角进入旧宅".into()],
+                    must_not_change: vec!["主角左手受伤".into()],
+                    acceptance_criteria: vec!["章末保留钩子".into()],
+                    allow_web_research: false,
+                }),
+            },
+            &AgentRuntimeContext {
+                novel_memory_root: Some(root.clone()),
+                graph_db_path: None,
+            },
+            move |job| {
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(AgentDone {
+                    status: "completed".into(),
+                    final_text: Some(
+                        "[NOVEL_CONTENT]\n第四章正文\n[/NOVEL_CONTENT]\n\
+                         [NOVEL_SELF_REVIEW]\n{\"verdict\":\"pass\",\"issues\":[],\"checks\":{\"outline_alignment\":\"pass\",\"canon_consistency\":\"pass\",\"character_consistency\":\"pass\",\"timeline_consistency\":\"pass\",\"plot_and_foreshadowing\":\"pass\",\"style_and_repetition\":\"pass\"},\"unverified_assumptions\":[]}\n[/NOVEL_SELF_REVIEW]\n\
+                         [NOVEL_MEMORY_DELTA]\n{}\n[/NOVEL_MEMORY_DELTA]"
+                            .into(),
+                    ),
+                    error: None,
+                    duration_ms: 1,
+                })
+                .expect("send Novel completion");
+                Ok(rx)
+            },
+        )
+        .expect("Novel launch should succeed");
+
+        assert!(launch.manifest.requires_main_review);
+        let review = launch
+            .manifest
+            .novel_self_review
+            .as_ref()
+            .expect("self-review metadata");
+        assert!(review.present);
+        assert!(review.valid);
+        assert_eq!(review.verdict.as_deref(), Some("pass"));
+
+        let job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("captured Novel job");
+        assert!(job.prompt.contains("小说委派清单"));
+        assert!(job.prompt.contains("anyang-ghost"));
+        assert!(job.prompt.contains(&context_path.display().to_string()));
+        assert!(!job.allowed_tools.contains("WebSearch"));
+        assert!(job.allowed_tools.contains("novel_recall_project"));
+
+        let mut executor =
+            SubagentToolExecutor::with_novel_scope(job.allowed_tools, job.novel_scope.clone());
+        let allowed = executor
+            .execute("read_file", &json!({"path": context_path}).to_string())
+            .expect("delegated file should be readable");
+        assert!(allowed.contains("第三章完整正文"));
+        let denied = executor
+            .execute("read_file", &json!({"path": denied_path}).to_string())
+            .expect_err("undelegated file should be denied");
+        assert!(denied.to_string().contains("context_files"));
+        let recall = executor
+            .execute(
+                "novel_recall_project",
+                &json!({
+                    "project_id": "anyang-ghost",
+                    "task_type": "continuation"
+                })
+                .to_string(),
+            )
+            .expect("scoped Canon recall should work");
+        assert!(recall.contains("安阳妖鬼录"));
+        let cross_project = executor
+            .execute(
+                "novel_check_consistency",
+                &json!({"project_id": "other-project"}).to_string(),
+            )
+            .expect_err("cross-project lookup should be denied");
+        assert!(cross_project.to_string().contains("scoped to project"));
+
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn novel_delegation_requires_context_and_synchronous_review() {
+        let missing_context = AgentInput {
+            description: "写正文".into(),
+            prompt: "写第一章".into(),
+            subagent_type: Some("Novel".into()),
+            name: None,
+            model: None,
+            run_in_background: false,
+            novel_context: None,
+        };
+        let error =
+            prepare_novel_delegation(&missing_context, "Novel", &AgentRuntimeContext::default())
+                .expect_err("Novel context should be required");
+        assert!(error.contains("require novel_context"));
+
+        let incomplete = super::from_value::<AgentInput>(&json!({
+            "description": "写正文",
+            "prompt": "写第一章",
+            "subagent_type": "Novel",
+            "novel_context": {
+                "project_id": "novel-a",
+                "task_type": "body"
+            }
+        }))
+        .expect_err("navigation fields must be present");
+        assert!(incomplete.contains("canon_revision"));
+
+        let background = AgentInput {
+            run_in_background: true,
+            novel_context: Some(NovelDelegationInput {
+                project_id: "novel-a".into(),
+                task_type: "body".into(),
+                target_chapter: Some(1),
+                canon_revision: 0,
+                output_path: "正文/第一章.md".into(),
+                context_files: Vec::new(),
+                must_happen: Vec::new(),
+                must_not_change: Vec::new(),
+                acceptance_criteria: vec!["形成可保存正文".into()],
+                allow_web_research: false,
+            }),
+            ..missing_context
+        };
+        let error = prepare_novel_delegation(&background, "Novel", &AgentRuntimeContext::default())
+            .expect_err("Novel background execution should be rejected");
+        assert!(error.contains("synchronously"));
+    }
+
+    #[test]
+    fn novel_graph_tools_are_scoped_to_the_delegated_project() {
+        let root = temp_path("novel-graph-project-scope");
+        let memory_root = root.join("memory");
+        let graph_path = root.join("graph.db");
+        fs::create_dir_all(&root).expect("create temp root");
+        let memory =
+            brain_memory::novel::NovelMemoryStore::new(&memory_root, Some(graph_path.clone()));
+        memory
+            .create_project(&brain_memory::novel::NovelProject::new("novel-a", "甲项目"))
+            .expect("create first project");
+        memory
+            .create_project(&brain_memory::novel::NovelProject::new("novel-b", "乙项目"))
+            .expect("create second project");
+
+        let allowed_tools = BTreeSet::from([
+            "graph_search_catalog".to_string(),
+            "graph_get_node_detail".to_string(),
+            "graph_trace_memory".to_string(),
+        ]);
+        let mut executor = SubagentToolExecutor::with_novel_scope(
+            allowed_tools,
+            Some(super::NovelToolScope {
+                project_id: "novel-a".into(),
+                memory_root,
+                graph_db_path: Some(graph_path),
+                allowed_context_files: BTreeSet::new(),
+            }),
+        );
+
+        let catalog = executor
+            .execute(
+                "graph_search_catalog",
+                &json!({"query": "乙项目", "graph_type": "Novel"}).to_string(),
+            )
+            .expect("cross-project catalog hits should be filtered");
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).expect("catalog JSON");
+        assert_eq!(catalog["status"], "empty");
+
+        let detail = executor
+            .execute(
+                "graph_get_node_detail",
+                &json!({"node_id": "novel_entity_project_novel-b"}).to_string(),
+            )
+            .expect_err("cross-project detail should be denied");
+        assert!(detail.to_string().contains("outside delegated project"));
+
+        let trace = executor
+            .execute(
+                "graph_trace_memory",
+                &json!({"root_id": "novel_entity_project_novel-b"}).to_string(),
+            )
+            .expect_err("cross-project trace should be denied");
+        assert!(trace.to_string().contains("outside delegated project"));
+
+        let own_detail = executor
+            .execute(
+                "graph_get_node_detail",
+                &json!({"node_id": "novel_entity_project_novel-a"}).to_string(),
+            )
+            .expect("own project detail should be readable");
+        assert!(own_detail.contains("甲项目"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn novel_self_review_requires_all_checks() {
+        let incomplete = inspect_novel_self_review(
+            Some("Novel"),
+            Some(
+                "[NOVEL_SELF_REVIEW]\n\
+                 {\"verdict\":\"pass\",\"issues\":[],\"checks\":{},\"unverified_assumptions\":[]}\n\
+                 [/NOVEL_SELF_REVIEW]",
+            ),
+        )
+        .expect("Novel metadata");
+        assert!(incomplete.present);
+        assert!(!incomplete.valid);
     }
 
     #[derive(Debug)]

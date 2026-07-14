@@ -1,0 +1,24 @@
+# Findings
+
+- Novel agents currently start with a fresh session and receive only the free-form `AgentInput.prompt` plus the static Novel system prompt.
+- The main brain's previous `read_file`, Canon recall, and consistency tool results are not inherited automatically.
+- Novel agents currently have `read_file`, Web tools, and generic graph read tools, but no direct project-scoped Novel memory tools.
+- The existing chapter-body prompt template is not loaded by runtime code.
+- `novel_recall_project.rendered_context` renders each fact as one summary line, although the full JSON pack retains structured fact data.
+- General EvalBrain defaults to `on_file_edit`; the user now wants it disabled by default while retaining main-brain Novel review.
+- Adding Novel tool names to the sub-agent allowlist is insufficient: `SubagentToolExecutor` delegates to `tools::execute_tool`, which explicitly rejects Novel memory tools as RealToolExecutor-only.
+- The clean integration point is an agent runtime context passed by `RealToolExecutor`; it already owns the active `PyramidMemoryBrain` and can expose only its base directory and graph path to the isolated read-only executor.
+- `status_structured()` currently hard-codes `eval_enabled: true`, so disabling the default also requires reporting the actual hook/brain state.
+- Existing graph read tools resolve the production graph path independently, but they are generic. Novel memory recall and consistency should be scoped to the delegated `project_id`.
+- Production `RealToolExecutor` can obtain both the memory root and graph DB path from `PyramidMemoryBrain::config()`, so no global environment mutation is needed.
+- Novel agents should remain synchronous: background completion cannot be reviewed by the main brain in the same tool loop turn.
+- The main-brain review can be made explicit in two layers: tagged Novel self-review metadata in the agent result and a system-prompt rule that forbids saving/committing before independent main review passes.
+- The current hook default can be made opt-in by setting `EvalGateConfig.enabled = false`; Orchestrator should only construct the expensive LLM EvalBrain when that flag is enabled.
+- Review metadata now validates all six required checks, the issue list, assumptions list, and consistency between `verdict` and check results; a bare `verdict=pass` is not accepted.
+- The planned output path lets the Novel brain produce confirmed facts conditionally; the main brain still saves the artifact before committing the Delta.
+- Cargo.lock changes only add the new `brain-memory` dependency to the existing `tools` workspace package.
+- Strict Clippy is not currently a clean repository baseline: unrelated warnings exist in `brain-hooks::runner`, `brain-mcp`, `brain-dispatch`, `brain-sensory`, `runtime`, and many existing `brain-memory` modules. The new config test-placement warning was fixed; the Novel-focused behavior is covered by tests and clean format/diff checks.
+- Final review confirmed a graph isolation gap: Catalog matching accepts any matching keyword, so appending `project_id` does not exclude other projects; detail/trace checked only the `novel_` prefix, while fact node IDs do not encode project ownership. Scoped graph reads therefore need explicit `props.project_id` validation/filtering, and the global domain-count tool should not be exposed to Novel agents.
+- Runtime injection is connected correctly: `RealToolExecutor` reads the active `PyramidMemoryBrain` config under its lock and passes memory/graph paths through `AgentRuntimeContext`, outside the LLM-visible schema.
+- The orchestrator has two evaluation components: LLM-backed `EvalBrain` reviews/retries answers, while legacy `EvaluationBrain` computes context-health diagnostics. The v1 query path still invoked the legacy component automatically, so it must also obey the opt-in gate; explicit manual diagnostics can remain available.
+- The main-brain system prompt still claimed the evaluator always ran in the background. This must be updated with the opt-in behavior so the main brain does not treat missing evaluation feedback as approval.

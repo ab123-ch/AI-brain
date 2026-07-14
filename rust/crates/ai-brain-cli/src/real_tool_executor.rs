@@ -162,17 +162,26 @@ struct AgentTraceRequest {
 
 impl AgentTraceRequest {
     fn from_input(input: &serde_json::Value) -> Self {
+        let prompt = input
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let prompt = input.get("novel_context").map_or_else(
+            || prompt.to_string(),
+            |context| {
+                format!(
+                    "{prompt}\n\nnovel_context:\n{}",
+                    serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string())
+                )
+            },
+        );
         Self {
             description: input
                 .get("description")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("子代理任务")
                 .to_string(),
-            prompt: input
-                .get("prompt")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            prompt,
             subagent_type: input
                 .get("subagent_type")
                 .and_then(serde_json::Value::as_str)
@@ -518,6 +527,16 @@ impl ToolExecutor for RealToolExecutor {
 
         if name == "Agent" {
             let dispatch = self.dispatch.clone();
+            let memory_brain = self.memory_brain.clone();
+            let graph_db_path = self.graph_db_path.clone();
+            let is_novel_agent = input
+                .get("subagent_type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| {
+                    kind.eq_ignore_ascii_case("novel")
+                        || kind.contains("小说")
+                        || kind.contains("写作")
+                });
             let trace = self
                 .runtime_trace_tx
                 .clone()
@@ -531,8 +550,24 @@ impl ToolExecutor for RealToolExecutor {
                 if let Some(trace) = &trace {
                     trace.publish_request();
                 }
+                let runtime_context = if is_novel_agent {
+                    if let Some(memory_brain) = memory_brain {
+                        let memory = memory_brain.lock().await;
+                        tools::AgentRuntimeContext {
+                            novel_memory_root: Some(memory.config().base_dir.clone()),
+                            graph_db_path: memory.config().graph_db_path.clone().or(graph_db_path),
+                        }
+                    } else {
+                        tools::AgentRuntimeContext {
+                            novel_memory_root: None,
+                            graph_db_path,
+                        }
+                    }
+                } else {
+                    tools::AgentRuntimeContext::default()
+                };
                 let result = tokio::task::spawn_blocking(move || {
-                    tools::execute_agent_tool_with_completion(&input)
+                    tools::execute_agent_tool_with_completion_and_context(&input, &runtime_context)
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
@@ -966,6 +1001,27 @@ mod tests {
         assert_eq!(request.phase, ExchangePhase::Request);
         assert_eq!(response.phase, ExchangePhase::Response);
         assert!(request.receiver.starts_with("novel:"));
+    }
+
+    #[test]
+    fn agent_trace_includes_structured_novel_context() {
+        let request = AgentTraceRequest::from_input(&json!({
+            "description": "续写第四章",
+            "prompt": "完成第四章正文",
+            "subagent_type": "Novel",
+            "novel_context": {
+                "project_id": "anyang-ghost",
+                "task_type": "continuation",
+                "context_files": [
+                    {"role": "previous_chapter", "path": "正文/第三章.md"}
+                ]
+            }
+        }));
+
+        assert!(request.prompt.contains("完成第四章正文"));
+        assert!(request.prompt.contains("novel_context"));
+        assert!(request.prompt.contains("anyang-ghost"));
+        assert!(request.prompt.contains("正文/第三章.md"));
     }
 
     #[tokio::test]
