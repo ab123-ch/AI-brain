@@ -19,6 +19,50 @@ cargo build --release
 ./target/release/claw --model sonnet prompt "fix the bug in main.rs"
 ```
 
+## Private Remote Access (Windows Host)
+
+Detailed Windows setup, native testing, phone verification, and Codex handoff:
+[docs/windows-remote-access.md](docs/windows-remote-access.md).
+
+AI Brain can expose its Web UI to your phone or another computer through a
+private Tailscale network. The backend remains bound to `127.0.0.1`; it is not
+published to the public internet.
+
+1. On the Windows host, install Tailscale for Windows and sign in:
+   <https://tailscale.com/download/windows>
+2. Install Tailscale on the phone and sign it into the same Tailnet.
+3. Enable Tailscale unattended mode if the PC should remain in the Tailnet at
+   the Windows sign-in screen. This keeps Tailscale online, not an interactive
+   `ai-brain.exe` process.
+4. In a normal PowerShell window, start AI Brain from the workspace it should
+   control. Administrator privileges are not required for port-based Serve:
+
+```powershell
+cargo build --release -p ai-brain-cli
+.\target\release\ai-brain.exe remote
+# Custom local port:
+.\target\release\ai-brain.exe remote --port 9090
+```
+
+The command prints a private `https://<device>.<tailnet>.ts.net` address. Open
+that address in the phone browser. Remote mode accepts only requests carrying
+Tailscale identity headers and rejects cross-origin WebSocket connections.
+
+Run Tailscale on the Windows host, not in a second WSL 2 installation. Keep the
+`ai-brain.exe remote` process running while remote control is needed. Windows
+may be locked, but signing out, restarting, or sleeping stops this interactive
+workflow until the command is started again.
+
+Tailscale Serve persists its proxy configuration. Disable it when no longer
+needed:
+
+```powershell
+tailscale serve off
+```
+
+Do not replace this setup with a `0.0.0.0` bind or router port forwarding: the
+Web UI can execute tools and edit files in the current workspace.
+
 ## Configuration
 
 Set your API credentials:

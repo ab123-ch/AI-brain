@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query as AxumQuery, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::{Path, Query as AxumQuery, Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
@@ -351,6 +352,15 @@ async fn handle_suggest(State(orch): State<SharedOrch>) -> impl IntoResponse {
 
 /// 启动 Web UI 服务（静态文件 + WebSocket）
 pub async fn serve_web(orch: Orchestrator, addr: &str) {
+    serve_web_with_policy(orch, addr, None).await;
+}
+
+/// 启动只接受 Tailscale Serve 请求的 Web UI。
+pub async fn serve_web_remote(orch: Orchestrator, addr: &str, expected_host: &str) {
+    serve_web_with_policy(orch, addr, Some(expected_host.to_string())).await;
+}
+
+async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: Option<String>) {
     let base_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("ai-brain");
@@ -373,6 +383,14 @@ pub async fn serve_web(orch: Orchestrator, addr: &str) {
         )
         .route("/ws", get(ws_upgrade))
         .with_state(state);
+    let app = if let Some(expected_host) = tailscale_host {
+        app.layer(middleware::from_fn_with_state(
+            TailscaleAccessPolicy { expected_host },
+            enforce_tailscale_access,
+        ))
+    } else {
+        app
+    };
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -385,6 +403,59 @@ pub async fn serve_web(orch: Orchestrator, addr: &str) {
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("Web 服务错误: {e}");
     }
+}
+
+#[derive(Clone)]
+struct TailscaleAccessPolicy {
+    expected_host: String,
+}
+
+async fn enforce_tailscale_access(
+    State(policy): State<TailscaleAccessPolicy>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !has_tailscale_identity(request.headers()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "仅允许通过 Tailscale Serve 访问"})),
+        )
+            .into_response();
+    }
+    if !origin_matches_tailscale_host(request.headers(), &policy.expected_host) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "请求来源与智脑远程地址不匹配"})),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
+fn has_tailscale_identity(headers: &HeaderMap) -> bool {
+    headers
+        .get("tailscale-user-login")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|login| !login.trim().is_empty())
+}
+
+fn origin_matches_tailscale_host(headers: &HeaderMap, expected_host: &str) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(uri) = origin.parse::<Uri>() else {
+        return false;
+    };
+
+    uri.scheme_str() == Some("https")
+        && uri.host().is_some_and(|host| {
+            host.trim_end_matches('.')
+                .eq_ignore_ascii_case(expected_host.trim_end_matches('.'))
+        })
 }
 
 async fn serve_index() -> impl IntoResponse {
@@ -520,5 +591,67 @@ async fn save_local_file(
             Json(serde_json::json!({"error": format!("保存失败: {error}")})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod remote_policy_tests {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::{has_tailscale_identity, origin_matches_tailscale_host};
+
+    #[test]
+    fn requires_non_empty_tailscale_login_header() {
+        let mut headers = HeaderMap::new();
+        assert!(!has_tailscale_identity(&headers));
+
+        headers.insert("tailscale-user-login", HeaderValue::from_static("   "));
+        assert!(!has_tailscale_identity(&headers));
+
+        headers.insert(
+            "tailscale-user-login",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        assert!(has_tailscale_identity(&headers));
+    }
+
+    #[test]
+    fn accepts_same_origin_and_headerless_non_browser_requests() {
+        let mut headers = HeaderMap::new();
+        assert!(origin_matches_tailscale_host(
+            &headers,
+            "brain-mac.example.ts.net"
+        ));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("https://brain-mac.example.ts.net"),
+        );
+        assert!(origin_matches_tailscale_host(
+            &headers,
+            "BRAIN-MAC.EXAMPLE.TS.NET."
+        ));
+    }
+
+    #[test]
+    fn rejects_cross_origin_and_insecure_browser_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(!origin_matches_tailscale_host(
+            &headers,
+            "brain-mac.example.ts.net"
+        ));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://brain-mac.example.ts.net"),
+        );
+        assert!(!origin_matches_tailscale_host(
+            &headers,
+            "brain-mac.example.ts.net"
+        ));
     }
 }

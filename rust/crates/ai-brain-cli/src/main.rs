@@ -1,4 +1,4 @@
-use ai_brain_cli::{api_server, init, orchestrator, repl, tui};
+use ai_brain_cli::{api_server, init, orchestrator, remote_access, repl, tui};
 use clap::{Parser, Subcommand};
 use orchestrator::{format_output, Orchestrator};
 use std::io::IsTerminal;
@@ -38,6 +38,11 @@ enum Commands {
     Web {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+    },
+    /// 通过 Tailscale 私有网络启动远程 Web UI
+    Remote {
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
     },
     /// v2 路径集成测试（3 轮对话，验证 eval_gate + 评估脑）
     V2Test,
@@ -168,6 +173,23 @@ async fn run_command(cli: Cli) {
             let orch = init_or_die().await;
             api_server::serve_web(orch, &addr).await;
         }
+        Some(Commands::Remote { port }) => match remote_access::configure(*port) {
+            Ok(endpoint) => {
+                println!("\n=== 智脑安全远程模式 ===");
+                println!("手机 / 异地电脑访问: {}", endpoint.url());
+                println!("访问范围: 仅当前 Tailscale 私有网络");
+                println!("本机监听: http://127.0.0.1:{port}");
+                println!("停止共享: tailscale serve off\n");
+
+                let orch = init_or_die().await;
+                let addr = format!("127.0.0.1:{port}");
+                api_server::serve_web_remote(orch, &addr, endpoint.host()).await;
+            }
+            Err(error) => {
+                eprintln!("远程模式启动失败: {error}");
+                std::process::exit(1);
+            }
+        },
         Some(Commands::Brain { action }) => {
             let orch = init_or_die().await;
             handle_brain_command(orch, action).await;

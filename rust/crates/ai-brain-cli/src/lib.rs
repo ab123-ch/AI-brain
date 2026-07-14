@@ -10,6 +10,7 @@ pub mod init;
 pub mod llm_usage_logger;
 pub mod orchestrator;
 pub mod real_tool_executor;
+pub mod remote_access;
 pub mod repl;
 pub mod runtime_trace;
 pub mod tui;
