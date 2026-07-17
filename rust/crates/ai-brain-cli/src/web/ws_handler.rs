@@ -6,7 +6,7 @@
 //!   3. 进入消息循环，路由客户端消息到 Orchestrator / SessionManager / PersonaManager
 //!   4. 将 ProgressEvent 转发为 WebProgressEvent 给前端
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,10 +25,11 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 use crate::orchestrator::Orchestrator;
 use crate::runtime_trace::ExchangePhase;
-use crate::web::progress_adapter::{PersonaInfo, SessionInfo, WebProgressEvent};
-use crate::web::session_manager::SessionManager;
+use crate::web::progress_adapter::{ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent};
+use crate::web::session_manager::{ConversationFork, SessionManager, UserQueryTurn};
 use brain_core::types::{MainBrainOutput, ProgressEvent};
 use brain_main::conversation::ChatMessageRestore;
+use brain_memory::conversation_memory::{ConversationMemoryInvalidation, ConversationMemoryScope};
 
 fn extract_modified_file_path(input: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(input).ok()?;
@@ -45,6 +46,7 @@ fn extract_modified_file_path(input: &str) -> Option<String> {
 pub struct AppState {
     pub orch: Arc<Orchestrator>,
     pub sessions: Arc<Mutex<SessionManager>>,
+    pub active_query_sessions: Arc<Mutex<HashSet<String>>>,
     pub workspace_root: std::path::PathBuf,
 }
 
@@ -56,6 +58,10 @@ pub struct AppState {
 enum ClientMessage {
     /// 发起查询
     Query { input: String },
+    /// 编辑一条用户消息并从该点重新生成
+    EditUserMessage { message_id: String, content: String },
+    /// 重新发送最后一条用户消息（不追加副本）
+    RetryLastUserMessage { message_id: String },
     /// 取消当前查询（MVP 暂空）
     Cancel,
     /// 回复 AskUser 问题（MVP 暂空）
@@ -84,6 +90,155 @@ pub async fn ws_upgrade(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+enum QueryAction {
+    New { input: String },
+    Edit { message_id: String, content: String },
+    Retry { message_id: String },
+}
+
+struct PreparedWebQuery {
+    turn: UserQueryTurn,
+    memory_scope: ConversationMemoryScope,
+    restore_history: Option<Vec<ChatMessageRestore>>,
+    updated_messages: Option<Vec<ChatMessage>>,
+}
+
+async fn claim_query_session(state: &Arc<AppState>, session_id: &str) -> bool {
+    state
+        .active_query_sessions
+        .lock()
+        .await
+        .insert(session_id.to_string())
+}
+
+async fn release_query_session(state: &Arc<AppState>, session_id: &str) {
+    state.active_query_sessions.lock().await.remove(session_id);
+}
+
+fn restore_messages_before_turn(
+    messages: &[ChatMessage],
+    message_id: &str,
+) -> Vec<ChatMessageRestore> {
+    messages
+        .iter()
+        .take_while(|message| message.id != message_id)
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .map(|message| ChatMessageRestore {
+            role: message.role.clone(),
+            content: message.content.clone(),
+        })
+        .collect()
+}
+
+async fn prepare_web_query(
+    state: &Arc<AppState>,
+    action: QueryAction,
+) -> Result<PreparedWebQuery, String> {
+    let session_id = state.sessions.lock().await.active().id.clone();
+    if !claim_query_session(state, &session_id).await {
+        return Err("当前会话已有查询正在进行，请等待完成".into());
+    }
+
+    let prepared = match action {
+        QueryAction::New { input } => {
+            let mut sessions = state.sessions.lock().await;
+            if sessions.active().id != session_id {
+                Err("活跃会话已变化，请重新发送".to_string())
+            } else {
+                sessions.push_user_query(&input).map(|turn| {
+                    let messages = sessions.active_visible_messages();
+                    let restore_history = restore_messages_before_turn(&messages, &turn.message_id);
+                    (turn, Some(restore_history), Some(messages))
+                })
+            }
+        }
+        QueryAction::Edit {
+            message_id,
+            content,
+        } => {
+            prepare_conversation_fork(state, &session_id, |sessions| {
+                sessions.edit_user_message(&message_id, &content)
+            })
+            .await
+        }
+        QueryAction::Retry { message_id } => {
+            prepare_conversation_fork(state, &session_id, |sessions| {
+                sessions.retry_last_user_message(&message_id)
+            })
+            .await
+        }
+    };
+
+    match prepared {
+        Ok((turn, restore_history, updated_messages)) => {
+            let memory_scope = match ConversationMemoryScope::new(
+                turn.session_id.clone(),
+                turn.generation_id.clone(),
+            ) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    release_query_session(state, &session_id).await;
+                    return Err(format!("创建对话记忆代次失败: {error}"));
+                }
+            };
+            Ok(PreparedWebQuery {
+                turn,
+                memory_scope,
+                restore_history,
+                updated_messages,
+            })
+        }
+        Err(error) => {
+            release_query_session(state, &session_id).await;
+            Err(error)
+        }
+    }
+}
+
+async fn prepare_conversation_fork(
+    state: &Arc<AppState>,
+    session_id: &str,
+    operation: impl FnOnce(&mut SessionManager) -> Result<ConversationFork, String>,
+) -> Result<
+    (
+        UserQueryTurn,
+        Option<Vec<ChatMessageRestore>>,
+        Option<Vec<ChatMessage>>,
+    ),
+    String,
+> {
+    let (snapshot, fork) = {
+        let mut sessions = state.sessions.lock().await;
+        if sessions.active().id != session_id {
+            return Err("活跃会话已变化，请重试操作".into());
+        }
+        let snapshot = sessions.active().clone();
+        let fork = operation(&mut sessions)?;
+        (snapshot, fork)
+    };
+
+    let invalidation = ConversationMemoryInvalidation {
+        conversation_id: fork.turn.session_id.clone(),
+        generation_ids: fork.invalidated_generation_ids.clone(),
+        includes_legacy_unscoped: fork.includes_legacy_unscoped,
+    };
+    if let Err(error) = state
+        .orch
+        .invalidate_conversation_memory(invalidation)
+        .await
+    {
+        state
+            .sessions
+            .lock()
+            .await
+            .restore_active_snapshot(snapshot);
+        return Err(error);
+    }
+
+    let restore_history = restore_messages_before_turn(&fork.messages, &fork.turn.message_id);
+    Ok((fork.turn, Some(restore_history), Some(fork.messages)))
+}
+
 // ─── 核心处理 ────────────────────────────────────────────────────────
 
 /// 处理一个完整的 WebSocket 连接生命周期
@@ -108,10 +263,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut query_handle: Option<tokio::task::JoinHandle<Result<MainBrainOutput, String>>> = None;
     let mut assistant_text = String::new();
     let mut query_session_id: Option<String> = None;
+    let mut query_generation_id: Option<String> = None;
     let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
-    let mut history_restored_session: Option<String> = None; // 已恢复历史的会话 ID
     let mut runtime_trace_rx = state.orch.subscribe_runtime_trace();
-    let mut exchange_sessions = HashMap::<String, String>::new();
+    let mut exchange_sessions = HashMap::<String, (String, Option<String>)>::new();
     let mut pending_modified_files = HashMap::<String, String>::new();
 
     // 心跳定时器 — 定期发送 Ping 防止连接因空闲被中间代理/浏览器断开
@@ -134,11 +289,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     Ok(exchange) => {
                         let exchange_id = exchange.exchange_id.clone();
                         let exchange_phase = exchange.phase;
-                        let exchange_session_id = match exchange_phase {
+                        let exchange_target = match exchange_phase {
                             ExchangePhase::Request => {
                                 if let Some(session_id) = query_session_id.clone() {
-                                    exchange_sessions.insert(exchange_id.clone(), session_id.clone());
-                                    Some(session_id)
+                                    let target = (session_id, query_generation_id.clone());
+                                    exchange_sessions.insert(exchange_id.clone(), target.clone());
+                                    Some(target)
                                 } else {
                                     None
                                 }
@@ -146,12 +302,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             ExchangePhase::Response => exchange_sessions
                                 .get(&exchange_id)
                                 .cloned()
-                                .or_else(|| query_session_id.clone()),
+                                .or_else(|| {
+                                    query_session_id
+                                        .clone()
+                                        .map(|session_id| (session_id, query_generation_id.clone()))
+                                }),
                         };
-                        if let Some(session_id) = exchange_session_id {
+                        if let Some((session_id, generation_id)) = exchange_target {
                             let mut sessions = state.sessions.lock().await;
-                            if !sessions.upsert_exchange_to(&session_id, exchange.clone()) {
-                                warn!("通信轨迹对应的会话不存在: {session_id}");
+                            if !sessions.upsert_exchange_to(
+                                &session_id,
+                                generation_id.as_deref(),
+                                exchange.clone(),
+                            ) {
+                                warn!("通信轨迹对应的会话或消息代次已失效: {session_id}");
                             }
                         }
                         if send_event(
@@ -182,53 +346,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 match maybe_msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Query { input }) => {
-                                if query_rx.is_some() || query_handle.is_some() {
-                                    send_event(&mut sender, WebProgressEvent::Error {
-                                        message: "当前有查询正在进行，请等待完成".into(),
-                                    }).await.ok();
-                                    continue;
-                                }
-
-                                // 记录用户消息到当前会话，并记住查询所属会话
-                                let current_id = {
-                                    let mut sessions = state.sessions.lock().await;
-                                    sessions.push_message("user", &input);
-                                    sessions.active().id.clone()
-                                };
-                                query_session_id = Some(current_id.clone());
-
-                                // 首次查询或会话切换时，恢复历史到 MainBrain
-                                if history_restored_session.as_ref() != Some(&current_id) {
-                                    let restore_msgs = {
-                                        let sessions = state.sessions.lock().await;
-                                        sessions.active_visible_messages().iter().map(|m| ChatMessageRestore {
-                                            role: m.role.clone(),
-                                            content: m.content.clone(),
-                                        }).collect::<Vec<_>>()
-                                    };
-                                    // 移除刚 push 的用户消息（会在 process_input 中重新添加）
-                                    let restore_msgs = if restore_msgs.last().map(|m| m.role.as_str()) == Some("user") {
-                                        &restore_msgs[..restore_msgs.len().saturating_sub(1)]
-                                    } else {
-                                        &restore_msgs[..]
-                                    };
-                                    let restore_owned = restore_msgs.to_vec();
-                                    state.orch.restore_session_history(restore_owned).await;
-                                    history_restored_session = Some(current_id.clone());
-                                    info!("已恢复会话 {} 的历史到 MainBrain", current_id);
-                                }
-
-                                // 启动流式查询
-                                let (rx, handle, cancel) = state.orch.query_streaming(&input);
-                                query_rx = Some(rx);
-                                query_handle = Some(handle);
-                                cancel_token = Some(cancel);
-                                assistant_text.clear();
-                            }
                             Ok(client_msg) => {
-                                // Cancel 消息需要在 select! 循环中直接处理（访问 cancel_token）
-                                if let ClientMessage::Cancel = client_msg {
+                                let query_action = match client_msg {
+                                    ClientMessage::Query { input } => Some(QueryAction::New { input }),
+                                    ClientMessage::EditUserMessage { message_id, content } => {
+                                        Some(QueryAction::Edit { message_id, content })
+                                    }
+                                    ClientMessage::RetryLastUserMessage { message_id } => {
+                                        Some(QueryAction::Retry { message_id })
+                                    }
+                                    ClientMessage::Cancel => {
                                     if let Some(ref ct) = cancel_token {
                                         ct.cancel();
                                         info!("已取消当前查询 (CancellationToken)");
@@ -243,13 +370,79 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                             sessions.push_message_to(sid, "assistant", &assistant_text);
                                         }
                                     }
+                                    if let Some(ref sid) = query_session_id {
+                                        release_query_session(&state, sid).await;
+                                    }
                                     query_rx = None;
                                     query_session_id = None;
+                                    query_generation_id = None;
                                     cancel_token = None;
                                     assistant_text.clear();
                                     send_event(&mut sender, WebProgressEvent::Done).await.ok();
-                                } else {
-                                    handle_client_message(&mut sender, &state, client_msg, &mut history_restored_session).await;
+                                        None
+                                    }
+                                    other => {
+                                        handle_client_message(
+                                            &mut sender,
+                                            &state,
+                                            other,
+                                        )
+                                        .await;
+                                        None
+                                    }
+                                };
+
+                                let Some(query_action) = query_action else {
+                                    continue;
+                                };
+                                if query_rx.is_some() || query_handle.is_some() {
+                                    send_event(&mut sender, WebProgressEvent::Error {
+                                        message: "当前有查询正在进行，请等待完成".into(),
+                                    }).await.ok();
+                                    continue;
+                                }
+
+                                match prepare_web_query(
+                                    &state,
+                                    query_action,
+                                ).await {
+                                    Ok(prepared) => {
+                                        if let Some(messages) = prepared.updated_messages.clone() {
+                                            send_session_list(&mut sender, &state).await.ok();
+                                            if send_event(
+                                                &mut sender,
+                                                WebProgressEvent::SessionMessagesUpdated {
+                                                    session_id: prepared.turn.session_id.clone(),
+                                                    messages,
+                                                },
+                                            ).await.is_err() {
+                                                release_query_session(&state, &prepared.turn.session_id).await;
+                                                break;
+                                            }
+                                        }
+                                        if let Some(history) = prepared.restore_history {
+                                            state.orch.restore_session_history(history).await;
+                                            info!("已恢复会话 {} 的历史到 MainBrain", prepared.turn.session_id);
+                                        }
+
+                                        let current_id = prepared.turn.session_id.clone();
+                                        let generation_id = prepared.turn.generation_id.clone();
+                                        let input = prepared.turn.input;
+                                        let (rx, handle, cancel) = state
+                                            .orch
+                                            .query_streaming_scoped(&input, prepared.memory_scope);
+                                        query_session_id = Some(current_id);
+                                        query_generation_id = Some(generation_id);
+                                        query_rx = Some(rx);
+                                        query_handle = Some(handle);
+                                        cancel_token = Some(cancel);
+                                        assistant_text.clear();
+                                    }
+                                    Err(message) => {
+                                        send_event(&mut sender, WebProgressEvent::Error { message })
+                                            .await
+                                            .ok();
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -342,6 +535,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             } => {
                 let session_id = query_session_id.take();
+                query_generation_id = None;
                 query_handle = None;
                 query_rx = None;
                 cancel_token = None;
@@ -379,12 +573,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     }
                     _ => {}
                 }
+                if let Some(ref sid) = session_id {
+                    release_query_session(&state, sid).await;
+                }
                 assistant_text.clear();
                 if send_event(&mut sender, WebProgressEvent::Done).await.is_err() {
                     break;
                 }
             }
         }
+    }
+
+    if let Some(cancel) = cancel_token.take() {
+        cancel.cancel();
+    }
+    if let Some(handle) = query_handle.take() {
+        handle.abort();
+    }
+    if let Some(session_id) = query_session_id.take() {
+        release_query_session(&state, &session_id).await;
     }
 
     info!("WebSocket 连接已断开");
@@ -462,10 +669,12 @@ async fn handle_client_message(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     state: &Arc<AppState>,
     msg: ClientMessage,
-    history_restored_session: &mut Option<String>,
 ) {
     match msg {
-        ClientMessage::Query { .. } | ClientMessage::Cancel => {
+        ClientMessage::Query { .. }
+        | ClientMessage::EditUserMessage { .. }
+        | ClientMessage::RetryLastUserMessage { .. }
+        | ClientMessage::Cancel => {
             // 已在 handle_socket 的 select! 中直接处理
         }
         ClientMessage::Heartbeat => {
@@ -485,19 +694,14 @@ async fn handle_client_message(
         ClientMessage::SwitchPersona { persona_id } => {
             handle_switch_persona(sender, state, persona_id).await
         }
-        ClientMessage::NewSession => {
-            *history_restored_session = None; // 新会话需要重新恢复历史
-            handle_new_session(sender, state).await
-        }
+        ClientMessage::NewSession => handle_new_session(sender, state).await,
         ClientMessage::SwitchSession { session_id } => {
-            *history_restored_session = None; // 切换会话需要重新恢复历史
             handle_switch_session(sender, state, session_id).await
         }
         ClientMessage::DeleteSession { session_id } => {
             handle_delete_session(sender, state, session_id).await
         }
         ClientMessage::DeleteTurn { message_index } => {
-            *history_restored_session = None; // 下次查询必须按隐藏后的窗口重建上下文
             handle_delete_turn(sender, state, message_index).await
         }
     }
@@ -717,4 +921,63 @@ async fn send_session_list(
         })
         .collect();
     send_event(sender, WebProgressEvent::SessionList { sessions: list }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_and_retry_client_messages_deserialize_with_stable_ids() {
+        let edit: ClientMessage = serde_json::from_str(
+            r#"{"type":"edit_user_message","message_id":"msg_1","content":"修订内容"}"#,
+        )
+        .unwrap();
+        match edit {
+            ClientMessage::EditUserMessage {
+                message_id,
+                content,
+            } => {
+                assert_eq!(message_id, "msg_1");
+                assert_eq!(content, "修订内容");
+            }
+            other => panic!("expected edit message, got {other:?}"),
+        }
+
+        let retry: ClientMessage =
+            serde_json::from_str(r#"{"type":"retry_last_user_message","message_id":"msg_2"}"#)
+                .unwrap();
+        match retry {
+            ClientMessage::RetryLastUserMessage { message_id } => {
+                assert_eq!(message_id, "msg_2");
+            }
+            other => panic!("expected retry message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_restore_stops_before_regenerated_user_turn() {
+        let message = |id: &str, role: &str, content: &str| ChatMessage {
+            id: id.into(),
+            role: role.into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+            hidden: false,
+            exchange: None,
+            memory_generation_id: None,
+        };
+        let messages = vec![
+            message("user_1", "user", "第一问"),
+            message("trace_1", "brain_communication", "内部轨迹"),
+            message("assistant_1", "assistant", "第一答"),
+            message("user_2", "user", "第二问"),
+        ];
+
+        let restored = restore_messages_before_turn(&messages, "user_2");
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].role, "user");
+        assert_eq!(restored[0].content, "第一问");
+        assert_eq!(restored[1].role, "assistant");
+        assert_eq!(restored[1].content, "第一答");
+    }
 }

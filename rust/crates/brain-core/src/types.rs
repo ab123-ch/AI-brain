@@ -112,6 +112,9 @@ impl BrainId {
     pub fn evaluation() -> Self {
         Self("evaluation".into())
     }
+    pub fn novel() -> Self {
+        Self("novel".into())
+    }
 }
 
 impl std::fmt::Display for BrainId {
@@ -130,6 +133,7 @@ pub enum BrainKind {
     Motor,
     Validation,
     Evaluation,
+    Novel,
 }
 
 /// 权重 [0.1, 1.0]
@@ -966,6 +970,7 @@ mod tests {
     fn brain_id_display() {
         assert_eq!(BrainId::sensory().to_string(), "sensory");
         assert_eq!(BrainId::master().to_string(), "master");
+        assert_eq!(BrainId::novel().to_string(), "novel");
     }
 
     #[test]

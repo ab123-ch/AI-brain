@@ -65,6 +65,22 @@ impl PyramidStorage {
         self.l1_dir().join(format!("{session_id}.jsonl"))
     }
 
+    /// Superseded conversation generations retained for audit but excluded
+    /// from active recall and concentration.
+    pub fn invalidated_l1_dir(&self) -> PathBuf {
+        self.pyramid_root().join("l1-invalidated")
+    }
+
+    pub fn invalidated_l1_session_path(&self, session_id: &str) -> PathBuf {
+        self.invalidated_l1_dir()
+            .join(format!("{session_id}.jsonl"))
+    }
+
+    /// Durable marker that prevents stale derived memory from being injected.
+    pub fn conversation_invalidation_path(&self) -> PathBuf {
+        self.pyramid_root().join("conversation-invalidations.json")
+    }
+
     // === L2 记忆摘要池 ===
 
     /// L2 目录: `personas/{persona_id}/pyramid/l2-summary/`
@@ -210,6 +226,7 @@ impl PyramidStorage {
     pub fn ensure_dirs(&self) -> Result<()> {
         let dirs = [
             self.l1_dir(),
+            self.invalidated_l1_dir(),
             self.l2_dir(),
             self.l3_dir(),
             // l4 是单文件，parent = pyramid_root

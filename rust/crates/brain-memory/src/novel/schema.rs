@@ -99,6 +99,9 @@ pub struct NovelProject {
     /// 未解决和已解决的 Canon 冲突审计记录。
     #[serde(default)]
     pub conflicts: Vec<ConflictRecord>,
+    /// 已经原子应用到 Canon 的发布事务 ID，用于崩溃恢复和幂等重试。
+    #[serde(default)]
+    pub applied_publications: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -120,6 +123,7 @@ impl NovelProject {
             canon_revision: 0,
             facts: Vec::new(),
             conflicts: Vec::new(),
+            applied_publications: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -245,6 +249,138 @@ pub struct NovelRecallPack {
     pub current_chapter: Option<u32>,
     pub facts: Vec<NovelFact>,
     pub rendered_context: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NovelTaskPhase {
+    Preparing,
+    Drafting,
+    SelfReview,
+    NeedsClarification,
+    AwaitingMainReview,
+    AwaitingUserDecision,
+    ApprovedForPublication,
+    PublicationPending,
+    ArtifactSavedMemoryPending,
+    Completed,
+    Rejected,
+    Cancelled,
+    Failed,
+    StaleRevision,
+}
+
+impl NovelTaskPhase {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Rejected | Self::Cancelled | Self::Failed
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NovelLifecycleActor {
+    User,
+    Main,
+    Novel,
+    Memory,
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NovelTaskEvent {
+    pub event_id: String,
+    pub task_id: String,
+    pub project_id: String,
+    pub actor: NovelLifecycleActor,
+    pub phase: NovelTaskPhase,
+    pub summary: String,
+    #[serde(default)]
+    pub details: Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NovelTaskCheckpoint {
+    pub task_id: String,
+    pub project_id: String,
+    pub phase: NovelTaskPhase,
+    pub draft_version: u32,
+    pub canon_revision: u64,
+    pub output_path: String,
+    /// Resident NovelBrain owns this typed payload; MemoryBrain persists it opaquely.
+    #[serde(default)]
+    pub state: Value,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NovelPublicationStatus {
+    Pending,
+    ArtifactSaved,
+    Completed,
+    Aborted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NovelArtifactReceipt {
+    pub canonical_path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub written_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NovelPublicationRecord {
+    pub publication_id: String,
+    pub task_id: String,
+    pub project_id: String,
+    pub draft_version: u32,
+    pub expected_revision: u64,
+    pub output_path: String,
+    pub content_sha256: String,
+    pub delta: NovelMemoryDelta,
+    pub status: NovelPublicationStatus,
+    pub artifact: Option<NovelArtifactReceipt>,
+    pub commit_report: Option<CommitReport>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl NovelPublicationRecord {
+    #[must_use]
+    pub fn pending(
+        publication_id: impl Into<String>,
+        task_id: impl Into<String>,
+        draft_version: u32,
+        output_path: impl Into<String>,
+        content_sha256: impl Into<String>,
+        delta: NovelMemoryDelta,
+    ) -> Self {
+        let now = chrono::Utc::now().timestamp_millis();
+        Self {
+            publication_id: publication_id.into(),
+            task_id: task_id.into(),
+            project_id: delta.project_id.clone(),
+            draft_version,
+            expected_revision: delta.expected_revision,
+            output_path: output_path.into(),
+            content_sha256: content_sha256.into(),
+            delta,
+            status: NovelPublicationStatus::Pending,
+            artifact: None,
+            commit_report: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 fn default_branch() -> String {

@@ -10,16 +10,10 @@ use api::{
     ToolDefinition, ToolResultContentBlock,
 };
 use brain_graph::{
-    error::ToolResult as GraphToolResult,
     id::gen_node_id,
-    schema::{
-        CatalogSearchResult, Edge, EdgeKind, GraphType, Node, NodeDetail, NodeKind, TraceDirection,
-        TraceResult,
-    },
+    schema::{Edge, EdgeKind, GraphType, Node, NodeKind, TraceDirection},
     store::{CatalogQuery, GraphStore, TraceQuery},
 };
-use brain_memory::novel::{NovelMemoryStore, NovelTaskType};
-use brain_memory::pyramid_memory_brain::PyramidMemoryBrainConfig;
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
@@ -425,49 +419,18 @@ The sub-agent runs in an isolated session with its own tools and returns results
 Use this when the task benefits from focused, independent work (e.g., codebase exploration, \
 code review, verification, research). Do NOT use for simple lookups — use read_file/grep/glob directly. \
 Available subagent_type values: 'Explore' (read-only research), 'Plan', 'Verification', \
-'Novel' (outline, chapter, continuation, review, and polish; requires novel_context), \
 'general-purpose' (full tool access). \
+小说任务必须使用 novel_start_task / novel_resume_task 等常驻小说脑工具，不得使用 Agent。 \
 The sub-agent inherits your model and API credentials automatically — do NOT research how to launch it, just call this tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "description": "Short description of what the agent will do" },
                     "prompt": { "type": "string", "description": "Detailed instructions for the agent" },
-                    "subagent_type": { "type": "string", "description": "Agent type: 'Explore', 'Plan', 'Verification', 'Novel', or 'general-purpose'. Novel handles outline, chapter, continuation, review, and polish using a required novel_context; the main brain handles discovery, persistence, and final review. Defaults to 'general-purpose'." },
+                    "subagent_type": { "type": "string", "enum": ["Explore", "Plan", "Verification", "general-purpose"], "description": "Temporary agent type. Novel is a resident brain and is not launched through Agent." },
                     "name": { "type": "string", "description": "Optional short name for the agent" },
                     "model": { "type": "string", "description": "Optional model override (leave empty to use default)" },
-                    "run_in_background": { "type": "boolean", "description": "Set to true to run this agent in the background. Novel agents must run synchronously so the main brain can review their result.", "default": false },
-                    "novel_context": {
-                        "type": "object",
-                        "description": "Required for Novel agents. A project-scoped navigation manifest prepared by the main brain.",
-                        "properties": {
-                            "project_id": { "type": "string", "minLength": 1 },
-                            "task_type": { "type": "string", "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"] },
-                            "target_chapter": { "type": "integer", "minimum": 1 },
-                            "canon_revision": { "type": "integer", "minimum": 0 },
-                            "output_path": { "type": "string", "minLength": 1, "description": "Planned path where the main brain will save the accepted artifact" },
-                            "context_files": {
-                                "type": "array",
-                                "description": "Exact files already located by the main brain. Novel read_file access is restricted to these paths.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "role": { "type": "string", "minLength": 1, "description": "For example previous_chapter, chapter_outline, volume_outline, style_guide, or draft" },
-                                        "path": { "type": "string", "minLength": 1 },
-                                        "description": { "type": "string" }
-                                    },
-                                    "required": ["role", "path"],
-                                    "additionalProperties": false
-                                }
-                            },
-                            "must_happen": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-                            "must_not_change": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-                            "acceptance_criteria": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
-                            "allow_web_research": { "type": "boolean", "default": false }
-                        },
-                        "required": ["project_id", "task_type", "canon_revision", "output_path", "context_files", "must_happen", "must_not_change", "acceptance_criteria"],
-                        "additionalProperties": false
-                    }
+                    "run_in_background": { "type": "boolean", "description": "Set to true to run this temporary agent in the background.", "default": false }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -773,6 +736,161 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "novel_start_task",
+            description: "向常驻小说脑提交一个项目级写作任务环境包。小说脑会通过 MemoryBrain 读取 Canon，通过授权 ContextRef 读取正文、章纲、角色卡等材料，生成草稿并完成自检。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "本次小说任务的稳定 ID，只能包含字母、数字、-、_" },
+                    "project_id": { "type": "string" },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"]
+                    },
+                    "task_brief": { "type": "string", "description": "主脑整理后的完整创作要求" },
+                    "target_chapter": { "type": "integer", "minimum": 1 },
+                    "expected_revision": { "type": "integer", "minimum": 0 },
+                    "output_path": { "type": "string", "description": "最终发布路径；草稿阶段不会写入" },
+                    "context_refs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "role": {
+                                    "type": "string",
+                                    "enum": ["body", "previous_chapter", "chapter_outline", "volume_outline", "character_card", "world_setting", "style_sample", "other"]
+                                },
+                                "canonical_path": { "type": "string" },
+                                "sha256": { "type": "string" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["role", "canonical_path", "sha256"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "must_happen": { "type": "array", "items": { "type": "string" } },
+                    "must_not_change": { "type": "array", "items": { "type": "string" } },
+                    "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "allow_web_research": { "type": "boolean", "default": false },
+                    "publication_policy": {
+                        "type": "string",
+                        "enum": ["require_user_acceptance", "auto_after_main_review"],
+                        "default": "require_user_acceptance"
+                    },
+                    "parent_task_id": { "type": "string" }
+                },
+                "required": ["task_id", "project_id", "task_type", "task_brief", "expected_revision", "output_path", "acceptance_criteria"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "novel_resume_task",
+            description: "把用户澄清、补充条件或可恢复的修订说明交回同一个常驻小说任务，不创建新 Agent 或新 task。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "input": { "type": "string" }
+                },
+                "required": ["task_id", "input"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "novel_review_draft",
+            description: "主脑对小说脑草稿提交独立复审。Pass 必须八项检查全通过、issues 为空并至少提供用户要求、章纲/前文、Canon 三类证据；Revise 必须给出具体 issues。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "draft_version": { "type": "integer", "minimum": 1 },
+                    "reviewed_canon_revision": { "type": "integer", "minimum": 0 },
+                    "verdict": { "type": "string", "enum": ["pass", "revise"] },
+                    "checks": {
+                        "type": "object",
+                        "properties": {
+                            "user_requirements": { "type": "string", "enum": ["pass", "fail"] },
+                            "outline_alignment": { "type": "string", "enum": ["pass", "fail"] },
+                            "canon_consistency": { "type": "string", "enum": ["pass", "fail"] },
+                            "character_consistency": { "type": "string", "enum": ["pass", "fail"] },
+                            "timeline_consistency": { "type": "string", "enum": ["pass", "fail"] },
+                            "plot_and_foreshadowing": { "type": "string", "enum": ["pass", "fail"] },
+                            "style_quality": { "type": "string", "enum": ["pass", "fail"] },
+                            "pacing_and_hook": { "type": "string", "enum": ["pass", "fail"] }
+                        },
+                        "required": ["user_requirements", "outline_alignment", "canon_consistency", "character_consistency", "timeline_consistency", "plot_and_foreshadowing", "style_quality", "pacing_and_hook"],
+                        "additionalProperties": false
+                    },
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "category": { "type": "string" },
+                                        "message": { "type": "string" },
+                                        "evidence_refs": { "type": "array", "items": { "type": "string" } }
+                                    },
+                                    "required": ["category", "message"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        }
+                    },
+                    "evidence_refs": { "type": "array", "items": { "type": "string" } },
+                    "summary": { "type": "string" }
+                },
+                "required": ["task_id", "draft_version", "reviewed_canon_revision", "verdict", "checks", "issues", "evidence_refs", "summary"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "novel_user_decision",
+            description: "记录用户对主脑复审通过候选稿的接受、修改或拒绝决定。默认策略只有 accept 才允许发布；revise 会在原常驻 task 中继续。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "draft_version": { "type": "integer", "minimum": 1 },
+                    "decision": { "type": "string", "enum": ["accept", "revise", "reject"] },
+                    "feedback": { "type": "string" },
+                    "decided_at": { "type": "integer", "description": "可省略；服务端将使用当前时间" }
+                },
+                "required": ["task_id", "draft_version", "decision"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "novel_publish",
+            description: "发布已经通过小说脑自检、主脑复审和默认用户确认的精确草稿。只传 task_id 和 draft_version；正文由常驻小说脑从已审核状态读取，原子写入后由 MemoryBrain 提交 Canon。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "draft_version": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["task_id", "draft_version"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "novel_status",
+            description: "查看常驻小说脑、项目工作区、活动 task、草稿版本、审核阶段和 pending publication 状态。",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "project_id": { "type": "string" } },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "novel_recall_project",
             description: "按大纲、章纲、正文、审稿或润色阶段召回指定小说项目的 Canon、人物状态、时间线、伏笔与写作经验。委派 Novel 小说脑前调用。",
             input_schema: json!({
@@ -801,21 +919,8 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "novel_commit_delta",
-            description: "正文或规划文件成功保存后，校验并提交小说脑给出的 NovelMemoryDelta。revision 过期或 Canon 冲突时不会静默覆盖。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "delta": { "type": "object", "description": "符合 NovelMemoryDelta schema 的结构化变更集" }
-                },
-                "required": ["delta"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
             name: "novel_resolve_conflict",
-            description: "在主脑或用户审查后标记一条小说 Canon 冲突已处理。该工具只保存审计结论，不直接修改事实；事实变更仍通过 novel_commit_delta 提交。",
+            description: "在主脑或用户审查后标记一条小说 Canon 冲突已处理。该工具只保存审计结论，不直接修改事实；新的 Confirmed Canon 只通过 novel_publish 发布事务提交。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1033,9 +1138,14 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         }
         "novel_create_project"
         | "novel_list_projects"
+        | "novel_start_task"
+        | "novel_resume_task"
+        | "novel_review_draft"
+        | "novel_user_decision"
+        | "novel_publish"
+        | "novel_status"
         | "novel_recall_project"
         | "novel_check_consistency"
-        | "novel_commit_delta"
         | "novel_resolve_conflict" => {
             Err(format!("{name} is handled by RealToolExecutor directly"))
         }
@@ -1870,14 +1980,6 @@ pub struct AgentToolLaunch {
     pub completion_rx: Option<std::sync::mpsc::Receiver<AgentCompletion>>,
 }
 
-/// Runtime-owned paths injected into an isolated agent. These values are not
-/// exposed in the public Agent tool schema and cannot be supplied by the LLM.
-#[derive(Debug, Clone, Default)]
-pub struct AgentRuntimeContext {
-    pub novel_memory_root: Option<PathBuf>,
-    pub graph_db_path: Option<PathBuf>,
-}
-
 #[derive(Debug, Clone)]
 pub struct AgentCompletion {
     pub agent_id: String,
@@ -1889,16 +1991,8 @@ pub struct AgentCompletion {
 }
 
 pub fn execute_agent_tool_with_completion(input: &Value) -> Result<AgentToolLaunch, String> {
-    execute_agent_tool_with_completion_and_context(input, &AgentRuntimeContext::default())
-}
-
-pub fn execute_agent_tool_with_completion_and_context(
-    input: &Value,
-    runtime_context: &AgentRuntimeContext,
-) -> Result<AgentToolLaunch, String> {
     let input = from_value::<AgentInput>(input)?;
-    let launch =
-        execute_agent_launch_with_context_and_spawn(input, runtime_context, spawn_agent_job)?;
+    let launch = execute_agent_launch_with_spawn(input, spawn_agent_job)?;
     let output_json = to_pretty_json(launch.manifest.clone())?;
     let completion_rx = launch.completion_rx.map(|rx| {
         let (completion_tx, completion_rx) = std::sync::mpsc::channel();
@@ -2045,31 +2139,6 @@ struct AgentInput {
     model: Option<String>,
     #[serde(default)]
     run_in_background: bool,
-    #[serde(default)]
-    novel_context: Option<NovelDelegationInput>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct NovelDelegationInput {
-    project_id: String,
-    task_type: String,
-    target_chapter: Option<u32>,
-    canon_revision: u64,
-    output_path: String,
-    context_files: Vec<NovelContextFile>,
-    must_happen: Vec<String>,
-    must_not_change: Vec<String>,
-    acceptance_criteria: Vec<String>,
-    #[serde(default)]
-    allow_web_research: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct NovelContextFile {
-    role: String,
-    path: String,
-    #[serde(default)]
-    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2451,17 +2520,6 @@ struct AgentOutput {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<String>,
-    #[serde(rename = "requiresMainReview", default)]
-    requires_main_review: bool,
-    #[serde(rename = "novelSelfReview", skip_serializing_if = "Option::is_none")]
-    novel_self_review: Option<NovelSelfReviewMetadata>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NovelSelfReviewMetadata {
-    present: bool,
-    valid: bool,
-    verdict: Option<String>,
 }
 
 /// Agent 子代理执行结果（从子代理线程通过 channel 发送回来）
@@ -2496,15 +2554,6 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
-    novel_scope: Option<NovelToolScope>,
-}
-
-#[derive(Debug, Clone)]
-struct NovelToolScope {
-    project_id: String,
-    memory_root: PathBuf,
-    graph_db_path: Option<PathBuf>,
-    allowed_context_files: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3078,154 +3127,10 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
-const NOVEL_WRITING_WORKFLOW_SKILL: &str =
-    include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
-const NOVEL_SELF_REVIEW_CHECKS: &[&str] = &[
-    "outline_alignment",
-    "canon_consistency",
-    "character_consistency",
-    "timeline_consistency",
-    "plot_and_foreshadowing",
-    "style_and_repetition",
-];
 
 /// 动态获取当前日期字符串（YYYY-MM-DD）
 fn current_date_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
-}
-
-fn prepare_novel_delegation(
-    input: &AgentInput,
-    subagent_type: &str,
-    runtime_context: &AgentRuntimeContext,
-) -> Result<(Option<NovelToolScope>, Option<String>), String> {
-    if subagent_type != "Novel" {
-        return Ok((None, None));
-    }
-    if input.run_in_background {
-        return Err(
-            "Novel agents must run synchronously so the main brain can review the draft".into(),
-        );
-    }
-
-    let delegation = input
-        .novel_context
-        .as_ref()
-        .ok_or_else(|| "Novel agents require novel_context".to_string())?;
-    let project_id = required_non_empty("novel_context.project_id", &delegation.project_id)?;
-    let task_type_name = required_non_empty("novel_context.task_type", &delegation.task_type)?;
-    let _: NovelTaskType = serde_json::from_value(Value::String(task_type_name.to_string()))
-        .map_err(|error| format!("invalid novel_context.task_type: {error}"))?;
-    let output_path = required_non_empty("novel_context.output_path", &delegation.output_path)?;
-    validate_novel_contract_items("novel_context.must_happen", &delegation.must_happen)?;
-    validate_novel_contract_items("novel_context.must_not_change", &delegation.must_not_change)?;
-    validate_novel_contract_items(
-        "novel_context.acceptance_criteria",
-        &delegation.acceptance_criteria,
-    )?;
-    if delegation.acceptance_criteria.is_empty() {
-        return Err("novel_context.acceptance_criteria must not be empty".into());
-    }
-
-    let default_memory_config = PyramidMemoryBrainConfig::default();
-    let memory_root = runtime_context
-        .novel_memory_root
-        .clone()
-        .unwrap_or(default_memory_config.base_dir);
-    let graph_db_path = runtime_context
-        .graph_db_path
-        .clone()
-        .or(default_memory_config.graph_db_path);
-    let store = NovelMemoryStore::new(&memory_root, graph_db_path.clone());
-    let project = store
-        .load_project(project_id)
-        .map_err(|error| format!("cannot prepare Novel agent for `{project_id}`: {error}"))?;
-    if delegation.canon_revision != project.canon_revision {
-        return Err(format!(
-            "novel_context.canon_revision is stale: supplied={}, actual={}",
-            delegation.canon_revision, project.canon_revision
-        ));
-    }
-
-    let (allowed_context_files, rendered_files) =
-        prepare_novel_context_files(&delegation.context_files)?;
-
-    let manifest = json!({
-        "project_id": project.project_id,
-        "project_title": project.title,
-        "task_type": task_type_name,
-        "target_chapter": delegation.target_chapter,
-        "canon_revision": project.canon_revision,
-        "active_branch": project.active_branch,
-        "current_chapter": project.current_chapter,
-        "output_path": output_path,
-        "context_files": rendered_files,
-        "must_happen": delegation.must_happen,
-        "must_not_change": delegation.must_not_change,
-        "acceptance_criteria": delegation.acceptance_criteria,
-        "allow_web_research": delegation.allow_web_research,
-    });
-    let manifest = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
-    let prompt_suffix = format!(
-        "# 小说委派清单（主脑已定位）\n\n{manifest}\n\n\
-         执行约束：\n\
-         - 先用 read_file 阅读清单中的必要文件；不要自行遍历目录。\n\
-         - 用 novel_recall_project 查询本项目完整结构化 Canon；写前调用 novel_check_consistency。\n\
-         - 只查询项目 `{project_id}`，图谱检索只使用 Novel 域并优先携带项目名或 project_id。\n\
-         - Web 调研仅在 allow_web_research=true 时使用。\n\
-         - 完成草稿后必须按系统要求输出自检报告，交由主脑独立复审。"
-    );
-
-    Ok((
-        Some(NovelToolScope {
-            project_id: project_id.to_string(),
-            memory_root,
-            graph_db_path,
-            allowed_context_files,
-        }),
-        Some(prompt_suffix),
-    ))
-}
-
-fn prepare_novel_context_files(
-    context_files: &[NovelContextFile],
-) -> Result<(BTreeSet<PathBuf>, Vec<Value>), String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut allowed_context_files = BTreeSet::new();
-    let mut rendered_files = Vec::new();
-    for file in context_files {
-        let role = required_non_empty("novel_context.context_files[].role", &file.role)?;
-        let path = required_non_empty("novel_context.context_files[].path", &file.path)?;
-        let candidate = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            cwd.join(path)
-        };
-        let canonical = candidate
-            .canonicalize()
-            .map_err(|error| format!("cannot open Novel context file `{path}`: {error}"))?;
-        if !canonical.is_file() {
-            return Err(format!(
-                "Novel context path is not a file: {}",
-                canonical.display()
-            ));
-        }
-        allowed_context_files.insert(canonical.clone());
-        rendered_files.push(json!({
-            "role": role,
-            "path": canonical.display().to_string(),
-            "description": file.description,
-        }));
-    }
-    Ok((allowed_context_files, rendered_files))
-}
-
-fn validate_novel_contract_items(field: &str, items: &[String]) -> Result<(), String> {
-    if items.iter().any(|item| item.trim().is_empty()) {
-        Err(format!("{field} must not contain empty items"))
-    } else {
-        Ok(())
-    }
 }
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
@@ -3243,22 +3148,18 @@ fn execute_agent_launch_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<
 where
     F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
 {
-    execute_agent_launch_with_context_and_spawn(input, &AgentRuntimeContext::default(), spawn_fn)
-}
-
-fn execute_agent_launch_with_context_and_spawn<F>(
-    input: AgentInput,
-    runtime_context: &AgentRuntimeContext,
-    spawn_fn: F,
-) -> Result<AgentLaunch, String>
-where
-    F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
-{
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
     if input.prompt.trim().is_empty() {
         return Err(String::from("prompt must not be empty"));
+    }
+    let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
+    if normalized_subagent_type == "Novel" {
+        return Err(
+            "Agent(subagent_type=Novel) 已停用；小说任务必须通过常驻 novel_start_task / novel_resume_task 执行"
+                .into(),
+        );
     }
 
     let agent_id = make_agent_id();
@@ -3266,7 +3167,6 @@ where
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
-    let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
     let model = resolve_agent_model(input.model.as_deref(), &normalized_subagent_type);
     let agent_name = input
         .name
@@ -3276,13 +3176,8 @@ where
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let (novel_scope, novel_manifest) =
-        prepare_novel_delegation(&input, &normalized_subagent_type, runtime_context)?;
-    let allowed_tools = allowed_tools_for_agent(&normalized_subagent_type, &input);
-    let agent_prompt = novel_manifest.map_or_else(
-        || input.prompt.clone(),
-        |manifest| format!("{}\n\n{}", input.prompt.trim(), manifest),
-    );
+    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let agent_prompt = input.prompt.clone();
 
     let output_contents = format!(
         "# Agent Task
@@ -3301,7 +3196,6 @@ where
     );
     std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
 
-    let requires_main_review = normalized_subagent_type == "Novel";
     let manifest = AgentOutput {
         agent_id,
         name: agent_name,
@@ -3316,8 +3210,6 @@ where
         completed_at: None,
         error: None,
         result: None,
-        requires_main_review,
-        novel_self_review: None,
     };
     write_agent_manifest(&manifest)?;
 
@@ -3327,7 +3219,6 @@ where
         prompt: agent_prompt,
         system_prompt,
         allowed_tools,
-        novel_scope,
     };
     let result_rx = spawn_fn(job).map_err(|error| {
         let err = format!("failed to spawn sub-agent: {error}");
@@ -3350,36 +3241,17 @@ where
         .map_err(|_| String::from("sub-agent channel closed unexpectedly (thread panicked?)"))?;
 
     // 构建最终 manifest
-    let novel_self_review = inspect_novel_self_review(
-        manifest.subagent_type.as_deref(),
-        agent_done.final_text.as_deref(),
-    );
     let final_manifest = AgentOutput {
         status: agent_done.status,
         completed_at: Some(iso8601_now()),
         error: agent_done.error,
         result: agent_done.final_text,
-        novel_self_review,
         ..manifest
     };
     Ok(AgentLaunch {
         manifest: final_manifest,
         completion_rx: None,
     })
-}
-
-fn allowed_tools_for_agent(subagent_type: &str, input: &AgentInput) -> BTreeSet<String> {
-    let mut allowed_tools = allowed_tools_for_subagent(subagent_type);
-    if subagent_type == "Novel"
-        && !input
-            .novel_context
-            .as_ref()
-            .is_some_and(|context| context.allow_web_research)
-    {
-        allowed_tools.remove("WebFetch");
-        allowed_tools.remove("WebSearch");
-    }
-    allowed_tools
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String> {
@@ -3526,8 +3398,7 @@ fn build_agent_runtime(
         .unwrap_or_else(|| resolve_agent_model(None, "general-purpose"));
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let tool_executor =
-        SubagentToolExecutor::with_novel_scope(allowed_tools, job.novel_scope.clone());
+    let tool_executor = SubagentToolExecutor::new(allowed_tools);
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
@@ -3542,24 +3413,6 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     // 子代理用轻量级系统提示词，不加载完整主脑 prompt（避免 60 万+ 字符撑爆弱模型上下文）
     let os = std::env::consts::OS;
     let today = current_date_str();
-    if subagent_type == "Novel" {
-        let prompt = format!(
-            "你是小说副脑（Novel sub-agent），只负责执行主脑委派的小说创作、审稿或润色任务。\n\
-             当前日期: {today}\n\
-             操作系统: {os}\n\
-             工作目录: {}\n\n\
-             不可变边界:\n\
-             - 必须执行下方 `novel-writing-workflow` 的小说脑分支；主脑委派清单和其中引用的 Canon/前文是最高约束。\n\
-             - 只能读取 `novel_context.context_files` 列出的文件和当前 project_id 的只读记忆/图谱；禁止遍历目录、修改文件或提交 Canon。\n\
-             - 仅当 `allow_web_research=true` 时使用 Web 工具。\n\
-             - 不向用户提问；只做最小、可逆且明确记录的创作假设。\n\
-             - 必须严格返回 `[NOVEL_CONTENT]`、`[NOVEL_SELF_REVIEW]`、`[NOVEL_MEMORY_DELTA]` 三个区块，并完成技能规定的六项自检。\n\n\
-             <loaded_skill name=\"novel-writing-workflow\">\n{}\n</loaded_skill>",
-            cwd.display(),
-            NOVEL_WRITING_WORKFLOW_SKILL
-        );
-        return Ok(vec![prompt]);
-    }
     let prompt = format!(
         "You are a background sub-agent of type `{subagent_type}`.\n\
          Current date: {today}\n\
@@ -3575,7 +3428,7 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     Ok(vec![prompt])
 }
 
-fn resolve_agent_model(model: Option<&str>, subagent_type: &str) -> String {
+fn resolve_agent_model(model: Option<&str>, _subagent_type: &str) -> String {
     // 优先使用调用者指定的模型，否则从子代理配置或主脑配置中获取
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         return m.to_string();
@@ -3588,11 +3441,7 @@ fn resolve_agent_model(model: Option<&str>, subagent_type: &str) -> String {
     }
     // 尝试从主脑配置获取 subagent brain model
     if let Ok(llm_config) = brain_llm::config::LlmConfig::load_default() {
-        let brain_name = match subagent_type {
-            "Novel" => "novel",
-            _ => "subagent",
-        };
-        let m = llm_config.model_for_brain(brain_name).to_string();
+        let m = llm_config.model_for_brain("subagent").to_string();
         if !m.is_empty() {
             return m;
         }
@@ -3638,17 +3487,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "StructuredOutput",
             "SendUserMessage",
             "PowerShell",
-        ],
-        "Novel" => vec![
-            "read_file",
-            "WebFetch",
-            "WebSearch",
-            "novel_recall_project",
-            "novel_check_consistency",
-            "graph_search_catalog",
-            "graph_get_node_detail",
-            "graph_trace_memory",
-            "StructuredOutput",
         ],
         "claw-guide" => vec![
             "read_file",
@@ -3724,83 +3562,7 @@ fn persist_agent_terminal_state(
     next_manifest.completed_at = Some(iso8601_now());
     next_manifest.error = error;
     next_manifest.result = result.map(str::to_string);
-    next_manifest.novel_self_review =
-        inspect_novel_self_review(manifest.subagent_type.as_deref(), result);
     write_agent_manifest(&next_manifest)
-}
-
-fn inspect_novel_self_review(
-    subagent_type: Option<&str>,
-    result: Option<&str>,
-) -> Option<NovelSelfReviewMetadata> {
-    if subagent_type != Some("Novel") {
-        return None;
-    }
-    let Some(result) = result else {
-        return Some(NovelSelfReviewMetadata {
-            present: false,
-            valid: false,
-            verdict: None,
-        });
-    };
-    let Some(review) = tagged_section(result, "[NOVEL_SELF_REVIEW]", "[/NOVEL_SELF_REVIEW]") else {
-        return Some(NovelSelfReviewMetadata {
-            present: false,
-            valid: false,
-            verdict: None,
-        });
-    };
-    let parsed = serde_json::from_str::<Value>(review.trim()).ok();
-    let verdict = parsed
-        .as_ref()
-        .and_then(|value| value.get("verdict"))
-        .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase());
-    let issues = parsed
-        .as_ref()
-        .and_then(|value| value.get("issues"))
-        .and_then(Value::as_array);
-    let assumptions_are_array = parsed
-        .as_ref()
-        .and_then(|value| value.get("unverified_assumptions"))
-        .is_some_and(Value::is_array);
-    let checks = parsed
-        .as_ref()
-        .and_then(|value| value.get("checks"))
-        .and_then(Value::as_object);
-    let checks_valid = checks.is_some_and(|checks| {
-        NOVEL_SELF_REVIEW_CHECKS.iter().all(|key| {
-            checks
-                .get(*key)
-                .and_then(Value::as_str)
-                .is_some_and(|status| matches!(status, "pass" | "fail"))
-        })
-    });
-    let verdict_consistent = match verdict.as_deref() {
-        Some("pass") => {
-            issues.is_some_and(Vec::is_empty)
-                && checks.is_some_and(|checks| {
-                    NOVEL_SELF_REVIEW_CHECKS
-                        .iter()
-                        .all(|key| checks.get(*key).and_then(Value::as_str) == Some("pass"))
-                })
-        }
-        Some("needs_revision") => issues.is_some_and(|issues| !issues.is_empty()),
-        _ => false,
-    };
-    let valid = issues.is_some() && assumptions_are_array && checks_valid && verdict_consistent;
-    Some(NovelSelfReviewMetadata {
-        present: true,
-        valid,
-        verdict,
-    })
-}
-
-fn tagged_section<'a>(value: &'a str, start: &str, end: &str) -> Option<&'a str> {
-    let start_index = value.find(start)? + start.len();
-    let remainder = &value[start_index..];
-    let end_index = remainder.find(end)?;
-    Some(&remainder[..end_index])
 }
 
 fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
@@ -4155,26 +3917,11 @@ impl ApiClient for ProviderRuntimeClient {
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
-    novel_scope: Option<NovelToolScope>,
 }
 
 impl SubagentToolExecutor {
-    #[cfg(test)]
     fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self {
-            allowed_tools,
-            novel_scope: None,
-        }
-    }
-
-    fn with_novel_scope(
-        allowed_tools: BTreeSet<String>,
-        novel_scope: Option<NovelToolScope>,
-    ) -> Self {
-        Self {
-            allowed_tools,
-            novel_scope,
-        }
+        Self { allowed_tools }
     }
 }
 
@@ -4187,311 +3934,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value: Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        if let Some(scope) = &self.novel_scope {
-            match tool_name {
-                "read_file" => validate_novel_context_file(scope, &value)?,
-                "novel_recall_project" | "novel_check_consistency" => {
-                    return execute_scoped_novel_memory_tool(scope, tool_name, &value)
-                        .map_err(ToolError::new);
-                }
-                "graph_search_catalog" | "graph_get_node_detail" | "graph_trace_memory" => {
-                    return execute_scoped_novel_graph_tool(scope, tool_name, &value)
-                        .map_err(ToolError::new);
-                }
-                _ => {}
-            }
-        }
         execute_tool(tool_name, &value).map_err(ToolError::new)
-    }
-}
-
-fn validate_novel_context_file(scope: &NovelToolScope, input: &Value) -> Result<(), ToolError> {
-    let path = input
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| ToolError::new("read_file.path is required"))?;
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()
-            .map_err(|error| ToolError::new(error.to_string()))?
-            .join(path)
-    };
-    let canonical = candidate
-        .canonicalize()
-        .map_err(|error| ToolError::new(format!("cannot open context file `{path}`: {error}")))?;
-    if scope.allowed_context_files.contains(&canonical) {
-        Ok(())
-    } else {
-        Err(ToolError::new(format!(
-            "Novel read_file is limited to the main brain's context_files; denied `{}`",
-            canonical.display()
-        )))
-    }
-}
-
-fn execute_scoped_novel_memory_tool(
-    scope: &NovelToolScope,
-    tool_name: &str,
-    input: &Value,
-) -> Result<String, String> {
-    let requested_project = input
-        .get("project_id")
-        .and_then(Value::as_str)
-        .filter(|project_id| !project_id.trim().is_empty())
-        .ok_or_else(|| format!("{tool_name}.project_id is required"))?;
-    if requested_project != scope.project_id {
-        return Err(format!(
-            "Novel agent is scoped to project `{}`, not `{requested_project}`",
-            scope.project_id
-        ));
-    }
-
-    let store = NovelMemoryStore::new(&scope.memory_root, scope.graph_db_path.clone());
-    match tool_name {
-        "novel_recall_project" => {
-            let task_type: NovelTaskType = serde_json::from_value(
-                input
-                    .get("task_type")
-                    .cloned()
-                    .ok_or_else(|| "novel_recall_project.task_type is required".to_string())?,
-            )
-            .map_err(|error| format!("invalid novel task_type: {error}"))?;
-            serde_json::to_string_pretty(
-                &store
-                    .recall(requested_project, task_type)
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())
-        }
-        "novel_check_consistency" => serde_json::to_string_pretty(
-            &store
-                .check_consistency(requested_project)
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string()),
-        _ => Err(format!("unsupported scoped Novel tool: {tool_name}")),
-    }
-}
-
-fn execute_scoped_novel_graph_tool(
-    scope: &NovelToolScope,
-    tool_name: &str,
-    input: &Value,
-) -> Result<String, String> {
-    let store = open_scoped_novel_graph(scope)?;
-    match tool_name {
-        "graph_search_catalog" => execute_scoped_novel_graph_catalog(scope, &store, input),
-        "graph_get_node_detail" => execute_scoped_novel_graph_detail(scope, &store, input),
-        "graph_trace_memory" => execute_scoped_novel_graph_trace(scope, &store, input),
-        _ => Err(format!("unsupported scoped Novel graph tool: {tool_name}")),
-    }
-}
-
-fn execute_scoped_novel_graph_catalog(
-    scope: &NovelToolScope,
-    store: &GraphStore,
-    input: &Value,
-) -> Result<String, String> {
-    let input = from_value::<GraphSearchCatalogInput>(input)?;
-    if input
-        .graph_type
-        .as_deref()
-        .map(parse_graph_type)
-        .transpose()?
-        .is_some_and(|graph_type| graph_type != GraphType::Novel)
-    {
-        return Err("Novel agents may only search the Novel graph domain".into());
-    }
-    let limit = input.limit.unwrap_or(10).min(50);
-    if limit == 0 {
-        return Err("graph_search_catalog.limit must be greater than zero".into());
-    }
-    let mut query = CatalogQuery::new(split_keywords(&input.query));
-    query.graph_type = Some(GraphType::Novel);
-    // Appending project_id to an OR-style keyword query is not isolation.
-    query.limit = usize::MAX;
-    let result = store
-        .search_catalog(&query)
-        .map_err(|error| error.to_string())?;
-    let scoped_result: GraphToolResult<CatalogSearchResult> = match result {
-        GraphToolResult::Ok { data } => {
-            let searched_matches = data.total_found;
-            let mut entries = Vec::new();
-            for entry in data.entries {
-                if graph_node_belongs_to_project(store, &entry.node_id, &scope.project_id)? {
-                    entries.push(entry);
-                }
-            }
-            let total_found = entries.len();
-            if total_found == 0 {
-                GraphToolResult::Empty {
-                    searched_nodes: searched_matches,
-                    searched_edges: 0,
-                    hint: Some(format!(
-                        "当前 Novel 项目 `{}` 未命中 catalog",
-                        scope.project_id
-                    )),
-                }
-            } else {
-                let truncated = total_found > limit;
-                entries.truncate(limit);
-                GraphToolResult::Ok {
-                    data: CatalogSearchResult {
-                        entries,
-                        total_found,
-                        truncated,
-                    },
-                }
-            }
-        }
-        GraphToolResult::Empty {
-            searched_nodes,
-            searched_edges,
-            hint,
-        } => GraphToolResult::Empty {
-            searched_nodes,
-            searched_edges,
-            hint,
-        },
-        GraphToolResult::Err { kind, message } => GraphToolResult::Err { kind, message },
-    };
-    to_pretty_json(scoped_result)
-}
-
-fn execute_scoped_novel_graph_detail(
-    scope: &NovelToolScope,
-    store: &GraphStore,
-    input: &Value,
-) -> Result<String, String> {
-    let input = from_value::<GraphGetNodeDetailInput>(input)?;
-    ensure_graph_node_in_project(store, &input.node_id, &scope.project_id)?;
-    let result = store
-        .get_node_detail(&input.node_id)
-        .map_err(|error| error.to_string())?;
-    let scoped_result: GraphToolResult<NodeDetail> = match result {
-        GraphToolResult::Ok { mut data } => {
-            let mut upstream = Vec::new();
-            for neighbor in data.upstream {
-                if graph_node_belongs_to_project(store, &neighbor.node_id, &scope.project_id)? {
-                    upstream.push(neighbor);
-                }
-            }
-            let mut downstream = Vec::new();
-            for neighbor in data.downstream {
-                if graph_node_belongs_to_project(store, &neighbor.node_id, &scope.project_id)? {
-                    downstream.push(neighbor);
-                }
-            }
-            data.upstream = upstream;
-            data.downstream = downstream;
-            GraphToolResult::Ok { data }
-        }
-        GraphToolResult::Empty {
-            searched_nodes,
-            searched_edges,
-            hint,
-        } => GraphToolResult::Empty {
-            searched_nodes,
-            searched_edges,
-            hint,
-        },
-        GraphToolResult::Err { kind, message } => GraphToolResult::Err { kind, message },
-    };
-    to_pretty_json(scoped_result)
-}
-
-fn execute_scoped_novel_graph_trace(
-    scope: &NovelToolScope,
-    store: &GraphStore,
-    input: &Value,
-) -> Result<String, String> {
-    let input = from_value::<GraphTraceMemoryInput>(input)?;
-    ensure_graph_node_in_project(store, &input.root_id, &scope.project_id)?;
-    let limit = input.limit.unwrap_or(20).min(100);
-    if limit == 0 {
-        return Err("graph_trace_memory.limit must be greater than zero".into());
-    }
-    let mut query = TraceQuery::new(input.root_id);
-    query.direction = input
-        .direction
-        .as_deref()
-        .map(parse_trace_direction)
-        .transpose()?
-        .unwrap_or(TraceDirection::Both);
-    query.max_depth = input.max_depth.unwrap_or(2).min(10);
-    query.limit = 100;
-    let result = store
-        .trace_memory(&query)
-        .map_err(|error| error.to_string())?;
-    let scoped_result: GraphToolResult<TraceResult> = match result {
-        GraphToolResult::Ok { mut data } => {
-            let mut steps = Vec::new();
-            for step in data.steps {
-                let from_is_scoped =
-                    graph_node_belongs_to_project(store, &step.from_node_id, &scope.project_id)?;
-                let to_is_scoped =
-                    graph_node_belongs_to_project(store, &step.to_node_id, &scope.project_id)?;
-                if from_is_scoped && to_is_scoped {
-                    steps.push(step);
-                }
-            }
-            data.truncated |= steps.len() > limit;
-            steps.truncate(limit);
-            data.steps = steps;
-            GraphToolResult::Ok { data }
-        }
-        GraphToolResult::Empty {
-            searched_nodes,
-            searched_edges,
-            hint,
-        } => GraphToolResult::Empty {
-            searched_nodes,
-            searched_edges,
-            hint,
-        },
-        GraphToolResult::Err { kind, message } => GraphToolResult::Err { kind, message },
-    };
-    to_pretty_json(scoped_result)
-}
-
-fn open_scoped_novel_graph(scope: &NovelToolScope) -> Result<GraphStore, String> {
-    let path = match &scope.graph_db_path {
-        Some(path) => path.clone(),
-        None => resolve_graph_db_path(None)?,
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    GraphStore::open(path).map_err(|error| error.to_string())
-}
-
-fn graph_node_belongs_to_project(
-    store: &GraphStore,
-    node_id: &str,
-    project_id: &str,
-) -> Result<bool, String> {
-    Ok(store
-        .get_node(node_id)
-        .map_err(|error| error.to_string())?
-        .is_some_and(|node| {
-            node.graph_type == GraphType::Novel
-                && node.props.get("project_id").and_then(Value::as_str) == Some(project_id)
-        }))
-}
-
-fn ensure_graph_node_in_project(
-    store: &GraphStore,
-    node_id: &str,
-    project_id: &str,
-) -> Result<(), String> {
-    if graph_node_belongs_to_project(store, node_id, project_id)? {
-        Ok(())
-    } else {
-        Err(format!(
-            "Novel graph node `{node_id}` is outside delegated project `{project_id}`"
-        ))
     }
 }
 
@@ -5926,13 +5369,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        execute_agent_launch_with_context_and_spawn, execute_agent_launch_with_spawn,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, inspect_novel_self_review,
-        mvp_tool_specs, normalize_subagent_type, permission_mode_from_plugin,
-        persist_agent_terminal_state, prepare_novel_delegation, push_output_block, AgentDone,
-        AgentInput, AgentJob, AgentRuntimeContext, NovelContextFile, NovelDelegationInput,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, execute_agent_launch_with_spawn,
+        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block, AgentDone,
+        AgentInput, AgentJob, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use brain_graph::{
@@ -5942,7 +5382,7 @@ mod tests {
     };
     use runtime::{
         ApiClient, ApiRequest, AssistantEvent, ConversationMessage, ConversationRuntime,
-        RuntimeError, Session, ToolExecutor as _,
+        RuntimeError, Session,
     };
     use serde_json::json;
 
@@ -6021,6 +5461,13 @@ mod tests {
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
+        assert!(names.contains(&"novel_start_task"));
+        assert!(names.contains(&"novel_resume_task"));
+        assert!(names.contains(&"novel_review_draft"));
+        assert!(names.contains(&"novel_user_decision"));
+        assert!(names.contains(&"novel_publish"));
+        assert!(names.contains(&"novel_status"));
+        assert!(!names.contains(&"novel_commit_delta"));
         assert!(names.contains(&"graph_search_catalog"));
         assert!(names.contains(&"graph_get_node_detail"));
         assert!(names.contains(&"graph_trace_memory"));
@@ -6635,60 +6082,17 @@ mod tests {
     }
 
     #[test]
-    fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let home = temp_path("skills-home");
-        let skill_dir = home.join(".agents").join("skills").join("help");
-        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "# help\n\nGuide on using oh-my-codex plugin\n",
-        )
-        .expect("skill file should exist");
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
-
-        let result = execute_tool(
+    fn skill_dispatch_is_reserved_for_real_tool_executor() {
+        let error = execute_tool(
             "Skill",
             &json!({
                 "skill": "help",
                 "args": "overview"
             }),
         )
-        .expect("Skill should succeed");
+        .expect_err("Skill should be dispatched by RealToolExecutor");
 
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
-        assert!(output["prompt"]
-            .as_str()
-            .expect("prompt")
-            .contains("Guide on using oh-my-codex plugin"));
-
-        let dollar_result = execute_tool(
-            "Skill",
-            &json!({
-                "skill": "$help"
-            }),
-        )
-        .expect("Skill should accept $skill invocation form");
-        let dollar_output: serde_json::Value =
-            serde_json::from_str(&dollar_result).expect("valid json");
-        assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
-
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        fs::remove_dir_all(home).expect("temp home should clean up");
+        assert_eq!(error, "Skill tool is handled by RealToolExecutor directly");
     }
 
     #[test]
@@ -6702,25 +6106,27 @@ mod tests {
         let matches = keyword_output["matches"].as_array().expect("matches");
         assert!(matches.iter().any(|value| value == "WebSearch"));
 
-        let selected = execute_tool("ToolSearch", &json!({"query": "select:Agent,Skill"}))
+        let selected = execute_tool("ToolSearch", &json!({"query": "select:WebSearch,Skill"}))
             .expect("ToolSearch should succeed");
         let selected_output: serde_json::Value =
             serde_json::from_str(&selected).expect("valid json");
-        assert_eq!(selected_output["matches"][0], "Agent");
+        assert_eq!(selected_output["matches"][0], "WebSearch");
         assert_eq!(selected_output["matches"][1], "Skill");
 
-        let aliased = execute_tool("ToolSearch", &json!({"query": "AgentTool"}))
+        let aliased = execute_tool("ToolSearch", &json!({"query": "WebSearchTool"}))
             .expect("ToolSearch should support tool aliases");
         let aliased_output: serde_json::Value = serde_json::from_str(&aliased).expect("valid json");
-        assert_eq!(aliased_output["matches"][0], "Agent");
-        assert_eq!(aliased_output["normalized_query"], "agent");
+        assert_eq!(aliased_output["matches"][0], "WebSearch");
+        assert_eq!(aliased_output["normalized_query"], "websearch");
 
-        let selected_with_alias =
-            execute_tool("ToolSearch", &json!({"query": "select:AgentTool,Skill"}))
-                .expect("ToolSearch alias select should succeed");
+        let selected_with_alias = execute_tool(
+            "ToolSearch",
+            &json!({"query": "select:WebSearchTool,Skill"}),
+        )
+        .expect("ToolSearch alias select should succeed");
         let selected_with_alias_output: serde_json::Value =
             serde_json::from_str(&selected_with_alias).expect("valid json");
-        assert_eq!(selected_with_alias_output["matches"][0], "Agent");
+        assert_eq!(selected_with_alias_output["matches"][0], "WebSearch");
         assert_eq!(selected_with_alias_output["matches"][1], "Skill");
     }
 
@@ -6742,7 +6148,6 @@ mod tests {
                 name: Some("ship-audit".to_string()),
                 model: None,
                 run_in_background: false,
-                novel_context: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -6784,30 +6189,8 @@ mod tests {
         assert!(captured_job.allowed_tools.contains("read_file"));
         assert!(!captured_job.allowed_tools.contains("Agent"));
 
-        let normalized = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Verify the branch",
-                "prompt": "Check tests.",
-                "subagent_type": "explorer"
-            }),
-        )
-        .expect("Agent should normalize built-in aliases");
-        let normalized_output: serde_json::Value =
-            serde_json::from_str(&normalized).expect("valid json");
-        assert_eq!(normalized_output["subagentType"], "Explore");
-
-        let named = execute_tool(
-            "Agent",
-            &json!({
-                "description": "Review the branch",
-                "prompt": "Inspect diff.",
-                "name": "Ship Audit!!!"
-            }),
-        )
-        .expect("Agent should normalize explicit names");
-        let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
-        assert_eq!(named_output["name"], "ship-audit");
+        assert_eq!(super::normalize_subagent_type(Some("explorer")), "Explore");
+        assert_eq!(super::slugify_agent_name("Ship Audit!!!"), "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6827,7 +6210,6 @@ mod tests {
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
                 run_in_background: false,
-                novel_context: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -6866,7 +6248,6 @@ mod tests {
                 name: Some("fail-task".to_string()),
                 model: None,
                 run_in_background: false,
-                novel_context: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -6904,7 +6285,6 @@ mod tests {
                 name: Some("spawn-error".to_string()),
                 model: None,
                 run_in_background: false,
-                novel_context: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -6945,7 +6325,6 @@ mod tests {
                 name: Some("background-task".to_string()),
                 model: None,
                 run_in_background: true,
-                novel_context: None,
             },
             |_job| {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -6999,75 +6378,57 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
-
-        let novel = allowed_tools_for_subagent("Novel");
-        assert!(
-            novel.contains("read_file"),
-            "小说副脑应能读取主脑提供的前文"
-        );
-        assert!(novel.contains("WebSearch"), "小说副脑应能调研公开平台资料");
-        assert!(novel.contains("novel_recall_project"));
-        assert!(novel.contains("novel_check_consistency"));
-        assert!(!novel.contains("graph_list_domains"));
-        assert!(
-            novel.contains("graph_search_catalog"),
-            "小说副脑应先召回小说图谱记忆"
-        );
-        assert!(
-            !novel.contains("write_file"),
-            "小说副脑不应直接修改项目文件"
-        );
-        assert!(
-            !novel.contains("graph_add_memory"),
-            "记忆写入应由主脑和记忆脑统一处理"
-        );
-        assert_eq!(normalize_subagent_type(Some("novel")), "Novel");
-        assert_eq!(normalize_subagent_type(Some("小说")), "Novel");
-        assert_eq!(normalize_subagent_type(Some("写作")), "Novel");
     }
 
     #[test]
-    fn novel_subagent_prompt_loads_shared_writing_skill() {
-        let prompt = build_agent_system_prompt("Novel")
-            .expect("Novel prompt should build")
-            .join("\n");
+    fn resident_novel_tools_replace_ephemeral_agent_schema() {
+        let specs = mvp_tool_specs();
+        let agent = specs
+            .iter()
+            .find(|spec| spec.name == "Agent")
+            .expect("Agent spec");
+        let agent_properties = agent.input_schema["properties"].as_object().unwrap();
+        assert!(!agent_properties.contains_key("novel_context"));
+        let agent_types = agent_properties["subagent_type"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(!agent_types.iter().any(|kind| kind == "Novel"));
 
-        assert!(prompt.contains("小说副脑"));
-        assert!(prompt.contains("<loaded_skill name=\"novel-writing-workflow\">"));
-        assert!(prompt.contains("## 主脑分支"));
-        assert!(prompt.contains("## 小说脑分支"));
-        assert!(prompt.contains("novel_context.context_files"));
-        assert!(prompt.contains("allow_web_research=true"));
-        assert!(prompt.contains("novel_recall_project"));
-        assert!(prompt.contains("NovelMemoryDelta"));
-        assert!(prompt.contains("[NOVEL_SELF_REVIEW]"));
-        assert!(prompt.contains("character_consistency"));
+        for name in [
+            "novel_start_task",
+            "novel_resume_task",
+            "novel_review_draft",
+            "novel_user_decision",
+            "novel_publish",
+            "novel_status",
+        ] {
+            assert!(specs.iter().any(|spec| spec.name == name), "missing {name}");
+        }
+        let publish = specs
+            .iter()
+            .find(|spec| spec.name == "novel_publish")
+            .unwrap();
+        let publish_properties = publish.input_schema["properties"].as_object().unwrap();
+        assert_eq!(publish_properties.len(), 2);
+        assert!(publish_properties.contains_key("task_id"));
+        assert!(publish_properties.contains_key("draft_version"));
+        assert!(!publish_properties.contains_key("content"));
+        assert!(!specs.iter().any(|spec| spec.name == "novel_commit_delta"));
     }
 
     #[test]
-    fn novel_delegation_scopes_files_memory_and_self_review() {
+    fn ephemeral_novel_agent_is_rejected_before_spawn() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("novel-scope");
         let agent_store = root.join("agents");
-        let context_path = root.join("chapter-3.md");
-        let denied_path = root.join("private-notes.md");
         fs::create_dir_all(&root).expect("create temp root");
-        fs::write(&context_path, "第三章完整正文").expect("write delegated context");
-        fs::write(&denied_path, "不应被小说脑读取").expect("write denied context");
-        let memory = brain_memory::novel::NovelMemoryStore::new(&root, None);
-        memory
-            .create_project(&brain_memory::novel::NovelProject::new(
-                "anyang-ghost",
-                "安阳妖鬼录",
-            ))
-            .expect("create novel project");
         std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
 
-        let captured = Arc::new(Mutex::new(None::<AgentJob>));
-        let captured_for_spawn = Arc::clone(&captured);
-        let launch = execute_agent_launch_with_context_and_spawn(
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawned_for_call = Arc::clone(&spawned);
+        let result = execute_agent_launch_with_spawn(
             AgentInput {
                 description: "续写第四章".into(),
                 prompt: "承接第三章并完成第四章正文。".into(),
@@ -7075,231 +6436,24 @@ mod tests {
                 name: Some("chapter-four".into()),
                 model: None,
                 run_in_background: false,
-                novel_context: Some(NovelDelegationInput {
-                    project_id: "anyang-ghost".into(),
-                    task_type: "continuation".into(),
-                    target_chapter: Some(4),
-                    canon_revision: 0,
-                    output_path: "正文/第四章.md".into(),
-                    context_files: vec![NovelContextFile {
-                        role: "previous_chapter".into(),
-                        path: context_path.display().to_string(),
-                        description: Some("承接前文".into()),
-                    }],
-                    must_happen: vec!["主角进入旧宅".into()],
-                    must_not_change: vec!["主角左手受伤".into()],
-                    acceptance_criteria: vec!["章末保留钩子".into()],
-                    allow_web_research: false,
-                }),
             },
-            &AgentRuntimeContext {
-                novel_memory_root: Some(root.clone()),
-                graph_db_path: None,
-            },
-            move |job| {
-                *captured_for_spawn
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+            move |_job| {
+                spawned_for_call.store(true, std::sync::atomic::Ordering::SeqCst);
                 let (tx, rx) = std::sync::mpsc::channel();
-                tx.send(AgentDone {
-                    status: "completed".into(),
-                    final_text: Some(
-                        "[NOVEL_CONTENT]\n第四章正文\n[/NOVEL_CONTENT]\n\
-                         [NOVEL_SELF_REVIEW]\n{\"verdict\":\"pass\",\"issues\":[],\"checks\":{\"outline_alignment\":\"pass\",\"canon_consistency\":\"pass\",\"character_consistency\":\"pass\",\"timeline_consistency\":\"pass\",\"plot_and_foreshadowing\":\"pass\",\"style_and_repetition\":\"pass\"},\"unverified_assumptions\":[]}\n[/NOVEL_SELF_REVIEW]\n\
-                         [NOVEL_MEMORY_DELTA]\n{}\n[/NOVEL_MEMORY_DELTA]"
-                            .into(),
-                    ),
-                    error: None,
-                    duration_ms: 1,
-                })
-                .expect("send Novel completion");
+                drop(tx);
                 Ok(rx)
             },
-        )
-        .expect("Novel launch should succeed");
-
-        assert!(launch.manifest.requires_main_review);
-        let review = launch
-            .manifest
-            .novel_self_review
-            .as_ref()
-            .expect("self-review metadata");
-        assert!(review.present);
-        assert!(review.valid);
-        assert_eq!(review.verdict.as_deref(), Some("pass"));
-
-        let job = captured
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("captured Novel job");
-        assert!(job.prompt.contains("小说委派清单"));
-        assert!(job.prompt.contains("anyang-ghost"));
-        assert!(job.prompt.contains(&context_path.display().to_string()));
-        assert!(!job.allowed_tools.contains("WebSearch"));
-        assert!(job.allowed_tools.contains("novel_recall_project"));
-
-        let mut executor =
-            SubagentToolExecutor::with_novel_scope(job.allowed_tools, job.novel_scope.clone());
-        let allowed = executor
-            .execute("read_file", &json!({"path": context_path}).to_string())
-            .expect("delegated file should be readable");
-        assert!(allowed.contains("第三章完整正文"));
-        let denied = executor
-            .execute("read_file", &json!({"path": denied_path}).to_string())
-            .expect_err("undelegated file should be denied");
-        assert!(denied.to_string().contains("context_files"));
-        let recall = executor
-            .execute(
-                "novel_recall_project",
-                &json!({
-                    "project_id": "anyang-ghost",
-                    "task_type": "continuation"
-                })
-                .to_string(),
-            )
-            .expect("scoped Canon recall should work");
-        assert!(recall.contains("安阳妖鬼录"));
-        let cross_project = executor
-            .execute(
-                "novel_check_consistency",
-                &json!({"project_id": "other-project"}).to_string(),
-            )
-            .expect_err("cross-project lookup should be denied");
-        assert!(cross_project.to_string().contains("scoped to project"));
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("ephemeral Novel launch must be rejected"),
+        };
+        assert!(error.contains("常驻 novel_start_task"));
+        assert!(!spawned.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!agent_store.exists());
 
         std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn novel_delegation_requires_context_and_synchronous_review() {
-        let missing_context = AgentInput {
-            description: "写正文".into(),
-            prompt: "写第一章".into(),
-            subagent_type: Some("Novel".into()),
-            name: None,
-            model: None,
-            run_in_background: false,
-            novel_context: None,
-        };
-        let error =
-            prepare_novel_delegation(&missing_context, "Novel", &AgentRuntimeContext::default())
-                .expect_err("Novel context should be required");
-        assert!(error.contains("require novel_context"));
-
-        let incomplete = super::from_value::<AgentInput>(&json!({
-            "description": "写正文",
-            "prompt": "写第一章",
-            "subagent_type": "Novel",
-            "novel_context": {
-                "project_id": "novel-a",
-                "task_type": "body"
-            }
-        }))
-        .expect_err("navigation fields must be present");
-        assert!(incomplete.contains("canon_revision"));
-
-        let background = AgentInput {
-            run_in_background: true,
-            novel_context: Some(NovelDelegationInput {
-                project_id: "novel-a".into(),
-                task_type: "body".into(),
-                target_chapter: Some(1),
-                canon_revision: 0,
-                output_path: "正文/第一章.md".into(),
-                context_files: Vec::new(),
-                must_happen: Vec::new(),
-                must_not_change: Vec::new(),
-                acceptance_criteria: vec!["形成可保存正文".into()],
-                allow_web_research: false,
-            }),
-            ..missing_context
-        };
-        let error = prepare_novel_delegation(&background, "Novel", &AgentRuntimeContext::default())
-            .expect_err("Novel background execution should be rejected");
-        assert!(error.contains("synchronously"));
-    }
-
-    #[test]
-    fn novel_graph_tools_are_scoped_to_the_delegated_project() {
-        let root = temp_path("novel-graph-project-scope");
-        let memory_root = root.join("memory");
-        let graph_path = root.join("graph.db");
-        fs::create_dir_all(&root).expect("create temp root");
-        let memory =
-            brain_memory::novel::NovelMemoryStore::new(&memory_root, Some(graph_path.clone()));
-        memory
-            .create_project(&brain_memory::novel::NovelProject::new("novel-a", "甲项目"))
-            .expect("create first project");
-        memory
-            .create_project(&brain_memory::novel::NovelProject::new("novel-b", "乙项目"))
-            .expect("create second project");
-
-        let allowed_tools = BTreeSet::from([
-            "graph_search_catalog".to_string(),
-            "graph_get_node_detail".to_string(),
-            "graph_trace_memory".to_string(),
-        ]);
-        let mut executor = SubagentToolExecutor::with_novel_scope(
-            allowed_tools,
-            Some(super::NovelToolScope {
-                project_id: "novel-a".into(),
-                memory_root,
-                graph_db_path: Some(graph_path),
-                allowed_context_files: BTreeSet::new(),
-            }),
-        );
-
-        let catalog = executor
-            .execute(
-                "graph_search_catalog",
-                &json!({"query": "乙项目", "graph_type": "Novel"}).to_string(),
-            )
-            .expect("cross-project catalog hits should be filtered");
-        let catalog: serde_json::Value = serde_json::from_str(&catalog).expect("catalog JSON");
-        assert_eq!(catalog["status"], "empty");
-
-        let detail = executor
-            .execute(
-                "graph_get_node_detail",
-                &json!({"node_id": "novel_entity_project_novel-b"}).to_string(),
-            )
-            .expect_err("cross-project detail should be denied");
-        assert!(detail.to_string().contains("outside delegated project"));
-
-        let trace = executor
-            .execute(
-                "graph_trace_memory",
-                &json!({"root_id": "novel_entity_project_novel-b"}).to_string(),
-            )
-            .expect_err("cross-project trace should be denied");
-        assert!(trace.to_string().contains("outside delegated project"));
-
-        let own_detail = executor
-            .execute(
-                "graph_get_node_detail",
-                &json!({"node_id": "novel_entity_project_novel-a"}).to_string(),
-            )
-            .expect("own project detail should be readable");
-        assert!(own_detail.contains("甲项目"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn novel_self_review_requires_all_checks() {
-        let incomplete = inspect_novel_self_review(
-            Some("Novel"),
-            Some(
-                "[NOVEL_SELF_REVIEW]\n\
-                 {\"verdict\":\"pass\",\"issues\":[],\"checks\":{},\"unverified_assumptions\":[]}\n\
-                 [/NOVEL_SELF_REVIEW]",
-            ),
-        )
-        .expect("Novel metadata");
-        assert!(incomplete.present);
-        assert!(!incomplete.valid);
     }
 
     #[derive(Debug)]
@@ -7657,8 +6811,13 @@ mod tests {
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
         )
-        .expect_err("identical old/new should fail");
-        assert!(edit_same.contains("must differ"));
+        .expect("identical old/new should be an idempotent no-op");
+        let edit_same_output: serde_json::Value = serde_json::from_str(&edit_same).expect("json");
+        assert_eq!(edit_same_output["structuredPatch"], json!([]));
+        assert_eq!(
+            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            "omega\nbeta\nomega\n"
+        );
 
         let edit_missing = execute_tool(
             "edit_file",
@@ -8243,7 +7402,7 @@ printf 'pwsh:%s' "$1"
         }
     }
 
-    /// 验证 ProviderRuntimeClient 能用配置文件的 default provider 创建成功
+    /// 验证 ProviderRuntimeClient 保留调用方显式指定的模型
     #[test]
     fn provider_runtime_client_creates_with_default_config() {
         let _guard = env_lock()
@@ -8257,11 +7416,9 @@ printf 'pwsh:%s' "$1"
 
         match &client {
             Ok(c) => {
-                // 应该使用配置文件的 default model，不是 claude-opus-4-6
-                let config = brain_llm::config::LlmConfig::load_default().expect("config");
                 assert_eq!(
-                    c.model, config.llm.default_model,
-                    "子代理应该用配置文件的 default_model"
+                    c.model, "claude-opus-4-6",
+                    "子代理应该保留调用方显式指定的模型"
                 );
                 eprintln!("[测试] ProviderRuntimeClient 创建成功: model={}", c.model);
             }

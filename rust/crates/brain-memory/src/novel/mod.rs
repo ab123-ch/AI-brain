@@ -4,15 +4,19 @@
 //! revision 与事实冲突检查，再原子提交快照并 best-effort 镜像到图谱。
 
 mod consistency;
+mod lifecycle;
 mod recall;
 mod schema;
 mod store;
 
 pub use consistency::{check_consistency, ConsistencyIssue, ConsistencyReport, IssueSeverity};
+pub(crate) use lifecycle::NovelLifecycleStore;
 pub use recall::build_recall_pack;
 pub use schema::{
-    CanonStatus, CommitReport, ConflictRecord, ExperienceCandidate, ForeshadowingUpdate, NovelFact,
-    NovelFactKind, NovelMemoryDelta, NovelProject, NovelProjectProgress, NovelProjectStatus,
-    NovelRecallPack, NovelTaskType, PlotUpdate, ProposedFact, StateChange,
+    CanonStatus, CommitReport, ConflictRecord, ExperienceCandidate, ForeshadowingUpdate,
+    NovelArtifactReceipt, NovelFact, NovelFactKind, NovelLifecycleActor, NovelMemoryDelta,
+    NovelProject, NovelProjectProgress, NovelProjectStatus, NovelPublicationRecord,
+    NovelPublicationStatus, NovelRecallPack, NovelTaskCheckpoint, NovelTaskEvent, NovelTaskPhase,
+    NovelTaskType, PlotUpdate, ProposedFact, StateChange,
 };
-pub use store::NovelMemoryStore;
+pub(crate) use store::NovelMemoryStore;

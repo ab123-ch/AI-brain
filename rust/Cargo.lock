@@ -33,6 +33,7 @@ dependencies = [
 name = "ai-brain-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "brain-bus",
  "brain-core",
@@ -49,6 +50,7 @@ dependencies = [
  "brain-mcp",
  "brain-memory",
  "brain-motor",
+ "brain-novel",
  "brain-plugin",
  "brain-reasoning",
  "brain-sensory",
@@ -61,6 +63,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -517,6 +520,23 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "brain-novel"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "brain-llm",
+ "brain-memory",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3146,7 +3166,6 @@ dependencies = [
  "api",
  "brain-graph",
  "brain-llm",
- "brain-memory",
  "chrono",
  "plugins",
  "reqwest",

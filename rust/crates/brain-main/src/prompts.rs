@@ -44,17 +44,18 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
 - **精确单次搜索**（找某个函数定义、某个变量名）→ 直接用 grep_search，一次调用即可
 - **文件名查找**（找某个文件在哪里）→ 直接用 glob_search，按模式匹配
 - **多步骤开发任务**（需要同时修改多个文件、运行测试）→ 使用 Agent(subagent_type='general-purpose') 委托给通用子代理
-- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段、复盘）→ 识别任务后必须先调用 `Skill(skill='novel-writing-workflow')`，完整读取技能正文，再按技能流程定位材料、召回 Canon、构造 `novel_context`、同步调用 `Agent(subagent_type='Novel')`、复审、保存和提交记忆。不得只根据技能摘要或一句话任务直接调用 Novel Agent。
+- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段、复盘）→ 识别任务后必须先调用 `Skill(skill='novel-writing-workflow')`，完整读取技能正文，再按技能流程定位材料并计算内容 hash、召回 Canon、构造任务环境包、调用 `novel_start_task` 与常驻小说脑协作。不得用 `Agent(subagent_type='Novel')`，也不得绕过审核状态机直接写正式正文或提交 Canon。
 
 ## 小说脑复审门禁
 
 `novel-writing-workflow` 可以细化流程，但不能覆盖以下门禁：
 
-1. Novel 只能读取委派文件和项目级只读记忆，不直接保存项目文件或提交 Canon。
-2. 自检缺失、无效或 verdict 不是 pass 时，必须携带具体问题重新委派修订。
-3. 主脑必须独立对照用户要求、前文、章纲和 Canon 复审；不得把小说脑自检或通用评估脑当作主脑复审。
-4. 只有小说脑自检和主脑复审均通过后才能保存 `[NOVEL_CONTENT]`；文件保存成功后才能提交 `[NOVEL_MEMORY_DELTA]`。
-5. revision 过期或 Canon 冲突时不得静默覆盖，必须重新召回、复审并按技能流程处理。
+1. 常驻小说脑只能读取任务合同中的 ContextRef 和由 MemoryBrain 返回的项目记忆；它不接收 memory root、graph path，也不直接响应用户。
+2. `novel_start_task` / `novel_resume_task` 返回的自检缺失或无效时不得进入主脑 Pass；修订必须沿用同一个 task_id。
+3. 主脑必须独立对照用户要求、前文、章纲和 Canon 复审，并通过 `novel_review_draft` 提交 typed review；不得把小说脑自检或通用评估脑当作主脑复审。
+4. 主脑 Pass 只产生待用户确认候选稿。默认必须把候选正文展示给用户，并在下一轮用 `novel_user_decision` 记录 accept/revise/reject；只有用户明确预先授权自动保存时才可使用 `auto_after_main_review`。
+5. 正式发布只能调用 `novel_publish(task_id, draft_version)`，不得再次传正文、不得用通用 `write_file` 代替，也不得调用或伪造 `novel_commit_delta`。
+6. revision 过期、ContextRef hash 变化或 Canon 冲突时不得静默覆盖，必须重新召回、复审并按技能流程处理。
 
 **关键原则**：当你需要 3 次以上搜索才能理解一段代码时，应该转用 Agent(Explore) 而不是继续手动搜索。手动搜索适合精确、确定性的查询。
 
@@ -278,12 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_mentions_novel_subagent_boundary() {
+    fn system_prompt_mentions_resident_novel_brain_boundary() {
         let prompt = build_system_prompt_with_tools();
         let skill = include_str!("../skills/novel-writing-workflow/SKILL.md");
-        assert!(prompt.contains("subagent_type='Novel'"));
-        assert!(prompt.contains("[NOVEL_CONTENT]"));
-        assert!(prompt.contains("novel_context"));
+        assert!(prompt.contains("不得用 `Agent(subagent_type='Novel')`"));
+        assert!(prompt.contains("novel_start_task"));
+        assert!(prompt.contains("novel_review_draft"));
+        assert!(prompt.contains("novel_user_decision"));
+        assert!(prompt.contains("novel_publish(task_id, draft_version)"));
         assert!(prompt.contains("Skill(skill='novel-writing-workflow')"));
         assert!(prompt.contains("必须先调用"));
         assert!(prompt.contains("小说脑复审门禁"));
@@ -291,8 +294,12 @@ mod tests {
         assert!(prompt.contains("不得把小说脑自检或通用评估脑"));
         assert!(prompt.contains("通用评估脑默认关闭"));
         assert!(skill.contains("novel_recall_project"));
-        assert!(skill.contains("novel_commit_delta"));
+        assert!(skill.contains("novel_start_task"));
+        assert!(skill.contains("novel_review_draft"));
+        assert!(skill.contains("novel_user_decision"));
+        assert!(skill.contains("novel_publish"));
+        assert!(!skill.contains("调用 `novel_commit_delta`"));
         assert!(skill.contains("## 主脑分支"));
-        assert!(skill.contains("## 小说脑分支"));
+        assert!(skill.contains("## 常驻小说脑分支"));
     }
 }

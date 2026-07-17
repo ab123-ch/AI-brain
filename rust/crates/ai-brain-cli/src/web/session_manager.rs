@@ -43,6 +43,22 @@ pub struct SessionManager {
     persist_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQueryTurn {
+    pub session_id: String,
+    pub message_id: String,
+    pub generation_id: String,
+    pub input: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationFork {
+    pub turn: UserQueryTurn,
+    pub invalidated_generation_ids: Vec<String>,
+    pub includes_legacy_unscoped: bool,
+    pub messages: Vec<ChatMessage>,
+}
+
 impl SessionManager {
     /// 创建 SessionManager，从 `base_dir/web-sessions/` 加载所有会话。
     /// 若目录不存在或为空，则创建一个默认会话。
@@ -130,6 +146,17 @@ impl SessionManager {
         self.sessions.get_mut(&self.active_id).unwrap()
     }
 
+    /// Restore a previously cloned active session after a cross-component fork
+    /// transaction fails before regeneration starts.
+    pub fn restore_active_snapshot(&mut self, snapshot: WebSession) -> bool {
+        if snapshot.id != self.active_id {
+            return false;
+        }
+        Self::persist_to_disk(&self.persist_dir, &snapshot);
+        self.sessions.insert(snapshot.id.clone(), snapshot);
+        true
+    }
+
     pub fn record_modified_file_to(
         &mut self,
         session_id: &str,
@@ -178,32 +205,11 @@ impl SessionManager {
 
     /// 向当前活跃会话追加一条消息并持久化
     pub fn push_message(&mut self, role: &str, content: &str) {
-        let msg = ChatMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-            timestamp: Utc::now(),
-            hidden: false,
-            exchange: None,
-        };
+        let msg = Self::create_chat_message(role, content);
 
         let session = self.sessions.get_mut(&self.active_id).unwrap();
         session.messages.push(msg);
-
-        // 若是第一条用户消息且标题是默认的，自动更新标题
-        if session.title == "New Session" {
-            if let Some(first_user) = session
-                .messages
-                .iter()
-                .find(|m| m.role == "user" && !m.hidden)
-            {
-                let truncated: String = first_user.content.chars().take(30).collect();
-                if first_user.content.chars().count() > 30 {
-                    session.title = format!("{truncated}...");
-                } else {
-                    session.title = truncated;
-                }
-            }
-        }
+        Self::refresh_default_title(session);
 
         // 持久化（clone 出 session 的关键数据，避免借用冲突）
         let id = self.active_id.clone();
@@ -215,32 +221,11 @@ impl SessionManager {
 
     /// 向指定会话追加一条消息并持久化（不切换活跃会话）
     pub fn push_message_to(&mut self, session_id: &str, role: &str, content: &str) {
-        let msg = ChatMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-            timestamp: Utc::now(),
-            hidden: false,
-            exchange: None,
-        };
+        let msg = Self::create_chat_message(role, content);
 
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.messages.push(msg);
-
-            // 若是第一条用户消息且标题是默认的，自动更新标题
-            if session.title == "New Session" {
-                if let Some(first_user) = session
-                    .messages
-                    .iter()
-                    .find(|m| m.role == "user" && !m.hidden)
-                {
-                    let truncated: String = first_user.content.chars().take(30).collect();
-                    if first_user.content.chars().count() > 30 {
-                        session.title = format!("{truncated}...");
-                    } else {
-                        session.title = truncated;
-                    }
-                }
-            }
+            Self::refresh_default_title(session);
 
             if let Some(s) = self.sessions.get(session_id) {
                 Self::persist_to_disk(&self.persist_dir, s);
@@ -248,8 +233,62 @@ impl SessionManager {
         }
     }
 
+    /// Append a new user turn and return the server-authoritative IDs used by
+    /// MainBrain memory scoping.
+    pub fn push_user_query(&mut self, content: &str) -> Result<UserQueryTurn, String> {
+        let input = content.trim();
+        if input.is_empty() {
+            return Err("用户消息不能为空".into());
+        }
+
+        let message = Self::create_chat_message("user", input);
+        let generation_id = message
+            .memory_generation_id
+            .clone()
+            .expect("new user messages always have a memory generation");
+        let turn = UserQueryTurn {
+            session_id: self.active_id.clone(),
+            message_id: message.id.clone(),
+            generation_id,
+            input: input.to_string(),
+        };
+        let session = self.sessions.get_mut(&self.active_id).unwrap();
+        session.messages.push(message);
+        Self::refresh_default_title(session);
+        Self::persist_to_disk(&self.persist_dir, session);
+        Ok(turn)
+    }
+
+    /// Edit a visible user message, replace its memory generation, and remove
+    /// every later message from the authoritative conversation branch.
+    pub fn edit_user_message(
+        &mut self,
+        message_id: &str,
+        content: &str,
+    ) -> Result<ConversationFork, String> {
+        let input = content.trim();
+        if input.is_empty() {
+            return Err("用户消息不能为空".into());
+        }
+        self.fork_user_message(message_id, Some(input), false)
+    }
+
+    /// Retry only the final visible user turn. The existing message is reused;
+    /// no duplicate user message is appended.
+    pub fn retry_last_user_message(
+        &mut self,
+        message_id: &str,
+    ) -> Result<ConversationFork, String> {
+        self.fork_user_message(message_id, None, true)
+    }
+
     /// Insert or update one paired runtime exchange in a specific chat session.
-    pub fn upsert_exchange_to(&mut self, session_id: &str, exchange: RuntimeExchange) -> bool {
+    pub fn upsert_exchange_to(
+        &mut self,
+        session_id: &str,
+        generation_id: Option<&str>,
+        exchange: RuntimeExchange,
+    ) -> bool {
         let exchange_id = exchange.exchange_id.clone();
         let phase = exchange.phase;
         let timestamp = exchange.occurred_at;
@@ -257,6 +296,15 @@ impl SessionManager {
         let Some(session) = self.sessions.get_mut(session_id) else {
             return false;
         };
+        if generation_id.is_some_and(|generation_id| {
+            !session.messages.iter().any(|message| {
+                message.role == "user"
+                    && message.memory_generation_id.as_deref() == Some(generation_id)
+            })
+        }) {
+            // The originating user generation was superseded by edit/retry.
+            return false;
+        }
 
         if let Some(message) = session.messages.iter_mut().rev().find(|message| {
             message.role == "brain_communication"
@@ -281,11 +329,13 @@ impl SessionManager {
                 ExchangePhase::Response => stored.response = Some(exchange),
             }
             session.messages.push(ChatMessage {
+                id: Self::new_message_id(),
                 role: "brain_communication".into(),
                 content: title,
                 timestamp,
                 hidden: false,
                 exchange: Some(stored),
+                memory_generation_id: generation_id.map(str::to_string),
             });
         }
 
@@ -347,6 +397,130 @@ impl SessionManager {
 
     // ─── 私有辅助方法 ───────────────────────────────────────────────
 
+    fn fork_user_message(
+        &mut self,
+        message_id: &str,
+        edited_content: Option<&str>,
+        require_last_user: bool,
+    ) -> Result<ConversationFork, String> {
+        let mut candidate = self.active().clone();
+        let target_index = candidate
+            .messages
+            .iter()
+            .position(|message| {
+                !message.hidden && message.role == "user" && message.id == message_id
+            })
+            .ok_or_else(|| "用户消息不存在或已不在当前上下文中".to_string())?;
+
+        if require_last_user {
+            let last_user_index = candidate
+                .messages
+                .iter()
+                .rposition(|message| !message.hidden && message.role == "user")
+                .ok_or_else(|| "当前会话没有可重试的用户消息".to_string())?;
+            if target_index != last_user_index {
+                return Err("只能重试最后一条用户消息".into());
+            }
+        }
+
+        let affected_users = candidate.messages[target_index..]
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+        let invalidated_generation_ids = affected_users
+            .iter()
+            .filter_map(|message| message.memory_generation_id.clone())
+            .collect::<Vec<_>>();
+        let includes_legacy_unscoped = affected_users
+            .iter()
+            .any(|message| message.memory_generation_id.is_none());
+
+        candidate.messages.truncate(target_index + 1);
+        let target = candidate
+            .messages
+            .get_mut(target_index)
+            .expect("target remains after truncation");
+        if let Some(content) = edited_content {
+            target.content = content.to_string();
+        }
+        let generation_id = Self::new_generation_id();
+        target.memory_generation_id = Some(generation_id.clone());
+        target.hidden = false;
+
+        // Editing the first user turn should also update its session title.
+        if candidate
+            .messages
+            .iter()
+            .filter(|message| !message.hidden && message.role == "user")
+            .next()
+            .is_some_and(|message| message.id == message_id)
+        {
+            candidate.title = "New Session".into();
+            Self::refresh_default_title(&mut candidate);
+        }
+
+        let turn = UserQueryTurn {
+            session_id: candidate.id.clone(),
+            message_id: message_id.to_string(),
+            generation_id,
+            input: candidate.messages[target_index].content.clone(),
+        };
+        let messages = candidate
+            .messages
+            .iter()
+            .filter(|message| !message.hidden)
+            .cloned()
+            .collect::<Vec<_>>();
+        Self::persist_to_disk(&self.persist_dir, &candidate);
+        self.sessions.insert(candidate.id.clone(), candidate);
+
+        Ok(ConversationFork {
+            turn,
+            invalidated_generation_ids,
+            includes_legacy_unscoped,
+            messages,
+        })
+    }
+
+    fn create_chat_message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: Self::new_message_id(),
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            hidden: false,
+            exchange: None,
+            memory_generation_id: (role == "user").then(Self::new_generation_id),
+        }
+    }
+
+    fn new_message_id() -> String {
+        format!("msg_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    fn new_generation_id() -> String {
+        format!("gen_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    fn refresh_default_title(session: &mut WebSession) {
+        if session.title != "New Session" {
+            return;
+        }
+        let Some(first_user) = session
+            .messages
+            .iter()
+            .find(|message| message.role == "user" && !message.hidden)
+        else {
+            return;
+        };
+        let truncated = first_user.content.chars().take(30).collect::<String>();
+        session.title = if first_user.content.chars().count() > 30 {
+            format!("{truncated}...")
+        } else {
+            truncated
+        };
+    }
+
     /// 创建一个新的 WebSession 实例（不插入到 map）
     fn create_session(title: String) -> WebSession {
         let id = uuid::Uuid::new_v4()
@@ -373,7 +547,17 @@ impl SessionManager {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
                     if let Ok(data) = fs::read_to_string(&path) {
-                        if let Ok(session) = serde_json::from_str::<WebSession>(&data) {
+                        if let Ok(mut session) = serde_json::from_str::<WebSession>(&data) {
+                            let mut migrated = false;
+                            for message in &mut session.messages {
+                                if message.id.is_empty() {
+                                    message.id = Self::new_message_id();
+                                    migrated = true;
+                                }
+                            }
+                            if migrated {
+                                Self::persist_to_disk(dir, &session);
+                            }
                             sessions.insert(session.id.clone(), session);
                         }
                     }
@@ -631,8 +815,8 @@ mod tests {
                 Some(42),
             );
 
-            assert!(mgr.upsert_exchange_to(&session_id, request));
-            assert!(mgr.upsert_exchange_to(&session_id, response));
+            assert!(mgr.upsert_exchange_to(&session_id, None, request));
+            assert!(mgr.upsert_exchange_to(&session_id, None, response));
             assert_eq!(mgr.active().messages.len(), 1);
             let stored = mgr.active().messages[0].exchange.as_ref().unwrap();
             assert_eq!(stored.request.as_ref().unwrap().content, "完整任务原文");
@@ -657,6 +841,7 @@ mod tests {
         mgr.push_message("user", "请小说脑设计章节");
         assert!(mgr.upsert_exchange_to(
             &session_id,
+            None,
             RuntimeExchange::new(
                 "delegation-hide",
                 "main",
@@ -691,5 +876,117 @@ mod tests {
         let mut mgr = SessionManager::new(tmp.path());
         mgr.active_mut().active_persona_id = "test-persona".to_string();
         assert_eq!(mgr.active().active_persona_id, "test-persona");
+    }
+
+    #[test]
+    fn editing_user_message_forks_history_and_replaces_memory_generation() {
+        let tmp = TempDir::new("test_session_edit_fork");
+        let mut mgr = SessionManager::new(tmp.path());
+        let first = mgr.push_user_query("第一条原文").unwrap();
+        mgr.push_message("assistant", "第一条回复");
+        let second = mgr.push_user_query("第二条原文").unwrap();
+        mgr.push_message("assistant", "第二条回复");
+
+        let fork = mgr
+            .edit_user_message(&first.message_id, "第一条修订")
+            .unwrap();
+
+        assert_eq!(fork.turn.message_id, first.message_id);
+        assert_eq!(fork.turn.input, "第一条修订");
+        assert_ne!(fork.turn.generation_id, first.generation_id);
+        assert_eq!(
+            fork.invalidated_generation_ids,
+            vec![first.generation_id, second.generation_id]
+        );
+        assert!(!fork.includes_legacy_unscoped);
+        assert_eq!(fork.messages.len(), 1);
+        assert_eq!(mgr.active().messages.len(), 1);
+        assert_eq!(mgr.active().messages[0].content, "第一条修订");
+
+        let reloaded = SessionManager::new(tmp.path());
+        assert_eq!(reloaded.active().messages.len(), 1);
+        assert_eq!(
+            reloaded.active().messages[0].memory_generation_id,
+            Some(fork.turn.generation_id)
+        );
+    }
+
+    #[test]
+    fn retry_reuses_only_the_last_user_message_without_duplication() {
+        let tmp = TempDir::new("test_session_retry_last");
+        let mut mgr = SessionManager::new(tmp.path());
+        let first = mgr.push_user_query("第一条").unwrap();
+        mgr.push_message("assistant", "第一条回复");
+        let second = mgr.push_user_query("第二条").unwrap();
+        mgr.push_message("assistant", "第二条回复");
+
+        let error = mgr.retry_last_user_message(&first.message_id).unwrap_err();
+        assert_eq!(error, "只能重试最后一条用户消息");
+
+        let fork = mgr.retry_last_user_message(&second.message_id).unwrap();
+        assert_eq!(fork.turn.message_id, second.message_id);
+        assert_eq!(fork.turn.input, "第二条");
+        assert_ne!(fork.turn.generation_id, second.generation_id);
+        assert_eq!(fork.invalidated_generation_ids, vec![second.generation_id]);
+        assert_eq!(mgr.active().messages.len(), 3);
+        assert_eq!(
+            mgr.active()
+                .messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            2
+        );
+        assert_eq!(mgr.active().messages.last().unwrap().id, second.message_id);
+    }
+
+    #[test]
+    fn editing_legacy_user_message_marks_unscoped_memory() {
+        let tmp = TempDir::new("test_session_edit_legacy");
+        let mut mgr = SessionManager::new(tmp.path());
+        let turn = mgr.push_user_query("旧消息").unwrap();
+        mgr.active_mut().messages[0].memory_generation_id = None;
+        mgr.push_message("assistant", "旧回复");
+
+        let fork = mgr.edit_user_message(&turn.message_id, "新消息").unwrap();
+        assert!(fork.includes_legacy_unscoped);
+        assert!(fork.invalidated_generation_ids.is_empty());
+    }
+
+    #[test]
+    fn late_exchange_from_superseded_generation_is_rejected() {
+        use crate::runtime_trace::{ExchangeKind, ExchangeStatus};
+
+        let tmp = TempDir::new("test_session_stale_exchange");
+        let mut mgr = SessionManager::new(tmp.path());
+        let original = mgr.push_user_query("需要后台代理").unwrap();
+        mgr.push_message("assistant", "已提交后台任务");
+        let fork = mgr.retry_last_user_message(&original.message_id).unwrap();
+        let stale_response = RuntimeExchange::new(
+            "delegation-late",
+            "agent:1",
+            "后台代理",
+            "main",
+            "主脑",
+            ExchangeKind::Delegation,
+            ExchangePhase::Response,
+            "迟到结果",
+            "旧分支结果",
+            ExchangeStatus::Completed,
+            Some(10),
+        );
+
+        assert!(!mgr.upsert_exchange_to(
+            &original.session_id,
+            Some(&original.generation_id),
+            stale_response.clone(),
+        ));
+        assert_eq!(mgr.active().messages.len(), 1);
+        assert!(mgr.upsert_exchange_to(
+            &original.session_id,
+            Some(&fork.turn.generation_id),
+            stale_response,
+        ));
+        assert_eq!(mgr.active().messages.len(), 2);
     }
 }

@@ -578,18 +578,6 @@ impl LlmProvider for OpenAiCompatClient {
         let fallback_model = self.model.clone();
         let retry_config = self.retry_config.clone();
 
-        // === DEBUG: 将完整请求体写入文件，用于排查 ===
-        if let Ok(serialized) = serde_json::to_string(&api_request) {
-            let debug_path = "/tmp/ai-brain-last-request.json";
-            let _ = std::fs::write(debug_path, &serialized);
-            tracing::info!(
-                "LLM 请求调试: url={}, body_size={}字节, 已写入 {}",
-                url,
-                serialized.len(),
-                debug_path
-            );
-        }
-
         Box::pin(async move {
             let mut attempts = 0u32;
             let max_attempts = retry_config.max_retries + 1;

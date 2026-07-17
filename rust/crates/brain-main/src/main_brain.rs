@@ -539,6 +539,12 @@ impl MainBrain {
         );
     }
 
+    /// Replace the durable memory portion of the system prompt. Conversation
+    /// forks use this to remove potentially stale derived memory immediately.
+    pub fn replace_memory_context(&mut self, memory_context: Option<String>) {
+        self.memory_context = memory_context.filter(|value| !value.trim().is_empty());
+    }
+
     /// 注入可用技能摘要（追加到 system prompt）
     pub fn inject_skill_summary(&mut self, summary: String) {
         if summary.is_empty() {
@@ -751,6 +757,27 @@ mod tests {
             "❌ system prompt 应包含注入的记忆内容，实际: {}",
             text.chars().take(200).collect::<String>()
         );
+    }
+
+    #[test]
+    fn replace_memory_context_removes_stale_prompt_content() {
+        let llm = Arc::new(StubLlm);
+        let executor = Arc::new(StubToolExecutor::new());
+        let mut brain = MainBrain::new(llm, executor, BrainConfig::default(), 32768, 0.7);
+        brain.inject_memory_context("旧分支结论");
+        assert!(brain.build_messages()[0]
+            .text_content()
+            .contains("旧分支结论"));
+
+        brain.replace_memory_context(Some("当前人格提示".into()));
+        let prompt = brain.build_messages()[0].text_content();
+        assert!(!prompt.contains("旧分支结论"));
+        assert!(prompt.contains("当前人格提示"));
+
+        brain.replace_memory_context(None);
+        assert!(!brain.build_messages()[0]
+            .text_content()
+            .contains("当前人格提示"));
     }
 
     /// 测试 push_memory_context 注入独立 system 消息

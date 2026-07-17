@@ -1,6 +1,7 @@
 // === 新金字塔模块（活跃） ===
 pub mod abstract_layer;
 pub mod concentration;
+pub mod conversation_memory;
 pub mod error;
 pub mod novel;
 pub mod persona_manager;

@@ -67,8 +67,10 @@ use brain_master::MasterBrain;
 use brain_mcp::config::load_mcp_servers;
 use brain_mcp::McpClientPool;
 // [Task 16] 旧 analyzer::AnalysisLlm 已随旧模块清理，使用新版 concentration::AnalysisLlm
+use brain_memory::conversation_memory::{ConversationMemoryInvalidation, ConversationMemoryScope};
 use brain_memory::pyramid_memory_brain::{PyramidMemoryBrain, PyramidMemoryBrainConfig};
 use brain_motor::motor_brain::{MotorBrain, MotorConfig};
+use brain_novel::{NovelBrainConfig, NovelBrainHandle};
 use brain_plugin::{PluginManager, SkillCatalog};
 use brain_reasoning::reasoning_brain::{ReasoningBrain, ReasoningConfig};
 use brain_sensory::llm::LlmProvider as SensoryLlmProvider;
@@ -256,6 +258,8 @@ pub struct Orchestrator {
     dispatch_output_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<brain_dispatch::MainLoopMessage>>>,
     /// Full runtime exchanges for WebSocket cockpit subscribers.
     runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
+    /// Stable resident NovelBrain service handle.
+    novel_brain: NovelBrainHandle,
     /// 插件管理器
     #[allow(dead_code)] // Task 8 会使用
     plugin_mgr: Option<PluginManager>,
@@ -436,6 +440,32 @@ impl Orchestrator {
             tokio::sync::mpsc::channel::<brain_dispatch::MainLoopMessage>(64);
         let (runtime_trace_tx, _) = broadcast::channel::<RuntimeExchange>(256);
 
+        // NovelBrain is a stable v2 domain service. It receives only typed Memory/Resource ports.
+        let (novel_llm, novel_startup_error): (Arc<dyn brain_llm::LlmProvider>, Option<String>) =
+            match llm_config.create_brain_client("novel") {
+                Ok(client) => (Arc::from(client), None),
+                Err(error) => (
+                    Arc::new(brain_llm::echo::EchoLlmProvider::new("novel-unavailable")),
+                    Some(error.to_string()),
+                ),
+            };
+        let novel_memory = Arc::new(crate::novel_adapters::PyramidNovelMemoryAdapter::new(
+            Arc::clone(&memory),
+        ));
+        let workspace_root =
+            std::env::current_dir().map_err(|error| format!("无法确定小说项目工作区: {error}"))?;
+        let novel_resources = Arc::new(
+            crate::novel_adapters::ScopedNovelResourceAdapter::new(&workspace_root)
+                .map_err(|error| format!("初始化小说资源端口失败: {error}"))?,
+        );
+        let novel_config = NovelBrainConfig {
+            startup_error: novel_startup_error,
+            ..NovelBrainConfig::default()
+        };
+        let (novel_brain, novel_task) =
+            brain_novel::spawn_novel_brain(novel_llm, novel_memory, novel_resources, novel_config);
+        tasks.push(novel_task);
+
         // 启动 dispatch loop
         {
             let dispatch_clone = dispatch.clone();
@@ -456,6 +486,7 @@ impl Orchestrator {
             Some(Arc::clone(&memory)),
             dispatch.clone(),
             runtime_trace_tx.clone(),
+            novel_brain.clone(),
         );
 
         // 12.0 评估脑接入统一 SkillCatalog
@@ -602,16 +633,20 @@ impl Orchestrator {
         }
 
         // 12.6 检查并注入上次会话的待分析对话
-        let pending_base_dir = {
+        let (pending_base_dir, memory_is_stale) = {
             let mem = match memory.try_lock() {
                 Ok(m) => m,
                 Err(_) => return Err("记忆脑锁被占用".to_string()),
             };
-            mem.base_dir().to_path_buf()
+            (
+                mem.base_dir().to_path_buf(),
+                mem.conversation_memory_is_stale(),
+            )
         };
-        if let Some(pending) =
-            brain_memory::pending_analysis::PendingAnalysis::load(&pending_base_dir)
-        {
+        let pending = (!memory_is_stale)
+            .then(|| brain_memory::pending_analysis::PendingAnalysis::load(&pending_base_dir))
+            .flatten();
+        if let Some(pending) = pending {
             let injection_text = pending.format_for_injection();
             let convs_for_analysis = pending.conversations.clone();
             let sess_id = pending.session_id.clone();
@@ -669,6 +704,7 @@ impl Orchestrator {
             dispatch,
             dispatch_output_rx: Arc::new(Mutex::new(dispatch_output_rx)),
             runtime_trace_tx,
+            novel_brain,
             plugin_mgr,
             skill_catalog,
             mcp_pool,
@@ -786,6 +822,49 @@ impl Orchestrator {
         }
     }
 
+    /// Invalidate memory written by superseded Web generations and immediately
+    /// remove derived memory from MainBrain's system context. Persona-authored
+    /// instructions remain active; Novel Canon/lifecycle storage is untouched.
+    pub async fn invalidate_conversation_memory(
+        &self,
+        invalidation: ConversationMemoryInvalidation,
+    ) -> Result<(), String> {
+        let conversation_id = invalidation.conversation_id.clone();
+        let generation_ids = invalidation.generation_ids.clone();
+        let includes_legacy_unscoped = invalidation.includes_legacy_unscoped;
+        let persona_prompt = {
+            let memory = self.memory_brain.lock().await;
+            memory
+                .invalidate_conversation_memory(&invalidation)
+                .map_err(|error| format!("失效旧分支记忆失败: {error}"))?;
+            memory.persona_manager().build_persona_prompt()
+        };
+
+        let cancelled_tasks = self
+            .novel_brain
+            .invalidate_conversation_generations(
+                conversation_id,
+                generation_ids,
+                includes_legacy_unscoped,
+            )
+            .await
+            .map_err(|error| format!("失效旧分支小说任务失败: {error}"))?;
+        if !cancelled_tasks.is_empty() {
+            tracing::info!(
+                "会话分叉已取消未发布小说任务: {}",
+                cancelled_tasks.join(", ")
+            );
+        }
+
+        let mut guard = self.v2_brain.lock().await;
+        if let Some(ref mut brain) = *guard {
+            brain.replace_memory_context(
+                (!persona_prompt.trim().is_empty()).then_some(persona_prompt),
+            );
+        }
+        Ok(())
+    }
+
     /// 系统状态结构体（TUI 用）
     pub fn status_structured(&self) -> SystemStatus {
         let (context_usage, cumulative_prompt, cumulative_completion, cumulative_cache_read) = self
@@ -842,6 +921,32 @@ impl Orchestrator {
     pub fn query_streaming(
         self: &Arc<Self>,
         input: &str,
+    ) -> (
+        tokio::sync::mpsc::Receiver<ProgressEvent>,
+        tokio::task::JoinHandle<Result<MainBrainOutput, String>>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        self.query_streaming_with_memory_scope(input, None)
+    }
+
+    /// Web query variant that tags every persisted L1 turn with the current
+    /// user-message generation.
+    pub fn query_streaming_scoped(
+        self: &Arc<Self>,
+        input: &str,
+        memory_scope: ConversationMemoryScope,
+    ) -> (
+        tokio::sync::mpsc::Receiver<ProgressEvent>,
+        tokio::task::JoinHandle<Result<MainBrainOutput, String>>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        self.query_streaming_with_memory_scope(input, Some(memory_scope))
+    }
+
+    fn query_streaming_with_memory_scope(
+        self: &Arc<Self>,
+        input: &str,
+        memory_scope: Option<ConversationMemoryScope>,
     ) -> (
         tokio::sync::mpsc::Receiver<ProgressEvent>,
         tokio::task::JoinHandle<Result<MainBrainOutput, String>>,
@@ -933,15 +1038,25 @@ impl Orchestrator {
                     }
 
                     // --- 1. 主脑首次处理 ---
-                    let mut result = brain
-                        .process_input(&input_owned, Some(&tx), Some(cancel_clone.clone()))
-                        .await
-                        .map_err(|e| format!("{e}"));
+                    let process =
+                        brain.process_input(&input_owned, Some(&tx), Some(cancel_clone.clone()));
+                    let mut result = match &memory_scope {
+                        Some(scope) => {
+                            crate::query_context::with_conversation_memory_scope(scope, process)
+                                .await
+                        }
+                        None => process.await,
+                    }
+                    .map_err(|e| format!("{e}"));
 
                     // 将本轮对话完整轨迹存入记忆脑（L1 全量基座）
                     if let Ok(ref output) = result {
                         let mem = this.memory_brain.lock().await;
-                        if let Err(e) = mem.store_turns(&output.turns) {
+                        let stored = match &memory_scope {
+                            Some(scope) => mem.store_turns_scoped(&output.turns, scope),
+                            None => mem.store_turns(&output.turns),
+                        };
+                        if let Err(e) = stored {
                             tracing::warn!("v2 对话存入记忆脑失败: {e}");
                         }
                     }
@@ -1169,10 +1284,17 @@ impl Orchestrator {
                                         // 主脑根据反馈重新生成
                                         let revision_prompt =
                                             "请根据以上评估反馈修正你的回答，直接输出修正后的完整内容。";
-                                        match brain
-                                            .process_input(revision_prompt, Some(&tx), None)
-                                            .await
-                                        {
+                                        let retry_process =
+                                            brain.process_input(revision_prompt, Some(&tx), None);
+                                        let retry_result = match &memory_scope {
+                                            Some(scope) => crate::query_context::with_conversation_memory_scope(
+                                                scope,
+                                                retry_process,
+                                            )
+                                            .await,
+                                            None => retry_process.await,
+                                        };
+                                        match retry_result {
                                             Ok(retry_output) => {
                                                 tracing::info!(
                                                     "评估重试第{}次完成, 新回答长度={}",
@@ -1182,9 +1304,16 @@ impl Orchestrator {
                                                 // 存入记忆脑
                                                 {
                                                     let mem = this.memory_brain.lock().await;
-                                                    if let Err(e) =
-                                                        mem.store_turns(&retry_output.turns)
-                                                    {
+                                                    let stored = match &memory_scope {
+                                                        Some(scope) => mem.store_turns_scoped(
+                                                            &retry_output.turns,
+                                                            scope,
+                                                        ),
+                                                        None => {
+                                                            mem.store_turns(&retry_output.turns)
+                                                        }
+                                                    };
+                                                    if let Err(e) = stored {
                                                         tracing::warn!(
                                                             "评估重试对话存入记忆脑失败: {e}"
                                                         );
@@ -1930,6 +2059,7 @@ impl Orchestrator {
 
     /// 优雅关闭（含强制四步分析）
     pub fn shutdown(&self) {
+        self.novel_brain.request_shutdown();
         let _ = self.shutdown_tx.send(true);
         tracing::info!("AI Brain 正在关闭...");
     }
@@ -1941,7 +2071,11 @@ impl Orchestrator {
         // 记录会话结束时的 LLM 使用统计
         llm_usage_logger::log_session_summary();
 
-        self.shutdown();
+        if let Err(error) = self.novel_brain.shutdown().await {
+            tracing::warn!("常驻小说脑关停未确认: {error}");
+        }
+        let _ = self.shutdown_tx.send(true);
+        tracing::info!("AI Brain 正在关闭...");
     }
 
     /// 检查是否需要触发四步浓缩（每 N 轮），并在后台启动
@@ -2313,6 +2447,7 @@ fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<PyramidMemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
     runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
+    novel_brain: NovelBrainHandle,
 ) -> (
     Arc<Mutex<Option<MainBrain>>>,
     Option<PluginManager>,
@@ -2403,7 +2538,8 @@ fn create_v2_main_brain(
         crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch)
             .with_skill_catalog(skill_catalog.clone())
             .with_mcp_pool(mcp_pool.clone())
-            .with_runtime_trace_sender(runtime_trace_tx),
+            .with_runtime_trace_sender(runtime_trace_tx)
+            .with_novel_brain(novel_brain),
     );
 
     let brain_config = BrainConfig::default();
@@ -2489,10 +2625,12 @@ mod tests {
         assert!(skill.description.contains("小说创作"));
         let body = catalog.load_content(skill).unwrap();
         assert!(body.contains("## 主脑分支"));
-        assert!(body.contains("## 小说脑分支"));
+        assert!(body.contains("## 常驻小说脑分支"));
+        assert!(body.contains("novel_start_task"));
+        assert!(body.contains("novel_publish"));
         let summary = catalog.summary_for_prompt();
         assert!(summary.contains("<name>novel-writing-workflow</name>"));
-        assert!(summary.contains("在调用 Novel Agent 或写入小说文件前使用"));
+        assert!(summary.contains("在调用常驻小说脑或发布作品前使用"));
 
         let skill_path = root.join(NOVEL_WRITING_SKILL_NAME).join("SKILL.md");
         std::fs::write(&skill_path, "stale").unwrap();
@@ -2531,9 +2669,10 @@ mod tests {
         let orch = orch.unwrap();
         assert_eq!(
             orch.task_count(),
-            4,
-            "应该有 4 个任务（3副脑+1dispatch_loop）"
+            5,
+            "应该有 5 个任务（3副脑+常驻小说脑+1dispatch_loop）"
         );
+        orch.shutdown();
     }
 
     #[tokio::test]

@@ -59,6 +59,7 @@ pub struct ConcentrationEngine {
     storage: PyramidStorage,
     #[allow(dead_code)]
     session_id: String,
+    rebuild_from_active_l1: bool,
 }
 
 impl ConcentrationEngine {
@@ -67,7 +68,16 @@ impl ConcentrationEngine {
         Self {
             storage,
             session_id,
+            rebuild_from_active_l1: false,
         }
+    }
+
+    /// Rebuild every derived layer without exposing superseded L2/L3/L4,
+    /// profile, or evaluation data to the analysis model.
+    #[must_use]
+    pub fn with_active_l1_rebuild(mut self, rebuild: bool) -> Self {
+        self.rebuild_from_active_l1 = rebuild;
+        self
     }
 
     /// 执行四步浓缩
@@ -91,6 +101,11 @@ impl ConcentrationEngine {
         };
 
         if conversation_json == "[]" {
+            if self.rebuild_from_active_l1 {
+                if let Err(error) = self.clear_derived_memory() {
+                    report.errors.push(format!("clear_derived_memory: {error}"));
+                }
+            }
             tracing::info!("四步浓缩: 无对话数据，跳过");
             return report;
         }
@@ -167,8 +182,11 @@ impl ConcentrationEngine {
     ) -> Result<usize> {
         // 读取现有 L2 索引
         let summary_pool = SummaryPool::new(self.storage.clone());
-        let existing_index = summary_pool.load_index()?;
-        let existing_json = serde_json::to_string_pretty(&existing_index)?;
+        let existing_json = if self.rebuild_from_active_l1 {
+            r#"{"entries":[]}"#.to_string()
+        } else {
+            serde_json::to_string_pretty(&summary_pool.load_index()?)?
+        };
 
         // 调用 LLM
         let (system, user) =
@@ -197,8 +215,11 @@ impl ConcentrationEngine {
         let l2_json = serde_json::to_string_pretty(&l2_data)?;
 
         // 读取现有 L3
-        let existing_l3 = abstract_layer.load_all()?;
-        let existing_l3_json = serde_json::to_string_pretty(&existing_l3)?;
+        let existing_l3_json = if self.rebuild_from_active_l1 {
+            "[]".to_string()
+        } else {
+            serde_json::to_string_pretty(&abstract_layer.load_all()?)?
+        };
 
         // 调用 LLM
         let (system, user) = prompts::build_concentration_step2_split(&l2_json, &existing_l3_json);
@@ -226,8 +247,11 @@ impl ConcentrationEngine {
         let l3_json = serde_json::to_string_pretty(&l3_data)?;
 
         // 读取现有 L4
-        let existing_l4 = subconscious.load()?;
-        let existing_l4_json = serde_json::to_string_pretty(&existing_l4)?;
+        let existing_l4_json = if self.rebuild_from_active_l1 {
+            r#"{"triggers":[],"narrative":"","version":0}"#.to_string()
+        } else {
+            serde_json::to_string_pretty(&subconscious.load()?)?
+        };
 
         // 调用 LLM
         let (system, user) = prompts::build_concentration_step3_split(&l3_json, &existing_l4_json);
@@ -254,9 +278,16 @@ impl ConcentrationEngine {
         let eval_store = EvalInfoStore::new(self.storage.clone());
 
         // 读取现有数据
-        let existing_profile = profile_store.summary().unwrap_or_default();
-        let existing_eval = eval_store.load()?;
-        let existing_eval_json = serde_json::to_string_pretty(&existing_eval)?;
+        let existing_profile = if self.rebuild_from_active_l1 {
+            String::new()
+        } else {
+            profile_store.summary().unwrap_or_default()
+        };
+        let existing_eval_json = if self.rebuild_from_active_l1 {
+            "null".to_string()
+        } else {
+            serde_json::to_string_pretty(&eval_store.load()?)?
+        };
 
         // 调用 LLM
         let (system, user) = prompts::build_concentration_step4_split(
@@ -284,11 +315,25 @@ impl ConcentrationEngine {
         let parsed: Step4Response = parse_json_response(&response)?;
 
         // 全量覆盖
-        if !parsed.profile.is_empty() {
+        if self.rebuild_from_active_l1 || !parsed.profile.is_empty() {
             profile_store.regenerate(&parsed.profile)?;
         }
         eval_store.regenerate(parsed.requirements, parsed.pitfalls, parsed.rules)?;
 
+        Ok(())
+    }
+
+    fn clear_derived_memory(&self) -> Result<()> {
+        SummaryPool::new(self.storage.clone()).regenerate(Vec::new())?;
+        AbstractLayer::new(self.storage.clone()).regenerate(Vec::new())?;
+        SubconsciousPool::new(self.storage.clone()).regenerate(&SubconsciousData {
+            triggers: Vec::new(),
+            narrative: String::new(),
+            version: 0,
+            updated_at: chrono::Utc::now(),
+        })?;
+        ProfileStore::new(self.storage.clone()).regenerate("")?;
+        EvalInfoStore::new(self.storage.clone()).regenerate(Vec::new(), Vec::new(), Vec::new())?;
         Ok(())
     }
 }
@@ -325,6 +370,9 @@ fn extract_json_str(response: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pyramid_types::{Experience, KeywordIndex, L1Ref, SubconsciousTrigger, TaskType};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     #[test]
     fn extract_json_from_raw() {
@@ -398,6 +446,103 @@ mod tests {
         }
     }
 
+    struct RecordingLlm {
+        responses: Mutex<VecDeque<String>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl RecordingLlm {
+        fn new(responses: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().map(str::to_string).collect()),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    impl AnalysisLlm for RecordingLlm {
+        fn analyze_structured(
+            &self,
+            _system: &str,
+            user: &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
+        > {
+            self.prompts.lock().unwrap().push(user.to_string());
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| "unexpected analysis call".to_string());
+            Box::pin(async move { response })
+        }
+    }
+
+    fn seed_derived_memory(storage: &PyramidStorage, marker: &str) {
+        let now = chrono::Utc::now();
+        SummaryPool::new(storage.clone())
+            .regenerate(vec![TaskSummary {
+                task_id: "old-task".into(),
+                task_type: TaskType::Coding,
+                task_name: marker.into(),
+                summary: marker.into(),
+                l1_refs: vec![L1Ref {
+                    session: "old-session".into(),
+                    paragraphs: vec![0],
+                }],
+                tags: vec![marker.into()],
+                importance: 0.8,
+                created_at: now,
+                updated_at: now,
+            }])
+            .unwrap();
+        AbstractLayer::new(storage.clone())
+            .regenerate(vec![TypeExperience {
+                task_type: TaskType::Coding,
+                experiences: vec![Experience {
+                    pattern: marker.into(),
+                    description: marker.into(),
+                    source_tasks: vec!["old-task".into()],
+                    frequency: 1,
+                    injectable: true,
+                }],
+                l2_refs: vec!["old-task".into()],
+                index: vec![KeywordIndex {
+                    keyword: marker.into(),
+                    l2_task_ids: vec!["old-task".into()],
+                }],
+                updated_at: now,
+            }])
+            .unwrap();
+        SubconsciousPool::new(storage.clone())
+            .regenerate(&SubconsciousData {
+                triggers: vec![SubconsciousTrigger {
+                    keyword: marker.into(),
+                    l3_type: TaskType::Coding,
+                    l2_task: "old-task".into(),
+                }],
+                narrative: marker.into(),
+                version: 1,
+                updated_at: now,
+            })
+            .unwrap();
+        ProfileStore::new(storage.clone())
+            .regenerate(marker)
+            .unwrap();
+        EvalInfoStore::new(storage.clone())
+            .regenerate(
+                vec![marker.into()],
+                vec![marker.into()],
+                vec![marker.into()],
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn step1_l1_to_l2_with_mock() {
         let tmp = tempfile::tempdir().unwrap();
@@ -464,5 +609,91 @@ mod tests {
 
         assert_eq!(report.step1_tasks, 0);
         assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidation_rebuild_never_prompts_with_old_derived_memory() {
+        const OLD: &str = "DELETED_BRANCH_SECRET";
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = PyramidStorage::new(tmp.path().to_path_buf(), "test");
+        storage.ensure_dirs().unwrap();
+        seed_derived_memory(&storage, OLD);
+        RawPool::new(storage.clone())
+            .append_turn("kept-session", "User", "safe active memory", None)
+            .unwrap();
+
+        let llm = RecordingLlm::new([
+            "[]",
+            "[]",
+            r#"{"triggers":[],"narrative":"","version":1}"#,
+            r#"{"profile":"safe-profile","requirements":[],"pitfalls":[],"rules":[]}"#,
+        ]);
+        let report = ConcentrationEngine::new(storage.clone(), "session".into())
+            .with_active_l1_rebuild(true)
+            .run(&llm)
+            .await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let prompts = llm.prompts();
+        assert_eq!(prompts.len(), 4);
+        assert!(prompts.iter().all(|prompt| !prompt.contains(OLD)));
+        assert!(SummaryPool::new(storage.clone())
+            .load_all()
+            .unwrap()
+            .is_empty());
+        assert!(AbstractLayer::new(storage.clone())
+            .load_all()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            ProfileStore::new(storage.clone()).summary().unwrap(),
+            "safe-profile"
+        );
+        assert!(EvalInfoStore::new(storage.clone())
+            .inject_text()
+            .unwrap()
+            .is_empty());
+        assert!(SubconsciousPool::new(storage)
+            .inject_text()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidation_rebuild_clears_derived_memory_when_no_l1_remains() {
+        const OLD: &str = "DELETED_ONLY_MEMORY";
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = PyramidStorage::new(tmp.path().to_path_buf(), "test");
+        storage.ensure_dirs().unwrap();
+        seed_derived_memory(&storage, OLD);
+
+        let llm = RecordingLlm::new([]);
+        let report = ConcentrationEngine::new(storage.clone(), "session".into())
+            .with_active_l1_rebuild(true)
+            .run(&llm)
+            .await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(llm.prompts().is_empty());
+        assert!(SummaryPool::new(storage.clone())
+            .load_all()
+            .unwrap()
+            .is_empty());
+        assert!(AbstractLayer::new(storage.clone())
+            .load_all()
+            .unwrap()
+            .is_empty());
+        assert!(ProfileStore::new(storage.clone())
+            .summary()
+            .unwrap()
+            .is_empty());
+        assert!(EvalInfoStore::new(storage.clone())
+            .inject_text()
+            .unwrap()
+            .is_empty());
+        assert!(SubconsciousPool::new(storage)
+            .inject_text()
+            .unwrap()
+            .is_empty());
     }
 }

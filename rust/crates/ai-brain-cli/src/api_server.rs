@@ -368,6 +368,7 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
     let state = Arc::new(AppState {
         orch: Arc::new(orch),
         sessions,
+        active_query_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
         workspace_root: std::env::current_dir()
             .and_then(std::fs::canonicalize)
             .unwrap_or_else(|_| std::path::PathBuf::from(".")),

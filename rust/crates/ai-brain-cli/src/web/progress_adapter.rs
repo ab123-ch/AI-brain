@@ -28,6 +28,9 @@ pub struct ModifiedFileInfo {
 /// 聊天消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Stable server-generated ID used by edit/retry operations.
+    #[serde(default)]
+    pub id: String,
     pub role: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
@@ -39,6 +42,10 @@ pub struct ChatMessage {
     /// Paired brain-to-brain request/result persisted with the chat turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exchange: Option<ChatExchange>,
+    /// Memory generation associated with a user turn. Older persisted
+    /// sessions omit this field and are handled conservatively on a fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_generation_id: Option<String>,
 }
 
 /// Persisted request/result pair for one runtime exchange.

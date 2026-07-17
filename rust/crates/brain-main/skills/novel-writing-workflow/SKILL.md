@@ -1,18 +1,21 @@
 ---
 name: novel-writing-workflow
-description: 统筹中文长篇小说的大纲、卷纲、章纲、正文、续写、审稿、润色、人物设定、剧情桥段和复盘，协调主脑资料定位、项目 Canon 召回、Novel 子代理委派、双层审稿、文件保存及记忆提交。遇到任何小说创作、修改或审校任务时，在调用 Novel Agent 或写入小说文件前使用。
+description: 统筹中文长篇小说的大纲、卷纲、章纲、正文、续写、审稿、润色、人物设定、剧情桥段和复盘，协调主脑准备任务环境、常驻小说脑创作与自检、主脑独立复审、用户确认、MemoryBrain 生命周期记录和受控发布。遇到任何小说创作、修改或审校任务时，在调用常驻小说脑或发布作品前使用。
 ---
 
-# 小说写作工作流
+# 常驻小说脑写作工作流
 
-把项目快照视为权威 Canon，把图谱视为按需索引。根据当前身份执行对应分支，不要让小说脑重复主脑已经完成的目录探索。
+项目文件是作品正文的权威来源，MemoryBrain 管理任务事件、checkpoint、Confirmed Canon、发布日志和图谱投影。常驻 NovelBrain 管理项目级短期工作态、创作、自检和连续修订。User 只与 MainBrain 对话。
 
 ## 共同门禁
 
-- 始终使用稳定的 `project_id`，不得跨项目读取或提交事实。
-- 把明确前文、章纲、设定和用户要求置于模型推测之前；信息不足时只做最小、可逆且明确标注的假设。
-- 默认禁止 Web 调研。仅当用户任务确实需要外部资料时设置 `allow_web_research=true`，只提炼机制与读者预期，不照搬表达、角色或情节。
-- 把通用评估脑与小说审稿分开；无论通用评估脑是否启用，都要完成小说脑自检和主脑独立复审。
+- 始终使用稳定的 `project_id` 和 `task_id`；同一项目的修订沿用原 task，不创建一次性 Novel Agent。
+- 严禁调用 `Agent(subagent_type='Novel')`。Explore、Plan、Verification 和 general-purpose 仍是临时 Agent。
+- 小说脑不接收 memory root 或 graph path。所有长期记忆读写都经过 MemoryBrain，所有材料读取和作品发布都经过受限 ResourcePort。
+- 把明确前文、章纲、角色卡、设定和用户要求置于模型推测之前；关键条件不足时让小说脑返回澄清请求，由主脑询问用户后调用 `novel_resume_task`。
+- 草稿、自检、主脑 review、用户反馈属于生命周期记录，不是 Confirmed Canon。只有成功的 `novel_publish` 事务可以提交新的 Canon。
+- 默认发布顺序不可跳过：小说脑自检 pass -> 主脑独立复审 pass -> 用户 accept -> 原子保存正文 -> MemoryBrain 完成 Canon commit。
+- 只有用户在最初任务中明确要求生成后自动保存，才能设置 `publication_policy=auto_after_main_review`。
 
 ## 主脑分支
 
@@ -20,97 +23,83 @@ description: 统筹中文长篇小说的大纲、卷纲、章纲、正文、续�
 
 1. 用 `novel_list_projects` 查找现有项目；确认不存在时再用 `novel_create_project` 创建。
 2. 将任务归类为 `outline`、`volume_outline`、`chapter_plan`、`body`、`continuation`、`review`、`polish` 或 `retrospective`。
-3. 明确目标章节、计划输出路径、字数/结构、视角、平台、文风、必须发生、禁止改变和验收标准。
+3. 明确目标章节、计划输出路径、视角、平台、文风、必须发生、禁止改变和可检查的验收标准。
+4. 为本次完整生命周期生成稳定 `task_id`。用户修改、小说脑澄清和主脑退修都沿用这个 ID。
 
-### 2. 定位完整材料
+### 2. 准备任务环境
 
-1. 由主脑查找并读取相关文件，不把目录探索交给小说脑。
-2. 优先定位目标章纲、上一章及必要的更早承接章节、卷纲/总纲、人物或世界观设定、风格样例和待审/待润色稿。
-3. 记录每个文件的精确路径与角色。不要用一句话摘要替代可直接读取的正文路径。
-4. 用 `novel_recall_project` 按任务类型召回结构化 Canon，再用 `novel_check_consistency` 获取冲突、重叠事实和逾期伏笔。
+1. 由主脑查找相关文件，不把目录探索交给小说脑。
+2. 优先定位待续写正文、上一章和必要前文、目标章纲、卷纲/总纲、角色卡、世界观设定、风格样例或待审稿件。
+3. 读取关键材料确认它们确实匹配当前项目，并用当前环境可用的 shell 工具计算每个文件的 SHA-256。
+4. 为每项材料构造 `ContextRef`：`role`、受工作区约束的路径、`sha256` 和可选描述。不要只传一句摘要代替正文或章纲。
+5. 用 `novel_recall_project` 获取当前 Canon revision，用 `novel_check_consistency` 检查未解决冲突、重叠事实和逾期伏笔。
 
-### 3. 构造委派合同
+### 3. 启动或恢复常驻任务
 
-同步调用 `Agent(subagent_type='Novel')`，并完整填写 `novel_context`：
+调用 `novel_start_task`，完整提交：
 
-- `project_id`：当前小说项目。
-- `task_type`：本轮任务类型。
-- `target_chapter`：适用时填写目标章节。
-- `canon_revision`：本次召回得到的当前 revision。
-- `output_path`：主脑计划在复审通过后保存的路径。
-- `context_files`：精确文件清单，每项包含 `role`、`path` 和可选 `description`。
-- `must_happen`：本轮必须发生或覆盖的事项。
-- `must_not_change`：不得改写的剧情事实、人设、时间线和视角约束。
-- `acceptance_criteria`：至少一条可检查的验收条件。
-- `allow_web_research`：默认 `false`。
+- `task_id`、`project_id`、`task_type` 和清晰的 `task_brief`；
+- `target_chapter`、当前 `expected_revision` 和最终 `output_path`；
+- 带 hash 的 `context_refs`；
+- `must_happen`、`must_not_change` 和 `acceptance_criteria`；
+- 默认 `publication_policy=require_user_acceptance`。
 
-在 `prompt` 中描述具体产物和本轮重点，不重复粘贴已经通过路径和 Canon 工具可获得的大段材料。
+若返回 `needs_clarification`，把问题整理后询问 User。用户下一轮回答时调用 `novel_resume_task(task_id, input)`；不要新建 task 或重新调用 Agent。
 
 ### 4. 独立复审
 
-1. 检查 Agent 返回的 `requiresMainReview=true`，以及 `novelSelfReview.present=true`、`valid=true`、`verdict=pass`。
-2. 从 `[NOVEL_CONTENT]` 提取候选产物，独立对照用户要求、章纲、相关前文、Canon、一致性报告、人物状态、时间线、剧情线、伏笔和委派合同。
-3. 检查剧情承接与遗漏、设定和人设冲突、因果链、时间线、视角、重复、AI 腔、文风、节奏及适用时的章末钩子。
-4. 发现问题时形成具体修订清单，沿用相同 `novel_context` 并更新 revision 后重新委派 Novel；不要由主脑悄悄大段改写后直接判定通过。
+`draft_ready` 只是候选稿。主脑必须独立检查：
 
-### 5. 保存与提交
+- 用户要求与任务合同；
+- 章纲、前文和承接关系；
+- Canon、人物状态、时间线、剧情线和伏笔；
+- 视角、文风、重复、AI 腔、节奏及适用时的章末钩子。
 
-1. 仅在小说脑自检和主脑复审均通过后保存 `[NOVEL_CONTENT]`。
-2. 确认文件保存成功后，再从 `[NOVEL_MEMORY_DELTA]` 提取 JSON 并调用 `novel_commit_delta`。
-3. 遇到 revision 过期或 Canon 冲突时停止提交、重新召回并复审；用 `novel_resolve_conflict` 记录审查结论，事实修改仍通过新的 Delta 提交。
+通过 `novel_review_draft` 提交完整 `MainReviewRecord`。Pass 时八项 checks 必须全部为 `pass`、issues 为空，并提供用户要求、章纲/前文、Canon 等实际 evidence refs。Revise 时必须给出具体 issues；常驻小说脑会在同一 task/session 生成下一版，再重新复审。主脑不得悄悄大段改写后直接判定通过。
 
-## 小说脑分支
+### 5. 展示候选稿并记录用户决定
 
-### 1. 读取与召回
+主脑 Pass 后，默认把候选正文完整展示给 User，明确说明这是待确认版本，不要声称已经保存。
 
-1. 先解析主脑给出的 `novel_context`，再按需读取 `context_files`；不得遍历目录或读取清单外文件。
-2. 调用 `novel_recall_project` 获取当前项目完整结构化 Canon，并在写作前调用 `novel_check_consistency`。
-3. 仅在具体疑点上查询 Novel 图谱；只查询委派的项目。仅在 `allow_web_research=true` 时使用 Web 工具。
+- User 接受：调用 `novel_user_decision`，decision=`accept`。
+- User 要求修改：调用同一工具，decision=`revise` 并提交具体 feedback；小说脑在原 task 中生成新版本，随后重新执行主脑复审和用户确认。
+- User 拒绝：调用同一工具，decision=`reject`；生命周期保留，但不得修改作品文件或 Canon。
 
-### 2. 生成产物
+不要替用户推断 accept。用户沉默、换话题或只评价局部内容都不等于发布授权。
 
-- 大纲/卷纲：给出阶段目标、因果链、主线转折、人物推进和伏笔安排。
-- 章纲：给出场景节拍、冲突升级、信息增量、承接点和章末钩子。
+### 6. 受控发布
+
+只有状态进入 `approved_for_publication` 后，调用 `novel_publish`，且只传 `task_id` 与已确认的 `draft_version`。
+
+- 不再次传正文；服务端从常驻任务状态取出已审核的精确内容。
+- 不用通用 `write_file` 保存正式小说产物。
+- 不直接提交 NovelMemoryDelta；MemoryBrain 在 artifact receipt 校验通过后完成 Canon commit。
+- revision 过期、文件 hash 变化或 Canon 冲突时停止发布，重新召回并复审，不静默覆盖。
+- 发布成功后向 User 汇报保存路径、内容 hash、draft version 和新的 Canon revision。
+
+`novel_status` 用于查看 resident/idle、当前项目、task phase、draft version 和 pending publication，不要靠猜测判断任务是否仍在内存中。
+
+## 常驻小说脑分支
+
+### 1. 使用服务端环境
+
+1. 读取主脑任务合同、MemoryBrain 返回的 Canon recall 和 ConsistencyReport。
+2. 阅读服务端已验证 hash 的 `authorized_context` 全文；不得请求目录遍历、任意文件、memory root 或 graph path。
+3. 若关键要求、承接正文或设定存在无法安全补全的缺口，返回 `needs_clarification`，不直接向 User 提问。
+
+### 2. 生成与自检
+
+- 大纲/卷纲：阶段目标、因果链、主线转折、人物推进和伏笔安排。
+- 章纲：场景节拍、冲突升级、信息增量、承接点和章末钩子。
 - 正文/续写：严格承接章纲与前文，保持人物动机、状态、时间线和叙事视角一致。
 - 审稿：定位问题、给出证据和可执行修订方案，不把未经确认的改写当成 Canon。
 - 润色：优化语言、动作、对话、感官细节与段落节奏，不改变剧情事实。
 - 复盘：沉淀可复用方法、失败模式和用户反馈，不虚构作品事实。
 
-### 3. 自检并先修正
+完成后逐项检查 `outline_alignment`、`canon_consistency`、`character_consistency`、`timeline_consistency`、`plot_and_foreshadowing`、`style_and_repetition`。先修正问题；只有六项全部 pass、issues 为空时才能返回 `draft_ready`。
 
-重新对照所有输入，逐项检查：
+### 3. Typed JSON 交付
 
-- `outline_alignment`：章纲、任务目标和必须发生事项。
-- `canon_consistency`：世界观、事件和既有事实。
-- `character_consistency`：人设、动机、关系和当前状态。
-- `timeline_consistency`：时间顺序、地点移动和伤势/物品状态。
-- `plot_and_foreshadowing`：剧情线、遗漏情节、伏笔铺设与回收。
-- `style_and_repetition`：视角、文风、节奏、重复和 AI 腔。
+只返回服务端要求的单个 JSON 对象。`draft_ready` 必须包含正文、六项自检、与当前 project/revision/source_ref 匹配的 `NovelMemoryDelta` 和证据引用。不得声称已保存或已提交 Canon。
 
-先修正发现的问题，再输出自检报告。任一检查失败时使用 `needs_revision`，不得用空检查表或空泛结论冒充通过。
-
-### 4. 按协议交付
-
-严格输出三个区块，不在 `[NOVEL_CONTENT]` 中混入解释、审稿元数据或 JSON：
-
-```text
-[NOVEL_CONTENT]
-可直接保存的最终产物
-[/NOVEL_CONTENT]
-
-[NOVEL_SELF_REVIEW]
-{"verdict":"pass|needs_revision","issues":[],"checks":{"outline_alignment":"pass|fail","canon_consistency":"pass|fail","character_consistency":"pass|fail","timeline_consistency":"pass|fail","plot_and_foreshadowing":"pass|fail","style_and_repetition":"pass|fail"},"unverified_assumptions":[]}
-[/NOVEL_SELF_REVIEW]
-
-[NOVEL_MEMORY_DELTA]
-单个 NovelMemoryDelta JSON 对象
-[/NOVEL_MEMORY_DELTA]
-```
-
-使用以下最小 Delta 结构：
-
-```json
-{"project_id":"...","branch_id":"main","expected_revision":0,"task_type":"outline|volume_outline|chapter_plan|body|continuation|review|polish|retrospective","source_ref":"计划保存路径","progress":{"current_volume":null,"current_chapter":null},"proposed_facts":[],"state_changes":[],"plot_updates":[],"foreshadowing_updates":[],"feedback":[],"experience_candidates":[]}
-```
-
-只记录本轮新增的稳定设定、状态、事件、剧情线、伏笔、反馈和有效写作经验。沿用召回包的 `project_id`、`branch_id` 和 revision；纯假设或备选创意标为 draft。没有新增时保留空数组，不要编造 Delta。
+`NovelMemoryDelta` 只记录本轮新增的稳定设定、状态、事件、剧情线、伏笔、反馈和有效写作经验。没有新增时保留空数组，不得编造事实。草稿和备选创意不能标为 Confirmed Canon。

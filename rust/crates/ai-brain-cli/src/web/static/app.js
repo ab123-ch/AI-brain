@@ -92,7 +92,7 @@ const brainProfiles = {
     eval: { label: '评估脑', role: '质量检查 / 结果评估', icon: 'E' },
     tool: { label: '工具执行器', role: '本地命令 / 文件 / 外部工具', icon: 'T' },
     agent: { label: '子代理池', role: '并行专题处理', icon: 'A' },
-    novel: { label: '小说脑', role: '创作型子代理', icon: 'N' },
+    novel: { label: '小说脑', role: '常驻创作 / 自检 / 修订', icon: 'N' },
     explore: { label: '探索脑', role: '检索 / 方案探索', icon: 'X' },
 };
 
@@ -808,13 +808,133 @@ function removeSpinner() {
     currentSpinnerEl = null;
 }
 
-function addUserMessage(text, messageIndex = null) {
+function addUserMessage(text, options = {}) {
+    const {
+        messageIndex = null,
+        messageId = null,
+        isLastUser = false,
+    } = options;
     const el = document.createElement('div');
     el.className = 'msg user';
-    el.textContent = text;
-    attachDeleteAction(el, messageIndex);
+    const content = document.createElement('div');
+    content.className = 'msg-content';
+    content.textContent = text;
+    el.appendChild(content);
+
+    if (messageId) {
+        el.dataset.messageId = messageId;
+        el.classList.add('has-actions');
+        const actions = document.createElement('div');
+        actions.className = 'msg-actions';
+        actions.appendChild(createMessageAction('pencil', '编辑这条消息', () => {
+            startInlineMessageEdit(el, text, messageId);
+        }));
+        if (isLastUser) {
+            actions.appendChild(createMessageAction('rotate-ccw', '重试最后一条消息', () => {
+                if (isGenerating) {
+                    addSystemMessage('生成中暂不能重试');
+                    return;
+                }
+                beginHistoryRegeneration('重试最后一条用户消息');
+                send('retry_last_user_message', { message_id: messageId });
+            }));
+        }
+        if (messageIndex !== null && messageIndex !== undefined) {
+            actions.appendChild(createMessageAction('trash-2', '删除这一轮历史', () => {
+                if (isGenerating) {
+                    addSystemMessage('生成中暂不能删除历史');
+                    return;
+                }
+                send('delete_turn', { message_index: messageIndex });
+            }, 'danger'));
+        }
+        el.appendChild(actions);
+    } else {
+        attachDeleteAction(el, messageIndex);
+    }
     $messages.appendChild(el);
     scrollToBottom();
+    refreshIcons();
+    return el;
+}
+
+function createMessageAction(icon, title, onClick, tone = '') {
+    const button = document.createElement('button');
+    button.className = `msg-action${tone ? ` ${tone}` : ''}`;
+    button.type = 'button';
+    button.title = title;
+    button.setAttribute('aria-label', title);
+    button.innerHTML = `<i data-lucide="${icon}" aria-hidden="true"></i>`;
+    button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        onClick();
+    });
+    return button;
+}
+
+function startInlineMessageEdit(messageEl, originalText, messageId) {
+    if (isGenerating) {
+        addSystemMessage('生成中暂不能编辑历史');
+        return;
+    }
+    document.querySelectorAll('.msg.user.editing').forEach((element) => {
+        element.querySelector('.msg-edit-cancel')?.click();
+    });
+
+    const content = messageEl.querySelector('.msg-content');
+    const actions = messageEl.querySelector('.msg-actions');
+    const editor = document.createElement('div');
+    editor.className = 'msg-edit-form';
+    const textarea = document.createElement('textarea');
+    textarea.className = 'msg-edit-textarea';
+    textarea.value = originalText;
+    textarea.rows = Math.min(8, Math.max(2, originalText.split('\n').length));
+    textarea.setAttribute('aria-label', '编辑用户消息');
+
+    const controls = document.createElement('div');
+    controls.className = 'msg-edit-controls';
+    const cancel = createMessageAction('x', '取消编辑', () => {
+        editor.remove();
+        content.classList.remove('hidden');
+        actions.classList.remove('hidden');
+        messageEl.classList.remove('editing');
+    });
+    cancel.classList.add('msg-edit-cancel');
+    const save = createMessageAction('check', '保存并重新生成', () => {
+        const nextContent = textarea.value.trim();
+        if (!nextContent) {
+            textarea.focus();
+            return;
+        }
+        if (nextContent === originalText.trim()) {
+            cancel.click();
+            return;
+        }
+        beginHistoryRegeneration('编辑用户消息并重新生成');
+        send('edit_user_message', { message_id: messageId, content: nextContent });
+    });
+    save.classList.add('primary');
+    controls.append(cancel, save);
+    editor.append(textarea, controls);
+
+    content.classList.add('hidden');
+    actions.classList.add('hidden');
+    messageEl.classList.add('editing');
+    messageEl.appendChild(editor);
+    textarea.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            cancel.click();
+        } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault();
+            save.click();
+        }
+    });
+    requestAnimationFrame(() => {
+        textarea.focus();
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    });
+    refreshIcons();
 }
 
 function attachDeleteAction(el, messageIndex) {
@@ -1415,7 +1535,7 @@ function statusText(status) {
 }
 
 function initializeCoreBrainNodes() {
-    ['client', 'main', 'memory', 'graph', 'eval', 'tool', 'agent'].forEach(ensureBrainNode);
+    ['client', 'main', 'memory', 'graph', 'eval', 'novel', 'tool', 'agent'].forEach(ensureBrainNode);
 }
 
 function cockpitIdleSummary() {
@@ -1805,10 +1925,18 @@ function renderMessages(messages) {
         showWelcome();
         return;
     }
+    const lastUserIndex = messages.reduce(
+        (latest, message, index) => message.role === 'user' ? index : latest,
+        -1,
+    );
     let lastAssistant = null;
     messages.forEach((m, index) => {
         if (m.role === 'user') {
-            addUserMessage(m.content, index);
+            addUserMessage(m.content, {
+                messageIndex: index,
+                messageId: m.id || null,
+                isLastUser: index === lastUserIndex,
+            });
         } else if (m.role === 'assistant') {
             const el = document.createElement('div');
             el.className = 'msg assistant';
@@ -1846,6 +1974,7 @@ function renderMessages(messages) {
     });
     if (lastAssistant) appendModifiedFiles(lastAssistant, sessionFiles);
     renderConclusionPanel();
+    refreshIcons();
     scrollToBottom();
 }
 
@@ -2004,32 +2133,34 @@ function stopGenerating() {
 }
 
 // ── Submit Query ────────────────────────────────────────────────
-function submitQuery() {
-    const text = $input.value.trim();
-    if (!text) return;
-
+function beginHistoryRegeneration(label) {
     currentTurnFiles = [];
     turnFileBaseline = new Map(sessionFiles.map((file) => [file.path, file.updated_at]));
-
-    addUserMessage(text);
     brainState.activeSince = Date.now();
-    markBrain('main', 'active', '接收用户任务');
-    addCommunication('client', 'main', '提交新任务', 'query');
-    addBrainEvent('用户提交新任务');
-    send('query', { input: text });
-    $input.value = '';
-    $input.style.height = 'auto';
+    markBrain('main', 'active', label);
+    addCommunication('client', 'main', label, 'query');
+    addBrainEvent(label);
     isGenerating = true;
-    setInputEnabled(true); // 不禁用输入框，只切换按钮状态
+    setInputEnabled(true);
     updateSendButton();
 
-    // Reset streaming state
     currentStreamingEl = null;
     currentThinkingEl = null;
     currentThinkingDetails = null;
     currentToolGroup = null;
     toolItems.clear();
     resetThinkingState();
+}
+
+function submitQuery() {
+    const text = $input.value.trim();
+    if (!text) return;
+
+    addUserMessage(text);
+    beginHistoryRegeneration('用户提交新任务');
+    send('query', { input: text });
+    $input.value = '';
+    $input.style.height = 'auto';
 }
 
 // ── Event Bindings ──────────────────────────────────────────────

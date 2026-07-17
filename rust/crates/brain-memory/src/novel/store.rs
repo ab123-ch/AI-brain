@@ -14,7 +14,7 @@ use super::schema::{
     NovelRecallPack, NovelTaskType, ProposedFact,
 };
 
-pub struct NovelMemoryStore {
+pub(crate) struct NovelMemoryStore {
     root: PathBuf,
     graph_db_path: Option<PathBuf>,
 }
@@ -106,9 +106,43 @@ impl NovelMemoryStore {
     }
 
     /// 校验并提交一次小说记忆变更。冲突事实不会进入 Canon，其余事实原子提交。
+    #[cfg(test)]
     pub fn commit_delta(&self, delta: &NovelMemoryDelta) -> Result<CommitReport> {
+        self.commit_delta_internal(delta, None)
+    }
+
+    /// 以发布事务 ID 幂等提交小说记忆变更。
+    pub fn commit_delta_for_publication(
+        &self,
+        delta: &NovelMemoryDelta,
+        publication_id: &str,
+    ) -> Result<CommitReport> {
+        validate_project_id(publication_id)?;
+        self.commit_delta_internal(delta, Some(publication_id))
+    }
+
+    fn commit_delta_internal(
+        &self,
+        delta: &NovelMemoryDelta,
+        publication_id: Option<&str>,
+    ) -> Result<CommitReport> {
         validate_delta(delta)?;
         let mut project = self.load_project(&delta.project_id)?;
+        if publication_id.is_some_and(|id| {
+            project
+                .applied_publications
+                .iter()
+                .any(|applied| applied == id)
+        }) {
+            return Ok(CommitReport {
+                project_id: project.project_id,
+                previous_revision: project.canon_revision.saturating_sub(1),
+                new_revision: project.canon_revision,
+                accepted_fact_ids: Vec::new(),
+                conflicts: Vec::new(),
+                graph_mirrored: true,
+            });
+        }
         if delta.expected_revision != project.canon_revision {
             return Err(MemoryError::Conflict(format!(
                 "小说项目 revision 已变化: expected={}, actual={}",
@@ -243,11 +277,18 @@ impl NovelMemoryStore {
             !accepted_fact_ids.is_empty() || reinforced_any || superseded_any || progress_changed;
         let has_new_conflicts = !conflicts.is_empty();
         project.conflicts.extend(conflicts.iter().cloned());
-        let new_revision = if canon_changed {
-            project.canon_revision = proposed_revision;
+        let new_revision = if canon_changed || publication_id.is_some() {
+            if canon_changed {
+                project.canon_revision = proposed_revision;
+            }
+            if let Some(publication_id) = publication_id {
+                project
+                    .applied_publications
+                    .push(publication_id.to_string());
+            }
             project.updated_at = now;
             self.write_project(&project)?;
-            proposed_revision
+            project.canon_revision
         } else {
             if has_new_conflicts {
                 project.updated_at = now;
@@ -888,5 +929,36 @@ mod tests {
         assert_eq!(project.facts.len(), 1);
         assert!(project.facts[0].confidence > initial_confidence);
         assert_eq!(project.canon_revision, 2);
+    }
+
+    #[test]
+    fn publication_commit_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = NovelMemoryStore::new(dir.path(), None);
+        store
+            .create_project(&NovelProject::new("dark-city", "暗城"))
+            .unwrap();
+        let update = delta(
+            "dark-city",
+            0,
+            vec![fact(
+                "location-a",
+                "character:linmo:location",
+                "林默位于旧港",
+            )],
+        );
+
+        let first = store
+            .commit_delta_for_publication(&update, "publication-1")
+            .unwrap();
+        let retry = store
+            .commit_delta_for_publication(&update, "publication-1")
+            .unwrap();
+
+        assert_eq!(first.new_revision, 1);
+        assert_eq!(retry.new_revision, 1);
+        let project = store.load_project("dark-city").unwrap();
+        assert_eq!(project.facts.len(), 1);
+        assert_eq!(project.applied_publications, vec!["publication-1"]);
     }
 }

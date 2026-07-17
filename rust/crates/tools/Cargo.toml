@@ -9,7 +9,6 @@ publish.workspace = true
 api = { path = "../api" }
 brain-llm = { path = "../brain-llm" }
 brain-graph = { path = "../brain-graph" }
-brain-memory = { path = "../brain-memory" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
