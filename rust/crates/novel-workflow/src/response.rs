@@ -43,14 +43,17 @@ pub fn parse_novel_response(
                     reason: payload.reason,
                 }))
             }
-            "draft_ready" => build_draft(
-                serde_json::from_value(value)?,
-                task_id,
-                project_id,
-                draft_version,
-                canon_revision,
-                fallback_evidence_refs,
-            ),
+            "draft_ready" => {
+                let payload = value.get("draft").cloned().unwrap_or(value);
+                build_draft(
+                    serde_json::from_value(payload)?,
+                    task_id,
+                    project_id,
+                    draft_version,
+                    canon_revision,
+                    fallback_evidence_refs,
+                )
+            }
             other => Err(NovelWorkflowError::Invalid(format!(
                 "unknown Novel outcome: {other}"
             ))),
@@ -127,4 +130,45 @@ fn tagged_section<'a>(value: &'a str, start: &str, end: &str) -> Option<&'a str>
     let remainder = &value[start_index..];
     let end_index = remainder.find(end)?;
     Some(&remainder[..end_index])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_domain_shaped_nested_draft_payload() {
+        let raw = serde_json::json!({
+            "outcome": "draft_ready",
+            "draft": {
+                "content": "第20章正文",
+                "self_review": {
+                    "verdict": "pass",
+                    "checks": {
+                        "outline_alignment": "pass",
+                        "canon_consistency": "pass",
+                        "character_consistency": "pass",
+                        "timeline_consistency": "pass",
+                        "plot_and_foreshadowing": "pass",
+                        "style_and_repetition": "pass"
+                    },
+                    "summary": "六项检查通过"
+                },
+                "proposed_delta": {
+                    "project_id": "project-1",
+                    "expected_revision": 5,
+                    "task_type": "body",
+                    "source_ref": "chapter-20.md"
+                }
+            }
+        })
+        .to_string();
+
+        let outcome = parse_novel_response(&raw, "task-1", "project-1", 1, 5, &[]).unwrap();
+
+        let NovelOutcome::DraftReady(draft) = outcome else {
+            panic!("应解析为候选稿");
+        };
+        assert_eq!(draft.content, "第20章正文");
+    }
 }
