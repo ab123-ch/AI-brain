@@ -273,6 +273,7 @@ pub enum NovelTaskPhase {
     Completed,
     Rejected,
     Cancelled,
+    #[serde(alias = "recoverable_error")]
     Failed,
     StaleRevision,
 }

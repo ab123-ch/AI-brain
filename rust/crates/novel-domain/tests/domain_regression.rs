@@ -378,3 +378,10 @@ fn automatic_approval_tracks_publication_recovery_states_and_cancellation_guards
     cancellable.cancel_for_conversation_fork().unwrap();
     assert_eq!(cancellable.phase, NovelTaskPhase::Cancelled);
 }
+
+#[test]
+fn legacy_recoverable_error_phase_migrates_to_failed() {
+    let phase: NovelTaskPhase = serde_json::from_str("\"recoverable_error\"").unwrap();
+
+    assert_eq!(phase, NovelTaskPhase::Failed);
+}
