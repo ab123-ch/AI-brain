@@ -1,0 +1,744 @@
+# Progress
+
+## 2026-07-25 Phase 7/8 Completion
+- Completed Phase 7 with one `novel-application` boundary, WAL-backed `novel.db`, strict repeatable legacy import, atomic Domain/outbox persistence, dual-sink projection reconciliation, TaskRun-backed revisions, and production routing through `TaskApplicationPort`.
+- Completed Phase 8 by replacing ten low-level Novel tools with `novel_task`/`novel_project`, moving project operations behind the application port, removing resident/Pyramid adapters and all special Brain/Subagent/Graph/model/WebSession identities, and physically deleting `brain-novel` plus `brain_memory::novel`.
+- Final workspace gates pass: `cargo check --offline --workspace`, `cargo fmt --all -- --check`, `git diff --check`, legacy identity scans, and the affected 48-test tools regression after package-scoped formatting.
+- The completed regression matrix remains green: Novel Domain 10, Workflow 7, Knowledge Adapter 5, Application 4, Brain Memory 187+3 generic, Graph 22+3 generic, Tools 48, Brain Core 25, Dispatch 5, Brain LLM 82, Novel-focused CLI 10, Web compatibility 1, Orchestrator init 1, and deterministic CLI library 247/247 with only the documented external Provider test filtered.
+- Strict `-D warnings` passes for the four Novel layers and affected Core/Graph/LLM crates. Unrelated pre-existing Clippy debt remains in Dispatch, tools, CLI, and Memory and was intentionally not refactored; ordinary all-target Clippy/test gates pass for affected compatibility packages.
+- Updated `docs/plans/2026-07-22-generic-multi-instance-brain-design.md` with Phase 7/8 completion evidence and TaskEngine `knowledge-graph.json` to validated v1.5.0 (24 provides, 18 components, 4 integrations, 24 validation rules).
+- Live `/Users/chenh/.ai-brain` contains no legacy Novel project/checkpoint/publication input, so migration is correctly zero-record. `novel.db` schema v1 remains integrity `ok`, with 0 project/checkpoint/event/publication/outbox rows and no pending Memory/Graph delivery.
+- Clean stop plus two starts preserved `novel.db` SHA-256 `cdaed51eab114e53f82b8e554ed6f1b81028b219fc0a6f4b53883d0ff5519f7e`, size 57344, mtime, and all counts. Both starts logged zero imports and zero projection batches.
+- Live HTTP returns 200, served JavaScript passes syntax validation, and a read-only WebSocket probe received the active 2-member/30-event/28-Inbox snapshot plus sequence-30 replay through sequence 30 with zero duplicate events.
+- The latest build remains running at `http://127.0.0.1:8080`. In-app Browser navigation could not start because the host omitted required sandbox metadata; no page state was touched, and equivalent public HTTP/RFC 6455 assertions passed.
+
+## 2026-07-25 Phase 7/8 Resume
+- Full deterministic CLI library regression passes 247/247 with only the previously documented external Provider integration test filtered.
+- Combined strict Clippy reached a known unrelated Dispatch lint boundary; strict verification continues package-scoped rather than mutating its public shutdown API.
+- Removed the confirmed empty compatibility directories, restored workspace discovery, and completed an offline CLI check. `cargo tree -i brain-novel` now reports no matching package.
+- Physically removed the resident `brain-novel` crate, `brain_memory::novel`, all Pyramid Novel methods/tests, and their manifest dependencies. Legacy on-disk inputs remain untouched for read-only migration.
+- Completed the pre-deletion reverse-reference audit for `brain_memory::novel` and `brain-novel`; no live composition or application consumer remains.
+- Refactored CLI Novel adapters onto `novel_domain`, `novel_workflow::parse_novel_response`, and `novel_application::NovelResourcePort`; deleted the Pyramid/resident bridge and its obsolete compatibility test.
+- Removed Novel from generic Brain/Dispatch/Graph identities, default model configuration, CLI templates, WebSession compatibility, and Agent alias handling. Focused Core 25, Dispatch 5, Graph 25, and LLM 82 tests pass.
+- Inventoried generic-layer domain names and expanded the removal set to obsolete `BrainId`/`BrainKind` Novel identities alongside Dispatch, Graph, model config, and flat Web session compatibility.
+- Replaced the MainBrain resident state-machine prompt and built-in Novel skill with the two high-level application facades. Focused prompt and built-in skill installation/load tests both pass.
+- Replaced the ten Novel tool schemas with strict `novel_task` and `novel_project` action unions, routed both through `TaskApplicationPort`, removed the executor's Novel Memory branch, and updated absence/schema/replay contracts.
+- Implemented Novel-owned project commands with explicit create semantics, hash-CAS conflict updates, and atomic projection outbox insertion. Complete `novel-application` verification passes 4/4.
+- Added and ran the project-facade red contract. Compilation reaches the new test and fails only on the five deliberately absent application methods.
+- Audited `NovelDomainStore` and legacy project semantics. Selected explicit create plus hash-CAS project update with atomic outbox insertion for the new application-level project commands.
+- Completed the first Phase 8 static inventory across application APIs, tool schemas/dispatch, prompts/skill, resident dependencies, Graph/config enums, and Web compatibility storage.
+- Selected two replacement facades: `novel_task` for start/resume/review/decision/publish/status and `novel_project` for create/list/recall/consistency/conflict resolution. Internal Domain transition authority remains unchanged.
+- Re-read the required `planning-with-files` workflow and ran session recovery; its recovered payload was an unrelated historical model discussion, so repository plans and the implementation handoff remain authoritative.
+- Re-audited the intentionally dirty worktree and preserved all existing Phase 1-7 changes.
+- Reconciled the Phase 7 handoff with persistent records: durable migration/application/workflow/routing contracts are green, while full/static/live verification remains part of the combined Phase 8 closeout.
+- Began Phase 8 with the approved removal order: high-level application facades first, then tool/prompt/config/session/generic-core compatibility deletion, resident crate removal, and final regression/live restart proof.
+
+## 2026-07-25 Phase 7/8 Cutover and Legacy Removal
+- Focused CLI executor tests pass 12/12 after replacing the old workflow-only fixture with real `novel.db + StoreWorkflowEnvironment + NovelApplicationService`; start/replay uses one Writer call and no resident handle.
+- Cut the production composition to `NovelApplicationService`: CLI check passes, no resident actor task is started, lifecycle commands share one ApplicationPort, legacy files are imported read-only into `novel.db`, and startup reuses the ContextBuilder's concrete Memory/Graph stores to drain the Novel outbox.
+- Extended the TaskRun-backed Writer workflow for revisions and clarification resumes. The focused new iteration contract and complete `novel-workflow` suite pass 7/7 with stable per-draft run identity and no regression to start/recovery behavior.
+- Added `novel-application` and made its migration contracts green 2/2: identity-preserving file import, restart/reimport idempotency, explicit old-active archival, durable dual-sink outbox, and real Memory/Graph Evidence rebuild all pass in temporary databases.
+- Completed the initial Phase 8 reverse-dependency inventory: only CLI wiring depends on the resident crate, so the removal can be staged after application cutover without cross-workspace API churn.
+- Verified the existing adapter and generic Memory contracts are sufficient migration sinks. Remaining design work is the Novel outbox event shape and deterministic conversion from imported Canon records.
+- Audited production composition. The required wiring change is one application service and one independent domain database, with the current shared TaskRepository/Coordinator and scoped resources retained.
+- Recovered the exact resident lifecycle and publication recovery algorithms. They can be transferred without changing Domain transitions or artifact safety checks.
+- Verified that the extracted Domain is already the complete transition authority. This reduces the implementation to persistence, migration, application orchestration, entrypoint routing, and compatibility cleanup.
+- Mapped the complete resident Handle command and port surface. This supplies the compatibility behavior checklist for the upcoming application service and prevents accidental deletion of publication recovery or conversation invalidation.
+- Inventoried project and lifecycle persistence plus generic projection capabilities. The next contract can assert complete import identity, repeatability, active-project uniqueness, and adapter-driven Graph/Memory rebuild against temporary databases.
+- Located the legacy project persistence and Phase 6 adapter. The cutover can be implemented as a repeatable read-only import from the legacy file layout followed by composition switch; no in-place rewrite of legacy files is required.
+- Re-read the active plan before the first architecture decision. Confirmed the missing production boundary is a Novel-owned durable application port spanning all lifecycle commands; the Phase 6 start-only workflow cannot satisfy the Phase 7 exit contract by itself.
+- Audited the approved Phase 7/8 design and current source couplings. The remaining live ownership is concentrated in Orchestrator/RealToolExecutor, `brain-novel`, legacy `brain_memory::novel` storage/projection, tool schemas, MainBrain prompt rules, Graph closed enums, and the flat WebSession compatibility field.
+- Resumed from the completed Phase 6 production vertical slice and identified the final two approved stages from the current task plan and architecture design.
+- Preserved the intentional uncommitted Phase 1-6 worktree. Session recovery contained no relevant implementation state, and no source or durable data has been changed during the initial audit.
+- Recorded the Phase 7 migration/cutover and Phase 8 removal contracts in the active task plan and findings. Next step is an exact inventory of legacy Novel persistence, application entrypoints, generic-domain couplings, and the extracted workflow/application ports before adding red migration contracts.
+
+## 2026-07-24 Phase 6 Novel Domain and Workflow Extraction
+- Final closeout gates pass after status synchronization: `cargo fmt --all -- --check`, `git diff --check`, and `jq empty docs/specs/003-task-engine/knowledge-graph.json` all exit cleanly.
+- Completed the final RFC 6455 `join_room` proof for room `7b82eef8`: the only application message sent was the read-only join, replay reached sequence 30, and A's `main` route alias resolved to the Web label `xiaomi/mimo-v2.5-pro` rather than `main`.
+- The latest `你能替我干什么？` event is sequence 28 and A's sequence-29 reply is nonblank at 349 characters. The append-only pre-fix blank event remains for audit, while frontend timeline filtering prevents it from rendering a `暂无内容` member preview.
+- Post-join persistence is byte-for-count stable at 32 RoomEvents, 28 Inbox items, 23 Tasks, 23 InstanceRuns, 23 Artifacts, and 115 TaskEvents; active Inbox/Task/Instance counts are all zero, SQLite integrity/foreign keys remain clean, HTTP remains 200, and PID 6439 stays live.
+- Marked Phase 6 complete. The remaining approved delivery stages are Phase 7 cutover/data migration and Phase 8 removal of the special Novel runtime; neither was started during this closeout.
+- Final live closeout resumed against the sustained Phase 6 service: PID 6439 is listening on `127.0.0.1:8080`, the root resource returns HTTP 200, and the browser-only visual path remains blocked before navigation by missing host `sandboxPolicy` metadata.
+- The verified pre-WebSocket durable baseline is unchanged at 32 RoomEvents, 28 Inbox items, 23 Tasks, 23 InstanceRuns, 23 Artifacts, and 115 TaskEvents; SQLite integrity is `ok` and the foreign-key check is empty.
+- Full Phase 6 regressions pass: `novel-domain` 10/10, `novel-workflow` 6/6, `novel-knowledge-adapter` 5/5, Legacy Memory 203/203, Legacy/Generic Graph 25/25, resident Novel 8/8, Knowledge Core 4/4, TaskEngine 14/14, deterministic CLI 248/248 with only the previously recorded real-provider timeout filtered, tools 48/48, Brain LLM 82/82, and MainBrain 24/24.
+- Static gates pass: strict all-target no-deps Clippy for all three new Novel crates, workspace check with only established warnings, full workspace rustfmt check, Git diff whitespace, Web JavaScript syntax, and exact generic-core dependency/domain-name neutrality scans.
+- Refactored the extracted Canon application and Novel graph projection into bounded deterministic helpers to satisfy strict Clippy without changing behavior or serialized contracts; retained one documented `NovelOutcome` enum-size allowance to avoid breaking the compatibility Rust API during cutover.
+- Added cross-crate Novel projection integration tests with the real GenericGraphStore. Committed events persist and support subject-to-source plus source-to-all-subject EvidenceLink queries; Draft/Rejected attempts leave no checkpoint or evidence. `novel-knowledge-adapter` now passes 5/5.
+- Closed the frozen-branch validation gap: Writer output and replayed Artifact envelopes must use the frozen project's active branch before Domain acceptance. A wrong-branch response settles as a failed TaskRun while leaving the Domain checkpoint at Drafting; `novel-workflow` now passes 6/6.
+- Added a production-boundary RealToolExecutor test using the actual Pyramid Novel environment adapter, TaskRepository/Coordinator, and `NovelStartWorkflow` with no resident Novel handle. Start succeeds, TaskRun completes, the legacy `NovelOutcome` JSON shape is preserved, and repeated execution replays with exactly one Writer call; the complete RealToolExecutor suite passes 12/12.
+- Extracted the Orchestrator's schema/projection registration into one deterministic no-I/O constructor used by production and tests. A new contract proves the Novel schema plus Canon, Artifact, Memory, and project-resource source adapters are all registered; the focused Orchestrator test passes.
+- Restored Domain-owned regression coverage as six direct public-contract tests: unresolved/overlapping/overdue consistency, branch/status/chapter/task recall filtering, deterministic newest-first 80-item recall bounds, clarification/resume, reviewer and user revision/rejection, automatic publication recovery states, and cancellation guards. The complete `novel-domain` suite passes 10/10.
+- Resumed Phase 6 closeout from the completed `NovelStartWorkflow` production wiring. Re-read the required file-planning and knowledge-graph workflows; session catch-up contained only an unrelated historical model discussion, and the intentional Phase 1-5 dirty worktree remains untouched.
+- Confirmed the remaining gate order: restore extracted Domain regression coverage, prove `novel_start_task` uses the Workflow without a resident handle, verify Orchestrator Novel schema/source registration and generic evidence projection, then run full quality gates and update the approved design/KG records.
+- Implemented the one-node `NovelStartWorkflow` service and ports over TaskRepository/TaskCoordinator with per-task serialization, frozen request/project/context, resource hash validation, exact provider usage, immutable writer envelopes, Artifact-bound Candidates, deterministic lifecycle events, and checkpoint reconciliation.
+- The focused restart/idempotency contract is green 1/1: first start calls Writer once and completes the durable Task; same-process and reopened-repository retries replay the same Artifact/Candidate without rereading a drifted project or consuming another model call.
+- The complete `novel-workflow` suite passes 4/4 and strict all-target no-deps Clippy passes with `-D warnings`; the initial method-size/ownership findings were resolved by bounded validation/persistence helpers and explicit serialization ownership.
+- Promoted one runtime TaskRepository/Scheduler/TaskCoordinator into Orchestrator, moved inflight recovery to that composition root, and migrated CollaborationRuntime to reuse the same repository and admission boundary as domain workflows; `ai-brain-cli` check remains green with only recorded pre-existing warnings.
+- Added the production Novel Workflow environment and stateless LLM Writer adapters, routed only `novel_start_task` through the new Workflow while preserving the legacy `NovelOutcome` tool response, retained all other Novel commands on the compatibility handle, and registered the Novel schema plus Canon/Artifact/Memory/project-resource projection adapters without starting Phase 7 data movement.
+- Focused production contracts pass: Novel adapters 4/4, RealToolExecutor 11/11, Novel tool schema/rejection 2/2, and the complete Collaboration namespace 37/37 after sharing the runtime TaskRepository/Scheduler. Writer requests are frozen/no-tool/output-capped, Provider usage is preserved exactly, stable lifecycle events dedupe, and existing group/restart/model-display behavior remains green.
+- Resumed the Phase 6 production vertical slice from the persisted handoff. Session catch-up was unrelated, the intentional Phase 1-5 dirty worktree matches the recorded inventory, and the focused start-workflow contract remains the only expected red boundary before implementation.
+- Started Phase 6 after the completed generic Memory/Graph production slice. Re-read the required file-planning and knowledge-graph workflows, ran session recovery, ignored its unrelated historical model discussion, and preserved the intentional dirty worktree.
+- KG v1.3 dependency validation confirms TaskCoordinator, TaskRepository, ContextBuilder, GenericMemoryStore, GenericGraphStore, ContextSnapshot and all Phase 5 provides are available for the domain/workflow/adapter extraction.
+- Began the approved-design and current-code ownership audit. No source edit will occur until Novel transition/publication authority and the compatibility facade boundary are mapped.
+
+## 2026-07-24 Phase 5 Generic Memory/Graph I/O
+- Resumed Phase 5 closeout from the implementation handoff. PID 95915 is still the pre-blank-history-fix listener; the intentional dirty worktree and existing planning/KG records are preserved.
+- Confirmed 19/19 TaskRuns and nodes are completed, 19/19 InstanceRuns succeeded, and all 19 reservations are settled. Inbox has 23 completed plus the one expected failed direct item caused by historical blank event sequence 6; there is no evidence of an in-flight model run.
+- The first aggregate audit guessed several obsolete column/table names. Recorded the error and switched to schema-driven read-only queries before completing the outbox, budget, Memory, and Graph checks.
+- Schema-driven closeout audit is clean: zero active Inbox/Task/Node/InstanceRun/reservation, every budget account has zero reserved input/output, and all 64 runtime outbox rows are published. The only failed Inbox is A's expected pre-fix direct item for event sequence 26; B's ambient reply and A's later participation decision are terminal.
+- Generic stores pass live integrity checks: Memory entries/scopes/sources/tombstones/outbox are all zero; Graph has one platform-core schema and zero nodes/edges/evidence/checkpoints/events. The pre-rebuild runtime logical hash is `6AC6747B49D3807302EBB71943FCA30E434CCB3801283FB08ADF831567E4B41F`.
+- Built the fixed `ai-brain` binary successfully, gracefully stopped pre-fix PID 95915, and started the replacement as PID 96430 in managed exec session 19626. Startup resolves the compatibility route to `xiaomi/mimo-v2.5-pro` and HTTP serves 200.
+- Immediate post-start recovery preserved the exact pre-rebuild logical hash `6AC6747B49D3807302EBB71943FCA30E434CCB3801283FB08ADF831567E4B41F`; no Task, Event, Artifact, Inbox result, or reply was duplicated.
+- Posted the exact regression question through `/ws` with public `post_room_message`, directly addressing A while retaining group delivery. Event sequence 28 entered A's model call instead of failing during ContextBuilder assembly; the compatibility route again resolved to `xiaomi/mimo-v2.5-pro`.
+- A completed as run `run-214ecd5b-a194-472b-be42-19c3611ff1d2` and persisted a nonblank 349-character reply at sequence 29. B independently replied at sequence 30; the resulting A/B participation decisions also completed, leaving zero active Inbox items.
+- A's durable Task uses `collaboration-task-v3`, concrete `xiaomi/mimo-v2.5-pro`, a 349-character immutable Artifact, exact provider usage 17516/257, and a fully settled reservation. Its ContextSnapshot contains 20 blocks and 967 estimated tokens under total/optional/Memory/Graph budgets 12000/3500/3000/1800 with no truncation or degradation.
+- The retained history blocks carry RoomEvent ID, sequence/revision and raw-content SHA-256; the current-input hash equals the independently calculated hash of `你能替我干什么？`. Historical blank sequence 6 is absent from the enumerated block list.
+- One concurrent external SQLite detail query hit `database is locked` because the CLI had no busy timeout while the final outbox write completed. Logged the audit-client error and will rerun read-only with `.timeout 5000`, matching product connections.
+- The bounded-timeout retry passed: persisted/embedded snapshot IDs are both `context-96652619baa9c77d556a3e92`, persisted/embedded content hashes are both `96652619baa9c77d556a3e92fd3105d6b23f5c90cffa379c51b86ea1a2e18553`, and direct lookup confirms the historical blank event ID is absent.
+- Post-run durable baseline is 23 completed Tasks/nodes, 23 succeeded InstanceRuns, 23 Artifacts, 115 Task events, 28 Inbox items (27 completed plus the one historical expected failure), zero active/reserved/pending state, and logical hash `8C78767E94F8E4158F1EBEF90E26F85C63631489792B71152D13B671610BF738`.
+- Gracefully restarted the fixed service again as PID 96715. The global logical hash remained exactly `8C78767E94F8E4158F1EBEF90E26F85C63631489792B71152D13B671610BF738`; A's Task/InstanceRun/Artifact/reply remain one each, its Task events remain five, its config/context hashes are unchanged, and no sequence above 30 was allocated.
+- Post-restart read-only WebSocket replay returned exactly sequences 28/29/30 through high-water 30, A's 349-character reply, zero active Inbox, and `main -> xiaomi/mimo-v2.5-pro`. The first probe's list-shape parsing mistake was corrected without durable mutation.
+- Final static gates currently pass: workspace rustfmt check, JavaScript syntax, Git whitespace and KG JSON parse. A broad domain-name scan produced only the generic local variable `canonical`; the exact identifier scan will replace this false positive.
+- The first KG summary query assumed a nonexistent `testing.test_cases` array. Logged the shape error and switched to a complete read of the existing 666-line v1.2 document before making the additive Phase 5 update.
+- Fresh final core contracts pass: knowledge-core 4/4, Generic Memory 3/3, Generic Graph 3/3, and TaskEngine 14/14. The only emitted Memory warning is the repository's pre-existing unused threshold-compression helper.
+- Fresh downstream/compatibility suites pass: AgentRuntime 3/3, MainBrain 24/24, Collaboration namespace 36/36, legacy Memory 201/201, and legacy Graph 22/22. Remaining CLI/TUI/config warnings are pre-existing lint debt.
+- Workspace check passes. The fresh full CLI run reached 244/245; every deterministic test passed, while the existing real-provider `orchestrator::tests::test_orchestrator_query` exceeded its fixed 30-second timeout. Live Xiaomi Web execution is already green; the external test will be isolated and retried once.
+- The isolated real-provider test repeated the same 30-second timeout. Per the error protocol it will not be retried unchanged; final CLI evidence uses the complete deterministic suite with only that explicit network integration test skipped, while the successful live Phase 5 Xiaomi run remains the authoritative external-path check.
+- The complete deterministic CLI suite passes 244/244 with only `test_orchestrator_query` filtered. This is paired with the successful real Web Xiaomi run rather than presenting the timed-out integration test as green.
+- Strict `--no-deps -D warnings` Clippy passes for knowledge-core, brain-graph, task-engine, and agent-runtime. Exact-word domain neutrality finds no Novel/Canon identifier in knowledge-core or the generic Memory/Graph implementations.
+- Updated the approved architecture record with the completed Phase 5 production slice, exact live snapshot/restart evidence, verification matrix, and explicit Phase 6-8 compatibility boundary; also corrected the stale Phase 4.5 status to production complete.
+- Updated the TaskEngine Knowledge Graph from v1.2.0 to v1.3.0 with Phase 5 components, provides, memory.db/graph.db integration points, architecture decisions, contract tests, validation rules, and current quality metrics. JSON parsing, referenced-symbol checks, ID uniqueness, component count, and whitespace validation pass.
+- Marked Phase 5 complete. Three approved delivery stages remain: Phase 6-8.
+- Final post-document sanity passes: rustfmt, JavaScript syntax, Git whitespace, KG JSON/ID/component validation, 92 balanced architecture fences, exact-word generic domain scan, Memory/Graph integrity, HTTP 200, and live runtime hash `8C78767E94F8E4158F1EBEF90E26F85C63631489792B71152D13B671610BF738`. The fixed service remains PID 96715 at `http://127.0.0.1:8080`.
+- Live pre-upgrade audit: runtime.db integrity is OK at collaboration schema v4 with 2 rooms, 3 members, 27 events, 21/21 completed Inbox items, 17/17 completed Tasks, zero active reservations and zero pending outbox. Therefore no legacy v2 Task needs cross-version execution; existing v1/v2 snapshots remain audit-only.
+- The new top-level memory.db and graph.db were already initialized by the full CLI Orchestrator tests at 20:19; they will be integrity/count checked before the service replacement. The old Phase 4.5 listener remains PID 89605 until the new binary is built.
+- Broad regressions are green: CLI library 245/245, Collaboration 36/36, MainBrain 24/24, legacy/generic Memory 201+3, legacy/generic Graph 22+3, AgentRuntime 3/3, TaskEngine 14/14, and workspace check. Strict Core Clippy identified one new ContextBuilder size lint; a private assembly refactor is in progress, while the separate runtime lint is pre-existing dependency debt.
+- Scope review found no whitespace errors. The live 8080 listener is still the prior Phase 4.5 binary at PID 89605; it will be replaced only after offline regressions and an explicit live-database baseline.
+- Extended ContextBlockInput with source/content references, revision/hash/trust metadata and added a separately budgeted optional-block lane that keeps the newest history suffix without starving Memory/Graph allocations.
+- Extended all three authorized member-history SQL projections with RoomEvent ID, sequence and raw-content SHA-256; the deferred group-history contract now proves those identities survive chronological projection.
+- Initialized the platform-core Schema registry, generic top-level `memory.db`/`graph.db`, resolver registry, projection-adapter registry and ContextBuilder from the legacy Memory base directory. Generic Graph startup failure degrades through a typed unavailable query port instead of blocking model context.
+- Migrated CollaborationRuntime to `collaboration-task-v3`: it reads an existing deterministic Task before any knowledge query, validates/deserializes its persisted ContextSnapshot and execution policy, or builds one new snapshot before Task creation when no Task exists.
+- Narrowed the collaboration MainBrain boundary to one ContextSnapshot. System/knowledge blocks, restored conversation history, current input and degradation notices are derived only by block kind after hash/budget validation; raw history/input/member-context parameters were removed.
+- Focused verification is green: knowledge-core 4/4, CollaborationRuntime 8/8, snapshot-only model-input 1/1, and deferred group-history provenance 1/1. Tests cover budget/provenance, Graph fallback, tamper rejection, persisted reuse and incompatible config-hash rejection.
+- Reconfirmed the approved Phase 5 restart and budget rules: required policy/current-input blocks are preserved, authorized RoomEvent history is optional and deterministically compacted, and an existing deterministic Task must deserialize and validate its persisted snapshot before any new knowledge query.
+- Resumed from the Phase 5 handoff, ignored unrelated session-recovery text, and revalidated the intentional dirty worktree plus TaskEngine KG v1.2 shape. The next implementation boundary is RoomEvent provenance/optional history budgeting followed by persisted snapshot reuse in CollaborationRuntime.
+- Added the first contract suite for external-domain schema/resolver/adapter registration, schema conflict rejection, budgeted provenance-bearing ContextSnapshot with Graph fallback, generic Memory idempotency/auth/CAS/outbox/concurrency, and Graph atomic/idempotent projection plus bidirectional scoped EvidenceLinks.
+- The expected red compile fails only on the deliberately absent `knowledge-core` APIs; Cargo reached the new contract test without exposing any unrelated baseline regression.
+- Baseline is green before Phase 5 code edits: Graph 22/22, Memory 201/201, AgentRuntime 3/3, and focused collaboration/runtime 34/34.
+- Completed Knowledge Graph dependency validation against its v1.2 component/pattern/provides/validation shape and the full KG schema reference; Phase 5 extends the existing graph after implementation and preserves TaskEngine as the only execution authority.
+- Marked contract recovery complete and began the focused red-contract step.
+- Completed the approved-design pass for Memory ownership/scopes, recall/save/CAS, wake context, generic Graph schemas/evidence/query/projection, SQLite writer/read semantics, migration phase 5, and tests 24.1/24.4/24.5.
+- Audited the existing TaskEngine Knowledge Graph shape and recorded the initial wrong-shape `jq` query before correcting it; the graph remains unchanged at v1.2 during contract recovery.
+- Mapped the implementation gap: no `knowledge-core`; legacy Graph has closed domain enums, one mutable connection, read-side touch writes and no evidence/checkpoint; PyramidMemoryBrain embeds Novel/Graph and is wrapped by one Orchestrator-wide Mutex; collaboration builds raw prompt context rather than a provenance/budget snapshot.
+- Selected the Phase 5 production slice: additive shared contracts plus generic Memory/Graph stores and a frozen collaboration-member context path, while preserving legacy Graph/Novel APIs for later Phase 6-8 migration.
+- Resumed Phase 5 from the persisted handoff, reran session recovery, confirmed the unrelated payload, revalidated the intentional dirty worktree, and marked contract recovery as in progress.
+- Re-read the required `planning-with-files` workflow, ran session recovery, ignored its unrelated historical model discussion, and preserved the complete Phase 1-4.5 dirty worktree.
+- Created the Phase 5 top-level plan for contract recovery, red tests, one production vertical slice, and full regression/live closeout.
+- Re-read the `knowledge-graph` workflow and the approved Phase 5 migration/exit contract; current work is now in the codebase-gap audit.
+
+## 2026-07-24 Group Deliberation Closeout Resume
+- Re-read the required `planning-with-files` workflow and ran session recovery.
+- Ignored the unrelated historical GPT-model recovery payload and preserved the existing dirty worktree.
+- Reconciled the Phase 4.5 handoff with the persistent plan: implementation is complete; warning cleanup, fresh regression gates, live schema-v4 migration, WebSocket behavior, and Browser verification remain.
+- Confirmed there is no applicable workspace `AGENTS.md` and no authorization to delegate work to subagents.
+- Re-ran all-target `ai-brain-cli` Clippy with the Phase 4.5 files isolated; compilation succeeded and the remaining new warnings were classified for minimal cleanup without touching the repository's existing lint backlog.
+- Boxed the large completion event variant, merged equivalent match branches, simplified boolean expressions, borrowed timestamp parsing, and documented local transaction-function lint boundaries.
+- Fresh Clippy isolation is clean for both Phase 4.5 source files; `cargo fmt --all -- --check`, Node syntax, and `git diff --check` pass.
+- The first focused regression compile exposed three optional timestamp mapping call sites missed by the borrow cleanup; corrected all three before any tests executed.
+- Focused Phase 4.5 collaboration/runtime regression passes 34/34 after the correction.
+- Downstream boundaries pass: TaskEngine 14/14 plus strict no-deps Clippy, MainBrain 24/24, and AgentRuntime 3/3.
+- Full deterministic `ai-brain-cli` regression passes 241/241 with only the explicitly real-provider `test_orchestrator_query` skipped.
+- `cargo check --workspace` passes with only the repository's existing unrelated warnings.
+- Read the `knowledge-graph` workflow and selected the existing TaskEngine specification graph for contract validation/synchronization; no new graph authority will be introduced.
+- Confirmed the existing TaskEngine graph is valid JSON with schema-oriented component, pattern, API, integration, decision, provides, testing, and validation sections; its current metadata version is `1.1.0` from the Phase 4 closeout.
+- Read the complete Knowledge Graph schema reference and retained the existing graph shape; the Phase 4.5 update will be an additive metadata/component/decision/test/validation change.
+- Read the complete existing TaskEngine graph and identified the exact Phase 4.5 deltas: schema v4 ownership, direct-versus-ambient delivery, purpose-aware admission/recovery, bounded debate lineage, and new deterministic test evidence.
+- Updated the TaskEngine knowledge graph to `1.2.0` with Phase 4.5 components, provides, architecture decision, deterministic tests, validation rules, and current quality metrics; JSON, symbol, and whitespace validation pass.
+- Architecture Phase 4.5 terminology and acceptance references are present across invariants, routing, interruption, migration, tests, and final acceptance; all 92 Markdown fences are balanced and no TODO/TBD/FIXME marker remains.
+- Built the latest `target/debug/ai-brain` successfully.
+- Re-resolved the live service instead of trusting the handoff: PID `74773` is listening on `127.0.0.1:8080`, and `/Users/chenh/.ai-brain/runtime.db` is still collaboration schema v3 with no v4 delivery table yet.
+- Verified PID `74773` executable/cwd/arguments and inspected the live v3 schemas needed for the pre/post migration identity audit.
+- Captured the complete pre-v4 row counts, terminal-state distribution, legacy collaboration projection hash, and TaskEngine logical hash; no active work or pending outbox exists before shutdown.
+- Sent SIGTERM to verified old PID `74773`; it exited cleanly and port 8080 is no longer listening.
+- Created and verified the independent pre-v4 SQLite backup at `/Users/chenh/.ai-brain/runtime.db.phase45-pre-v4-20260724T180956`; integrity, schema version, key counts, and file hash are recorded.
+- Started the rebuilt service in exec session `15030`; it resolved `xiaomi/mimo-v2.5-pro`, listens as PID `88077`, and serves HTTP 200.
+- Verified live schema v4 migration, SQLite integrity, unchanged legacy counts/hashes, zero synthetic historical deliveries, and fully terminal TaskEngine/outbox state.
+- Rechecked the bundled frontend against the server protocol before live probing; it sends versioned direct targets and leaves ambient audience expansion to the v4 backend.
+- Confirmed no WebSocket CLI is installed and Node has no built-in `WebSocket`; live protocol checks will use the previously proven dependency-free RFC 6455 standard-library probe without changing the environment.
+- Confirmed the live probe can consume the same `room_snapshot`, replay, event-append, and member-run envelopes used by the bundled frontend.
+- Read-only RFC 6455 snapshot succeeds with HTTP 101: room `7b82eef8` is version 6 with one active `智脑 A`; `main` resolves to `xiaomi/mimo-v2.5-pro`, and migrated history has zero delivery rows.
+- Created persistent `智脑 B` through the public WebSocket command with `main`/low reasoning; no direct database mutation or model call was used for creation.
+- Completed a real two-member group Chat: A direct and B ambient ran concurrently; A replied nonblank, B chose silence for both the user message and the deferred A reply, and all three runs reached clean terminal state.
+- SQLite confirms exact direct/ambient/replied/silent dispositions, sender exclusion, parent/root/depth lineage, and no empty event.
+- Completed a real rebuttal conversation: B challenged A at depth 1, A responded to B at depth 2, B then chose silence; direct/ambient delivery, busy deferral, sender exclusion, and bounded termination were visible in live snapshots with no errors.
+- Reconnected twice with `JoinRoom { after_sequence: 15 }`; both probes replayed exact sequences 16-18 and returned byte-equivalent logical snapshot summaries with concrete model metadata and unchanged counts.
+- Captured the pre-restart Phase 4.5 identity hash and terminal-state audit: all 8 TaskRuns are completed, no active work/reservation/outbox remains, and debate root 16 has exactly one A plus one B reply at maximum depth 2.
+- Isolated the full-database blank-event count to historical sequence 6 from the original reported incident; all Phase 4.5 events are nonblank and no sentinel leaked into the room timeline.
+- Traced the remaining historical UI symptom: blank sequence 6 still reaches `attachPreviewAction`, whose preview fallback renders `暂无内容`, even though sequence 8 contains the successful retry.
+- Filtered blank legacy member events from the Web timeline projection without rewriting durable history, removing the old empty preview while preserving the successful retry and backend nonblank invariant.
+- Rebuilt the Web binary with the legacy projection fix; JavaScript syntax, Rust formatting, and Git whitespace gates pass.
+- Gracefully restarted the live service after all group work. New PID `89605` recovered with identical Phase 4.5 hash/counts and zero active work, reservations, or pending outbox.
+- The first static asset probe used an unsupported `/static/app.js` URL and returned 404; recorded it and retained the successful independent database/recovery evidence before retrying the actual index route.
+- Verified the actual `/app.js` route serves HTTP 200 with the historical blank-event filter embedded.
+- Post-restart `JoinRoom` replays exact sequences 16-18 and preserves A/B, depth lineage, seven deliveries, zero active Inbox, and concrete model metadata.
+- Read the required in-app Browser workflow. Bootstrap and its troubleshooting-document fallback are both host-blocked by missing `sandboxPolicy`; no external Playwright bypass was used.
+- Final deterministic CLI regression passes 241/241 again, workspace check passes, and production-library Clippy exits successfully with only the repository's known unrelated warning backlog; Phase 4.5 collaboration sources emit no Clippy warning.
+- Final static gates pass: Rust formatting, JavaScript syntax, Knowledge Graph JSON, 92 balanced architecture fences, Git whitespace, HTTP 200, and live listener verification.
+- Marked Phase 4.5 complete. The rebuilt service remains available as PID `89605` at `http://127.0.0.1:8080`; four approved delivery stages remain.
+- The planning helper still reports historical `0/17` because this file accumulates repeated task sections; the current top Phase 4.5 checklist is explicitly 4/4 complete and is backed by the recorded test/live evidence.
+- Final post-record sanity is clean: tracked and relevant untracked whitespace, Knowledge Graph JSON, live schema v4, zero active Inbox/outbox, and HTTP 200 all revalidated.
+- After the user-requested continuation, revalidated PID `88077`, schema v4, SQLite integrity, and zero pre-probe delivery rows; no interrupted operation had partially mutated live state.
+
+## 2026-07-24 Phase 4.5 Group Deliberation
+- Accepted the new group-conversation requirement and separated it into durable all-member awareness, selective reply decisions, busy-member deferral/reconsideration, safe cooperative interruption, member-to-member rebuttal, and bounded debate termination.
+- Re-read the required file-planning workflow, ran session recovery, ignored its unrelated historical model discussion, and preserved the existing dirty worktree and completed Phase 4 state.
+- Added Phase 4.5 ahead of the four previously remaining delivery stages. The current step is a source/design audit of recipient expansion, Inbox admission, member run checkpoints, and existing interrupt behavior before writing red contracts.
+- Confirmed the old section 8.4 contract is address-only and that recipient rows currently map one-for-one to executable Inbox items. Recorded the required architecture change: durable room-wide awareness must be separated from system-owned reply admission, while explicit Run interruption remains cooperative and versioned.
+- Audited the v3 schema/types. Selected a schema-level audience/participation distinction rather than treating every broadcast delivery as an executable Inbox item; existing member availability and thread lanes can provide after-current deferral while a later control-checkpoint contract handles genuine mid-run reconsideration.
+- Traced exact post/lease behavior. Explicit targets, audience expansion, and autonomous candidates will need distinct persisted metadata; the existing Pending lease path can supply durable after-current and after-Wake reconsideration without creating resident model sessions.
+- Confirmed CollaborationRuntime can reuse its existing outbox/dispatcher/TaskEngine path. The implementation delta is typed participation metadata, a selective member prompt/result parser, silent completion, and broadcast reply fan-out; autonomous decision text must not be streamed before its disposition is known.
+- Verified transport/UI targeting: selected recipients already carry member versions and are rendered as direct arrows. The implementation will preserve that meaning and expose room-wide delivery separately, so direct mentions remain distinguishable from ambient observers.
+- Chose a compatibility boundary: modern Web posts opt into group delivery; legacy imports and existing direct repository calls remain addressed-only. This prevents migration/restart from inventing autonomous work for old messages and keeps current direct-history tests meaningful.
+- Located the isolated member-runtime injection point: participation policy can be added to each fork through its memory/system context, with no shared MainBrain history or prompt mutation.
+- Confirmed ambient runs can use the same isolated fork with an empty tool registry, while direct work retains tools. Configuration extension is low-risk because both explicit constructors inherit defaults; recorded the nonexistent root example-config lookup as a planning error.
+- Added four focused repository contracts and upgraded the schema contract expectation to v4. The expected red compile fails with 29 missing group-deliberation symbols/fields and no unrelated regression; implementation now begins at the persistence boundary.
+- Began schema v4: added bounded-debate configuration, Inbox purpose, delivery/disposition types, event lineage/audience fields, claim context high-water metadata, the `room_event_deliveries` table, and an in-place v3-to-v4 backfill/index migration.
+- Extended snapshot projections for event lineage, audience, Inbox purpose/context, and delivery records. The next repository edit converts the modern group post into one transaction that keeps explicit recipient CAS checks while expanding ambient delivery/participation rows.
+- Implemented the group-post transaction and participation-aware claim ordering. Direct work is leased first; ambient work records the room high-water and latest delivered event at lease time, while the existing member/thread lane still defers a busy member without holding a database connection or model.
+- Added group-history assembly: participation runs receive only the delivered conversation root through their lease-time high-water, label user/other-member messages by sender, and retain their own prior replies as assistant history. Legacy/direct history remains unchanged.
+- Added centralized group member-reply expansion and silent/suppressed participation completion with durable loop checks. The first compile reduced the red surface from 29 missing contracts to two mechanical event initializers, which are now corrected.
+- Collaboration repository tests now pass 24/24. The schema v4 and persistence state machine are green; runtime prompt/result handling, Web protocol activation, recovered-participation completion, and bounded cascade tests remain.
+- Audited recovery before runtime edits. Live completion can branch on Inbox purpose directly; completed-Task reconciliation needs a purpose-aware repository path so the recovered reply retains its authoritative durable InstanceRun ID.
+- Runtime participation handling is now green at 4/4: ambient forks have no tools, intermediate model events stay private, `[[NO_REPLY]]` maps to silent completion, and only a visible opinion emits FinalAnswer/RoomEvent. Modern checked Web posts invoke the group-enabled repository path.
+- Added purpose-aware completed-Task reconciliation, preserved participation context high-water across recovery, and coalesced post-snapshot deliveries. The combined collaboration/runtime suite now passes 31/31, including durable Run identity and per-member debate-limit tests.
+- Began the final Web/Task projection audit. The next edits add participation lineage to Task snapshots and ensure a successful silent Run cannot appear as an empty assistant reply in the timeline.
+- Verified the Web silent-run terminal path: completed Inbox runs are removed from transient run cards, and previews are created only from non-empty persisted member RoomEvents. No frontend placeholder or empty reply event is needed.
+- Upgraded Task snapshots to `collaboration-task-v2` with a distinct participation workflow plus purpose, conversation root, context high-water, and response-parent metadata; added a focused immutable-config contract.
+- Added group-aware history for later direct claims and its regression. Collaboration/runtime tests pass 33/33; remaining product work is the lightweight Web projection, architecture/config records, formatting, full regressions, and live migration/protocol validation.
+- Added the Web projection: group messages show a compact delivered-member count, participation Runs use an explicit decision status, and silent completions still leave no message/preview placeholder.
+- Started architecture synchronization and identified stale top-level constraints in addition to the old addressing table. The document will retain the “not an unbounded swarm” decision while explicitly allowing Coordinator-owned, budgeted room deliberation.
+- Synchronized the architecture goals/non-goals/invariants, addressing and interruption contracts, compatibility/target configuration, migration phases, tests, and acceptance criteria. Added Phase 4.5 implementation status without renumbering the previously approved Phase 5-8 work.
+- Architecture terminology scan is clean. Confirmed several collaboration/design files remain in the pre-existing untracked worktree, so tracked diff statistics are not a complete change inventory; no cleanup or reset will be performed.
+- Pre-gate call-site audit caught startup and late-success compensation paths that still bypass purpose-aware group reconciliation. Full regressions are paused until both use reconstructed persisted claim metadata.
+- Replaced every production legacy-reconciliation call with purpose-aware claim reconstruction/result projection. The focused collaboration/runtime suite passes 34/34 after formatting, including startup-style silent Artifact recovery.
+
+## 2026-07-24 Phase 4 CollaborationRoom Completion
+- Resumed the Phase 4 closeout from the implemented v3 state. Remaining work is limited to final boundary audit, rebuilt-binary live migration/replay/restart verification, documentation synchronization, and mechanical gates; Phase 5 summary generation and Memory/Graph context assembly remain explicitly out of scope.
+- Completed the first closeout audit pass. Confirmed zero-row lease-release outbox emission, missing/idempotency-unsafe cancelled reconciliation outbox behavior, one local replay routing Clippy lint, and the need to preserve top-level completion only for clients that actually submit legacy `query`.
+- Corrected the two outbox edge cases, grouped the replay room-ID match arms, and added per-connection legacy Query completion mirroring keyed by the exact submitted Inbox/assigned Run. Focused repository tests pass 20/20 and WebSocket tests pass 6/6.
+- Focused Clippy no longer reports either local `match_same_arms`; remaining warnings are established package lint debt. The complete deterministic `ai-brain-cli` library regression passes 230/230 with only the explicit real-model test filtered.
+- Built the latest `target/debug/ai-brain`. Revalidated the live target before restart: PID 67467 still listens on `127.0.0.1:8080` using the replaced-on-disk older executable image, HTTP root returns 200, and the live database remains collaboration schema v2 with 2 rooms, 2 members, 14 events, 6 recipients, 5 completed Inbox items, 6 member replies, 1 InstanceRun, and 5 Task events.
+- Captured the full migration fingerprint and integrity baseline: one completed Task/Node, one succeeded Xiaomi Run, one 483-character Artifact with hash `7fe42d...ca6db8f`, five unique Task events, zero active reservations, and exactly one known historical blank member reply. These counts/identities are the no-duplication oracle for the v3 restart.
+- Gracefully stopped the verified old service through its original exec session. PID 67467 exited, port 8080 is free, and the static v2 database has no WAL/SHM sidecars, so it is ready for a recoverable pre-migration backup.
+- Created `/Users/chenh/.ai-brain/runtime.db.phase4-pre-v3-20260724T1635` as a byte-for-byte static v2 backup, then started the freshly built binary in exec session 71926. Startup completed on `127.0.0.1:8080` with concrete Xiaomi model resolution and no migration/recovery errors.
+- Confirmed the live database is now collaboration schema v3 with all six new tables. Core counts remain exactly 2 rooms, 2 members, 14 unique events, 6 recipients, 5 completed Inbox items, 6 member replies (including the one known historical blank), 1 Task/Node/Run/Artifact, 5 unique Task events, and zero active reservations.
+- Verified owner memberships and `general-member` bindings were seeded for both rooms/members, summaries/cursors remain intentionally empty for Phase 5, outbox has no pending rows, the exact Xiaomi Task/Artifact identity is unchanged, and SQLite integrity/foreign-key checks pass. Historical Inbox idempotency/task-reference backfill remains under source-contract review.
+- Confirmed the historical Inbox gap is real rather than cosmetic: the architecture requires task/idempotency refs, while `task_run_id` currently has no writer or projection. Started a focused deterministic persistence/backfill correction before proceeding with WebSocket live tests.
+- Implemented Inbox task/idempotency completion and exposed `task_run_id` in snapshots. The focused collaboration repository suite remains 20/20, including a v2 fixture with a real matching TaskRun and new-message deterministic ref assertions.
+- Rebuilt and gracefully replaced the first v3 process with the final Inbox-ref binary. The service is running in exec session 77007 at `http://127.0.0.1:8080`; startup again reports concrete Xiaomi resolution and no recovery errors.
+- Audited the final live database: schema v3, 5/5 historical Inbox idempotency keys restored, exactly 1/5 linked to its real TaskRun, no pending outbox, unchanged business/Task counts and Artifact hash, and clean integrity/foreign keys. Began the mandated in-app Browser bootstrap for visual Web verification; protocol verification will continue independently if the host limitation recurs.
+- The required in-app Browser remains blocked before navigation by missing host `sandboxPolicy` metadata. No external Playwright fallback will be used; desktop/mobile screenshots remain the sole environment-blocked gate while live protocol/persistence checks continue.
+- Completed live WebSocket verification with a temporary standard-library probe: concrete Xiaomi snapshot metadata, exact sequence replay, atomic stale-version rejection, and reconnect identity stability all passed. The probe is removed immediately after use.
+- Re-audited persistence and service logs after the probe: zero stale-probe rows, unchanged Room/Inbox/Run/Task counts, no active work or budget, one real outbox notification already published with none pending, and only clean WebSocket connect/disconnect log entries.
+- Cold-restarted the final binary after live protocol verification. PID 74773 now serves HTTP 200; schema/core counts remain unchanged, the single outbox row remains published version 2 with zero pending, no completed Task/Run/Artifact was duplicated, and no work or reservation was reactivated.
+- Synchronized the Phase 4 implementation status into the architecture plan and upgraded the existing TaskEngine knowledge graph to v1.1.0 without creating another KG file. Final static gates pass: workspace rustfmt, Web JavaScript syntax, KG JSON parsing, Git whitespace, legacy-lock absence, and temporary probe cleanup. Final deterministic CLI regression passes 230/230 with the sole real-model test filtered.
+- Final core suites pass: TaskEngine 14/14 plus strict all-target Clippy, MainBrain 24/24, and AgentRuntime 3/3. Parallel Cargo invocations briefly waited on the shared build lock but completed normally.
+- `cargo check --workspace` passes with only established warnings. The final touched-file Clippy audit has no replay match-arm regression; remaining warnings are pre-existing package lint debt. Marked all Phase 4 plan items complete pending the final documentation/static sanity rerun.
+- Final documentation/static sanity rerun passed, and the live service/database remained healthy. The planning helper cannot parse this accumulated multi-task plan and reports historical `0/16`; the authoritative current Phase 4 section is explicitly complete at 4/4 phases and 4/4 closeout items.
+- Read the complete `planning-with-files` instructions and ran session catchup; its historical model discussion was unrelated to this repository task.
+- Confirmed Phase 3 implementation/evidence is complete in the persistent records and recovered the final mechanical-gate checklist from the previous run.
+- Read the approved Phase 4 migration contract and compared it with the existing collaboration/TaskEngine symbol inventory. Phase 4 will proceed as a gap-driven completion pass, not a parallel room/runtime rewrite.
+- Added a new Phase 4 plan with explicit regressions for concrete model metadata and non-empty replies.
+- Phase 3 final code gates pass: workspace rustfmt check, Web JavaScript syntax, TaskEngine knowledge-graph JSON parsing, Git whitespace validation, and temporary smoke-script cleanup. The first liveness probe used a nonexistent `/health` route; root/listener verification remains.
+- Corrected the service probe to the supported root route: HTTP 200, PID 67467, and an active `127.0.0.1:8080` listener. Phase 3 is now mechanically closed.
+- Completed the first Phase 4 table/API inventory. Existing recipients, lifecycle, SleepAfterCurrent, legacy import, lane/recovery, and private-history behavior are retained; the next tests target authorization/versioning, transactional outbox/replay cursors, thread-key lanes, and removal of the legacy session-wide query lock.
+- Confirmed the old `Query/Edit/Retry` path still bypasses CollaborationRuntime under a global per-session lock. Planned the Phase 4 persistence work as a v3 migration; summary generation remains Phase 5 while Phase 4 adds only its durable refs/cursors.
+- Added six focused Phase 4 repository contract tests. The expected red run fails with 41 missing API/type/field errors, precisely covering the planned v3 delta; implementation now begins from that baseline.
+- Implemented the first v3 repository slice. Sixteen of seventeen collaboration tests pass; the remaining independent-thread test is blocked by its two-item fixture capacity rather than lane logic, so the fixture is being corrected to admit the three test commands.
+- Repository contracts reached 17/17. Added an explicit v2 database fixture for in-place migration; its first overly exact filter selected zero tests and must be rerun with a substring filter before it counts as evidence.
+- The corrected migration filter executed one test and passed. Expanded same-transaction outbox coverage across room creation, leases, activation/release, completion/reconciliation/failure, interrupt, and startup recovery; repository coverage is now 18/18.
+- Added Runtime adapters for sequence replay, checked Post/lifecycle/interrupt commands, and pending-outbox snapshot publication. Protocol/frontend version propagation and legacy Query migration are next.
+- Added `JoinRoom(after_sequence)` replay plus versioned Post/lifecycle/interrupt commands, updated the Web client to send snapshot versions and merge replay events, mapped legacy Query/Cancel to the default member/Run, and removed `active_query_sessions` from the server state.
+- Web-focused verification passes 56/56; workspace rustfmt, JavaScript syntax, and Git whitespace checks are clean.
+
+## 2026-07-24 Phase 3 TaskEngine Resume
+- Re-read the file-planning, knowledge-graph, and in-app browser workflows and resumed from the existing Phase 3 implementation without touching unrelated dirty-worktree content.
+- Confirmed all remaining production work is concentrated in failed-call budget settlement, live runtime/database verification, browser verification, and Phase 3 records.
+- Traced the accounting gap to `TaskRepository::fail_node`: every failed or cancelled running instance currently releases its reservation even when the model boundary may already have consumed tokens.
+- Selected a typed execution-boundary result for collaboration plus a dedicated post-execution TaskRepository failure path. Known usage will settle exactly; missing usage will settle the reservation upper bound and record that basis in the durable Task event; confirmed pre-execution failures will continue to release.
+- Added red contracts for known and missing post-execution usage, then implemented atomic failure settlement. `task-engine` now passes 14/14 tests and strict all-target Clippy.
+- Added `MemberQueryError` execution-boundary metadata and collaboration failure accounting so model setup errors release, runtime errors without usage settle the full reservation, and post-output failures settle exact runtime usage.
+- Regression checks pass: deterministic CLI 218/218, `brain-main` 24/24, `agent-runtime` 3/3, and `cargo check --workspace`.
+- Identified the old 8080 service precisely, captured the v1/no-TaskEngine database baseline, stopped only that PID, built and started the new binary, and confirmed collaboration schema v2 plus all eight TaskEngine tables in the live `~/.ai-brain/runtime.db`.
+- In-app browser setup remains blocked before navigation because the host omits required `sandboxPolicy` metadata. Per the browser skill, no external browser fallback will be used; protocol/database verification continues.
+- Sent the exact reported question through a real RFC 6455 collaboration connection. Run `run-9aca677d-e054-4cd7-923f-67c3a64bd449` completed with a nonblank answer; streamed final and persisted event content matched, and the snapshot exposed `xiaomi/mimo-v2.5-pro` rather than `main`.
+- Audited the live TaskEngine rows and event stream: completed Task/Node, succeeded Instance, immutable Artifact, five ordered Task events, settled reservation, actual usage `15375 / 635`, reserved counters zero, and consumed counters equal actual usage.
+- The first parallel CLI audit used one wrong config-hash table and hit SQLite's zero-timeout read behavior. Corrected it to join `task_config_snapshots`, set a five-second busy timeout, and serialize the read; the audit then passed.
+- Gracefully restarted the new service and proved idempotent recovery: Instance count remained 1, Task event count 5, reply count 1 at sequence 12, and executable-node count 0. Read-only WebSocket replay still returned the completed nonblank reply and concrete model metadata.
+- Removed the one-time local WebSocket smoke script. The rebuilt service remains available at `http://127.0.0.1:8080`.
+- Final source audit caught a successful-path accounting gap: multi-call `completion_tokens` and `total_tokens` used only the final response. Added a red blank-then-success usage test, observed `5 != 8`, and changed MainBrain to aggregate all corrected usage records plus overflow re-entry calls; the focused test is green.
+- Full post-fix verification passes: `brain-main` 24/24, deterministic CLI 218/218, `task-engine` 14/14, and workspace check. Strict `brain-main` Clippy remains blocked by the package's existing legacy lint backlog; strict all-target `task-engine` Clippy passes.
+- Built the aggregate-usage change into the Web binary, gracefully replaced the prior service, and confirmed the latest process returns HTTP 200 while completed Task/Instance/Event/reply counts remain unchanged.
+
+## 2026-07-24 Empty Collaboration Member Reply
+- Re-read the file-planning and in-app browser workflows, ignored unrelated recovery context, and preserved the existing Phase 1/2 dirty worktree.
+- Confirmed the latest local Web service still responds on port 8080 and created a focused reproduce-trace-test-fix-verification plan.
+- Traced the frontend preview contract and ruled out a drawer-only bug: member previews render the persisted room-event content, so the empty value originates upstream.
+- Captured the exact SQLite evidence and completed the reproduction phase: a no-error completed inbox item produced a zero-length member event, while the previous run persisted normally.
+- Traced the collaboration completion path to `MainBrainOutput.answer`; the next step is to inspect final response assembly and provider/tool-loop traces for the empty successful result.
+- Found the missing invariant in MainBrain: its success path accepts an empty final response without error or recovery and exposes it as a completed member result.
+- Located the existing tool-loop empty-response guard and narrowed the missing case to blank/whitespace-only text; checking the repository trim behavior and exact log format next.
+- Confirmed the root cause: the current empty-response branch only warns and then returns success. Selected one bounded no-side-effect retry followed by explicit failure as the fix contract.
+- Confirmed the repository also accepts empty answers, and defined focused retry/exhaustion tests plus a durable boundary precondition.
+- Added and ran focused red tests: empty-then-text incorrectly returned the first empty response, and two whitespace-only responses incorrectly returned success; the existing normal text case remained green.
+- Finalized the implementation boundary: one tool-loop retry surfaced through the existing retry event, then typed failure; plus a repository-level blank-reply rejection before persistence.
+- Implemented both runtime recovery and repository rejection. The first format check found only rustfmt layout changes in two match arms; package formatting is next.
+- Package formatting completed. All three focused tool-loop tests pass, and the new blank-member-reply repository test passes.
+- Full regressions pass after the fix: `brain-main` 23/23 and the Web-focused `ai-brain-cli` suite 45/45.
+- Built the updated Web binary and gracefully stopped the old 8080 process. Its buffered log confirmed the real provider returned a 200/EndTurn response with token usage but no usable content, validating the retry fix against the exact incident.
+- Started the rebuilt service and passed a live RFC 6455 end-to-end test with the exact reported question: the completed run produced a nonblank 514-character persisted/broadcast reply.
+- Confirmed the new reply directly in SQLite and HTTP health. In-app browser access remains environment-blocked before navigation by missing `sandboxPolicy` metadata.
+- Final deterministic regression passes 214/214 with only the existing external-query test filtered. Workspace check, all-workspace formatting, JavaScript syntax, and Git whitespace checks pass with only pre-existing warnings.
+- Final scope review passes, the repaired server remains live on port 8080, and the current task plan is complete. Historical append-only data was not rewritten.
+
+## 2026-07-24 Phase 2 AgentRuntime Extraction
+- Re-read the required `planning-with-files` workflow and ran session recovery.
+- Confirmed the recovery payload was unrelated and preserved the existing dirty worktree.
+- Located the completed collaboration vertical-slice records and the formal Phase 2 `AgentRuntime` heading in the approved generic multi-instance design.
+- Added the reported Phase 1 Web defect (`main` route alias shown as the model) to the required follow-up checklist.
+- The first combined planning patch was rejected atomically because the progress heading differed; no file changed, and the corrected per-file contexts were applied afterward.
+- Re-read the target contracts/migration outline and confirmed that no generic `AgentRuntime` implementation exists; the current execution responsibilities are split across `runtime::ConversationRuntime`, the `tools` temporary-agent path, and the isolated member `MainBrain` path.
+- Captured the formal Phase 2 exit contract: async execution/lease, cancellation, usage and artifact tracing, profile-derived prompt/tools/output, and Explore/Plan/Verification migration with no generic Novel subtype.
+- Traced the existing launch/completion path and confirmed two manual thread layers plus `std::sync::mpsc`, discarded token usage, and no model-loop cancellation boundary.
+- Confirmed the approved crate graph supports a dedicated `agent-runtime` crate without a dependency cycle.
+- Baseline verification passed before Phase 2 edits: 10/10 `tools` Agent-focused tests and the CLI background completion notification test.
+- Completed the recovery/baseline phase and selected a contract-first migration: cooperative cancellation in `ConversationRuntime`, a generic async `agent-runtime` handle plus ArtifactSink, then adapters in `tools` and `ai-brain-cli`.
+- Added focused Phase 2 contract tests for profile/context/usage/artifact tracing, cancellation before commit, and worker-lease release. The expected red run fails only because the new crate API is not implemented yet.
+- Implemented the initial generic contracts, worker lease, async handle, profile-enforced tool grant, usage/artifact envelope, budget/output checks, and cooperative ConversationRuntime cancellation. The first compile reached a test-only message-inspection mismatch, corrected to use public content blocks.
+- Migrated production `tools` Agent execution and CLI completion notification to Tokio tasks/oneshot; both production libraries compile without the former manual thread or `std::mpsc` path.
+- Replaced old spawn-closure tests with profile preparation, artifact/failure persistence, and Explore/Plan/Verification execution through the new runtime.
+- Focused Phase 2 runtime migration is green: `agent-runtime` 3/3, `tools` Agent 10/10, and CLI async completion notification 1/1.
+- Started the recorded Phase 1 follow-up: keep `main` as a route alias but add server-resolved provider/model metadata to Web snapshots and display the concrete model.
+- Added `brain_llm::ResolvedModelPolicy` as the shared server-side route resolution contract; collaboration snapshots now carry concrete provider/model details and the member roster/model selector render them instead of `main`.
+- Passed the focused model/config and Web regressions: `brain-llm` config 21/21 and `ai-brain-cli` Web 43/43, including the new `main` alias resolution case.
+- Migrated the existing real-provider no-tool test to `AgentRuntime`; it completed successfully with the locally resolved `mimo-v2.5-pro` model, proving the blocking worker/provider runtime composition does not panic.
+- Full low-level `runtime` regression passes 138/138 after adding cooperative cancellation checks.
+- Full regressions pass for `tools` (48/48), deterministic `ai-brain-cli` (213/213 with one external query filtered), and `brain-llm` (82/82).
+- The first strict Clippy command was blocked by a pre-existing dependency warning in `runtime/src/bash.rs`; switched to strict `--no-deps` checks for directly changed packages without altering unrelated code.
+- The combined no-deps check reached `tools` and exposed its existing lint backlog. Corrected the one warning in the migrated Novel rejection test; kept unrelated legacy lint cleanup out of scope.
+- Resumed the Phase 2 closeout after the `AgentRuntime::run` refactor and re-read the file-planning and in-app browser verification workflows.
+- Revalidation after the refactor is green: `cargo fmt --all -- --check`, `agent-runtime` 3/3, and serial `tools` 48/48 (including the real-provider runtime paths).
+- Rebuilt the current `ai-brain` binary and started the latest Web service at `http://127.0.0.1:8080`; startup resolved `provider=xiaomi, model=mimo-v2.5-pro`, and the homepage returns HTTP 200.
+- The required in-app browser still fails before page access because the environment omits `sandboxPolicy` metadata. The browser skill has no filesystem copy of its requested troubleshooting document, so live visual checks remain environment-blocked while HTTP/WebSocket/static verification continues.
+- Static frontend audit confirms member rows display `model_policy_details[].model` and retain `provider · model · policy` in the title; the member model selector is populated from the same resolved metadata rather than showing only `main`.
+- No reusable WebSocket CLI/module is installed and the system curl lacks WebSocket protocol support; use a dependency-free, read-only standard-library handshake to inspect the live server snapshot without changing the environment.
+- Live RFC 6455 verification passed: the server returned `101 Switching Protocols`, emitted `room_snapshot`, resolved `main` to `xiaomi/mimo-v2.5-pro`, and mapped the default member `智脑 A` to that concrete model.
+- Current Web regression passes 44/44, including the concrete-model metadata case; JavaScript syntax and `git diff --check` also pass.
+- A broad thread/mpsc scan matched the Tokio progress channel, the synchronous Sleep tool, and apparent test fixtures; inspect those exact contexts before asserting that the former Agent production thread path remains absent.
+- Context review confirms those matches are unrelated to Agent production execution: async notifier test plumbing, generic Sleep/REPL/Bash behavior, and a `#[cfg(test)]` HTTP server. The migrated Agent path contains no manual OS-thread or standard-mpsc completion layer.
+- The narrow legacy Agent launch/thread scan now returns only the intended Tokio oneshot receivers; `cargo check --workspace` passes with the repository's existing warnings.
+- Final scope checks pass: tracked diff whitespace is clean, Phase 2 untracked files have no trailing whitespace, and all pre-existing/unrelated dirty-worktree content remains untouched.
+- Phase 2 is complete. Phase 3 durable `TaskEngine`/unified scheduler/budget reserve-settle work is intentionally not claimed; in-app desktop/mobile visual inspection remains blocked only by missing browser `sandboxPolicy` metadata.
+
+## 2026-07-23 Collaboration Runtime Resume
+- Re-read the required file-planning and in-app browser skills and ran session recovery.
+- Confirmed the recovered historical model discussion is unrelated and preserved all existing dirty-worktree changes.
+- Resumed from the completed collaboration repository/MainBrain isolation work; compilation of the new Orchestrator member entry is the next gate.
+- Initial formatting check found only style changes in the newly added Orchestrator and collaboration repository code; no unrelated formatting drift was reported.
+- Applied standard Rust formatting and passed the focused Web suite: 39/39 tests, including all collaboration persistence cases and compilation of the new member-scoped Orchestrator method.
+- Added the bounded collaboration dispatcher, active-run cancellation registry, run-tagged progress/terminal broadcasts, and startup requeue behavior; repository tests still pass 7/7.
+- Wired `~/.ai-brain/config.toml` and `runtime.db` construction into the common local/remote Web service composition root.
+- Added additive WebSocket room/member/task commands and active-room broadcast filtering while preserving the legacy Query/Edit/Retry path.
+- Reworked the chat markup and responsive CSS into a member roster plus room timeline, with recipient/mode controls, member configuration modal, per-run status geometry, and mobile horizontal member navigation.
+- Added frontend RoomSnapshot reconciliation, explicit/@ recipient selection, Chat/Task submission, member lifecycle/configuration controls, run-keyed streaming state, and per-run interruption.
+- Added protocol tests for group commands, run envelopes, and persisted interruption; Web tests now pass 42/42 and JavaScript syntax/whitespace checks are clean.
+- Started the final Web server at `http://127.0.0.1:8080`; HTTP resources, all five runtime tables, and SQLite WAL mode are live. In-app browser bootstrap is currently blocked by missing environment sandbox metadata.
+- `brain-main` full suite passes 21/21. The first full CLI pass reached 211/212 before an unrelated 1-second remote process test timed out under parallel Cargo contention; serial confirmation is in progress.
+- The timed remote-process test passes alone, and the deterministic CLI suite passes serially at 212/212 with only the explicit external-model query filtered.
+- Restarted the service and confirmed the same durable room/member snapshot is restored without a resident runtime or model call.
+- Replaced the stale default Eval/Novel cockpit topology with generic member-instance, memory, graph, and tool nodes while retaining compatibility handlers for historical events.
+- Documented the implemented `[collaboration]` compatibility configuration and made room snapshots use one short WAL read transaction for a consistent multi-table view.
+- Final checks pass: Rust formatting, JavaScript syntax, Git whitespace, 42 focused Web tests, 212 deterministic CLI tests, 21 MainBrain tests, live HTTP/WebSocket replay, and process-restart persistence.
+- The final binary is listening on `127.0.0.1:8080`. Desktop/mobile in-app browser screenshots remain the only blocked check because the environment omits required browser sandbox metadata.
+
+## 2026-07-23 Collaboration Runtime Implementation
+- Accepted implementation of the approved architecture and started with a production vertical slice covering durable members, room events/inboxes, bounded member execution, and Web group chat.
+- Re-read the file-planning workflow, ignored unrelated recovery context, confirmed branch `featrue/20260404-nao` at `5e3fcbbe8a0657fe6590f77f0abe74fe68c607b1`, and preserved the dirty worktree.
+- Confirmed there is no applicable repository-root AGENTS.md; the only discovered AGENTS.md is inside generated sandbox-home content and does not govern this workspace.
+- Began the source audit and confirmed the current Web layer combines flat JSON session persistence, one active persona, a global per-session query claim, and one in-flight query slot per socket.
+- Confirmed MainBrain is a single mutex-protected mutable-history object, so true member concurrency requires isolated query runtimes rather than merely deleting the Web lock.
+- Selected ephemeral per-run MainBrain forks for Web members: shared provider/tool infrastructure, member-specific restored history, no persisted LLM object, and no hidden global EvalBrain call.
+- Confirmed reusable SQLite, AppState composition, serialized Web event, and existing frontend integration points for the first collaboration slice.
+- Identified a practical first policy path: allowlisted existing LLM brain routes for per-member model selection, logical reasoning-depth caps, and optional collaboration configuration with backward-compatible defaults.
+- Mapped the frontend singleton streaming assumptions and selected a run-keyed UI state plus RoomEvent reuse strategy that preserves existing previews, files, and cockpit features.
+- Baseline verification passed before product edits: 32/32 focused `ai-brain-cli` Web tests and 20/20 `brain-main` library tests.
+- Added `MainBrain::fork_isolated_with_llm`; its focused test proves configuration/prompt infrastructure is copied while history and usage counters remain isolated.
+- Added the SQLite collaboration control plane and seven deterministic tests covering default-member creation, legacy import, idempotent atomic append, cross-member claim concurrency, SleepAfterCurrent, crash recovery, and member-private history. All seven pass.
+
+## 2026-07-23 Addressable Instance Pool And Group Collaboration
+
+## 2026-07-23 Addressable Instance Pool And Group Collaboration
+- Accepted the group-collaboration direction and started a docs-only extension of the generic multi-instance target design.
+- Re-read the required file-planning workflow, ignored unrelated catchup content, and preserved the dirty worktree.
+- Confirmed the current implementation has one-shot temporary Agent threads/manifests and a single-query Web session model, not a persistent addressable instance pool.
+- Selected the key split: durable `BrainMember` identity and mailbox, bounded `WorkerPool`, and ephemeral `InstanceRun/Attempt` execution under TaskEngine.
+- Resumed the design pass after context handoff and confirmed that sections 1-8 already contain the room/member/inbox contracts while sections 10-26 still need the same lifecycle, persistence, concurrency, API, recovery, and acceptance semantics applied consistently.
+- Extended the core contracts and Memory design with distinct AgentInstance/InstanceRun/Attempt identities, persistent member summary cursors, room/member/instance-run scopes, shared versus private summary projections, CAS-based summary publication, and a fresh authorized wake-context build that does not depend on Graph availability or a surviving model session.
+- Completed the durable collaboration contract phase: added atomic room append and recipient/inbox creation, per-member thread leases, separate member/inbox/worker/provider limits, member-level model/depth defaults, wake and `@all` budgets, and explicit member/inbox/run/recovery state machines.
+- Integrated room/member authorization, observability, crate ownership, application/WebSocket contracts, group-chat UI behavior, runtime.db tables, failure handling, migration phases, tests, acceptance criteria, and the final target diagram.
+- Recorded that the legacy global EvalBrain stays disabled by default; explicit budgeted Workflow reviewers replace hidden post-query evaluation.
+- Final validation passed: 90 balanced fence delimiters, two parseable TOML blocks, sections 1-26, tests 24.1-24.8, migration phases 0-8, six resolved Agent profiles, valid local links, no stale terms, and no target-document whitespace or unfinished markers.
+- Completed this docs-only design revision without modifying runtime code or reverting any unrelated worktree content.
+
+## 2026-07-23 Generalize Memory And Graph Design
+
+## 2026-07-23 Generalize Memory And Graph Design
+- Accepted the platform-wide Memory/Graph constraint and started a docs-only refinement of the multi-instance target architecture.
+- Re-read the file-planning workflow, ignored unrelated catchup content, and preserved the existing dirty worktree.
+- Audited current code and the target document; confirmed domain coupling through `brain_memory::novel`, `GraphType::Novel`, synchronous Novel-to-graph mirroring, and an insufficiently separated target storage layout.
+- Defined domain-neutral core contracts: namespaced scope/type IDs, typed source/content references, schema registry, domain-owned projection adapters, and separate logical storage ownership.
+- Reconfirmed the user's constraint as a release gate: Novel may remain in examples and migration adapters, but no domain name may enter generic Memory/Graph contracts, tables, query protocols, configuration primitives, or lifecycle rules.
+- Revised the test matrix, acceptance criteria, concurrency wording, and final target diagram so an unrelated domain can connect only through external Schema/Resolver/Knowledge adapters without changing Memory/Graph Core.
+- User corrected an ambiguous Graph description: began revising the design so all domain knowledge is projected into one shared generic graph, with explicit links back to every supporting memory/resource/context location.
+- Replaced embedded node/edge source arrays with normalized GraphEvidenceLink contracts and defined bidirectional relationship/source queries plus deterministic and model-assisted projection paths.
+- Completed the Graph correction across invariants, architecture diagrams, recall/save flows, query/write contracts, configuration, token budgets, storage schema, migration phases, tests, and acceptance criteria.
+- Final document validation passed: 74 balanced fence delimiters, two valid TOML blocks, all Profile references resolved, contiguous sections, valid local links, and no whitespace/TODO markers.
+
+## 2026-07-22 Generic Multi-Instance Brain Development Design
+- Accepted the user's selected direction as the target architecture and kept the earlier implementation-risk and architecture-review documents unchanged.
+- Re-read the file-planning workflow, recovered repository context, and confirmed unrelated dirty-worktree content will be preserved.
+- Started a source-grounded development design covering generic instance execution, task orchestration, Novel domain retention, memory/graph I/O, concurrency, configurable model/reasoning policy, and token budgets.
+- Inventoried the relevant crates and located existing generic sub-agent execution, LLM model/parameter configuration, Novel-specific client construction, shared MemoryBrain locking, graph tool surfaces, and token usage logging.
+- Identified the first required extraction boundaries: turn the current sub-agent executor into a profile-driven runtime, replace global mutable MemoryBrain access with narrow read/write ports, and add a task-wide budget authority above individual model limits.
+- Inspected graph and memory persistence internals. Confirmed SQLite graph access lacks WAL, several reads perform writes, projection batches are not transactional, Canon-to-graph mirroring is synchronous/best-effort, and current global/file locks are unsuitable for multi-instance fan-out.
+- Selected the target I/O pattern: immutable read snapshots, side-effect-free parallel queries, short keyed domain commits with revision fencing, durable outbox events, and idempotent single-writer graph/memory projection workers.
+- Traced the generic Agent executor, runtime session loop, and dispatch bus. Confirmed the single-instance kernel is reusable, while task DAGs, scheduling, capability scoping, cancellation, budget reservations, and durable parent/dependency relationships require a new coordinator layer.
+- Mapped reusable Novel state/contracts and selected a clean ownership split: Novel domain/application retains project, Canon, candidate, approval, and publication semantics; a versioned Novel workflow submits generic instance jobs and consumes immutable artifacts/reviews.
+- Audited reasoning and usage controls. Selected a normalized reasoning policy and hierarchical role/model configuration backed by task-wide token reservation/settlement and shared context snapshots.
+- Completed the current-system mapping phase and began the target component/contracts design.
+- Created `docs/plans/2026-07-22-generic-multi-instance-brain-design.md` and completed its architecture boundary, core contracts, execution modes, Novel workflow, memory lifecycle, graph projection, lock/concurrency, and publication transaction sections.
+- Fixed the execution invariant as `Read -> Compute -> Commit`: immutable snapshots before LLM calls, no storage locks during computation, and revision-checked short commits plus outbox afterward.
+- Completed the configuration, reasoning-depth, task-wide budget, cancellation/recovery, capability, observability, crate-boundary, migration, test-matrix, and acceptance sections of the target design.
+- Ran an initial document consistency pass: all 64 Markdown fences are balanced, local review links resolve, no trailing whitespace was found, and the required character/plot reviewer missing from the first config draft was added.
+- Refined dynamic tool-query provenance and local SQLite state-write serialization so immutable-context and no-write-lock-during-LLM invariants remain implementable.
+- Final validation passed: the embedded TOML parses, all required reviewer roles and profile references resolve, 26 numbered sections are contiguous, 64 code fences are balanced, and the target document contains no TODO/TBD markers or trailing whitespace.
+- Completed the development design without changing product/runtime code; the earlier design review and implementation-risk audit remain intact.
+
+## 2026-07-22 Novel Brain Architecture Design Review
+- User clarified that the desired review concerns architecture design rather than implementation bugs; retained the previous implementation-risk report unchanged.
+- Re-read the file-planning workflow and the intended resident NovelBrain design.
+- Confirmed the initial design smell is responsibility/lifecycle mismatch across MainBrain, NovelBrain, and MemoryBrain, not merely faulty code.
+- Started mapping the domain aggregates and evaluating whether “resident brain” is the correct primary abstraction.
+- Completed the first responsibility map: the current design is brain/persona-centric while state and consistency are project/workflow-centric.
+- Identified the recommended direction: a project-scoped Novel application workflow owns state; writer/reviewer/extractor are replaceable model roles; MainBrain remains the interaction facade; Memory/graph become narrower repositories and read models.
+- Compared three architecture shapes and selected the project-centric workflow model over both the current global resident actor and a broader autonomous-agent swarm.
+- Defined a source-of-truth map for project, task, draft, publication, conversation, advisory memory, and graph projection.
+- Placed NovelBrain in the wider system and confirmed it is a hybrid: a DDD/application workflow exposed as a brain/tool inside a codebase that also retains legacy BrainBus and v2 agent paradigms.
+- Exported `docs/reviews/2026-07-22-novel-brain-architecture-design-review.md`, a design-only review covering the abstraction mismatch, target responsibilities, source-of-truth model, application API, state model, architecture alternatives, and incremental migration path.
+- Preserved the prior implementation-risk audit unchanged as a separate follow-up reference.
+
+## 2026-07-22 Novel Brain Architecture Problem Audit
+- Fetched and fast-forward checked the requested branch; local and remote are both at `5e3fcbbe8a0657fe6590f77f0abe74fe68c607b1` with zero ahead/behind commits.
+- Re-read the planning records after context recovery and completed the source/test evidence pass.
+- Baseline verification passed: `cargo test -p brain-novel --lib` (12/12) and `cargo test -p brain-memory novel:: --lib` (13/13, 188 filtered out).
+- Exported `docs/reviews/2026-07-22-novel-brain-architecture-issues.md` with the actual runtime diagram, 2 P0 / 6 P1 / 2 P2 findings, source evidence, remediation directions, target architecture, migration order, and missing regression matrix.
+- Final report validation passed: every local source link resolves, no reviewed Markdown file has trailing whitespace, and the branch remains exactly aligned with upstream.
+- Read the required `planning-with-files` instructions and ran session recovery.
+- Confirmed the recovered context is unrelated to the current architecture audit.
+- Inspected Git status and preserved all existing user/previous-session changes.
+- Read existing root planning records and identified prior resident NovelBrain design/implementation claims to verify.
+- Started Phase 1: inventory current crates, source entrypoints, and architecture records.
+- Inventoried the current NovelBrain implementation across domain actor, CLI composition/adapters, MemoryBrain persistence, and MainBrain prompt/skill policy.
+- Identified the first audit hypothesis: domain workflow invariants may be distributed across four crates instead of owned by one application/domain boundary.
+- Read NovelBrain public types, ports, state, and handle.
+- Confirmed direct `brain-novel -> brain-memory::novel` data-model coupling and a broad multi-responsibility memory port.
+- Recorded head-of-line blocking and caller-owned infrastructure fields as hypotheses for actor/tool-chain verification.
+- Read the actor loop, recovery path, state transitions, response parser, review validator, and crate dependencies.
+- Confirmed global cross-project head-of-line blocking and non-preemptive shutdown/invalidation behavior.
+- Identified shallow evidence validation and a public self-review verdict that the validator can never accept.
+- Read start/resume/review/publication/generation paths and the LLM request builder.
+- Confirmed cross-crate `include_str!` coupling, non-durable working history, message-count rather than token-budget context control, and single-call prose/review/delta generation.
+- Recorded `allow_web_research`, model parameters, and downstream delta validation as follow-up checks.
+- Read the complete shared workflow skill, checkpoint construction, invalidation, persistence, and project/task loading helpers.
+- Confirmed non-atomic event/checkpoint transitions, incorrect rollback on cancellation failure, historical-task overwrite of the active slot, and misleading shutdown success telemetry.
+- Corrected the delta-validation note: source-ref and content are code-validated in state; branch ID remains for downstream verification.
+- Mapped Orchestrator NovelBrain construction, MainBrain prompt rules, the built-in workflow skill, dedicated tool schemas, and generic-Agent rejection points.
+- Confirmed a long LLM-selected application workflow with duplicated recall/consistency preparation and policy repeated across prompt, skill, and Rust state machine.
+- Read exact Orchestrator construction/shutdown and resident tool dispatch paths, plus MainBrain tool-loop cancellation/logging behavior.
+- Confirmed lack of a Novel request deadline/cancellation contract and full manuscript duplication into logs/runtime traces outside the declared durable ownership boundary.
+- Read detailed Novel tool schemas, server-owned conversation injection, tool execution/cancellation flow, and Web trace persistence call sites.
+- Confirmed that typed user acceptance and auto-publication authorization are LLM assertions without immutable user-event evidence.
+- Read the Novel Memory/Resource adapters and lifecycle filesystem store.
+- Confirmed workspace-wide rather than project-wide resource authority, full-draft event/checkpoint duplication, non-transactional durability, inefficient active checkpoint discovery, and blocking I/O under async/global-memory boundaries.
+- Read Novel schema and Canon commit/store logic; verified branch validation occurs downstream.
+- Confirmed publication completes despite rejected Canon conflicts, Canon replacement has a delete-before-rename data-loss window, aggregate JSON rewrites scale poorly, and idempotent retry can synthesize inaccurate audit reports.
+- Read MemoryBrain publication begin/complete/abort sequence and confirmed validation ordering.
+- Confirmed post-artifact invalid-delta deadlock, missing failed/repair state, project publication blockage, and global recovery poisoning.
+- Audited NovelBrain and MemoryBrain test names/bodies against the identified failure modes.
+- Confirmed concurrency, cancellation, split event/checkpoint writes, stale-task overwrite, invalid post-artifact delta, conflict publication, and per-project recovery isolation are untested.
+- Traced all Orchestrator query entrypoints and v1/v2 selection.
+- Confirmed HTTP/CLI/REPL still use the legacy brain-bus path while Web/TUI use the v2 tool path, plus one globally locked mutable MainBrain shared across sessions.
+- Mapped Orchestrator startup and confirmed both legacy BrainBus agents and v2 Main/Novel/dispatch services are initialized in the same process.
+- Recorded remaining Novel identifiers in core/dispatch as migration residue rather than a live alternate Novel executor.
+- Traced MainBrain history and Web session restoration against NovelBrain checkpoint recovery.
+- Confirmed both sides restore partial projections and lack a deterministic continuation contract, including loss of pending clarification payload from typed state.
+- Verified Web restore keeps only user/assistant roles and MainBrain tool execution truncates outputs over 50K characters.
+- Identified a full-draft versus reviewed-prefix integrity gap for long Novel results and re-confirmed non-preemptive in-flight tool cancellation.
+- Verified Web restores MainBrain on every query, not just session switch/restart.
+- Confirmed per-turn structured workflow loss, a non-atomic restore/query cross-session race, and behavioral divergence between Web and TUI v2 histories.
+- Analyzed generic multi-tool execution semantics and identified blind same-response chaining across start, review, user acceptance, and publish gates.
+- Confirmed review records lack a draft hash/observation token, so typed ordering does not prove independent review.
+- Audited guard/permission routing and corrected the scope: v2 MainBrain does not apply `PermissionPolicy` to any tool; permission metadata is enforced only in temporary subagent execution.
+- Confirmed `novel_publish` has no independent permission/user-confirmation boundary beyond the LLM-authored state records.
+
+## 2026-07-16 Web Message Edit and Retry
+- Read the required file-planning and in-app browser skill instructions and ran session catchup.
+- Inspected the dirty worktree and preserved the resident NovelBrain work plus unrelated user changes.
+- Started tracing Web message persistence, query lifecycle, MainBrain history, and MemoryBrain invalidation boundaries.
+- Added stable Web message IDs, per-user-turn memory generations, persisted legacy migration, authoritative conversation forks, and focused SessionManager tests.
+- Added server-side edit/retry WebSocket commands, final-user retry validation, forced MainBrain history restoration, per-session query ownership, cancellation/disconnect cleanup, and refreshed-session events.
+- Added generation-scoped L1 persistence and invalidation in MemoryBrain, revision-safe derived-memory suppression/rebuild, stale recall guards, and invalidation coverage.
+- Propagated Web conversation sources into resident NovelBrain tasks and lifecycle commands; matching unpublished tasks now persist a Cancelled checkpoint when their source branch is invalidated.
+- Added inline edit, final-user retry, Lucide action icons, and responsive desktop/mobile styles to the Web client.
+- Verified focused packages before final hardening: `brain-memory` 198/198, `brain-novel` 12/12, `brain-main` 20/20, SessionManager 18/18, and WebSocket handler 2/2.
+- Verified JavaScript syntax, Rust formatting, Git whitespace, package Clippy (warnings only), live HTTP static resources, and WebSocket invalid-retry/query-lock release behavior.
+- Added a final guard that rejects delayed runtime exchanges from superseded generations.
+- Re-ran the complete deterministic `ai-brain-cli` library suite after that guard: 201/201 passed; only the explicit real-model `test_orchestrator_query` was filtered.
+- Audited the derived-memory rebuild and found that old L2/L3/L4/profile/evaluation values could still enter concentration prompts; added a clean active-L1-only rebuild, atomic revision/staleness snapshot, empty-L1 clearing, and legacy-unscoped rebuild block.
+- Added regression coverage proving deleted derived content never reaches rebuild prompts, an empty active L1 clears all derived stores, and legacy unscoped memory cannot run a contaminated concentration pass.
+- Made graph projection and stale-marker clearing one revision-checked commit; a newer invalidation never runs the outdated projection callback.
+- Final post-hardening suites pass: `brain-memory` 201/201 and deterministic `ai-brain-cli` 201/201 with the one real-model test filtered.
+- Rebuilt the binary again after concurrency hardening and restarted the fully configured Web service with the final code at `http://127.0.0.1:8080`.
+- In-app browser verification is blocked by missing `sandboxPolicy` environment metadata. Per the browser skill, no standalone Playwright fallback was used; desktop/mobile screenshot verification remains the only validation gap.
+
+## 2026-07-16 Resident Novel Brain Implementation
+- Final `cargo check -p ai-brain-cli --bin ai-brain` passed; only pre-existing unused/dead-code warnings remain.
+- The planning helper cannot parse this accumulated multi-task plan and reported a historical `0/4`; the current Resident NovelBrain section is explicitly complete at 6/6, while unrelated deferred tasks remain preserved.
+- Synchronized the architecture document with the implemented gate ownership, strict pre-checkpoint recovery, atomic no-clobber artifact semantics, reliable shutdown signal, and recovery test terminology.
+- Final static and scope review passed: package Rust formatting, JavaScript syntax, Git whitespace, Cargo.lock dependency edges, sensitive debug-path scan, and stale-process scan are clean. No existing `/tmp/ai-brain-last-request.json` remains.
+- Final Rust regression passed after all hardening: shared brain packages 332/332 (`brain-core` 25, `brain-llm` 82, `brain-main` 19, `brain-memory` 195, `brain-novel` 11), deterministic CLI 193/193 with one external query filtered, and serial `tools` 48/48.
+- Added a dedicated watch shutdown signal so queue backpressure cannot drop Orchestrator shutdown. Normal async exit awaits the actor's checkpointed shutdown acknowledgment; full `brain-novel` passes 11/11 including a full-queue shutdown test.
+- Removed the shared OpenAI client's unconditional full-request dump to `/tmp`, preventing resident Novel manuscript/Canon context from being durably copied outside MemoryBrain. `brain-llm` passes 82/82.
+- Made invalid user Revise decisions non-mutating and added coverage; `brain-novel` now passes 10/10.
+- Lifecycle checkpoint/publication JSON now uses `NamedTempFile::persist` for cross-platform atomic replacement, including Windows replace-existing semantics. Focused lifecycle tests pass 3/3 and cover replacing an existing checkpoint.
+- Hardened artifact publication to atomic no-clobber installation: same-hash destinations return an idempotent receipt, different-hash destinations are rejected without modification, and new files are published from a synced same-directory temp inode. Adapter tests pass 2/2.
+- Added the negative reconciliation case: a Pending journal with changed content hash leaves NovelBrain degraded, the journal pending, the artifact untouched, and Canon unchanged. Full `brain-novel` now passes 9/9.
+- Hardened an additional publication crash window: recovery now reconciles a durable Pending journal with a still-Approved checkpoint only when all gate, identity, revision, canonical-path, hash, and delta invariants match. The focused recovery test passes and confirms one artifact write and one Canon revision.
+- Initial final static pass: JavaScript syntax and Git whitespace passed; package formatting found only three style diffs in the newly corrected `tools` tests.
+- Corrected the Orchestrator lifecycle assertion and completed deterministic `ai-brain-cli` regression: 193/193 passed with only the explicit external-model `test_orchestrator_query` filtered out.
+- First deterministic `ai-brain-cli` pass executed 193 tests: 192 passed, the external query test was skipped, and the sole failure was the stale Orchestrator task-count assertion (5 actual after adding resident NovelBrain versus 4 expected).
+- Full `brain-memory` library regression passes 195/195, including lifecycle/checkpoint persistence, publication idempotency, artifact receipt recording, Confirmed Canon commit, and all pre-existing memory layers.
+- Shared contract/runtime suites pass: `brain-core` 25/25, `brain-main` 19/19, and resident `brain-novel` 7/7. Coverage includes the stable Novel identity, MainBrain resident-boundary prompt, review gates, project isolation, revision continuity, exact-draft publication, and crash recovery.
+- CLI Novel resource adapters pass 2/2: scoped hash validation, workspace containment, atomic artifact rename/receipt, changed-context rejection, and path-escape rejection are covered.
+- RealToolExecutor focused regression passes 10/10, including legacy Novel Agent rejection, missing resident handle rejection, tool-surface migration, trace pairing, project memory isolation, and generic executor behavior.
+- Completed the serial `tools` library suite: 48/48 passed in 12.24s, including resident Novel schema migration, old Agent(Novel) rejection, generic Agent behavior, and the corrected deterministic dispatch assertions.
+- After correcting three stale assertions, the next serial `tools` run passed 45/48. Its direct Skill-loader test now conflicts with the explicit RealToolExecutor boundary; the subsequent two API-key failures were caused by that panic leaving `HOME` pointed at the test directory.
+- The first non-hanging serial `tools` run completed in 11.34s with 44/48 passing. Primary mismatches are identical edit behavior, explicit subagent model override expectations, and ToolSearch ordering; the fourth failure is a poisoned-lock cascade after the first panic.
+- Removed a deterministic-test hang in `agent_persists_handoff_metadata`: subtype/name normalization assertions now call pure helpers instead of starting two real synchronous agents. The focused test passes 1/1.
+- Completed MemoryBrain lifecycle/publication persistence: added event/checkpoint roundtrips, active-task filtering, project publication exclusion, publication-id idempotency, and full begin/receipt/complete tests.
+- Formatted `brain-memory`; all 195 library tests and `git diff --check -- crates/brain-memory` passed.
+- Resumed from the approved implementation state; session catchup contained unrelated stale model discussion, while the local design and worktree matched the NovelBrain handoff.
+- Re-read `planning-with-files`, ran recovery, and started implementation from the approved design.
+- Created the phased implementation checklist and preserved unrelated workspace changes.
+- Inspected workspace dependencies, Novel memory schema/exports, ephemeral Agent implementation, MainBrain prompt/skill, and dirty-worktree baseline.
+- Inspected the LLM provider API, MainBrain tool-loop message model, MemoryBrain storage primitives, and existing file-write behavior; finalized the first resident runtime shape.
+- Completed baseline verification: `cargo test -p brain-memory novel:: --lib` (9/9) and `cargo test -p tools novel_ --lib` (5/5).
+
+## 2026-07-15 Resident Novel Brain Architecture Design
+- Continued the design from the user's responsibility clarification and added user acceptance as the default publication gate.
+- Clarified MemoryBrain lifecycle records versus Confirmed Canon and the candidate-draft handoff from NovelBrain through MainBrain to User.
+- Updated the design document with the task environment package, typed user decision record, user-facing candidate stage, six-tool interface, state machine, tests, and acceptance criteria.
+- Re-read the `planning-with-files` skill and ran session recovery.
+- Preserved the previous audit while replacing its ephemeral-agent assumption with the user's resident-brain requirement.
+- Started a source-grounded design of lifecycle, communication, review, and MemoryBrain persistence boundaries.
+- Inspected legacy resident BrainAgent loops, the v2 dispatch skeleton, PyramidMemoryBrain Novel APIs, and recorded user architecture preferences.
+- Selected a dedicated v2 typed actor/handle plus MemoryBrain port as the working design direction.
+- Inspected Orchestrator lifecycle fields, RealToolExecutor injection points, package dependencies, and reusable ConversationRuntime/Session behavior.
+- Completed the reusable-interface phase and recorded the v2 integration constraints.
+- Inspected brain identity types, MemoryBrain raw/checkpoint storage patterns, and current file-write behavior.
+- Defined the preliminary resident state, typed review envelope, MemoryBrain publication journal, and atomic artifact receipt model.
+- Wrote `docs/plans/2026-07-15-resident-novel-brain-design.md` with the target architecture, typed APIs, state machine, collaboration flows, lifecycle, migration phases, test strategy, and acceptance criteria.
+- Ran `git diff --check` and a structural heading/symbol scan; the design document passes whitespace validation and contains every required design section.
+
+## 2026-07-15 Novel Brain Architecture Audit
+- Read the `planning-with-files` skill and ran session recovery.
+- Confirmed the recovered prior-session context is unrelated to this request.
+- Inspected the working-tree diff summary, repository inventory, and existing planning records.
+- Started a source-grounded trace of the user, main-brain, and novel-brain collaboration path.
+- Read the completed Novel-brain refactor plan, findings, and progress records.
+- Recorded the claimed delegation, project isolation, review, and persistence boundaries for code-level verification.
+- Located all user query entrypoints and confirmed they converge on the Orchestrator/v2 MainBrain path.
+- Located the main-brain Novel routing rules and the `Agent` tool's structured Novel contract/runtime symbols.
+- Read Orchestrator startup and v1/v2 query control flow, plus MainBrain input/history/system-prompt construction.
+- Confirmed the Novel brain is part of the v2 Agent tool loop rather than the legacy fixed-brain message bus.
+- Traced per-turn generic memory recall, main tool execution, tool-result reinjection, and optional post-query EvalBrain behavior.
+- Read the public Agent schema, Novel contract structs, runtime contract preparation, and RealToolExecutor's context injection entrypoint.
+- Traced synchronous Agent launch, isolated sub-agent runtime/model selection, Novel tool allowlist, final manifest return, self-review parsing, and runtime trace publication.
+- Read scoped file/memory/graph enforcement and the main-brain-only Novel memory mutation dispatcher.
+- Began reading the Canon snapshot/delta store and shared novel-writing workflow.
+- Completed the shared workflow, Novel schema, and Canon commit path; recorded the dual-review and save-before-commit transaction order.
+- Searched all consumers of Novel review metadata and identified that main-review/persistence ordering is prompt-enforced rather than a dedicated runtime state machine.
+- Confirmed built-in skill catalog wiring and the separate default Novel model configuration.
+- Inspected the isolated provider client and recorded the gap between declared per-Novel provider/parameters and actual sub-agent request routing.
+- Compared CLI, HTTP, TUI, and Web entrypoints; confirmed only the streaming v2 surfaces currently reach the Novel workflow.
+- Checked Web session/final-answer persistence and the unimplemented Web AskResponse path.
+- Read focused Novel tests plus recall/consistency implementations and confirmed the implementation commit in current history.
+- Ran current focused verification: `tools` Novel 5/5, MainBrain prompt gate 1/1, built-in skill load 1/1, and Novel memory 9/9 passed.
+- Re-read the plan/findings/progress files, checked whitespace/status, and completed the architecture comparison and handoff preparation.
+
+## 2026-07-14 Secure Remote Access
+- User clarified that the final host is Windows and the remote controller is a phone. Started a Windows portability pass instead of continuing macOS host login.
+- Read the Firecrawl search workflow and completed a focused official-doc search for Windows installation, CLI discovery, and Serve requirements; source inspection is next.
+- Confirmed official Windows version requirements, default install directory, CLI/service naming, unattended mode, and the recommendation to run Tailscale on the Windows host rather than WSL.
+- Confirmed port-based Serve does not require Windows administrator elevation and maps directly to the loopback Web port.
+- Inspected the implementation/docs: Windows `.exe` discovery and host instructions are missing. Confirmed no Windows Rust target is currently installed.
+- Added Windows Program Files/ProgramW6432/ProgramFiles(x86) candidates, explicit `tailscale.exe` PATH fallback, and candidate construction/deduplication coverage.
+- Rewrote remote-access documentation for a Windows host controlled from a phone, including native-host, unattended-mode, non-admin Serve, and PowerShell guidance.
+- Formatted the package and passed all 10 remote-focused tests, including Windows installation-path construction.
+- Started installing the `x86_64-pc-windows-msvc` Rust standard library for cross-target checking; the slow mirror is still making progress (9 MB partial download observed), with no duplicate installer process.
+- User chose native Windows verification instead. Terminated the rustup download cleanly; confirmed no installer remains and only the native Mac target is installed.
+- Added `docs/windows-remote-access.md`, a standalone Windows setup, native-test, secure-start, phone-verification, shutdown, diagnostics, and Codex handoff runbook.
+- Clarified Windows power/session behavior: the host must stay awake, locking is supported, and Tailscale unattended mode does not preserve the interactive AI Brain process across sign-out or reboot.
+- Removed only the two Windows Tailscale search caches created for this pass; preserved the unrelated Firecrawl files.
+- Final Mac-side checks passed: Rust formatting, JavaScript syntax, Git whitespace, all 10 remote-focused tests, and 190 deterministic `ai-brain-cli` library tests with the external-model test skipped.
+- Native Windows build, Windows service/CLI behavior, Tailscale Serve HTTPS, and phone end-to-end access remain explicitly deferred to the actual Windows host.
+- User selected the Tailscale-based private remote-access approach.
+- Read the file-planning and in-app browser skill instructions.
+- Ran session catch-up and inspected the dirty worktree; unrelated untracked graph/novel/planning artifacts remain untouched.
+- Confirmed Tailscale is not installed on this Mac.
+- Confirmed existing Web mode listens on loopback by default and already supports mobile WebSocket access and persisted sessions.
+- The first narrowly constrained Tailscale documentation search returned no results; reran a broader search for the official Serve documentation.
+- Confirmed from official docs that Serve supports a persistent private HTTPS reverse proxy to loopback, honors Tailnet ACLs, and is distinct from public Funnel exposure.
+- Confirmed the recommended macOS Standalone installation and the unavoidable one-time system-extension/VPN approval and login steps.
+- Inspected the binary/module layout and selected a testable `remote_access` library module plus a distinct `Remote` CLI variant.
+- Added the `remote_access` module, `ai-brain remote --port`, a Tailscale-only Web policy, and remote setup documentation.
+- `git diff --check` passed; the initial `cargo fmt --check` found three style-only differences that will be formatted next.
+- Applied package-scoped formatting and completed `cargo check -p ai-brain-cli` successfully; only pre-existing warnings remain.
+- Added unit coverage for required Tailscale identity, same-origin acceptance, and cross-origin/insecure-origin rejection.
+- Package formatting completed. The first targeted test command used two Cargo filters and was rejected before running tests; switching to one `remote` filter.
+- Targeted remote-access and remote-policy suite passed: 6 tests, 0 failures.
+- Verified the final CLI help, formatting check, and whitespace diff check.
+- Confirmed the host meets Tailscale's macOS requirement and that Homebrew can install the current Standalone app package.
+- Downloaded and verified Tailscale 1.98.8. Cancelled the terminal `sudo` password prompt and opened the package in macOS Installer; installation is still awaiting local approval.
+- Installed the Tailscale app/package receipt through the native privileged flow. Network-extension approval/login remains pending; stopped a hung read-only CLI probe.
+- Ran the full deterministic library suite: 186 passed, 0 failed, 1 external-model test skipped. Binary target compilation also passed.
+- Confirmed no stale process was listening on port 8080 before the fresh Web smoke test.
+- Started a fresh Web server at `http://127.0.0.1:8080`; Orchestrator initialization and listener binding succeeded.
+- In-app browser bootstrap failed on missing sandbox metadata; switching to installed Playwright/system Chrome for visual verification.
+- Confirmed Playwright 1.61.1 and system Chrome are available for the fallback browser pass.
+- Completed Playwright desktop/mobile functional checks with WebSocket connection, view switching, and overflow/error assertions passing.
+- Screenshot review found a pre-existing desktop overlap at the bottom of the topology panel; investigating its CSS geometry before final sign-off.
+- Confirmed a 156px desktop intersection between the map panel and following agent panel. Added explicit minimum heights for the first two desktop grid tracks and rebuilt/restarted the embedded Web server.
+- First geometry rerun removed the 156px map overlap but found a 5.6px conclusion/memory overlap; adjusted the second desktop track minimum for the final pass.
+- Final desktop/mobile geometry pass has no overlaps, overflow, console errors, or page errors; screenshot inspection is clean.
+- Native installer reported a successful Tailscale upgrade/install. Confirmed the app, system extension, receipt, and CLI wrapper are present; live CLI status still awaits onboarding completion.
+- Stopped a non-responsive `tailscale login` attempt after the browser/system onboarding did not complete; implementing bounded status probing before final CLI verification.
+- Replaced executable probing with filesystem/PATH discovery and added a 5-second status timeout that kills an unresponsive child.
+- Remote-focused suite now passes 8 tests, including PATH discovery and a real child-process timeout/termination check.
+- Added executable-bit validation, successful command-output coverage, and a non-zero CLI exit on remote setup failure. Remote-focused suite now passes 9 tests.
+- Rebuilt the binary and verified the live incomplete-onboarding path exits within the bounded timeout with status 1 and the intended user-facing message.
+- Final macOS process-selection refinement passes all 9 remote tests; timeout testing now kills a direct process rather than a shell wrapper.
+- Rebuilt and re-ran the final remote failure path; verified exit code 1 and zero leftover probe/test processes.
+- Removed only the three Tailscale research JSON files created during this task; preserved unrelated existing Firecrawl research artifacts.
+- Final verification passed: 189 deterministic library tests, Rust formatting, JavaScript syntax, and Git whitespace checks.
+- Confirmed the retained smoke-test server listens only on loopback, returns HTTP 200, and has no leftover Tailscale probe/login children.
+
+## 2026-07-10 Novel Result Persistence Follow-up
+- Confirmed `/Users/chenh/RustObject/.clawd-agents/agent-1783663610878779000.json` completed successfully with a 4701-character result.
+- Confirmed Web session `f664d3dc` contains no persisted `brain_communication` message, which explains why the authoritative Novel result was absent from chat history.
+- Implemented persisted request/response pairing and per-turn collapsed tool groups in the five scoped Web files.
+- `node --check crates/ai-brain-cli/src/web/static/app.js`: passed.
+- `git diff --check`: passed.
+- `cargo test -p ai-brain-cli --bin ai-brain`: 174 passed, one external-query test timed out at 30 seconds; targeted re-run pending.
+- The external-query test timed out again when run alone; the deterministic suite passed 175/175 with that network-backed test skipped.
+- Backfilled Web session `f664d3dc` with a clearly labeled historical request reconstruction and the exact 4701-character Novel result; the original file is preserved as a `.bak` beside it.
+- Browser verification with system Chrome passed:
+  - history restored one completed Main -> Novel exchange with 293-character recovered request context and 4701-character exact result;
+  - two tool calls rendered under one closed group, with full inputs/results available after pointer expansion;
+  - a new turn created a second closed tool group;
+  - reasoning remained closed by default;
+  - 390px viewport had no document, message-list, or exchange overflow.
+- Rebuilt and restarted the Web service at `http://127.0.0.1:8080`.
+
+## 2026-07-10
+- Read planning-with-files skill.
+- Checked git status, existing planning files, and current Web UI file locations.
+- Started dedicated cockpit redesign plan.
+- Inspected `index.html`, `app.js`, `style.css`, `ws_handler.rs`, and `progress_adapter.rs`.
+- Reworked cockpit HTML into a dedicated monitoring view with topbar, metrics, topology, communication, agent status, and event panels.
+- Extended cockpit JS state aggregation for connection status, active brains, tool calls, memory injection, errors/retries, communication links, and agent status.
+- Replaced cockpit CSS with dense operational dashboard styling and responsive mobile rules.
+- Ran `node --check crates/ai-brain-cli/src/web/static/app.js`: passed.
+- Started Web UI with `cargo run -p ai-brain-cli -- web --addr 127.0.0.1:8080`.
+- Verified `/`, `/style.css`, and `/app.js` return HTTP 200 from the running server.
+- Verified served `app.js` with `node --check`: passed.
+- Verified required cockpit DOM ids and CSS selectors are present and matched.
+- Attempted in-app browser verification, but the browser tool failed before connecting.
+- Attempted Python Playwright verification; browser binary was missing, and Chromium download was interrupted due to slow progress.
+- Added sidebar delete buttons for non-active sessions; buttons send the existing `delete_session` WebSocket message after confirmation.
+- Added cockpit metrics for knowledge graph reads and writes.
+- Added a dedicated `记忆 / 图谱 I/O` cockpit panel.
+- Added graph node/status tracking and classification for `graph_*` read/write tools.
+- Restarted Web UI because static assets are compiled with `include_str!`.
+- Verified running server returns the new delete-session, graph metrics, and memory/graph panel resources.
+- Received follow-up requirements for arrowed data links, streaming/collapsible main-brain reasoning, intermediate conclusions, collapsible tool details, and full brain/sub-agent communication task/result payloads.
+- Confirmed the current cockpit derives communication summaries on the frontend and does not yet carry authoritative full exchange content.
+- Traced synchronous/background `Agent` execution, dispatch completion delivery, WebSocket progress forwarding, memory recall, evaluation, thinking, and tool event rendering.
+- Identified two correctness gaps to fix with the UI work: synchronous agents omit final text from tool output, and background completions are not observable after the active query receiver closes.
+- Added typed runtime exchange events and an orchestrator broadcast channel for memory, evaluation, novel-brain, and dynamic sub-agent request/result pairs.
+- Added main-brain intermediate checkpoint events around task intake, memory recall, tool execution, and evaluation.
+- Added stable tool call IDs across main/evaluation progress events and the WebSocket adapter.
+- Rebuilt chat reasoning/checkpoint/tool traces as independently collapsible, full-content details with reasoning typewriter streaming retained while collapsed.
+- Rebuilt cockpit communication rows as paired full task/result disclosures and added visible SVG arrowheads with active direction animation.
+- Updated the palette toward neutral charcoal with teal, amber, green, and red operational states; kept the cockpit switch available on mobile.
+- Added Rust tests for exchange serialization/pairing, intermediate conclusion adaptation, full communication content, and synchronous agent final result retention.
+- `cargo fmt --all` is currently blocked by a pre-existing syntax error in `crates/rusty-claude-cli/src/menu.rs:436`; switching to package-scoped formatting for touched crates.
+- First Playwright pass validated disclosure/content behavior and mobile reachability, then exposed hidden-view SVG `NaN` coordinates; added zero-size guards before topology geometry calculation.
+- Final Playwright pass: no console errors, full reasoning/checkpoint/tool/exchange content, valid arrow paths, latest-direction filtering, desktop/mobile screenshots, and 390px layout without horizontal overflow or clipped communication panels.
+- Required workspace clippy is blocked by existing `brain-hooks` and CLI lint debt; required workspace tests are blocked by the existing `v2_integration_test.rs` import of a missing library target.
+- Added paired full-content brain communication disclosures to the chat stream, covering memory, evaluation, novel, and general sub-agent exchanges.
+- Browser pointer testing exposed message children shrinking and overlapping inside the scrollable Flex column; fixed it by disabling shrink for direct message children.
+- Final local-Chrome pass verified one request/result record in chat and cockpit, 740/904-character payload retention, pointer collapse/expand, valid arrow paths, and no 390px horizontal overflow.
+- Final checks passed: `cargo fmt -p ai-brain-cli -p tools`, `cargo test -p ai-brain-cli --bin ai-brain` (174 tests), `cargo test -p brain-main -p brain-eval` (19 + 74 tests), targeted tools agent persistence test, `node --check`, and `git diff --check`.
+- Committed the scoped UI/runtime work as `e654e7d` (`feat(web): expose live brain communication traces`) without staging unrelated graph/memory/IDE changes.
+- After fetch, remote had advanced by one commit and the local branch had diverged; avoided the repository export script's destructive reset path.
+- Replayed the four existing local graph/docs commits plus the UI commit onto `origin/featrue/20260404-nao` in an isolated worktree, re-ran the 173-test clean snapshot, and exported five patches to `/tmp/brain-patches-20260710-ui`.
+- Verified the patch directory by applying all five patches with `git am` onto a fresh remote worktree; the imported and source tree hashes matched exactly.
+# 2026-07-24 Phase 6 Resume
+- Re-read the `planning-with-files` and `knowledge-graph` instructions before continuing Phase 6.
+- Session recovery surfaced only an unrelated historical GPT-model discussion; retained the current Phase 6 plan, repository state, approved design, Phase 5 verification evidence, and live service as authoritative.
+- Audited `git status`/`git diff --stat` and confirmed the expected intentional Phase 1-5 dirty state with no Phase 6 source implementation.
+- Parsed the TaskEngine KG metadata and shape; v1.3.0 with 16 provides is valid and ready for Phase 6 contract validation.
+- Inventoried all current Novel source files and symbol references across `brain-novel`, Novel Memory, tools, Orchestrator, and RealToolExecutor.
+- Added `ai-brain-cli/src/novel_adapters.rs` to the Phase 6 audit scope after locating the existing Memory/Resource composition boundary.
+- Re-read the approved Phase 6/7/8 boundaries and Novel end-to-end acceptance matrix.
+- Audited all current Novel Memory schema types and confirmed the exact aggregate/publication contracts to relocate without changing persisted serialization.
+- Audited `brain-novel` request/review/outcome types and the complete task transition authority in `state.rs`; identified the exact guard set and the missing immutable Candidate hash contract.
+- Located the TaskEngine public surface and confirmed Phase 6 can remain an external Workflow crate without modifying TaskEngine domain neutrality.
+- Audited TaskEngine run/node/artifact/admission contracts and confirmed they support explicit Novel profiles and dependency DAGs without Core changes.
+- Audited AgentRuntime Profile/Run/Artifact contracts and TaskRepository's create/start/complete/recovery APIs; confirmed frozen snapshots and provenance can back Novel workflow nodes.
+- Audited Knowledge Core registry and graph projection contracts; confirmed the Novel adapter can be a pure registered event-to-mutation crate with evidence-linked output.
+- Audited CLI Novel Memory/Resource adapters and `brain-memory::novel` exports; identified the legacy data and atomic-file bridges to retain during additive Phase 6 extraction.
+- Audited legacy lifecycle and Canon commit implementations; captured the complete project/Canon/publication guard set that must relocate into Novel Domain.
+- Audited `PyramidMemoryBrain` publication orchestration and recorded its crash-recovery/idempotency ordering for the extracted application service.
+- Audited workspace and resident Novel dependencies; fixed the target crate dependency direction before writing contracts.
+- Audited resident Novel public exports and typed ports; selected compatibility re-export/delegation rather than Phase 8 deletion.
+- Located the live Collaboration TaskEngine execution/recovery pattern to mirror for the first Novel workflow path.
+- Audited the exact collaboration prepare/admit/execute/artifact/complete ordering for reuse in Novel Workflow contracts.
+- Audited the resident Novel model runtime and confirmed generation is stateless enough to place behind a TaskEngine Writer node.
+- Audited actor start/review/publish/recovery behavior and selected `novel_start_task` as the first production compatibility-facade migration.
+- Audited resident error and review parsing/validation boundaries; separated pure Domain failures from runtime/parser concerns in the target design.
+- Audited consistency and recall logic and added both pure read-model computations to the Domain extraction scope.
+- Audited Novel tool schemas and executor dispatch; confirmed additive start-task routing requires no user-visible request format change.
+- Audited ContextSnapshot construction/validation and collaboration task-config serialization; fixed the Novel workflow replay format and stable identity scheme.
+- Added Phase 6 red contracts for Domain, Workflow, and Knowledge Adapter and captured the expected unresolved-symbol failures before production implementation.
+- Implemented and formatted `novel-domain`; focused Domain contracts pass 4/4.
+- Implemented and formatted `novel-workflow`; focused Profile/frozen-context/DAG contracts pass 3/3.
+- Implemented and formatted `novel-knowledge-adapter`; schema/approval/evidence contracts pass 3/3.
+- Completed the red-to-green contract phase. Phase 6 implementation/migration is now in progress.
+- Audited package manifests for the compatibility migration and fixed the minimal dependency additions.
+- Migrated Legacy Memory schema/recall/consistency exports and Canon commit calls to `novel-domain`; package check succeeds with only the now-obsolete duplicated helper warnings plus one pre-existing warning.
+- Deleted the obsolete Memory Canon helper copy and passed focused Legacy Novel Memory tests 14/14.
+- Migrated resident Novel task/review types and state to Domain compatibility exports; resident actor/recovery tests pass 8/8 with legacy error matching preserved.
+- Confirmed the existing Novel LLM port exposes exact usage needed for TaskEngine settlement in the migrated Writer path.
+- Added and ran the production start-task recovery red contract; it fails only on the seven not-yet-implemented Workflow service/port APIs.

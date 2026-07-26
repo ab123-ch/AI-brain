@@ -3,165 +3,115 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use brain_memory::novel::{
-    CommitReport, ConsistencyReport, NovelArtifactReceipt, NovelPublicationRecord, NovelRecallPack,
-    NovelTaskCheckpoint, NovelTaskEvent, NovelTaskType,
-};
-use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
-use brain_novel::{
-    ContextDocument, ContextRef, NovelMemoryPort, NovelPortError, NovelResourcePort,
-    NovelWorkspaceSnapshot,
+use brain_llm::{ChatMessage, ChatRequest, LlmProvider};
+use novel_application::{NovelApplicationError, NovelResourcePort};
+use novel_domain::{ContextRef, NovelArtifactReceipt};
+use novel_workflow::{
+    parse_novel_response, NovelContextDocument, NovelWorkflowPortError, NovelWriterExecution,
+    NovelWriterInvocation, NovelWriterPort,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use task_engine::ActualUsage;
 
-pub struct PyramidNovelMemoryAdapter {
-    memory: Arc<Mutex<PyramidMemoryBrain>>,
+const NOVEL_WRITING_WORKFLOW: &str =
+    include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
+
+pub struct LlmNovelWriterAdapter {
+    llm: Arc<dyn LlmProvider>,
+    temperature: f64,
 }
 
-impl PyramidNovelMemoryAdapter {
+impl LlmNovelWriterAdapter {
     #[must_use]
-    pub fn new(memory: Arc<Mutex<PyramidMemoryBrain>>) -> Self {
-        Self { memory }
+    pub fn new(llm: Arc<dyn LlmProvider>, temperature: f64) -> Self {
+        Self { llm, temperature }
     }
 }
 
 #[async_trait]
-impl NovelMemoryPort for PyramidNovelMemoryAdapter {
-    async fn load_workspace(
+impl NovelWriterPort for LlmNovelWriterAdapter {
+    async fn execute(
         &self,
-        project_id: &str,
-    ) -> Result<NovelWorkspaceSnapshot, NovelPortError> {
-        let memory = self.memory.lock().await;
-        let project = memory
-            .load_novel_project(project_id)
-            .map_err(memory_error)?;
-        let active_checkpoint = memory
-            .active_novel_task_for_project(project_id)
-            .map_err(memory_error)?;
-        Ok(NovelWorkspaceSnapshot {
-            project,
-            active_checkpoint,
-        })
-    }
-
-    async fn active_checkpoints(&self) -> Result<Vec<NovelTaskCheckpoint>, NovelPortError> {
-        let memory = self.memory.lock().await;
-        let projects = memory.list_novel_projects().map_err(memory_error)?;
-        let mut checkpoints = Vec::new();
-        for project in projects {
-            if let Some(checkpoint) = memory
-                .active_novel_task_for_project(&project.project_id)
-                .map_err(memory_error)?
-            {
-                checkpoints.push(checkpoint);
-            }
+        invocation: NovelWriterInvocation,
+    ) -> Result<NovelWriterExecution, NovelWorkflowPortError> {
+        invocation.context_snapshot.validate().map_err(|error| {
+            NovelWorkflowPortError::ContextChanged(format!(
+                "Writer ContextSnapshot validation failed: {error}"
+            ))
+        })?;
+        if invocation.profile.tool_grant.iter().next().is_some() {
+            return Err(NovelWorkflowPortError::InvalidRequest(
+                "Novel Writer profile must not grant tools".into(),
+            ));
         }
-        Ok(checkpoints)
-    }
-
-    async fn load_checkpoint(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<NovelTaskCheckpoint>, NovelPortError> {
-        self.memory
-            .lock()
+        let max_tokens = u32::try_from(invocation.budget.output_tokens).map_err(|_| {
+            NovelWorkflowPortError::InvalidRequest(
+                "Novel Writer output reservation exceeds Provider limits".into(),
+            )
+        })?;
+        let system_prompt = format!(
+            "{}\n\
+             Return exactly one JSON object matching novel.writer-output.v1. Never publish, write Canon, Memory, Graph, or files.\n\
+             draft_ready requires content, a passing six-check self_review, proposed_delta, and evidence_refs.\n\
+             needs_clarification requires non-empty questions and a reason.\n\n\
+             <novel-writing-workflow>\n{NOVEL_WRITING_WORKFLOW}\n</novel-writing-workflow>",
+            invocation.profile.system_prompt.join("\n")
+        );
+        let response = self
+            .llm
+            .complete(ChatRequest {
+                model: Some(invocation.model.model.clone()),
+                messages: vec![
+                    ChatMessage::system(system_prompt),
+                    ChatMessage::user(invocation.context_snapshot.render()),
+                ],
+                max_tokens: Some(max_tokens),
+                temperature: Some(self.temperature),
+                tools: None,
+                tool_choice: None,
+            })
             .await
-            .load_novel_task_checkpoint(task_id)
-            .map_err(memory_error)
-    }
-
-    async fn recall_project(
-        &self,
-        project_id: &str,
-        task_type: NovelTaskType,
-    ) -> Result<NovelRecallPack, NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .recall_novel_project(project_id, task_type)
-            .map_err(memory_error)
-    }
-
-    async fn check_consistency(
-        &self,
-        project_id: &str,
-    ) -> Result<ConsistencyReport, NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .check_novel_consistency(project_id)
-            .map_err(memory_error)
-    }
-
-    async fn append_task_event(&self, event: NovelTaskEvent) -> Result<(), NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .append_novel_task_event(&event)
-            .map_err(memory_error)
-    }
-
-    async fn save_checkpoint(&self, checkpoint: NovelTaskCheckpoint) -> Result<(), NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .save_novel_task_checkpoint(&checkpoint)
-            .map_err(memory_error)
-    }
-
-    async fn begin_publication(
-        &self,
-        record: NovelPublicationRecord,
-    ) -> Result<(), NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .begin_novel_publication(&record)
-            .map_err(memory_error)
-    }
-
-    async fn load_publication(
-        &self,
-        publication_id: &str,
-    ) -> Result<NovelPublicationRecord, NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .load_novel_publication(publication_id)
-            .map_err(memory_error)
-    }
-
-    async fn complete_publication(
-        &self,
-        publication_id: &str,
-        artifact: NovelArtifactReceipt,
-    ) -> Result<CommitReport, NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .complete_novel_publication(publication_id, artifact)
-            .map_err(memory_error)
-    }
-
-    async fn abort_publication(
-        &self,
-        publication_id: &str,
-        reason: &str,
-    ) -> Result<(), NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .abort_novel_publication(publication_id, reason)
-            .map_err(memory_error)
-    }
-
-    async fn pending_publications(&self) -> Result<Vec<NovelPublicationRecord>, NovelPortError> {
-        self.memory
-            .lock()
-            .await
-            .pending_novel_publications()
-            .map_err(memory_error)
+            .map_err(|error| {
+                NovelWorkflowPortError::Storage(format!("Novel Writer Provider failed: {error}"))
+            })?;
+        let raw_output = response.text();
+        if raw_output.trim().is_empty() {
+            return Err(NovelWorkflowPortError::InvalidWriterOutput(
+                "Novel Writer Provider returned no text".into(),
+            ));
+        }
+        let mut evidence_refs = invocation
+            .context_documents
+            .iter()
+            .map(|document| {
+                format!(
+                    "{}#sha256:{}",
+                    document.reference.canonical_path.display(),
+                    document.reference.sha256
+                )
+            })
+            .collect::<Vec<_>>();
+        evidence_refs.push(format!(
+            "canon:{}@{}",
+            invocation.request.project_id, invocation.request.expected_revision
+        ));
+        let outcome = parse_novel_response(
+            &raw_output,
+            &invocation.request.task_id,
+            &invocation.request.project_id,
+            invocation.next_draft_version,
+            invocation.request.expected_revision,
+            &evidence_refs,
+        )
+        .map_err(|error| NovelWorkflowPortError::InvalidWriterOutput(error.to_string()))?;
+        Ok(NovelWriterExecution {
+            outcome,
+            raw_output,
+            usage: ActualUsage {
+                input_tokens: response.usage.prompt_tokens,
+                output_tokens: response.usage.completion_tokens,
+            },
+        })
     }
 }
 
@@ -170,10 +120,10 @@ pub struct ScopedNovelResourceAdapter {
 }
 
 impl ScopedNovelResourceAdapter {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, NovelPortError> {
+    pub fn new(workspace_root: impl AsRef<Path>) -> novel_application::Result<Self> {
         let root = std::fs::canonicalize(workspace_root.as_ref()).map_err(resource_error)?;
         if !root.is_dir() {
-            return Err(NovelPortError::ResourceDenied(format!(
+            return Err(NovelApplicationError::ResourceDenied(format!(
                 "小说项目工作区不是目录: {}",
                 root.display()
             )));
@@ -183,12 +133,16 @@ impl ScopedNovelResourceAdapter {
         })
     }
 
-    fn resolve_scoped(&self, path: &Path, require_file: bool) -> Result<PathBuf, NovelPortError> {
+    fn resolve_scoped(
+        &self,
+        path: &Path,
+        require_file: bool,
+    ) -> novel_application::Result<PathBuf> {
         if path
             .components()
             .any(|component| component == Component::ParentDir)
         {
-            return Err(NovelPortError::ResourceDenied(format!(
+            return Err(NovelApplicationError::ResourceDenied(format!(
                 "路径不允许包含父目录跳转: {}",
                 path.display()
             )));
@@ -200,13 +154,13 @@ impl ScopedNovelResourceAdapter {
         };
         let resolved = resolve_existing_ancestor(&candidate)?;
         if !resolved.starts_with(&self.workspace_root) {
-            return Err(NovelPortError::ResourceDenied(format!(
+            return Err(NovelApplicationError::ResourceDenied(format!(
                 "路径超出小说项目工作区: {}",
                 path.display()
             )));
         }
         if require_file && !resolved.is_file() {
-            return Err(NovelPortError::Resource(format!(
+            return Err(NovelApplicationError::Resource(format!(
                 "小说上下文文件不存在: {}",
                 resolved.display()
             )));
@@ -217,19 +171,15 @@ impl ScopedNovelResourceAdapter {
 
 #[async_trait]
 impl NovelResourcePort for ScopedNovelResourceAdapter {
-    async fn resolve_artifact_path(&self, path: &Path) -> Result<PathBuf, NovelPortError> {
-        self.resolve_scoped(path, false)
-    }
-
     async fn read_context(
         &self,
         reference: &ContextRef,
-    ) -> Result<ContextDocument, NovelPortError> {
+    ) -> novel_application::Result<NovelContextDocument> {
         let path = self.resolve_scoped(&reference.canonical_path, true)?;
         let content = std::fs::read_to_string(&path).map_err(resource_error)?;
         let actual_hash = sha256(content.as_bytes());
         if !actual_hash.eq_ignore_ascii_case(reference.sha256.trim()) {
-            return Err(NovelPortError::ContextChanged(format!(
+            return Err(NovelApplicationError::ContextChanged(format!(
                 "{} 的内容 hash 已变化: expected={}, actual={actual_hash}",
                 path.display(),
                 reference.sha256
@@ -238,25 +188,29 @@ impl NovelResourcePort for ScopedNovelResourceAdapter {
         let mut normalized = reference.clone();
         normalized.canonical_path = path;
         normalized.sha256 = actual_hash;
-        Ok(ContextDocument {
+        Ok(NovelContextDocument {
             reference: normalized,
             content,
         })
+    }
+
+    async fn resolve_artifact_path(&self, path: &Path) -> novel_application::Result<PathBuf> {
+        self.resolve_scoped(path, false)
     }
 
     async fn write_artifact_atomic(
         &self,
         path: &Path,
         exact_content: &str,
-    ) -> Result<NovelArtifactReceipt, NovelPortError> {
+    ) -> novel_application::Result<NovelArtifactReceipt> {
         let path = self.resolve_scoped(path, false)?;
         let parent = path.parent().ok_or_else(|| {
-            NovelPortError::ResourceDenied(format!("输出路径没有父目录: {}", path.display()))
+            NovelApplicationError::ResourceDenied(format!("输出路径没有父目录: {}", path.display()))
         })?;
         std::fs::create_dir_all(parent).map_err(resource_error)?;
         let canonical_parent = std::fs::canonicalize(parent).map_err(resource_error)?;
         if !canonical_parent.starts_with(&self.workspace_root) {
-            return Err(NovelPortError::ResourceDenied(format!(
+            return Err(NovelApplicationError::ResourceDenied(format!(
                 "输出目录超出小说项目工作区: {}",
                 parent.display()
             )));
@@ -265,7 +219,7 @@ impl NovelResourcePort for ScopedNovelResourceAdapter {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
-                NovelPortError::ResourceDenied(format!("输出文件名无效: {}", path.display()))
+                NovelApplicationError::ResourceDenied(format!("输出文件名无效: {}", path.display()))
             })?
             .to_string();
         let path = canonical_parent.join(&file_name);
@@ -300,7 +254,7 @@ impl NovelResourcePort for ScopedNovelResourceAdapter {
         &self,
         path: &Path,
         expected_sha256: &str,
-    ) -> Result<Option<NovelArtifactReceipt>, NovelPortError> {
+    ) -> novel_application::Result<Option<NovelArtifactReceipt>> {
         let path = self.resolve_scoped(path, false)?;
         if !path.is_file() {
             return Ok(None);
@@ -312,11 +266,11 @@ impl NovelResourcePort for ScopedNovelResourceAdapter {
 fn existing_artifact_receipt(
     path: &Path,
     expected_sha256: &str,
-) -> Result<NovelArtifactReceipt, NovelPortError> {
+) -> novel_application::Result<NovelArtifactReceipt> {
     let content = std::fs::read(path).map_err(resource_error)?;
     let actual_hash = sha256(&content);
     if !actual_hash.eq_ignore_ascii_case(expected_sha256) {
-        return Err(NovelPortError::ContextChanged(format!(
+        return Err(NovelApplicationError::ContextChanged(format!(
             "作品文件 {} 已存在且 hash 不匹配，拒绝覆盖: expected={expected_sha256}, actual={actual_hash}",
             path.display()
         )));
@@ -336,7 +290,7 @@ fn existing_artifact_receipt(
     })
 }
 
-fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, NovelPortError> {
+fn resolve_existing_ancestor(path: &Path) -> novel_application::Result<PathBuf> {
     if path.exists() {
         return std::fs::canonicalize(path).map_err(resource_error);
     }
@@ -344,11 +298,11 @@ fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, NovelPortError> {
     let mut missing = Vec::new();
     while !ancestor.exists() {
         let name = ancestor.file_name().ok_or_else(|| {
-            NovelPortError::ResourceDenied(format!("无法解析路径: {}", path.display()))
+            NovelApplicationError::ResourceDenied(format!("无法解析路径: {}", path.display()))
         })?;
         missing.push(name.to_os_string());
         if !ancestor.pop() {
-            return Err(NovelPortError::ResourceDenied(format!(
+            return Err(NovelApplicationError::ResourceDenied(format!(
                 "无法解析路径: {}",
                 path.display()
             )));
@@ -365,19 +319,121 @@ fn sha256(content: &[u8]) -> String {
     format!("{:x}", Sha256::digest(content))
 }
 
-fn memory_error(error: impl std::fmt::Display) -> NovelPortError {
-    NovelPortError::Memory(error.to_string())
-}
-
-fn resource_error(error: impl std::fmt::Display) -> NovelPortError {
-    NovelPortError::Resource(error.to_string())
+fn resource_error(error: impl std::fmt::Display) -> NovelApplicationError {
+    NovelApplicationError::Resource(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use brain_novel::{ContextRole, NovelResourcePort};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use brain_llm::{ChatResponse, ContentBlock, FinishReason, TokenUsage};
+    use knowledge_core::ContextSnapshot;
+    use novel_domain::{
+        ContextRole, NovelOutcome, NovelProject, NovelTaskRequest, NovelTaskType, PublicationPolicy,
+    };
+    use novel_workflow::{writer_profile, NovelWorkflowBudget, NovelWriterPort, ProfileModel};
 
     use super::*;
+
+    struct RecordingLlm {
+        request: std::sync::Mutex<Option<ChatRequest>>,
+    }
+
+    impl LlmProvider for RecordingLlm {
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn complete(
+            &self,
+            request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            *self.request.lock().unwrap() = Some(request);
+            Box::pin(async {
+                Ok(ChatResponse {
+                    content: vec![ContentBlock::text(
+                        r#"{"outcome":"needs_clarification","questions":["Which ending?"],"reason":"ending is unspecified"}"#,
+                    )],
+                    model: "test-model".into(),
+                    usage: TokenUsage {
+                        prompt_tokens: 111,
+                        completion_tokens: 22,
+                        total_tokens: 133,
+                        ..TokenUsage::default()
+                    },
+                    finish_reason: Some(FinishReason::EndTurn),
+                })
+            })
+        }
+    }
+
+    fn workflow_request() -> NovelTaskRequest {
+        NovelTaskRequest {
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            task_type: NovelTaskType::Body,
+            task_brief: "Write chapter one".into(),
+            target_chapter: Some(1),
+            expected_revision: 0,
+            output_path: PathBuf::from("chapters/0001.md"),
+            context_refs: Vec::new(),
+            must_happen: Vec::new(),
+            must_not_change: Vec::new(),
+            acceptance_criteria: vec!["complete chapter".into()],
+            allow_web_research: false,
+            publication_policy: PublicationPolicy::RequireUserAcceptance,
+            parent_task_id: None,
+            source_conversation_id: None,
+            source_generation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_uses_frozen_context_without_tools_and_preserves_provider_usage() {
+        let llm = Arc::new(RecordingLlm {
+            request: std::sync::Mutex::new(None),
+        });
+        let adapter = LlmNovelWriterAdapter::new(llm.clone(), 0.25);
+        let execution = adapter
+            .execute(NovelWriterInvocation {
+                request: workflow_request(),
+                project: NovelProject::new("project-1", "Project"),
+                context_snapshot: ContextSnapshot::from_text(
+                    "novel-context-task-1",
+                    "frozen task input",
+                )
+                .unwrap(),
+                context_documents: Vec::new(),
+                next_draft_version: 1,
+                profile: writer_profile().unwrap(),
+                model: ProfileModel::new("test-provider", "test-model"),
+                budget: NovelWorkflowBudget {
+                    input_tokens: 1_000,
+                    output_tokens: 321,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(execution.usage.input_tokens, 111);
+        assert_eq!(execution.usage.output_tokens, 22);
+        assert!(matches!(
+            execution.outcome,
+            NovelOutcome::NeedsClarification(_)
+        ));
+        let request = llm.request.lock().unwrap().take().unwrap();
+        assert_eq!(request.model.as_deref(), Some("test-model"));
+        assert_eq!(request.max_tokens, Some(321));
+        assert_eq!(request.temperature, Some(0.25));
+        assert!(request.tools.is_none());
+        assert!(request
+            .messages
+            .last()
+            .unwrap()
+            .text_content()
+            .contains("frozen task input"));
+    }
 
     #[tokio::test]
     async fn scoped_resources_validate_hash_scope_and_atomic_receipt() {
@@ -413,7 +469,7 @@ mod tests {
                 .write_artifact_atomic(Path::new("chapters/0001.md"), "不同正文")
                 .await
                 .unwrap_err(),
-            NovelPortError::ContextChanged(_)
+            NovelApplicationError::ContextChanged(_)
         ));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("chapters/0001.md")).unwrap(),
@@ -430,7 +486,7 @@ mod tests {
                 .verify_artifact(Path::new(&receipt.canonical_path), &receipt.sha256)
                 .await
                 .unwrap_err(),
-            NovelPortError::ContextChanged(_)
+            NovelApplicationError::ContextChanged(_)
         ));
     }
 
@@ -448,14 +504,14 @@ mod tests {
         };
         assert!(matches!(
             adapter.read_context(&reference).await.unwrap_err(),
-            NovelPortError::ContextChanged(_)
+            NovelApplicationError::ContextChanged(_)
         ));
         assert!(matches!(
             adapter
                 .resolve_artifact_path(Path::new("../outside.md"))
                 .await
                 .unwrap_err(),
-            NovelPortError::ResourceDenied(_)
+            NovelApplicationError::ResourceDenied(_)
         ));
     }
 }

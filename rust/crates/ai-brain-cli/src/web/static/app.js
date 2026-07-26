@@ -26,6 +26,10 @@ const toolItems = new Map();
 const chatExchangeItems = new Map();
 const expandedCommunicationIds = new Set();
 const collapsedCommunicationIds = new Set();
+let roomSnapshot = null;
+let roomMode = 'chat';
+const selectedMemberIds = new Set();
+const memberRunStates = new Map();
 
 // ── Typewriter State ──────────────────────────────────────────
 let thinkingFullContent = '';
@@ -82,10 +86,32 @@ const $previewContent = document.getElementById('preview-content');
 const $previewSelectionTools = document.getElementById('preview-selection-tools');
 const $previewSelectionInfo = document.getElementById('preview-selection-info');
 const $previewQuote = document.getElementById('preview-quote');
+const $memberList = document.getElementById('member-list');
+const $memberCapacity = document.getElementById('member-capacity');
+const $workerStatus = document.getElementById('worker-status');
+const $workerStatusText = document.getElementById('worker-status-text');
+const $addMemberBtn = document.getElementById('add-member-btn');
+const $roomTitle = document.getElementById('room-title');
+const $roomSequence = document.getElementById('room-sequence');
+const $roomRefreshBtn = document.getElementById('room-refresh-btn');
+const $roomMode = document.getElementById('room-mode');
+const $recipientSelector = document.getElementById('recipient-selector');
+const $memberModal = document.getElementById('member-modal');
+const $memberForm = document.getElementById('member-form');
+const $memberModalTitle = document.getElementById('member-modal-title');
+const $memberModalClose = document.getElementById('member-modal-close');
+const $memberModalCancel = document.getElementById('member-modal-cancel');
+const $memberId = document.getElementById('member-id');
+const $memberVersion = document.getElementById('member-version');
+const $memberName = document.getElementById('member-name');
+const $memberModel = document.getElementById('member-model');
+const $memberDepth = document.getElementById('member-depth');
+const $toastRegion = document.getElementById('toast-region');
 
 // ── Cockpit State ───────────────────────────────────────────────
 const brainProfiles = {
     client: { label: '用户端', role: '输入 / WebSocket 会话', icon: 'U' },
+    instance: { label: '成员实例', role: '独立任务 / 交叉验证', icon: 'I' },
     main: { label: '主脑', role: '任务规划 / 汇总输出', icon: 'M' },
     memory: { label: '记忆脑', role: '历史召回 / 上下文注入', icon: 'R' },
     graph: { label: '知识图谱', role: '语义节点 / 关系读写', icon: 'G' },
@@ -132,6 +158,12 @@ function connect() {
         setConnectionState('online');
         addBrainEvent('WebSocket 已连接');
         startHeartbeat();
+        if (activeSessionId && roomSnapshot?.room?.room_id === activeSessionId) {
+            send('join_room', {
+                room_id: activeSessionId,
+                after_sequence: Number(roomSnapshot.room.latest_event_seq || 0),
+            });
+        }
     };
 
     ws.onmessage = (e) => {
@@ -238,6 +270,36 @@ function handleServerMessage(data) {
             handleBrainCommunication(data.exchange);
             break;
 
+        case 'room_snapshot':
+            applyRoomSnapshot(data.snapshot);
+            break;
+
+        case 'room_event_appended':
+            mergeRoomEvent(data.event);
+            break;
+
+        case 'room_events_replayed':
+            if (data.room_id === activeSessionId) {
+                (data.events || []).forEach((event) => mergeRoomEvent(event));
+            }
+            break;
+
+        case 'member_changed':
+            mergeMember(data.member);
+            break;
+
+        case 'inbox_item_changed':
+            mergeInboxItem(data.room_id, data.item);
+            break;
+
+        case 'member_run_progress':
+            handleMemberRunProgress(data);
+            break;
+
+        case 'member_run_finished':
+            handleMemberRunFinished(data);
+            break;
+
         case 'memory_injected':
             markBrain('memory', 'active', `召回 ${data.count} 条记忆`);
             brainState.metrics.memoryRefs += Number(data.count || 0);
@@ -311,6 +373,8 @@ function handleServerMessage(data) {
 
         case 'session_switched':
             activeSessionId = data.session_id;
+            roomSnapshot = null;
+            selectedMemberIds.clear();
             sessionFiles = data.files || [];
             currentTurnFiles = [];
             turnFileBaseline = new Map(sessionFiles.map((file) => [file.path, file.updated_at]));
@@ -350,6 +414,10 @@ function handleServerMessage(data) {
         case 'error':
             brainState.metrics.errors += 1;
             addBrainEvent(`错误: ${data.message}`);
+            if (roomSnapshot?.room?.room_id === activeSessionId) {
+                showToast(data.message);
+                break;
+            }
             markBrain('main', 'error', data.message);
             addSystemMessage(`错误: ${data.message}`);
             removeSpinner();
@@ -361,6 +429,600 @@ function handleServerMessage(data) {
         default:
             console.log('Unknown message type:', data.type, data);
     }
+}
+
+// ── Collaboration Room ─────────────────────────────────────────
+function applyRoomSnapshot(snapshot) {
+    if (!snapshot?.room || snapshot.room.room_id !== activeSessionId) return;
+    roomSnapshot = {
+        ...snapshot,
+        members: snapshot.members || [],
+        events: snapshot.events || [],
+        inbox: snapshot.inbox || [],
+    };
+    roomSnapshot.members.forEach((member) => {
+        ensureBrainNode(member.member_id, {
+            label: member.display_name,
+            role: '独立成员实例',
+            icon: member.display_name.slice(0, 1).toUpperCase(),
+        });
+        markBrain(
+            member.member_id,
+            member.activity === 'running' ? 'active' : member.activity === 'failed' ? 'error' : 'idle',
+            memberActivityLabel(member),
+        );
+    });
+    reconcileSelectedMembers();
+    renderCollaborationRoom();
+    setInputEnabled(true);
+    updateSendButton();
+}
+
+function reconcileSelectedMembers() {
+    if (!roomSnapshot) return;
+    const selectable = new Set(
+        roomSnapshot.members
+            .filter((member) => member.availability === 'active')
+            .map((member) => member.member_id),
+    );
+    [...selectedMemberIds].forEach((memberId) => {
+        if (!selectable.has(memberId)) selectedMemberIds.delete(memberId);
+    });
+    if (selectedMemberIds.size === 0) {
+        const defaultMember = roomSnapshot.members.find(
+            (member) => member.member_id === roomSnapshot.room.default_member_id
+                && member.availability === 'active',
+        );
+        const fallback = defaultMember || roomSnapshot.members.find(
+            (member) => member.availability === 'active',
+        );
+        if (fallback) selectedMemberIds.add(fallback.member_id);
+    }
+}
+
+function renderCollaborationRoom() {
+    if (!roomSnapshot) return;
+    $roomTitle.textContent = roomSnapshot.room.title || '当前会话';
+    $roomSequence.textContent = `${roomSnapshot.room.latest_event_seq || 0} 条事件`;
+    $memberCapacity.textContent = `${roomSnapshot.members.filter((member) => member.availability !== 'archived').length} / ${roomSnapshot.max_members}`;
+    renderMemberList();
+    renderRecipientSelector();
+    renderRoomTimeline();
+}
+
+function renderMemberList() {
+    $memberList.innerHTML = '';
+    if (!roomSnapshot) return;
+    const members = [...roomSnapshot.members].sort((left, right) => {
+        if (left.availability === 'archived' && right.availability !== 'archived') return 1;
+        if (left.availability !== 'archived' && right.availability === 'archived') return -1;
+        return String(left.created_at).localeCompare(String(right.created_at));
+    });
+    let runningCount = 0;
+    members.forEach((member) => {
+        if (member.activity === 'running') runningCount += 1;
+        const row = document.createElement('div');
+        const stateClass = member.activity === 'running'
+            ? 'running'
+            : member.activity === 'failed'
+                ? 'failed'
+                : member.availability === 'active' ? 'active' : '';
+        row.className = `member-row ${stateClass} ${member.availability === 'archived' ? 'archived' : ''} ${selectedMemberIds.has(member.member_id) ? 'selected' : ''}`;
+        row.dataset.memberId = member.member_id;
+        const selectable = member.availability === 'active';
+        const modelDetail = resolvedMemberModel(member);
+        const modelLabel = modelDetail?.model || member.model_policy;
+        const modelTitle = modelDetail
+            ? `${modelDetail.provider} · ${modelDetail.model} · ${member.model_policy}`
+            : member.model_policy;
+        row.innerHTML = `
+            <input class="member-select" type="checkbox" aria-label="选择 ${escapeHtml(member.display_name)}" ${selectedMemberIds.has(member.member_id) ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
+            <div class="member-copy">
+                <div class="member-name-line"><span class="member-state-dot"></span><strong>${escapeHtml(member.display_name)}</strong></div>
+                <div class="member-meta"><span>${escapeHtml(memberActivityLabel(member))}</span><span title="${escapeHtml(modelTitle)}">${escapeHtml(modelLabel)}</span><span>${escapeHtml(member.reasoning_depth)}</span>${member.pending_count ? `<span>${member.pending_count} 待处理</span>` : ''}</div>
+            </div>
+            <div class="member-actions">${memberActionButtons(member)}</div>
+        `;
+        row.querySelector('.member-select').addEventListener('change', (event) => {
+            setMemberSelected(member.member_id, event.target.checked);
+        });
+        row.querySelectorAll('[data-member-action]').forEach((button) => {
+            button.addEventListener('click', () => {
+                handleMemberAction(button.dataset.memberAction, member);
+            });
+        });
+        $memberList.appendChild(row);
+    });
+    $workerStatus.classList.toggle('busy', runningCount > 0);
+    $workerStatusText.textContent = `${runningCount} 个运行中 · 上限 ${roomSnapshot.max_workers}`;
+    refreshIcons();
+}
+
+function resolvedMemberModel(member) {
+    return (roomSnapshot?.model_policy_details || [])
+        .find((policy) => policy.policy_id === member.model_policy) || null;
+}
+
+function memberActionButtons(member) {
+    if (member.availability === 'archived') {
+        return '<button class="member-action" type="button" data-member-action="restore" title="恢复成员" aria-label="恢复成员"><i data-lucide="archive-restore"></i></button>';
+    }
+    const buttons = [];
+    if (member.activity === 'running' && member.active_run_id) {
+        buttons.push('<button class="member-action danger" type="button" data-member-action="interrupt" title="停止当前运行" aria-label="停止当前运行"><i data-lucide="square"></i></button>');
+    } else if (member.availability === 'active') {
+        buttons.push('<button class="member-action" type="button" data-member-action="sleep" title="休眠成员" aria-label="休眠成员"><i data-lucide="moon"></i></button>');
+    } else {
+        buttons.push('<button class="member-action" type="button" data-member-action="wake" title="唤醒成员" aria-label="唤醒成员"><i data-lucide="play"></i></button>');
+    }
+    buttons.push('<button class="member-action" type="button" data-member-action="configure" title="成员设置" aria-label="成员设置"><i data-lucide="settings-2"></i></button>');
+    if (member.activity !== 'running') {
+        buttons.push('<button class="member-action danger" type="button" data-member-action="archive" title="归档成员" aria-label="归档成员"><i data-lucide="archive"></i></button>');
+    }
+    return buttons.join('');
+}
+
+function memberActivityLabel(member) {
+    if (member.activity === 'running') return '运行中';
+    if (member.activity === 'queued') return '排队中';
+    if (member.activity === 'failed') return '上次失败';
+    if (member.availability === 'sleep_after_current') return '完成后休眠';
+    if (member.availability === 'sleeping') return '休眠';
+    if (member.availability === 'archived') return '已归档';
+    return '空闲';
+}
+
+function renderRecipientSelector() {
+    $recipientSelector.innerHTML = '';
+    if (!roomSnapshot) return;
+    roomSnapshot.members
+        .filter((member) => member.availability !== 'archived')
+        .forEach((member) => {
+            const option = document.createElement('button');
+            option.type = 'button';
+            option.className = `recipient-option ${selectedMemberIds.has(member.member_id) ? 'selected' : ''}`;
+            option.disabled = member.availability !== 'active';
+            option.innerHTML = `<span class="member-state-dot"></span><span>@${escapeHtml(member.display_name)}</span>`;
+            option.addEventListener('click', () => {
+                setMemberSelected(member.member_id, !selectedMemberIds.has(member.member_id));
+            });
+            $recipientSelector.appendChild(option);
+        });
+}
+
+function setMemberSelected(memberId, selected) {
+    if (selected) selectedMemberIds.add(memberId);
+    else selectedMemberIds.delete(memberId);
+    renderMemberList();
+    renderRecipientSelector();
+}
+
+function syncMentionRecipients() {
+    if (!roomSnapshot) return;
+    const value = $input.value;
+    let changed = false;
+    roomSnapshot.members.forEach((member) => {
+        if (member.availability === 'active'
+            && value.includes(`@${member.display_name}`)
+            && !selectedMemberIds.has(member.member_id)) {
+            selectedMemberIds.add(member.member_id);
+            changed = true;
+        }
+    });
+    if (changed) {
+        renderMemberList();
+        renderRecipientSelector();
+    }
+}
+
+function renderRoomTimeline() {
+    if (!roomSnapshot) return;
+    $messages.innerHTML = '';
+    const entries = [];
+    roomSnapshot.events
+        .filter((event) => event.kind !== 'member_message' || String(event.content || '').trim())
+        .forEach((event) => {
+            entries.push({ kind: 'event', at: Date.parse(event.created_at) || 0, value: event });
+        });
+    roomSnapshot.inbox
+        .filter((item) => ['leased', 'running', 'failed', 'cancelled'].includes(item.state) && item.run_id)
+        .forEach((item) => {
+            entries.push({
+                kind: 'run',
+                at: Date.parse(item.started_at || item.completed_at || item.created_at) || 0,
+                value: item,
+            });
+        });
+    entries.sort((left, right) => left.at - right.at || (left.kind === 'event' ? -1 : 1));
+    entries.forEach((entry) => {
+        if (entry.kind === 'event') renderRoomEvent(entry.value);
+        else renderRunItem(entry.value);
+    });
+    if (entries.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'service-event';
+        empty.textContent = '暂无消息';
+        $messages.appendChild(empty);
+    }
+    refreshIcons();
+    scrollToBottom();
+}
+
+function renderRoomEvent(event) {
+    if (event.kind !== 'user_message' && event.kind !== 'member_message') {
+        const service = document.createElement('div');
+        service.className = 'service-event';
+        service.textContent = `${event.content} · ${formatRoomTime(event.created_at)}`;
+        $messages.appendChild(service);
+        return;
+    }
+    const message = document.createElement('div');
+    message.className = `msg ${event.sender_kind === 'user' ? 'user' : 'assistant'}`;
+    const metadata = document.createElement('div');
+    metadata.className = 'msg-meta';
+    const recipientNames = (event.recipients || [])
+        .map((memberId) => roomSnapshot.members.find((member) => member.member_id === memberId)?.display_name)
+        .filter(Boolean);
+    const audienceCount = Array.isArray(event.audience) ? event.audience.length : 0;
+    const audienceMeta = event.group_enabled && audienceCount
+        ? `<span class="msg-audience" title="已投递给 ${audienceCount} 个智脑"><i data-lucide="users"></i>${audienceCount}</span>`
+        : '';
+    metadata.innerHTML = `<strong>${escapeHtml(event.sender_name)}</strong><span>${escapeHtml(formatRoomTime(event.created_at))}</span>${recipientNames.length ? `<span>→ ${escapeHtml(recipientNames.join('、'))}</span>` : ''}${audienceMeta}`;
+    const content = document.createElement('div');
+    content.className = 'msg-content';
+    if (event.sender_kind === 'member') {
+        renderMarkdown(content, event.content);
+        attachPreviewAction(message, `${event.sender_name} 回复`, event.sender_name, event.content);
+        addBrainConclusion(event.member_id || event.sender_id, event.content, `${event.sender_name} 回复`, `room-${event.event_id}`, false);
+    } else {
+        content.textContent = event.content;
+    }
+    message.appendChild(metadata);
+    message.appendChild(content);
+    $messages.appendChild(message);
+}
+
+function renderRunItem(item) {
+    const member = roomSnapshot.members.find((candidate) => candidate.member_id === item.member_id);
+    const state = ensureMemberRunState(item.run_id, item.member_id, roomSnapshot.room.room_id);
+    state.status = item.state;
+    state.purpose = item.purpose || state.purpose;
+    state.error = item.error || state.error;
+    const message = document.createElement('div');
+    message.className = `msg assistant run-message ${state.status}`;
+    message.dataset.runId = item.run_id;
+    message.innerHTML = `
+        <div class="msg-meta"><strong>${escapeHtml(member?.display_name || item.member_id)}</strong><span>${escapeHtml(formatRoomTime(item.started_at || item.created_at))}</span></div>
+        <div class="run-status"><span>${escapeHtml(runStatusLabel(state))}</span>${item.state === 'running' ? '<button class="run-cancel" type="button" title="停止运行" aria-label="停止运行"><i data-lucide="square"></i></button>' : ''}</div>
+        <div class="run-content"></div>
+        <div class="run-log ${state.logs.length ? '' : 'hidden'}"></div>
+    `;
+    state.element = message;
+    message.querySelector('.run-cancel')?.addEventListener('click', () => {
+        send('interrupt_member_run', {
+            member_id: item.member_id,
+            run_id: item.run_id,
+            expected_version: Number(item.version),
+        });
+    });
+    $messages.appendChild(message);
+    updateRunElement(state);
+}
+
+function ensureMemberRunState(runId, memberId, roomId) {
+    if (!memberRunStates.has(runId)) {
+        memberRunStates.set(runId, {
+            runId,
+            memberId,
+            roomId,
+            status: 'running',
+            statusText: '',
+            rawText: '',
+            logs: [],
+            error: null,
+            purpose: null,
+            element: null,
+        });
+    }
+    return memberRunStates.get(runId);
+}
+
+function updateRunElement(state) {
+    const element = state.element;
+    if (!element?.isConnected) return;
+    element.className = `msg assistant run-message ${state.status}`;
+    const status = element.querySelector('.run-status > span');
+    if (status) status.textContent = runStatusLabel(state);
+    const content = element.querySelector('.run-content');
+    if (content) {
+        if (state.rawText) renderMarkdown(content, state.rawText);
+        else content.textContent = state.error || '';
+    }
+    const log = element.querySelector('.run-log');
+    if (log) {
+        log.textContent = state.logs.slice(-5).join('\n');
+        log.classList.toggle('hidden', state.logs.length === 0);
+    }
+    refreshIcons();
+}
+
+function runStatusLabel(state) {
+    if (state.statusText) return state.statusText;
+    if (state.purpose === 'participation') {
+        if (state.status === 'leased') return '等待查看群聊';
+        if (state.status === 'running') return '判断是否参与';
+    }
+    if (state.status === 'leased') return '等待调度';
+    if (state.status === 'completed') return '已完成';
+    if (state.status === 'failed') return state.error ? `失败：${state.error}` : '运行失败';
+    if (state.status === 'cancelled') return '已停止';
+    return '运行中';
+}
+
+function handleMemberRunProgress(data) {
+    if (data.room_id !== activeSessionId || !data.event) return;
+    const state = ensureMemberRunState(data.run_id, data.member_id, data.room_id);
+    const inbox = roomSnapshot?.inbox.find((item) => item.run_id === data.run_id);
+    state.purpose = inbox?.purpose || state.purpose;
+    const event = data.event;
+    switch (event.type) {
+        case 'connecting':
+            state.statusText = `连接 ${event.model}`;
+            break;
+        case 'thinking':
+            state.statusText = '思考中';
+            break;
+        case 'text_delta':
+            state.statusText = '输出中';
+            state.rawText += event.text || '';
+            break;
+        case 'thinking_delta':
+            state.statusText = '思考中';
+            break;
+        case 'intermediate_conclusion':
+            state.logs.push(`阶段结论：${truncate(event.content || '', 120)}`);
+            break;
+        case 'tool_start':
+            state.statusText = `调用 ${event.tool_name}`;
+            state.logs.push(`开始：${event.tool_name}`);
+            break;
+        case 'tool_done':
+            state.statusText = event.is_error ? `${event.tool_name} 失败` : `${event.tool_name} 完成`;
+            state.logs.push(`${event.is_error ? '失败' : '完成'}：${event.tool_name} · ${event.duration_ms}ms`);
+            break;
+        case 'memory_injected':
+            state.logs.push(`记忆：${event.count} 条`);
+            break;
+        case 'llm_retry':
+            state.logs.push(`重试：${event.attempt}/${event.max_attempts}`);
+            break;
+        case 'final_answer':
+            state.rawText = event.content || state.rawText;
+            state.statusText = '提交结果';
+            break;
+        case 'error':
+            state.error = event.message;
+            state.statusText = event.message;
+            break;
+        default:
+            break;
+    }
+    if (!state.element?.isConnected) renderRoomTimeline();
+    updateRunElement(state);
+    const member = roomSnapshot?.members.find((candidate) => candidate.member_id === data.member_id);
+    updateAgentStatus(data.member_id, state.statusText || '运行中', member?.display_name || data.member_id);
+    scrollToBottom();
+}
+
+function handleMemberRunFinished(data) {
+    if (data.room_id !== activeSessionId) return;
+    const state = ensureMemberRunState(data.run_id, data.member_id, data.room_id);
+    state.status = data.status;
+    state.statusText = '';
+    state.error = data.error || state.error;
+    const inbox = roomSnapshot?.inbox.find((item) => item.run_id === data.run_id);
+    if (inbox) {
+        state.purpose = inbox.purpose || state.purpose;
+        inbox.state = data.status;
+        inbox.error = data.error || inbox.error;
+    }
+    renderRoomTimeline();
+}
+
+function mergeRoomEvent(event) {
+    if (!roomSnapshot || event.room_id !== activeSessionId) return;
+    if (!roomSnapshot.events.some((candidate) => candidate.event_id === event.event_id)) {
+        roomSnapshot.events.push(event);
+        roomSnapshot.room.latest_event_seq = Math.max(
+            roomSnapshot.room.latest_event_seq || 0,
+            event.sequence || 0,
+        );
+    }
+    if (event.run_id) {
+        const inbox = roomSnapshot.inbox.find((item) => item.run_id === event.run_id);
+        if (inbox) inbox.state = 'completed';
+    }
+    renderCollaborationRoom();
+}
+
+function mergeMember(member) {
+    if (!roomSnapshot || member.room_id !== activeSessionId) return;
+    const index = roomSnapshot.members.findIndex((candidate) => candidate.member_id === member.member_id);
+    if (index >= 0) roomSnapshot.members[index] = member;
+    else roomSnapshot.members.push(member);
+    reconcileSelectedMembers();
+    renderCollaborationRoom();
+}
+
+function mergeInboxItem(roomId, item) {
+    if (!roomSnapshot || roomId !== activeSessionId) return;
+    const index = roomSnapshot.inbox.findIndex((candidate) => candidate.inbox_item_id === item.inbox_item_id);
+    if (index >= 0) roomSnapshot.inbox[index] = item;
+    else roomSnapshot.inbox.push(item);
+    renderCollaborationRoom();
+}
+
+function formatRoomTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function showToast(message) {
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.textContent = message;
+    $toastRegion.appendChild(toast);
+    setTimeout(() => toast.remove(), 5000);
+}
+
+function handleMemberAction(action, member) {
+    switch (action) {
+        case 'configure':
+            openMemberModal(member);
+            break;
+        case 'sleep':
+            send('sleep_member', {
+                member_id: member.member_id,
+                expected_version: Number(member.version),
+            });
+            break;
+        case 'wake':
+            send('wake_member', {
+                member_id: member.member_id,
+                expected_version: Number(member.version),
+            });
+            break;
+        case 'restore':
+            send('restore_member', {
+                member_id: member.member_id,
+                expected_version: Number(member.version),
+            });
+            break;
+        case 'interrupt':
+            if (member.active_run_id) {
+                const item = roomSnapshot.inbox.find(
+                    (candidate) => candidate.run_id === member.active_run_id,
+                );
+                if (!item) {
+                    showToast('运行状态已变化，请刷新后重试');
+                    break;
+                }
+                send('interrupt_member_run', {
+                    member_id: member.member_id,
+                    run_id: member.active_run_id,
+                    expected_version: Number(item.version),
+                });
+            }
+            break;
+        case 'archive':
+            if (window.confirm(`归档成员「${member.display_name}」？`)) {
+                send('archive_member', {
+                    member_id: member.member_id,
+                    expected_version: Number(member.version),
+                });
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+function openMemberModal(member = null) {
+    if (!roomSnapshot) return;
+    $memberModalTitle.textContent = member ? '成员设置' : '创建成员';
+    $memberId.value = member?.member_id || '';
+    $memberVersion.value = member?.version ?? '';
+    $memberName.value = member?.display_name || '';
+    fillModelSelect($memberModel, member?.model_policy);
+    fillSelect($memberDepth, roomSnapshot.reasoning_depths || [], member?.reasoning_depth);
+    $memberModal.classList.remove('hidden');
+    setTimeout(() => $memberName.focus(), 0);
+    refreshIcons();
+}
+
+function closeMemberModal() {
+    $memberModal.classList.add('hidden');
+    $memberForm.reset();
+    $memberId.value = '';
+    $memberVersion.value = '';
+}
+
+function fillModelSelect(select, selected) {
+    const details = roomSnapshot?.model_policy_details || [];
+    const policies = roomSnapshot?.model_policies || [];
+    select.innerHTML = '';
+    policies.forEach((policyId) => {
+        const detail = details.find((policy) => policy.policy_id === policyId);
+        const option = document.createElement('option');
+        option.value = policyId;
+        option.textContent = detail ? `${detail.model} · ${detail.provider}` : policyId;
+        option.title = detail ? `${detail.provider} · ${detail.model} · ${policyId}` : policyId;
+        option.selected = policyId === selected;
+        select.appendChild(option);
+    });
+}
+
+function fillSelect(select, values, selected) {
+    select.innerHTML = '';
+    values.forEach((value) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value;
+        option.selected = value === selected;
+        select.appendChild(option);
+    });
+}
+
+function submitMemberForm() {
+    const displayName = $memberName.value.trim();
+    if (!displayName) return;
+    const memberId = $memberId.value;
+    if (memberId) {
+        send('configure_member', {
+            member_id: memberId,
+            display_name: displayName,
+            model_policy: $memberModel.value,
+            reasoning_depth: $memberDepth.value,
+            expected_version: Number($memberVersion.value),
+        });
+    } else {
+        send('create_member', {
+            display_name: displayName,
+            model_policy: $memberModel.value || null,
+            reasoning_depth: $memberDepth.value || null,
+        });
+    }
+    closeMemberModal();
+}
+
+function submitCollaborationMessage() {
+    const content = $input.value.trim();
+    if (!content) return;
+    const recipients = [...selectedMemberIds]
+        .map((memberId) => roomSnapshot.members.find((member) => member.member_id === memberId))
+        .filter(Boolean)
+        .map((member) => ({
+            member_id: member.member_id,
+            expected_version: Number(member.version),
+        }));
+    if (recipients.length === 0) {
+        showToast('请选择至少一个成员');
+        return;
+    }
+    const commandId = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    send('post_room_message', {
+        recipients,
+        content,
+        mode: roomMode,
+        thread_key: 'room',
+        expected_room_version: Number(roomSnapshot.room.version),
+        command_id: commandId,
+    });
+    $input.value = '';
+    $input.style.height = 'auto';
 }
 
 // ── Streaming Text (Typewriter) ─────────────────────────────────
@@ -514,12 +1176,8 @@ function showWelcome() {
     const el = document.createElement('div');
     el.className = 'welcome';
     el.innerHTML = `
-        <h2>智脑 AI v2</h2>
-        <p>一主二从架构 · 主脑 + 记忆脑 + 评估脑</p>
-        <div class="welcome-tips">
-            <div class="welcome-tip">输入查询开始对话</div>
-            <div class="welcome-tip">Enter 发送 · Shift+Enter 换行</div>
-        </div>
+        <h2>智脑协作</h2>
+        <p>等待消息</p>
     `;
     $messages.appendChild(el);
 }
@@ -957,14 +1615,15 @@ function attachDeleteAction(el, messageIndex) {
 }
 
 function setInputEnabled(enabled) {
-    $input.disabled = !enabled;
-    if (enabled) {
+    const effectiveEnabled = roomSnapshot ? true : enabled;
+    $input.disabled = !effectiveEnabled;
+    if (effectiveEnabled) {
         $input.focus();
     }
 }
 
 function updateSendButton() {
-    if (isGenerating) {
+    if (isGenerating && !roomSnapshot) {
         $sendBtn.classList.add('stop-mode');
         $sendBtn.innerHTML = '<i data-lucide="square"></i>';
         $sendBtn.title = '停止生成 (Esc / Ctrl+C)';
@@ -1535,14 +2194,14 @@ function statusText(status) {
 }
 
 function initializeCoreBrainNodes() {
-    ['client', 'main', 'memory', 'graph', 'eval', 'novel', 'tool', 'agent'].forEach(ensureBrainNode);
+    ['client', 'instance', 'memory', 'graph', 'tool'].forEach(ensureBrainNode);
 }
 
 function cockpitIdleSummary() {
     if (brainState.currentModel) {
         return `已连接 ${brainState.currentModel}，等待任务进入`;
     }
-    return '所有脑区待命，等待任务进入';
+    return '所有成员与服务待命，等待任务进入';
 }
 
 function setConnectionState(state) {
@@ -2153,6 +2812,10 @@ function beginHistoryRegeneration(label) {
 }
 
 function submitQuery() {
+    if (roomSnapshot?.room?.room_id === activeSessionId) {
+        submitCollaborationMessage();
+        return;
+    }
     const text = $input.value.trim();
     if (!text) return;
 
@@ -2179,7 +2842,7 @@ $input.addEventListener('keydown', (e) => {
         // 正在 IME 组合态（如中文候选窗），不拦截，让输入法处理确认
         if (isComposing) return;
         e.preventDefault();
-        if (isGenerating) return; // 生成中不重复提交
+        if (isGenerating && !roomSnapshot) return; // 旧查询生成中不重复提交
         submitQuery();
     }
     // 生成中 ESC 停止
@@ -2203,7 +2866,7 @@ document.addEventListener('keydown', (e) => {
 
 // 发送按钮：根据状态切换发送/停止
 $sendBtn.addEventListener('click', () => {
-    if (isGenerating) {
+    if (isGenerating && !roomSnapshot) {
         stopGenerating();
     } else {
         submitQuery();
@@ -2214,6 +2877,28 @@ $sendBtn.addEventListener('click', () => {
 $input.addEventListener('input', () => {
     $input.style.height = 'auto';
     $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
+    syncMentionRecipients();
+});
+
+$roomMode.querySelectorAll('[data-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+        roomMode = button.dataset.mode;
+        $roomMode.querySelectorAll('[data-mode]').forEach((candidate) => {
+            candidate.classList.toggle('active', candidate === button);
+        });
+    });
+});
+
+$addMemberBtn.addEventListener('click', () => openMemberModal());
+$roomRefreshBtn.addEventListener('click', () => send('request_room_snapshot'));
+$memberModalClose.addEventListener('click', closeMemberModal);
+$memberModalCancel.addEventListener('click', closeMemberModal);
+$memberModal.addEventListener('click', (event) => {
+    if (event.target === $memberModal) closeMemberModal();
+});
+$memberForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    submitMemberForm();
 });
 
 $personaSelect.addEventListener('change', () => {

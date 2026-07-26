@@ -10,13 +10,13 @@ use std::sync::Arc;
 use brain_core::tool_executor::ToolExecutor;
 use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
-use brain_memory::novel::{NovelProject, NovelTaskType};
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
-use brain_novel::{
-    MainReviewRecord, NovelBrainHandle, NovelConversationSource, NovelResumeInput,
-    NovelTaskRequest, UserDecisionRecord,
-};
 use brain_plugin::SkillCatalog;
+use novel_application::TaskApplicationPort;
+use novel_domain::{
+    MainReviewRecord, NovelConversationSource, NovelProject, NovelResumeInput, NovelTaskRequest,
+    NovelTaskType, UserDecisionRecord,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -39,8 +39,8 @@ pub struct RealToolExecutor {
     graph_db_path: Option<PathBuf>,
     /// Live brain/sub-agent exchanges consumed by WebSocket clients.
     runtime_trace_tx: Option<tokio::sync::broadcast::Sender<RuntimeExchange>>,
-    /// Stable resident NovelBrain RPC handle.
-    novel_brain: Option<NovelBrainHandle>,
+    /// One high-level application boundary for every Novel task command.
+    novel_application: Option<Arc<dyn TaskApplicationPort>>,
 }
 
 impl RealToolExecutor {
@@ -68,7 +68,7 @@ impl RealToolExecutor {
             mcp_pool: None,
             graph_db_path: default_graph_db_path(),
             runtime_trace_tx: None,
-            novel_brain: None,
+            novel_application: None,
         }
     }
 
@@ -115,8 +115,11 @@ impl RealToolExecutor {
         self
     }
 
-    pub fn with_novel_brain(mut self, handle: NovelBrainHandle) -> Self {
-        self.novel_brain = Some(handle);
+    pub fn with_novel_application(
+        mut self,
+        application: Option<Arc<dyn TaskApplicationPort>>,
+    ) -> Self {
+        self.novel_application = application;
         self
     }
 }
@@ -129,17 +132,17 @@ impl Default for RealToolExecutor {
 
 fn spawn_agent_completion_notifier(
     dispatch: Option<brain_dispatch::TokioDispatch>,
-    completion_rx: std::sync::mpsc::Receiver<tools::AgentCompletion>,
+    completion_rx: tokio::sync::oneshot::Receiver<tools::AgentCompletion>,
     trace: Option<AgentTracePublisher>,
 ) {
-    std::thread::spawn(move || {
-        let Ok(completion) = completion_rx.recv() else {
+    tokio::spawn(async move {
+        let Ok(completion) = completion_rx.await else {
             tracing::warn!("后台子代理完成通道提前关闭，无法注入通知");
             return;
         };
         let status = match completion.status.as_str() {
             "completed" => brain_dispatch::AgentStatus::Completed,
-            "failed" => brain_dispatch::AgentStatus::Failed,
+            "failed" | "cancelled" | "deadline_exceeded" => brain_dispatch::AgentStatus::Failed,
             _ => brain_dispatch::AgentStatus::Running,
         };
         if let Some(trace) = trace {
@@ -287,23 +290,26 @@ impl ToolExecutor for RealToolExecutor {
         if is_graph_tool(&name) {
             inject_graph_db_path(&mut input, self.graph_db_path.as_ref());
         }
-        if name == "novel_start_task" {
+        if name == "novel_task"
+            && input.get("action").and_then(serde_json::Value::as_str) == Some("start")
+        {
             inject_novel_conversation_scope(&mut input);
         }
 
-        if is_resident_novel_tool(&name) {
-            let novel_brain = self.novel_brain.clone();
+        if is_novel_application_tool(&name) {
+            let novel_application = self.novel_application.clone();
             let trace = self.runtime_trace_tx.clone();
             return Box::pin(async move {
                 let start = std::time::Instant::now();
                 let exchange_id = format!("novel-{}", Uuid::new_v4());
+                let (novel_participant, novel_label) = ("novel-application", "小说任务工作流");
                 if let Some(sender) = &trace {
                     let _ = sender.send(RuntimeExchange::new(
                         &exchange_id,
                         "main",
                         "主脑",
-                        "novel",
-                        "常驻小说脑",
+                        novel_participant,
+                        novel_label,
                         ExchangeKind::Delegation,
                         ExchangePhase::Request,
                         &name,
@@ -312,9 +318,11 @@ impl ToolExecutor for RealToolExecutor {
                         None,
                     ));
                 }
-                let result = match novel_brain {
-                    Some(handle) => execute_resident_novel_tool(&handle, &name, input).await,
-                    None => Err("常驻小说脑未初始化".into()),
+                let result = match novel_application {
+                    Some(application) => {
+                        execute_application_novel_tool(application.as_ref(), &name, input).await
+                    }
+                    None => Err("小说任务应用服务未初始化".into()),
                 };
                 let duration_ms = start.elapsed().as_millis() as u64;
                 if let Some(sender) = &trace {
@@ -324,8 +332,8 @@ impl ToolExecutor for RealToolExecutor {
                     };
                     let _ = sender.send(RuntimeExchange::new(
                         &exchange_id,
-                        "novel",
-                        "常驻小说脑",
+                        novel_participant,
+                        novel_label,
                         "main",
                         "主脑",
                         ExchangeKind::Delegation,
@@ -348,44 +356,6 @@ impl ToolExecutor for RealToolExecutor {
                         output: error,
                         is_error: true,
                         duration_ms,
-                    },
-                }
-            });
-        }
-
-        if matches!(
-            name.as_str(),
-            "novel_create_project"
-                | "novel_list_projects"
-                | "novel_recall_project"
-                | "novel_check_consistency"
-                | "novel_resolve_conflict"
-        ) {
-            let memory_brain = self.memory_brain.clone();
-            return Box::pin(async move {
-                let start = std::time::Instant::now();
-                let Some(memory_brain) = memory_brain else {
-                    return ToolExecutionResult {
-                        tool_name: tool_name_owned,
-                        output: format!("{name}: PyramidMemoryBrain not available"),
-                        is_error: true,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    };
-                };
-                let guard = memory_brain.lock().await;
-                let result = execute_novel_memory_tool(&guard, &name, &input);
-                match result {
-                    Ok(output) => ToolExecutionResult {
-                        tool_name: tool_name_owned,
-                        output,
-                        is_error: false,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    },
-                    Err(error) => ToolExecutionResult {
-                        tool_name: tool_name_owned,
-                        output: error,
-                        is_error: true,
-                        duration_ms: start.elapsed().as_millis() as u64,
                     },
                 }
             });
@@ -592,24 +562,6 @@ impl ToolExecutor for RealToolExecutor {
 
         if name == "Agent" {
             let dispatch = self.dispatch.clone();
-            let is_novel_agent = input
-                .get("subagent_type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| {
-                    kind.eq_ignore_ascii_case("novel")
-                        || kind.contains("小说")
-                        || kind.contains("写作")
-                });
-            if is_novel_agent {
-                return Box::pin(async move {
-                    ToolExecutionResult {
-                        tool_name: tool_name_owned,
-                        output: "Agent(subagent_type=Novel) 已停用；请使用 novel_start_task / novel_resume_task 与常驻小说脑协作".into(),
-                        is_error: true,
-                        duration_ms: 0,
-                    }
-                });
-            }
             let trace = self
                 .runtime_trace_tx
                 .clone()
@@ -623,11 +575,7 @@ impl ToolExecutor for RealToolExecutor {
                 if let Some(trace) = &trace {
                     trace.publish_request();
                 }
-                let result = tokio::task::spawn_blocking(move || {
-                    tools::execute_agent_tool_with_completion(&input)
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
+                let result = tools::execute_agent_tool_with_completion(&input).await;
 
                 match result {
                     Ok(launch) => {
@@ -751,17 +699,22 @@ struct NovelPublishToolInput {
     draft_version: u32,
 }
 
-async fn execute_resident_novel_tool(
-    handle: &NovelBrainHandle,
+async fn execute_application_novel_tool(
+    application: &dyn TaskApplicationPort,
     name: &str,
-    input: serde_json::Value,
+    mut input: serde_json::Value,
 ) -> Result<String, String> {
-    if name != "novel_start_task" {
+    let action = required_string(&input, "action")?.to_owned();
+    input
+        .as_object_mut()
+        .ok_or_else(|| "Novel facade input must be an object".to_string())?
+        .remove("action");
+    if name == "novel_task" && action != "start" {
         if let (Some(scope), Some(task_id)) = (
             crate::query_context::current_conversation_memory_scope(),
             input.get("task_id").and_then(serde_json::Value::as_str),
         ) {
-            handle
+            application
                 .associate_conversation_source(
                     task_id,
                     NovelConversationSource {
@@ -773,84 +726,72 @@ async fn execute_resident_novel_tool(
                 .map_err(|error| error.to_string())?;
         }
     }
-    let output = match name {
-        "novel_start_task" => {
-            let request: NovelTaskRequest = serde_json::from_value(input)
-                .map_err(|error| format!("NovelTaskRequest 格式错误: {error}"))?;
-            serde_json::to_value(
-                handle
-                    .start_task(request)
-                    .await
-                    .map_err(|e| e.to_string())?,
-            )
-        }
-        "novel_resume_task" => {
+    let output = match (name, action.as_str()) {
+        ("novel_task", "resume") => {
             let input: NovelResumeToolInput = serde_json::from_value(input)
-                .map_err(|error| format!("novel_resume_task 格式错误: {error}"))?;
+                .map_err(|error| format!("novel_task resume 格式错误: {error}"))?;
             serde_json::to_value(
-                handle
-                    .resume_task(input.task_id, NovelResumeInput { input: input.input })
+                application
+                    .resume_task(&input.task_id, NovelResumeInput { input: input.input })
                     .await
                     .map_err(|error| error.to_string())?,
             )
         }
-        "novel_review_draft" => {
+        ("novel_task", "review") => {
             let review: MainReviewRecord = serde_json::from_value(input)
                 .map_err(|error| format!("MainReviewRecord 格式错误: {error}"))?;
             serde_json::to_value(
-                handle
+                application
                     .review_draft(review)
                     .await
                     .map_err(|error| error.to_string())?,
             )
         }
-        "novel_user_decision" => {
+        ("novel_task", "decide") => {
             let decision: UserDecisionRecord = serde_json::from_value(input)
                 .map_err(|error| format!("UserDecisionRecord 格式错误: {error}"))?;
             serde_json::to_value(
-                handle
+                application
                     .user_decision(decision)
                     .await
                     .map_err(|error| error.to_string())?,
             )
         }
-        "novel_publish" => {
+        ("novel_task", "publish") => {
             let input: NovelPublishToolInput = serde_json::from_value(input)
-                .map_err(|error| format!("novel_publish 格式错误: {error}"))?;
+                .map_err(|error| format!("novel_task publish 格式错误: {error}"))?;
             serde_json::to_value(
-                handle
-                    .publish(input.task_id, input.draft_version)
+                application
+                    .publish(&input.task_id, input.draft_version)
                     .await
                     .map_err(|error| error.to_string())?,
             )
         }
-        "novel_status" => {
+        ("novel_task", "status") => {
             let project_id = input
                 .get("project_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
             serde_json::to_value(
-                handle
-                    .status(project_id)
+                application
+                    .status(project_id.as_deref())
                     .await
                     .map_err(|error| error.to_string())?,
             )
         }
-        _ => return Err(format!("unsupported resident Novel tool: {name}")),
-    }
-    .map_err(|error| error.to_string())?;
-    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
-}
-
-fn execute_novel_memory_tool(
-    memory: &PyramidMemoryBrain,
-    name: &str,
-    input: &serde_json::Value,
-) -> Result<String, String> {
-    match name {
-        "novel_create_project" => {
-            let project_id = required_string(input, "project_id")?;
-            let title = required_string(input, "title")?;
+        ("novel_task", "start") => {
+            let request: NovelTaskRequest = serde_json::from_value(input)
+                .map_err(|error| format!("NovelTaskRequest 格式错误: {error}"))?;
+            serde_json::to_value(
+                application
+                    .start_task(request)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+        }
+        ("novel_project", "create") => {
+            let project_id = required_string(&input, "project_id")?;
+            let title = required_string(&input, "title")?;
             let mut project = NovelProject::new(project_id, title);
             project.genres = input
                 .get("genres")
@@ -867,19 +808,21 @@ fn execute_novel_memory_tool(
                 .get("target_platform")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
-            memory
-                .create_novel_project(&project)
-                .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&project).map_err(|error| error.to_string())
+            serde_json::to_value(
+                application
+                    .create_project(project)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
         }
-        "novel_list_projects" => {
-            let projects = memory
-                .list_novel_projects()
-                .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&projects).map_err(|error| error.to_string())
-        }
-        "novel_recall_project" => {
-            let project_id = required_string(input, "project_id")?;
+        ("novel_project", "list") => serde_json::to_value(
+            application
+                .list_projects()
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        ("novel_project", "recall") => {
+            let project_id = required_string(&input, "project_id")?;
             let task_type: NovelTaskType = serde_json::from_value(
                 input
                     .get("task_type")
@@ -887,29 +830,37 @@ fn execute_novel_memory_tool(
                     .ok_or_else(|| "缺少 task_type".to_string())?,
             )
             .map_err(|error| format!("无效 task_type: {error}"))?;
-            let pack = memory
-                .recall_novel_project(project_id, task_type)
-                .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&pack).map_err(|error| error.to_string())
+            serde_json::to_value(
+                application
+                    .recall_project(project_id, task_type)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
         }
-        "novel_check_consistency" => {
-            let report = memory
-                .check_novel_consistency(required_string(input, "project_id")?)
-                .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
-        }
-        "novel_resolve_conflict" => {
-            memory
-                .resolve_novel_conflict(
-                    required_string(input, "project_id")?,
-                    required_string(input, "conflict_id")?,
-                    required_string(input, "resolution")?,
+        ("novel_project", "consistency") => serde_json::to_value(
+            application
+                .check_consistency(required_string(&input, "project_id")?)
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        ("novel_project", "resolve_conflict") => serde_json::to_value(
+            application
+                .resolve_conflict(
+                    required_string(&input, "project_id")?,
+                    required_string(&input, "conflict_id")?,
+                    required_string(&input, "resolution")?,
                 )
-                .map_err(|error| error.to_string())?;
-            Ok("小说 Canon 冲突已标记为已处理".into())
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        _ => {
+            return Err(format!(
+                "unsupported Novel application command: {name} action={action}"
+            ))
         }
-        _ => Err(format!("unsupported novel memory tool: {name}")),
     }
+    .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
 }
 
 fn required_string<'a>(input: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
@@ -920,16 +871,8 @@ fn required_string<'a>(input: &'a serde_json::Value, key: &str) -> Result<&'a st
         .ok_or_else(|| format!("缺少或无效字段: {key}"))
 }
 
-fn is_resident_novel_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "novel_start_task"
-            | "novel_resume_task"
-            | "novel_review_draft"
-            | "novel_user_decision"
-            | "novel_publish"
-            | "novel_status"
-    )
+fn is_novel_application_tool(name: &str) -> bool {
+    matches!(name, "novel_task" | "novel_project")
 }
 
 fn is_graph_tool(name: &str) -> bool {
@@ -997,13 +940,94 @@ pub fn mvp_tool_definitions() -> Vec<brain_llm::ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use brain_graph::{
         id::gen_node_id,
         schema::{GraphType, Node, NodeKind},
         store::GraphStore,
     };
+    use novel_application::{
+        NovelApplicationService, NovelDomainStore, NovelResourcePort as ApplicationResourcePort,
+        StoreWorkflowEnvironment,
+    };
+    use novel_domain::{
+        NovelDraftEnvelope, NovelMemoryDelta, NovelOutcome, NovelSelfReview, NovelSelfReviewChecks,
+        NovelSelfReviewVerdict, NovelTaskPhase, ReviewCheckStatus,
+    };
+    use novel_workflow::{
+        NovelStartWorkflow, NovelWorkflowBudget, NovelWorkflowModels, NovelWorkflowPortError,
+        NovelWriterExecution, NovelWriterInvocation, NovelWriterPort, ProfileModel,
+    };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use task_engine::{
+        ActualUsage, Scheduler, SchedulerLimits, TaskCoordinator, TaskRepository, TaskRunState,
+    };
+
+    use crate::novel_adapters::ScopedNovelResourceAdapter;
+
+    struct ExecutorTestWriter {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl NovelWriterPort for ExecutorTestWriter {
+        async fn execute(
+            &self,
+            invocation: NovelWriterInvocation,
+        ) -> Result<NovelWriterExecution, NovelWorkflowPortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = NovelOutcome::DraftReady(NovelDraftEnvelope {
+                task_id: invocation.request.task_id.clone(),
+                draft_version: invocation.next_draft_version,
+                project_id: invocation.request.project_id.clone(),
+                canon_revision: invocation.request.expected_revision,
+                content: "Chapter one from TaskEngine workflow".into(),
+                self_review: NovelSelfReview {
+                    verdict: NovelSelfReviewVerdict::Pass,
+                    checks: NovelSelfReviewChecks {
+                        outline_alignment: ReviewCheckStatus::Pass,
+                        canon_consistency: ReviewCheckStatus::Pass,
+                        character_consistency: ReviewCheckStatus::Pass,
+                        timeline_consistency: ReviewCheckStatus::Pass,
+                        plot_and_foreshadowing: ReviewCheckStatus::Pass,
+                        style_and_repetition: ReviewCheckStatus::Pass,
+                    },
+                    issues: Vec::new(),
+                    unverified_assumptions: Vec::new(),
+                    summary: "Self review passed".into(),
+                },
+                proposed_delta: NovelMemoryDelta {
+                    project_id: invocation.request.project_id.clone(),
+                    branch_id: invocation.project.active_branch,
+                    expected_revision: invocation.request.expected_revision,
+                    task_type: invocation.request.task_type,
+                    source_ref: invocation
+                        .request
+                        .output_path
+                        .to_string_lossy()
+                        .into_owned(),
+                    progress: None,
+                    proposed_facts: Vec::new(),
+                    state_changes: Vec::new(),
+                    plot_updates: Vec::new(),
+                    foreshadowing_updates: Vec::new(),
+                    feedback: Vec::new(),
+                    experience_candidates: Vec::new(),
+                },
+                evidence_refs: vec!["task:requirements".into(), "canon:revision:0".into()],
+            });
+            Ok(NovelWriterExecution {
+                raw_output: serde_json::to_string(&outcome).unwrap(),
+                outcome,
+                usage: ActualUsage {
+                    input_tokens: 21,
+                    output_tokens: 34,
+                },
+            })
+        }
+    }
 
     fn graph_node(title: &str) -> Node {
         let now = chrono::Utc::now().timestamp_millis();
@@ -1028,37 +1052,32 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"bash"), "应包含 bash 工具");
         assert!(names.contains(&"read_file"), "应包含 read_file 工具");
-        assert!(names.contains(&"novel_create_project"));
-        assert!(names.contains(&"novel_list_projects"));
-        assert!(names.contains(&"novel_start_task"));
-        assert!(names.contains(&"novel_resume_task"));
-        assert!(names.contains(&"novel_review_draft"));
-        assert!(names.contains(&"novel_user_decision"));
-        assert!(names.contains(&"novel_publish"));
-        assert!(names.contains(&"novel_status"));
-        assert!(names.contains(&"novel_recall_project"));
-        assert!(names.contains(&"novel_check_consistency"));
-        assert!(!names.contains(&"novel_commit_delta"));
-        assert!(names.contains(&"novel_resolve_conflict"));
+        assert!(names.contains(&"novel_task"));
+        assert!(names.contains(&"novel_project"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("novel_"))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
-    async fn novel_project_tools_create_and_recall_isolated_memory() {
+    async fn novel_project_facade_create_and_recall_use_domain_store() {
         let dir = tempfile::tempdir().unwrap();
-        let memory = PyramidMemoryBrain::new(
-            brain_memory::pyramid_memory_brain::PyramidMemoryBrainConfig {
-                base_dir: dir.path().to_path_buf(),
-                session_id: "novel-tool-test".into(),
-                graph_db_path: Some(dir.path().join("graph.db")),
-            },
-        )
-        .unwrap();
-        let exec = RealToolExecutor::with_memory(Some(Arc::new(tokio::sync::Mutex::new(memory))));
+        let store = Arc::new(NovelDomainStore::open(dir.path().join("novel.db")).unwrap());
+        let resources: Arc<dyn ApplicationResourcePort> =
+            Arc::new(ScopedNovelResourceAdapter::new(dir.path()).unwrap());
+        let application: Arc<dyn TaskApplicationPort> =
+            Arc::new(NovelApplicationService::new(store, None, resources));
+        let exec = RealToolExecutor::new().with_novel_application(Some(application));
 
         let create = exec
             .execute(&ToolCall {
-                tool_name: "novel_create_project".into(),
+                tool_name: "novel_project".into(),
                 input: json!({
+                    "action": "create",
                     "project_id": "dark-city",
                     "title": "暗城",
                     "genres": ["悬疑"],
@@ -1072,8 +1091,8 @@ mod tests {
 
         let recall = exec
             .execute(&ToolCall {
-                tool_name: "novel_recall_project".into(),
-                input: json!({ "project_id": "dark-city", "task_type": "outline" }),
+                tool_name: "novel_project".into(),
+                input: json!({ "action": "recall", "project_id": "dark-city", "task_type": "outline" }),
                 validated: false,
                 validation_id: None,
             })
@@ -1098,21 +1117,115 @@ mod tests {
             })
             .await;
         assert!(result.is_error);
-        assert!(result.output.contains("常驻小说脑"));
+        assert!(result.output.contains("unsupported built-in agent role"));
     }
 
     #[tokio::test]
-    async fn resident_novel_tool_reports_missing_handle() {
+    async fn novel_tool_reports_missing_workflow() {
         let result = RealToolExecutor::new()
             .execute(&ToolCall {
-                tool_name: "novel_status".into(),
-                input: json!({}),
+                tool_name: "novel_task".into(),
+                input: json!({ "action": "status" }),
                 validated: false,
                 validation_id: None,
             })
             .await;
         assert!(result.is_error);
         assert!(result.output.contains("未初始化"));
+    }
+
+    #[tokio::test]
+    async fn novel_start_uses_task_workflow_without_a_resident_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(NovelDomainStore::open(dir.path().join("novel.db")).unwrap());
+        store
+            .import_project(&NovelProject::new("project-1", "Project One"))
+            .unwrap();
+        let resources: Arc<dyn ApplicationResourcePort> =
+            Arc::new(ScopedNovelResourceAdapter::new(dir.path()).unwrap());
+        let environment = Arc::new(StoreWorkflowEnvironment::new(
+            Arc::clone(&store),
+            Arc::clone(&resources),
+        ));
+        let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+        let scheduler = Scheduler::new(SchedulerLimits {
+            max_workers: 1,
+            max_global: 1,
+            max_per_room: 1,
+            max_per_member: 1,
+            max_per_provider: 1,
+            max_per_profile: 1,
+            max_per_task: 1,
+        })
+        .unwrap();
+        let writer = Arc::new(ExecutorTestWriter {
+            calls: AtomicUsize::new(0),
+        });
+        let model = ProfileModel::new("test-provider", "test-model");
+        let workflow = Arc::new(NovelStartWorkflow::new(
+            Arc::clone(&repository),
+            TaskCoordinator::new(Arc::clone(&repository), scheduler),
+            environment,
+            writer.clone(),
+            NovelWorkflowModels {
+                writer: model.clone(),
+                reviewer: model.clone(),
+                canon_extractor: model,
+            },
+            NovelWorkflowBudget {
+                input_tokens: 1_000,
+                output_tokens: 1_000,
+            },
+        ));
+        let application = Arc::new(NovelApplicationService::new(
+            Arc::clone(&store),
+            Some(Arc::clone(&workflow)),
+            resources,
+        ));
+        let application_port: Arc<dyn TaskApplicationPort> = application;
+        let executor = RealToolExecutor::new().with_novel_application(Some(application_port));
+        assert!(executor.novel_application.is_some());
+
+        let input = json!({
+            "action": "start",
+            "task_id": "task-1",
+            "project_id": "project-1",
+            "task_type": "body",
+            "task_brief": "Write chapter one",
+            "target_chapter": 1,
+            "expected_revision": 0,
+            "output_path": "chapters/0001.md",
+            "context_refs": [],
+            "must_happen": [],
+            "must_not_change": [],
+            "acceptance_criteria": ["Complete chapter one"],
+            "allow_web_research": false,
+            "publication_policy": "require_user_acceptance"
+        });
+        let call = ToolCall {
+            tool_name: "novel_task".into(),
+            input,
+            validated: false,
+            validation_id: None,
+        };
+        let first = executor.execute(&call).await;
+        assert!(!first.is_error, "{}", first.output);
+        assert!(matches!(
+            serde_json::from_str::<NovelOutcome>(&first.output).unwrap(),
+            NovelOutcome::DraftReady(_)
+        ));
+        assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repository.task("novel-task-task-1").unwrap().state,
+            TaskRunState::Completed
+        );
+
+        let replay = executor.execute(&call).await;
+        assert!(!replay.is_error, "{}", replay.output);
+        assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+        let replay = store.load_checkpoint("task-1").unwrap().unwrap();
+        assert_eq!(replay.phase, NovelTaskPhase::AwaitingMainReview);
+        assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1249,7 +1362,7 @@ mod tests {
             })
         };
 
-        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         spawn_agent_completion_notifier(Some(dispatch.clone()), completion_rx, None);
 
         assert!(

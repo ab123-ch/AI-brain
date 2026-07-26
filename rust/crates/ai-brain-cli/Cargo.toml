@@ -25,7 +25,13 @@ brain-evolution = { path = "../brain-evolution" }
 brain-evolver = { path = "../brain-evolver" }
 brain-hooks = { path = "../brain-hooks" }
 brain-dispatch = { path = "../brain-dispatch" }
-brain-novel = { path = "../brain-novel" }
+novel-application = { path = "../novel-application" }
+novel-domain = { path = "../novel-domain" }
+novel-workflow = { path = "../novel-workflow" }
+novel-knowledge-adapter = { path = "../novel-knowledge-adapter" }
+brain-graph = { path = "../brain-graph" }
+knowledge-core = { path = "../knowledge-core" }
+task-engine = { path = "../task-engine" }
 
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-std", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -51,9 +57,9 @@ uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 async-trait = "0.1"
 sha2 = "0.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
-brain-graph = { path = "../brain-graph" }
 tempfile = "3"
 
 [lints]

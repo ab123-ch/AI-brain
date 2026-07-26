@@ -1,6 +1,6 @@
 //! 知识图谱类型定义（见设计文档 3.1-3.7）
 //!
-//! 5 类 NodeKind × 4+Custom GraphType × 11 种 EdgeKind。
+//! 5 类 NodeKind × 3+Custom GraphType × 11 种 EdgeKind。
 //! 二维分类：NodeKind（纵向基础类型）× GraphType（横向域）。
 
 use serde::{Deserialize, Serialize};
@@ -23,14 +23,13 @@ pub enum NodeKind {
     Code,
 }
 
-/// 图谱域（4 个固定域 + Custom 兜底）
+/// 图谱域（3 个固定域 + Custom 兜底）
 ///
 /// 同一 Entity 在不同域是**独立节点**。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GraphType {
     Memory,
     Code,
-    Novel,
     Video,
     /// 兜底自定义域（MVP 数据层支持，不开放创建工具）
     Custom(String),

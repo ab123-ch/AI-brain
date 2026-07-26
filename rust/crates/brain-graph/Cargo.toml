@@ -11,6 +11,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 log = "0.4"
 thiserror = "2"
+knowledge-core = { path = "../knowledge-core" }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

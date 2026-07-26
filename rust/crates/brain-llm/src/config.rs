@@ -66,6 +66,15 @@ pub struct BrainParams {
     pub temperature: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedModelPolicy {
+    pub policy_id: String,
+    pub provider: String,
+    pub model: String,
+    pub max_output_tokens: u32,
+    pub temperature: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub api_base: String,
@@ -176,6 +185,18 @@ impl LlmConfig {
         }
     }
 
+    #[must_use]
+    pub fn resolve_model_policy(&self, policy_id: &str) -> ResolvedModelPolicy {
+        let (max_output_tokens, temperature) = self.params_for_brain(policy_id);
+        ResolvedModelPolicy {
+            policy_id: policy_id.to_string(),
+            provider: self.provider_for_brain(policy_id).to_string(),
+            model: self.model_for_brain(policy_id).to_string(),
+            max_output_tokens,
+            temperature,
+        }
+    }
+
     /// 解析 API Key（优先环境变量，其次直接配置）
     pub fn resolve_api_key(&self, provider_name: &str) -> Result<String> {
         let provider = self
@@ -270,7 +291,6 @@ impl LlmConfig {
         brain_providers.insert("memory".into(), "xiaomi".into());
         brain_providers.insert("eval".into(), "deepseek".into());
         brain_providers.insert("evolver".into(), "xiaomi".into());
-        brain_providers.insert("novel".into(), "xiaomi".into());
 
         let mut brain_models = HashMap::new();
         brain_models.insert("main".into(), "mimo-7b".into());
@@ -279,7 +299,6 @@ impl LlmConfig {
         brain_models.insert("memory".into(), "mimo-7b".into());
         brain_models.insert("eval".into(), "deepseek-chat".into());
         brain_models.insert("evolver".into(), "mimo-7b".into());
-        brain_models.insert("novel".into(), "mimo-7b".into());
 
         let mut brain_params = HashMap::new();
         brain_params.insert(
@@ -308,13 +327,6 @@ impl LlmConfig {
             BrainParams {
                 max_tokens: 16384,
                 temperature: 0.3,
-            },
-        );
-        brain_params.insert(
-            "novel".into(),
-            BrainParams {
-                max_tokens: 32768,
-                temperature: 0.9,
             },
         );
         brain_params.insert(
@@ -419,16 +431,19 @@ mod tests {
         assert_eq!(config.llm.default_provider, "xiaomi");
         assert_eq!(config.llm.default_model, "mimo-7b");
         assert!(config.llm.brain_providers.contains_key("main"));
-        assert!(config.llm.brain_providers.contains_key("novel"));
-        assert!(config.llm.brain_models.contains_key("novel"));
+        assert!(!config.llm.brain_providers.contains_key("novel"));
+        assert!(!config.llm.brain_models.contains_key("novel"));
         assert_eq!(config.provider_for_brain("eval"), "deepseek");
-        assert_eq!(config.provider_for_brain("novel"), "xiaomi");
         assert_eq!(config.model_for_brain("main"), "mimo-7b");
         assert_eq!(config.model_for_brain("eval"), "deepseek-chat");
-        assert_eq!(config.model_for_brain("novel"), "mimo-7b");
-        let (novel_max_tokens, novel_temperature) = config.params_for_brain("novel");
-        assert_eq!(novel_max_tokens, 32768);
-        assert!((novel_temperature - 0.9).abs() < f64::EPSILON);
+        let main_policy = config.resolve_model_policy("main");
+        assert_eq!(main_policy.policy_id, "main");
+        assert_eq!(main_policy.provider, "xiaomi");
+        assert_eq!(main_policy.model, "mimo-7b");
+        assert_eq!(
+            main_policy.max_output_tokens,
+            config.params_for_brain("main").0
+        );
 
         let kimi = config
             .llm

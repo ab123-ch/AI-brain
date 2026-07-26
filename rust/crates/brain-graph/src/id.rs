@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// 生成节点 ID
 ///
 /// 格式：`{graph_type}_{kind}_{uuid8}`
-/// - graph_type: Memory/Code/Novel/Video 或 Custom(name)
+/// - graph_type: Memory/Code/Video 或 Custom(name)
 /// - kind: Memory/Concept/Entity/Tool/Code
 /// - uuid8: 取 UUID 前 8 位
 ///
@@ -25,7 +25,6 @@ pub fn gen_node_id(graph_type: GraphType, kind: NodeKind) -> String {
     let gt_str = match &graph_type {
         GraphType::Memory => "memory",
         GraphType::Code => "code",
-        GraphType::Novel => "novel",
         GraphType::Video => "video",
         GraphType::Custom(name) => &format!("custom({name})"),
     };

@@ -25,8 +25,6 @@ pub struct WebSession {
     pub created_at: String,
     /// 对话历史
     pub messages: Vec<ChatMessage>,
-    /// 当前人格 ID
-    pub active_persona_id: String,
     #[serde(default)]
     pub modified_files: Vec<ModifiedFileInfo>,
 }
@@ -534,7 +532,6 @@ impl SessionManager {
             title,
             created_at: Utc::now().to_rfc3339(),
             messages: Vec::new(),
-            active_persona_id: String::new(),
             modified_files: Vec::new(),
         }
     }
@@ -626,6 +623,21 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn legacy_flat_persona_field_is_ignored_and_not_rewritten() {
+        let session = SessionManager::create_session("Legacy".into());
+        let mut value = serde_json::to_value(&session).unwrap();
+        assert!(value.get("active_persona_id").is_none());
+        value["active_persona_id"] = serde_json::Value::String("legacy-persona".into());
+
+        let restored: WebSession = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.title, "Legacy");
+        assert!(serde_json::to_value(restored)
+            .unwrap()
+            .get("active_persona_id")
+            .is_none());
     }
 
     #[test]
@@ -868,14 +880,6 @@ mod tests {
         assert!(mgr.active().messages[..3]
             .iter()
             .all(|message| message.hidden));
-    }
-
-    #[test]
-    fn active_mut_returns_mutable_ref() {
-        let tmp = TempDir::new("test_session_active_mut");
-        let mut mgr = SessionManager::new(tmp.path());
-        mgr.active_mut().active_persona_id = "test-persona".to_string();
-        assert_eq!(mgr.active().active_persona_id, "test-persona");
     }
 
     #[test]

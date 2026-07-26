@@ -78,6 +78,32 @@ impl MainBrain {
         }
     }
 
+    /// Create a clean execution runtime that reuses immutable infrastructure
+    /// but owns its conversation history and usage counters.
+    ///
+    /// Durable collaboration members call this for every admitted run. The
+    /// returned runtime can safely execute alongside other forks because no
+    /// mutable conversation state is shared.
+    pub fn fork_isolated_with_llm(
+        &self,
+        llm: Arc<dyn LlmProvider>,
+        llm_max_tokens: u32,
+        llm_temperature: f64,
+    ) -> Self {
+        let mut fork = Self::new(
+            llm,
+            Arc::clone(&self.tool_executor),
+            self.config.clone(),
+            llm_max_tokens,
+            llm_temperature,
+        );
+        fork.tools = self.tools.clone();
+        fork.memory_context.clone_from(&self.memory_context);
+        fork.skill_summary.clone_from(&self.skill_summary);
+        fork.bootstrap_content.clone_from(&self.bootstrap_content);
+        fork
+    }
+
     /// 注册可用工具
     pub fn register_tools(&mut self, tools: Vec<ToolDefinition>) {
         tracing::info!("主脑注册 {} 个工具", tools.len());
@@ -154,7 +180,7 @@ impl MainBrain {
         }
 
         // ── 3. 构建 messages（用户消息已在 history 中）──
-        let mut messages = self.build_messages();
+        let messages = self.build_messages();
 
         // 发送 Connecting 事件
         if let Some(tx) = progress_tx {
@@ -178,9 +204,11 @@ impl MainBrain {
         }
 
         // ── 4. 跑 tool_loop（支持上下文溢出时压缩 + 重入）──
-        let mut loop_result;
+        let loop_result;
         let mut messages = messages;
         let mut overflow_count = 0u32;
+        let mut prior_usage_records = Vec::new();
+        let mut prior_llm_calls = 0u32;
 
         loop {
             let result = tool_loop::run_tool_loop_with_config(
@@ -200,6 +228,8 @@ impl MainBrain {
                 Ok(r) => {
                     if r.context_overflow && overflow_count < 2 {
                         overflow_count += 1;
+                        prior_llm_calls = prior_llm_calls.saturating_add(r.llm_calls);
+                        prior_usage_records.extend(r.usage_records.iter().cloned());
                         // 上下文溢出：同步 messages → history → 压缩 → 重建 messages → 重入
                         tracing::warn!(
                             "tool_loop 因上下文溢出中断（第{overflow_count}次），执行压缩后重入"
@@ -322,16 +352,27 @@ impl MainBrain {
         }
 
         let answer = loop_result.response.text();
-        // 使用 usage_records 中的修正后 usage（如果 API 不返回则使用估算值）
-        let corrected_usage = loop_result
-            .usage_records
-            .last()
-            .cloned()
-            .unwrap_or_default();
-        let total_tokens = corrected_usage.total_tokens;
-        let prompt_tokens = loop_result.total_prompt_tokens;
+        let prompt_tokens = prior_usage_records
+            .iter()
+            .fold(0_u64, |total, usage| {
+                total.saturating_add(usage.prompt_tokens)
+            })
+            .saturating_add(loop_result.total_prompt_tokens);
+        let completion_tokens = prior_usage_records
+            .iter()
+            .chain(&loop_result.usage_records)
+            .fold(0_u64, |total, usage| {
+                total.saturating_add(usage.completion_tokens)
+            });
+        let cache_read = prior_usage_records
+            .iter()
+            .chain(&loop_result.usage_records)
+            .fold(0_u64, |total, usage| {
+                total.saturating_add(usage.cache_read_input_tokens)
+            });
+        let total_tokens = prompt_tokens.saturating_add(completion_tokens);
         let last_prompt_tokens = loop_result.last_prompt_tokens;
-        let completion_tokens = corrected_usage.completion_tokens;
+        let llm_calls = prior_llm_calls.saturating_add(loop_result.llm_calls);
 
         // ── 5. 成功后写入 LLM 响应和工具调用到历史（用户消息已在开头保存）──
         let old_history_len = self.history.len() - 1;
@@ -384,8 +425,6 @@ impl MainBrain {
         }
 
         // ── 5. 更新 session token 追踪 ──
-        // 使用 usage_records 中的修正后 usage（如果 API 不返回则使用估算值）
-        let cache_read = corrected_usage.cache_read_input_tokens;
         self.session_prompt_tokens += prompt_tokens;
         self.session_completion_tokens += completion_tokens;
         self.session_cache_read_tokens += cache_read;
@@ -399,7 +438,7 @@ impl MainBrain {
             answer,
             usage: TurnUsage {
                 total_tokens,
-                llm_calls: loop_result.llm_calls,
+                llm_calls,
                 duration_ms: elapsed.as_millis() as u64,
                 prompt_tokens,
                 completion_tokens,
@@ -648,6 +687,7 @@ mod tests {
     use brain_llm::{ChatResponse, ContentBlock, TokenUsage};
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct StubLlm;
 
@@ -682,6 +722,61 @@ mod tests {
 
         assert_eq!(output.answer, "测试回复");
         assert!(!output.answer.is_empty());
+    }
+
+    struct BlankThenTextUsageLlm {
+        calls: AtomicUsize,
+    }
+
+    impl LlmProvider for BlankThenTextUsageLlm {
+        fn model(&self) -> &'static str {
+            "blank-then-text-usage"
+        }
+
+        fn complete(
+            &self,
+            _request: brain_llm::ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let (content, prompt_tokens, completion_tokens) = if call == 0 {
+                    (Vec::new(), 10, 3)
+                } else {
+                    (vec![ContentBlock::text("重试成功")], 20, 5)
+                };
+                Ok(ChatResponse {
+                    content,
+                    model: "blank-then-text-usage".into(),
+                    usage: TokenUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    },
+                    finish_reason: Some(brain_llm::FinishReason::EndTurn),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn process_input_accumulates_usage_across_all_llm_calls() {
+        let llm = Arc::new(BlankThenTextUsageLlm {
+            calls: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(StubToolExecutor::new());
+        let mut brain = MainBrain::new(llm, executor, BrainConfig::default(), 32768, 0.7);
+
+        let output = brain.process_input("你好", None, None).await.unwrap();
+
+        assert_eq!(output.answer, "重试成功");
+        assert_eq!(output.usage.llm_calls, 2);
+        assert_eq!(output.usage.prompt_tokens, 30);
+        assert_eq!(output.usage.completion_tokens, 8);
+        assert_eq!(output.usage.total_tokens, 38);
+        assert_eq!(brain.cumulative_prompt_tokens(), 30);
+        assert_eq!(brain.cumulative_completion_tokens(), 8);
     }
 
     #[test]
@@ -778,6 +873,32 @@ mod tests {
         assert!(!brain.build_messages()[0]
             .text_content()
             .contains("当前人格提示"));
+    }
+
+    #[test]
+    fn isolated_fork_copies_configuration_without_copying_history_or_usage() {
+        let llm = Arc::new(StubLlm);
+        let executor = Arc::new(StubToolExecutor::new());
+        let mut brain = MainBrain::new(llm.clone(), executor, BrainConfig::default(), 32768, 0.7);
+        brain.register_tools(vec![]);
+        brain.inject_memory_context("持久人格上下文");
+        brain.inject_skill_summary("可用技能摘要".into());
+        brain.inject_bootstrap("启动约束".into());
+        brain.history.push_user("旧成员私有历史");
+        brain.session_prompt_tokens = 321;
+
+        let fork = brain.fork_isolated_with_llm(llm, 4096, 0.2);
+
+        assert_eq!(brain.history_len(), 1);
+        assert_eq!(fork.history_len(), 0);
+        assert_eq!(fork.cumulative_prompt_tokens(), 0);
+        assert_eq!(fork.llm_max_tokens, 4096);
+        assert_eq!(fork.llm_temperature, 0.2);
+        let prompt = fork.build_messages()[0].text_content();
+        assert!(prompt.contains("持久人格上下文"));
+        assert!(prompt.contains("可用技能摘要"));
+        assert!(prompt.contains("启动约束"));
+        assert!(!prompt.contains("旧成员私有历史"));
     }
 
     /// 测试 push_memory_context 注入独立 system 消息

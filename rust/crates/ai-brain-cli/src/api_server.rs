@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::orchestrator::Orchestrator;
+use crate::web::collaboration::{
+    default_runtime_dir, CollaborationConfig, CollaborationRepository,
+};
+use crate::web::collaboration_runtime::CollaborationRuntime;
 use crate::web::session_manager::SessionManager;
 use crate::web::ws_handler::{ws_upgrade, AppState};
 
@@ -365,10 +369,37 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("ai-brain");
     let sessions = Arc::new(Mutex::new(SessionManager::new(&base_dir)));
+    let runtime_dir = default_runtime_dir();
+    let collaboration_config = match CollaborationConfig::load(&runtime_dir.join("config.toml")) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!("加载协作配置失败: {error}");
+            return;
+        }
+    };
+    let collaboration_repository =
+        match CollaborationRepository::new(&runtime_dir, collaboration_config) {
+            Ok(repository) => Arc::new(repository),
+            Err(error) => {
+                tracing::error!("初始化协作存储失败: {error}");
+                return;
+            }
+        };
+    let orch = Arc::new(orch);
+    let collaboration =
+        match CollaborationRuntime::start(Arc::clone(&collaboration_repository), Arc::clone(&orch))
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!("启动协作运行时失败: {error}");
+                return;
+            }
+        };
     let state = Arc::new(AppState {
-        orch: Arc::new(orch),
+        orch,
         sessions,
-        active_query_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        collaboration,
         workspace_root: std::env::current_dir()
             .and_then(std::fs::canonicalize)
             .unwrap_or_else(|_| std::path::PathBuf::from(".")),

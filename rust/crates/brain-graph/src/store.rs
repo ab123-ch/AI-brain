@@ -878,7 +878,6 @@ fn domain_description(graph_type: &GraphType) -> String {
     match graph_type {
         GraphType::Memory => "memory graph".into(),
         GraphType::Code => "code graph".into(),
-        GraphType::Novel => "novel graph".into(),
         GraphType::Video => "video graph".into(),
         GraphType::Custom(name) => format!("custom graph: {name}"),
     }

@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime_trace::RuntimeExchange;
+use crate::web::collaboration::{BrainMemberView, InboxItemView, RoomEventView, RoomSnapshot};
 
 // ─── 辅助结构体 ──────────────────────────────────────────────────────
 
@@ -140,6 +141,40 @@ pub enum WebProgressEvent {
     /// Full request/result communication emitted outside the query channel.
     BrainCommunication {
         exchange: RuntimeExchange,
+    },
+
+    // ── 多实例协作事件 ──
+    RoomSnapshot {
+        snapshot: RoomSnapshot,
+    },
+    RoomEventAppended {
+        event: RoomEventView,
+    },
+    RoomEventsReplayed {
+        room_id: String,
+        after_sequence: u64,
+        through_sequence: u64,
+        events: Vec<RoomEventView>,
+    },
+    MemberChanged {
+        member: BrainMemberView,
+    },
+    InboxItemChanged {
+        room_id: String,
+        item: InboxItemView,
+    },
+    MemberRunProgress {
+        room_id: String,
+        member_id: String,
+        run_id: String,
+        event: Box<WebProgressEvent>,
+    },
+    MemberRunFinished {
+        room_id: String,
+        member_id: String,
+        run_id: String,
+        status: String,
+        error: Option<String>,
     },
 
     // ── WebSocket 控制消息 ──
@@ -339,6 +374,25 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"session_list""#));
+    }
+
+    #[test]
+    fn serialize_member_run_progress_keeps_run_identity() {
+        let event = WebProgressEvent::MemberRunProgress {
+            room_id: "room-1".into(),
+            member_id: "member-a".into(),
+            run_id: "run-1".into(),
+            event: Box::new(WebProgressEvent::TextDelta {
+                text: "partial".into(),
+            }),
+        };
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["type"], "member_run_progress");
+        assert_eq!(json["room_id"], "room-1");
+        assert_eq!(json["member_id"], "member-a");
+        assert_eq!(json["run_id"], "run-1");
+        assert_eq!(json["event"]["type"], "text_delta");
+        assert_eq!(json["event"]["text"], "partial");
     }
 
     #[test]

@@ -30,10 +30,44 @@
             <div id="session-list"></div>
         </aside>
         <main id="chat-area" class="view-panel active">
-            <div id="messages"></div>
-            <div id="input-area">
-                <textarea id="input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
-                <button id="send-btn" title="发送" aria-label="发送"><i data-lucide="send-horizontal"></i></button>
+            <div id="collaboration-layout">
+                <aside id="member-panel" aria-label="智脑成员">
+                    <div class="member-panel-heading">
+                        <div>
+                            <h2>成员</h2>
+                            <span id="member-capacity">0 / 0</span>
+                        </div>
+                        <button id="add-member-btn" class="icon-btn" type="button" title="创建成员" aria-label="创建成员"><i data-lucide="user-plus"></i></button>
+                    </div>
+                    <div id="member-list"></div>
+                    <div id="worker-status">
+                        <span class="status-dot"></span>
+                        <span id="worker-status-text">0 个运行中</span>
+                    </div>
+                </aside>
+                <section id="room-chat">
+                    <div id="room-heading">
+                        <div>
+                            <h2 id="room-title">当前会话</h2>
+                            <span id="room-sequence">0 条事件</span>
+                        </div>
+                        <button id="room-refresh-btn" class="icon-btn" type="button" title="刷新房间" aria-label="刷新房间"><i data-lucide="refresh-cw"></i></button>
+                    </div>
+                    <div id="messages"></div>
+                    <div id="input-area">
+                        <div class="composer-toolbar">
+                            <div id="room-mode" class="segmented-control" aria-label="消息模式">
+                                <button type="button" class="active" data-mode="chat">聊天</button>
+                                <button type="button" data-mode="task">任务</button>
+                            </div>
+                            <div id="recipient-selector" aria-label="收件人"></div>
+                        </div>
+                        <div class="composer-row">
+                            <textarea id="input" placeholder="发送消息..." rows="1"></textarea>
+                            <button id="send-btn" title="发送" aria-label="发送"><i data-lucide="send-horizontal"></i></button>
+                        </div>
+                    </div>
+                </section>
             </div>
         </main>
         <main id="cockpit-area" class="view-panel">
@@ -53,7 +87,7 @@
 
             <section class="cockpit-metrics" aria-label="驾驶舱指标">
                 <div class="metric-tile">
-                    <span>工作脑区</span>
+                    <span>运行实例</span>
                     <strong id="metric-active-brains">0</strong>
                     <small>active brains</small>
                 </div>
@@ -88,8 +122,8 @@
                 <section class="cockpit-panel cockpit-map-panel">
                     <div class="panel-heading">
                         <div>
-                            <h3>脑区拓扑</h3>
-                            <p>主脑、记忆脑、评估脑与子代理的实时工作关系</p>
+                            <h3>协作拓扑</h3>
+                            <p>成员实例、记忆、图谱与工具的实时关系</p>
                         </div>
                         <span id="cockpit-runtime">空闲</span>
                     </div>
@@ -124,8 +158,8 @@
                 <section class="cockpit-panel cockpit-agents-panel">
                     <div class="panel-heading">
                         <div>
-                            <h3>代理状态</h3>
-                            <p>模型连接、人格、会话与工具执行状态</p>
+                            <h3>成员状态</h3>
+                            <p>成员、模型与工具执行状态</p>
                         </div>
                     </div>
                     <div id="agent-status-list"></div>
@@ -179,6 +213,27 @@
             <div id="ask-options"></div>
         </div>
     </div>
+    <div id="member-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="member-modal-title">
+        <form id="member-form" class="member-modal-content">
+            <header>
+                <h2 id="member-modal-title">创建成员</h2>
+                <button id="member-modal-close" class="icon-btn" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <input id="member-id" type="hidden">
+            <input id="member-version" type="hidden">
+            <label for="member-name">名称</label>
+            <input id="member-name" type="text" maxlength="48" required autocomplete="off">
+            <label for="member-model">模型</label>
+            <select id="member-model"></select>
+            <label for="member-depth">思考深度</label>
+            <select id="member-depth"></select>
+            <footer>
+                <button id="member-modal-cancel" type="button" class="secondary-btn">取消</button>
+                <button type="submit" class="primary-btn">保存</button>
+            </footer>
+        </form>
+    </div>
+    <div id="toast-region" aria-live="polite" aria-atomic="true"></div>
     <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>

@@ -6,7 +6,7 @@
 //!   3. 进入消息循环，路由客户端消息到 Orchestrator / SessionManager / PersonaManager
 //!   4. 将 ProgressEvent 转发为 WebProgressEvent 给前端
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +25,11 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 use crate::orchestrator::Orchestrator;
 use crate::runtime_trace::ExchangePhase;
+use crate::web::collaboration::{
+    InboxState, LegacyMessageSeed, MemberAddress, PostMessageResult, RoomInputMode, RoomSnapshot,
+    DEFAULT_THREAD_KEY,
+};
+use crate::web::collaboration_runtime::CollaborationRuntime;
 use crate::web::progress_adapter::{ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent};
 use crate::web::session_manager::{ConversationFork, SessionManager, UserQueryTurn};
 use brain_core::types::{MainBrainOutput, ProgressEvent};
@@ -46,7 +51,7 @@ fn extract_modified_file_path(input: &str) -> Option<String> {
 pub struct AppState {
     pub orch: Arc<Orchestrator>,
     pub sessions: Arc<Mutex<SessionManager>>,
-    pub active_query_sessions: Arc<Mutex<HashSet<String>>>,
+    pub collaboration: Arc<CollaborationRuntime>,
     pub workspace_root: std::path::PathBuf,
 }
 
@@ -76,8 +81,63 @@ enum ClientMessage {
     DeleteSession { session_id: String },
     /// 删除当前会话窗口中的一整轮历史（仅隐藏 UI/上下文，不删除历史文件内容）
     DeleteTurn { message_index: usize },
+    /// 获取当前房间的权威快照
+    RequestRoomSnapshot,
+    /// 加入房间并从客户端已确认的 sequence 之后重放。
+    JoinRoom {
+        room_id: String,
+        after_sequence: u64,
+    },
+    /// 向一个或多个成员发送群聊消息/任务
+    PostRoomMessage {
+        recipients: Vec<MemberAddress>,
+        content: String,
+        mode: RoomInputMode,
+        #[serde(default = "default_thread_key")]
+        thread_key: String,
+        expected_room_version: u64,
+        #[serde(default)]
+        command_id: String,
+    },
+    CreateMember {
+        display_name: String,
+        model_policy: Option<String>,
+        reasoning_depth: Option<String>,
+    },
+    ConfigureMember {
+        member_id: String,
+        display_name: String,
+        model_policy: String,
+        reasoning_depth: String,
+        expected_version: u64,
+    },
+    WakeMember {
+        member_id: String,
+        expected_version: u64,
+    },
+    SleepMember {
+        member_id: String,
+        expected_version: u64,
+    },
+    ArchiveMember {
+        member_id: String,
+        expected_version: u64,
+    },
+    RestoreMember {
+        member_id: String,
+        expected_version: u64,
+    },
+    InterruptMemberRun {
+        member_id: String,
+        run_id: String,
+        expected_version: u64,
+    },
     /// 应用层心跳（浏览器无法发送原生 Ping 帧）
     Heartbeat,
+}
+
+fn default_thread_key() -> String {
+    DEFAULT_THREAD_KEY.into()
 }
 
 // ─── WebSocket 升级入口 ──────────────────────────────────────────────
@@ -91,7 +151,6 @@ pub async fn ws_upgrade(
 }
 
 enum QueryAction {
-    New { input: String },
     Edit { message_id: String, content: String },
     Retry { message_id: String },
 }
@@ -103,16 +162,29 @@ struct PreparedWebQuery {
     updated_messages: Option<Vec<ChatMessage>>,
 }
 
-async fn claim_query_session(state: &Arc<AppState>, session_id: &str) -> bool {
-    state
-        .active_query_sessions
-        .lock()
-        .await
-        .insert(session_id.to_string())
+#[derive(Debug)]
+struct PendingLegacyQuery {
+    room_id: String,
+    inbox_item_id: String,
+    run_id: Option<String>,
+    answer_sent: bool,
+    error_sent: bool,
 }
 
-async fn release_query_session(state: &Arc<AppState>, session_id: &str) {
-    state.active_query_sessions.lock().await.remove(session_id);
+impl PendingLegacyQuery {
+    fn from_post(result: &PostMessageResult) -> Result<Self, String> {
+        let inbox_item = result
+            .inbox_items
+            .first()
+            .ok_or_else(|| "旧 Query 未创建默认成员 Inbox".to_string())?;
+        Ok(Self {
+            room_id: result.event.room_id.clone(),
+            inbox_item_id: inbox_item.inbox_item_id.clone(),
+            run_id: inbox_item.run_id.clone(),
+            answer_sent: false,
+            error_sent: false,
+        })
+    }
 }
 
 fn restore_messages_before_turn(
@@ -135,23 +207,8 @@ async fn prepare_web_query(
     action: QueryAction,
 ) -> Result<PreparedWebQuery, String> {
     let session_id = state.sessions.lock().await.active().id.clone();
-    if !claim_query_session(state, &session_id).await {
-        return Err("当前会话已有查询正在进行，请等待完成".into());
-    }
 
     let prepared = match action {
-        QueryAction::New { input } => {
-            let mut sessions = state.sessions.lock().await;
-            if sessions.active().id != session_id {
-                Err("活跃会话已变化，请重新发送".to_string())
-            } else {
-                sessions.push_user_query(&input).map(|turn| {
-                    let messages = sessions.active_visible_messages();
-                    let restore_history = restore_messages_before_turn(&messages, &turn.message_id);
-                    (turn, Some(restore_history), Some(messages))
-                })
-            }
-        }
         QueryAction::Edit {
             message_id,
             content,
@@ -176,10 +233,7 @@ async fn prepare_web_query(
                 turn.generation_id.clone(),
             ) {
                 Ok(scope) => scope,
-                Err(error) => {
-                    release_query_session(state, &session_id).await;
-                    return Err(format!("创建对话记忆代次失败: {error}"));
-                }
+                Err(error) => return Err(format!("创建对话记忆代次失败: {error}")),
             };
             Ok(PreparedWebQuery {
                 turn,
@@ -188,11 +242,69 @@ async fn prepare_web_query(
                 updated_messages,
             })
         }
-        Err(error) => {
-            release_query_session(state, &session_id).await;
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
+}
+
+fn default_member_address(snapshot: &RoomSnapshot) -> Result<MemberAddress, String> {
+    snapshot
+        .members
+        .iter()
+        .find(|member| member.member_id == snapshot.room.default_member_id)
+        .map(|member| MemberAddress {
+            member_id: member.member_id.clone(),
+            expected_version: member.version,
+        })
+        .ok_or_else(|| format!("房间 {} 缺少默认成员", snapshot.room.room_id))
+}
+
+async fn submit_legacy_query(
+    state: &Arc<AppState>,
+    input: String,
+) -> Result<PendingLegacyQuery, String> {
+    let snapshot = active_room_snapshot(state).await?;
+    let target = default_member_address(&snapshot)?;
+    let result = state
+        .collaboration
+        .post_message_checked(
+            snapshot.room.room_id,
+            vec![target],
+            input,
+            RoomInputMode::Chat,
+            DEFAULT_THREAD_KEY.into(),
+            snapshot.room.version,
+            format!("legacy-query-{}", uuid::Uuid::new_v4()),
+        )
+        .await?;
+    PendingLegacyQuery::from_post(&result)
+}
+
+async fn cancel_default_member_run(state: &Arc<AppState>) -> Result<(), String> {
+    let snapshot = active_room_snapshot(state).await?;
+    let target = default_member_address(&snapshot)?;
+    let member = snapshot
+        .members
+        .iter()
+        .find(|member| member.member_id == target.member_id)
+        .ok_or_else(|| "默认成员状态已变化".to_string())?;
+    let run_id = member
+        .active_run_id
+        .clone()
+        .ok_or_else(|| "默认成员当前没有可中断的运行".to_string())?;
+    let inbox = snapshot
+        .inbox
+        .iter()
+        .find(|item| item.run_id.as_deref() == Some(run_id.as_str()))
+        .ok_or_else(|| "默认成员运行状态已变化".to_string())?;
+    state
+        .collaboration
+        .interrupt_run_checked(
+            snapshot.room.room_id,
+            member.member_id.clone(),
+            run_id,
+            inbox.version,
+        )
+        .await
 }
 
 async fn prepare_conversation_fork(
@@ -239,6 +351,144 @@ async fn prepare_conversation_fork(
     Ok((fork.turn, Some(restore_history), Some(fork.messages)))
 }
 
+async fn active_room_snapshot(
+    state: &Arc<AppState>,
+) -> Result<crate::web::collaboration::RoomSnapshot, String> {
+    let (room_id, title, legacy_messages) = {
+        let sessions = state.sessions.lock().await;
+        let active = sessions.active();
+        let legacy_messages = active
+            .messages
+            .iter()
+            .map(|message| LegacyMessageSeed {
+                id: message.id.clone(),
+                role: message.role.clone(),
+                content: message.content.clone(),
+                timestamp: message.timestamp,
+                hidden: message.hidden,
+            })
+            .collect();
+        (active.id.clone(), active.title.clone(), legacy_messages)
+    };
+    state
+        .collaboration
+        .ensure_room(room_id, title, legacy_messages)
+        .await
+}
+
+async fn active_room_id(state: &Arc<AppState>) -> String {
+    state.sessions.lock().await.active().id.clone()
+}
+
+fn collaboration_event_room_id(event: &WebProgressEvent) -> Option<&str> {
+    match event {
+        WebProgressEvent::RoomSnapshot { snapshot } => Some(&snapshot.room.room_id),
+        WebProgressEvent::RoomEventAppended { event } => Some(&event.room_id),
+        WebProgressEvent::MemberChanged { member } => Some(&member.room_id),
+        WebProgressEvent::RoomEventsReplayed { room_id, .. }
+        | WebProgressEvent::InboxItemChanged { room_id, .. }
+        | WebProgressEvent::MemberRunProgress { room_id, .. }
+        | WebProgressEvent::MemberRunFinished { room_id, .. } => Some(room_id),
+        _ => None,
+    }
+}
+
+fn legacy_query_mirrors(
+    pending: &mut Option<PendingLegacyQuery>,
+    event: &WebProgressEvent,
+) -> Vec<WebProgressEvent> {
+    let Some(query) = pending.as_mut() else {
+        return Vec::new();
+    };
+    if collaboration_event_room_id(event) != Some(query.room_id.as_str()) {
+        return Vec::new();
+    }
+
+    let mut mirrors = Vec::new();
+    let mut completed = false;
+    match event {
+        WebProgressEvent::RoomSnapshot { snapshot } => {
+            let Some(item) = snapshot
+                .inbox
+                .iter()
+                .find(|item| item.inbox_item_id == query.inbox_item_id)
+            else {
+                return mirrors;
+            };
+            if let Some(run_id) = &item.run_id {
+                query.run_id = Some(run_id.clone());
+            }
+            match item.state {
+                InboxState::Completed => {
+                    if !query.answer_sent {
+                        let answer = item.run_id.as_deref().and_then(|run_id| {
+                            snapshot.events.iter().find(|room_event| {
+                                room_event.kind == "member_message"
+                                    && room_event.run_id.as_deref() == Some(run_id)
+                            })
+                        });
+                        if let Some(answer) = answer {
+                            mirrors.push(WebProgressEvent::FinalAnswer {
+                                content: answer.content.clone(),
+                            });
+                            query.answer_sent = true;
+                        }
+                    }
+                    if query.answer_sent {
+                        mirrors.push(WebProgressEvent::Done);
+                        completed = true;
+                    }
+                }
+                InboxState::Failed => {
+                    if !query.error_sent {
+                        if let Some(message) = &item.error {
+                            mirrors.push(WebProgressEvent::Error {
+                                message: message.clone(),
+                            });
+                            query.error_sent = true;
+                        }
+                    }
+                    mirrors.push(WebProgressEvent::Done);
+                    completed = true;
+                }
+                InboxState::Cancelled => {
+                    mirrors.push(WebProgressEvent::Done);
+                    completed = true;
+                }
+                _ => {}
+            }
+        }
+        WebProgressEvent::MemberRunProgress {
+            run_id,
+            event: run_event,
+            ..
+        } if query.run_id.as_deref() == Some(run_id.as_str()) => match run_event.as_ref() {
+            WebProgressEvent::FinalAnswer { content } if !query.answer_sent => {
+                mirrors.push(WebProgressEvent::FinalAnswer {
+                    content: content.clone(),
+                });
+                query.answer_sent = true;
+            }
+            WebProgressEvent::Error { message } if !query.error_sent => {
+                mirrors.push(WebProgressEvent::Error {
+                    message: message.clone(),
+                });
+                query.error_sent = true;
+            }
+            WebProgressEvent::Done => {
+                mirrors.push(WebProgressEvent::Done);
+                completed = true;
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    if completed {
+        *pending = None;
+    }
+    mirrors
+}
+
 // ─── 核心处理 ────────────────────────────────────────────────────────
 
 /// 处理一个完整的 WebSocket 连接生命周期
@@ -266,6 +516,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut query_generation_id: Option<String> = None;
     let mut cancel_token: Option<tokio_util::sync::CancellationToken> = None;
     let mut runtime_trace_rx = state.orch.subscribe_runtime_trace();
+    let mut collaboration_rx = state.collaboration.subscribe();
+    let mut pending_legacy_query: Option<PendingLegacyQuery> = None;
     let mut exchange_sessions = HashMap::<String, (String, Option<String>)>::new();
     let mut pending_modified_files = HashMap::<String, String>::new();
 
@@ -341,6 +593,55 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
 
+            collaboration_event = collaboration_rx.recv() => {
+                match collaboration_event {
+                    Ok(event) => {
+                        let mirrors = legacy_query_mirrors(&mut pending_legacy_query, &event);
+                        let current_room_id = active_room_id(&state).await;
+                        let belongs_to_current_room = collaboration_event_room_id(&event)
+                            .is_some_and(|room_id| room_id == current_room_id);
+                        if belongs_to_current_room
+                            && send_event(&mut sender, event).await.is_err()
+                        {
+                            break;
+                        }
+                        let mut mirror_send_failed = false;
+                        for mirror in mirrors {
+                            if send_event(&mut sender, mirror).await.is_err() {
+                                mirror_send_failed = true;
+                                break;
+                            }
+                        }
+                        if mirror_send_failed {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("WebSocket 协作事件落后，跳过 {skipped} 条并刷新快照");
+                        match active_room_snapshot(&state).await {
+                            Ok(snapshot) => {
+                                if send_event(
+                                    &mut sender,
+                                    WebProgressEvent::RoomSnapshot { snapshot },
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                warn!("协作事件落后后刷新快照失败: {error}");
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("协作事件通道已关闭");
+                        break;
+                    }
+                }
+            }
+
             // ── 分支1: 客户端消息（始终活跃） ──
             maybe_msg = receiver.next() => {
                 match maybe_msg {
@@ -348,7 +649,32 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(client_msg) => {
                                 let query_action = match client_msg {
-                                    ClientMessage::Query { input } => Some(QueryAction::New { input }),
+                                    ClientMessage::Query { input } => {
+                                        if pending_legacy_query.is_some()
+                                            || query_rx.is_some()
+                                            || query_handle.is_some()
+                                        {
+                                            send_event(&mut sender, WebProgressEvent::Error {
+                                                message: "当前连接已有查询正在进行，请等待完成".into(),
+                                            }).await.ok();
+                                        } else {
+                                            match submit_legacy_query(&state, input).await {
+                                                Ok(pending) => pending_legacy_query = Some(pending),
+                                                Err(message) => {
+                                                    send_event(
+                                                        &mut sender,
+                                                        WebProgressEvent::Error { message },
+                                                    )
+                                                    .await
+                                                    .ok();
+                                                    send_event(&mut sender, WebProgressEvent::Done)
+                                                        .await
+                                                        .ok();
+                                                }
+                                            }
+                                        }
+                                        None
+                                    }
                                     ClientMessage::EditUserMessage { message_id, content } => {
                                         Some(QueryAction::Edit { message_id, content })
                                     }
@@ -356,29 +682,42 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         Some(QueryAction::Retry { message_id })
                                     }
                                     ClientMessage::Cancel => {
-                                    if let Some(ref ct) = cancel_token {
-                                        ct.cancel();
-                                        info!("已取消当前查询 (CancellationToken)");
-                                    }
-                                    if let Some(handle) = query_handle.take() {
-                                        handle.abort();
-                                    }
-                                    // 将已收集的 assistant 回复记录到会话
-                                    if !assistant_text.is_empty() {
-                                        let mut sessions = state.sessions.lock().await;
-                                        if let Some(ref sid) = query_session_id {
-                                            sessions.push_message_to(sid, "assistant", &assistant_text);
+                                        let direct_query = cancel_token.is_some()
+                                            || query_handle.is_some()
+                                            || query_rx.is_some();
+                                        if direct_query {
+                                            if let Some(ref ct) = cancel_token {
+                                                ct.cancel();
+                                                info!("已取消当前连接的兼容查询 (CancellationToken)");
+                                            }
+                                            if let Some(handle) = query_handle.take() {
+                                                handle.abort();
+                                            }
+                                            if !assistant_text.is_empty() {
+                                                let mut sessions = state.sessions.lock().await;
+                                                if let Some(ref sid) = query_session_id {
+                                                    sessions.push_message_to(
+                                                        sid,
+                                                        "assistant",
+                                                        &assistant_text,
+                                                    );
+                                                }
+                                            }
+                                        } else if let Err(message) = cancel_default_member_run(&state).await {
+                                            send_event(
+                                                &mut sender,
+                                                WebProgressEvent::Error { message },
+                                            )
+                                            .await
+                                            .ok();
                                         }
-                                    }
-                                    if let Some(ref sid) = query_session_id {
-                                        release_query_session(&state, sid).await;
-                                    }
-                                    query_rx = None;
-                                    query_session_id = None;
-                                    query_generation_id = None;
-                                    cancel_token = None;
-                                    assistant_text.clear();
-                                    send_event(&mut sender, WebProgressEvent::Done).await.ok();
+                                        query_rx = None;
+                                        query_session_id = None;
+                                        query_generation_id = None;
+                                        cancel_token = None;
+                                        pending_legacy_query = None;
+                                        assistant_text.clear();
+                                        send_event(&mut sender, WebProgressEvent::Done).await.ok();
                                         None
                                     }
                                     other => {
@@ -395,7 +734,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 let Some(query_action) = query_action else {
                                     continue;
                                 };
-                                if query_rx.is_some() || query_handle.is_some() {
+                                if query_rx.is_some()
+                                    || query_handle.is_some()
+                                    || pending_legacy_query.is_some()
+                                {
                                     send_event(&mut sender, WebProgressEvent::Error {
                                         message: "当前有查询正在进行，请等待完成".into(),
                                     }).await.ok();
@@ -416,7 +758,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                                     messages,
                                                 },
                                             ).await.is_err() {
-                                                release_query_session(&state, &prepared.turn.session_id).await;
                                                 break;
                                             }
                                         }
@@ -573,9 +914,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     }
                     _ => {}
                 }
-                if let Some(ref sid) = session_id {
-                    release_query_session(&state, sid).await;
-                }
                 assistant_text.clear();
                 if send_event(&mut sender, WebProgressEvent::Done).await.is_err() {
                     break;
@@ -590,9 +928,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if let Some(handle) = query_handle.take() {
         handle.abort();
     }
-    if let Some(session_id) = query_session_id.take() {
-        release_query_session(&state, &session_id).await;
-    }
+    query_session_id.take();
 
     info!("WebSocket 连接已断开");
 }
@@ -659,6 +995,11 @@ async fn send_initial_state(
         .await?;
     }
 
+    let snapshot = active_room_snapshot(state)
+        .await
+        .map_err(|error| axum::Error::new(std::io::Error::other(error)))?;
+    send_event(sender, WebProgressEvent::RoomSnapshot { snapshot }).await?;
+
     Ok(())
 }
 
@@ -674,11 +1015,9 @@ async fn handle_client_message(
         ClientMessage::Query { .. }
         | ClientMessage::EditUserMessage { .. }
         | ClientMessage::RetryLastUserMessage { .. }
-        | ClientMessage::Cancel => {
-            // 已在 handle_socket 的 select! 中直接处理
-        }
-        ClientMessage::Heartbeat => {
-            // 应用层心跳 — 浏览器无法发送原生 Ping，用 JSON 消息替代
+        | ClientMessage::Cancel
+        | ClientMessage::Heartbeat => {
+            // 查询控制已在 select! 中处理；应用层心跳无需额外动作。
         }
         ClientMessage::AskResponse { .. } => {
             // MVP: 暂空实现
@@ -704,7 +1043,203 @@ async fn handle_client_message(
         ClientMessage::DeleteTurn { message_index } => {
             handle_delete_turn(sender, state, message_index).await
         }
+        ClientMessage::RequestRoomSnapshot => match active_room_snapshot(state).await {
+            Ok(snapshot) => {
+                send_event(sender, WebProgressEvent::RoomSnapshot { snapshot })
+                    .await
+                    .ok();
+            }
+            Err(error) => send_collaboration_error(sender, error).await,
+        },
+        ClientMessage::JoinRoom {
+            room_id,
+            after_sequence,
+        } => {
+            let active_room = active_room_id(state).await;
+            if room_id != active_room {
+                send_collaboration_error(
+                    sender,
+                    format!("房间 {room_id} 不是当前活跃会话，请先切换会话"),
+                )
+                .await;
+                return;
+            }
+            match active_room_snapshot(state).await {
+                Ok(snapshot) => {
+                    let through_sequence = snapshot.room.latest_event_seq;
+                    if send_event(sender, WebProgressEvent::RoomSnapshot { snapshot })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    match state
+                        .collaboration
+                        .events_after(room_id.clone(), after_sequence)
+                        .await
+                    {
+                        Ok(events) => {
+                            send_event(
+                                sender,
+                                WebProgressEvent::RoomEventsReplayed {
+                                    room_id,
+                                    after_sequence,
+                                    through_sequence,
+                                    events,
+                                },
+                            )
+                            .await
+                            .ok();
+                        }
+                        Err(error) => send_collaboration_error(sender, error).await,
+                    }
+                }
+                Err(error) => send_collaboration_error(sender, error).await,
+            }
+        }
+        ClientMessage::PostRoomMessage {
+            recipients,
+            content,
+            mode,
+            thread_key,
+            expected_room_version,
+            command_id,
+        } => {
+            let room_id = active_room_id(state).await;
+            let command_id = if command_id.trim().is_empty() {
+                format!("web-{}", uuid::Uuid::new_v4())
+            } else {
+                command_id
+            };
+            if let Err(error) = state
+                .collaboration
+                .post_message_checked(
+                    room_id,
+                    recipients,
+                    content,
+                    mode,
+                    thread_key,
+                    expected_room_version,
+                    command_id,
+                )
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
+        ClientMessage::CreateMember {
+            display_name,
+            model_policy,
+            reasoning_depth,
+        } => {
+            let room_id = active_room_id(state).await;
+            if let Err(error) = state
+                .collaboration
+                .create_member(room_id, display_name, model_policy, reasoning_depth)
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
+        ClientMessage::ConfigureMember {
+            member_id,
+            display_name,
+            model_policy,
+            reasoning_depth,
+            expected_version,
+        } => {
+            let room_id = active_room_id(state).await;
+            if let Err(error) = state
+                .collaboration
+                .configure_member(
+                    room_id,
+                    member_id,
+                    display_name,
+                    model_policy,
+                    reasoning_depth,
+                    expected_version,
+                )
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
+        ClientMessage::WakeMember {
+            member_id,
+            expected_version,
+        } => {
+            let room_id = active_room_id(state).await;
+            if let Err(error) = state
+                .collaboration
+                .wake_member_checked(room_id, member_id, expected_version)
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
+        ClientMessage::SleepMember {
+            member_id,
+            expected_version,
+        } => {
+            let room_id = active_room_id(state).await;
+            if let Err(error) = state
+                .collaboration
+                .sleep_member_checked(room_id, member_id, expected_version)
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
+        ClientMessage::ArchiveMember {
+            member_id,
+            expected_version,
+        } => {
+            let room_id = active_room_id(state).await;
+            if let Err(error) = state
+                .collaboration
+                .archive_member_checked(room_id, member_id, expected_version)
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
+        ClientMessage::RestoreMember {
+            member_id,
+            expected_version,
+        } => {
+            let room_id = active_room_id(state).await;
+            if let Err(error) = state
+                .collaboration
+                .restore_member_checked(room_id, member_id, expected_version)
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
+        ClientMessage::InterruptMemberRun {
+            member_id,
+            run_id,
+            expected_version,
+        } => {
+            let room_id = active_room_id(state).await;
+            if let Err(error) = state
+                .collaboration
+                .interrupt_run_checked(room_id, member_id, run_id, expected_version)
+                .await
+            {
+                send_collaboration_error(sender, error).await;
+            }
+        }
     }
+}
+
+async fn send_collaboration_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: String,
+) {
+    send_event(sender, WebProgressEvent::Error { message })
+        .await
+        .ok();
 }
 
 // ─── 人格切换 ────────────────────────────────────────────────────────
@@ -769,6 +1304,14 @@ async fn handle_new_session(
     )
     .await
     .ok();
+    match active_room_snapshot(state).await {
+        Ok(snapshot) => {
+            send_event(sender, WebProgressEvent::RoomSnapshot { snapshot })
+                .await
+                .ok();
+        }
+        Err(error) => send_collaboration_error(sender, error).await,
+    }
 }
 
 /// 切换会话
@@ -801,6 +1344,14 @@ async fn handle_switch_session(
             )
             .await
             .ok();
+            match active_room_snapshot(state).await {
+                Ok(snapshot) => {
+                    send_event(sender, WebProgressEvent::RoomSnapshot { snapshot })
+                        .await
+                        .ok();
+                }
+                Err(error) => send_collaboration_error(sender, error).await,
+            }
         }
         None => {
             send_event(
@@ -956,6 +1507,63 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_client_messages_deserialize_with_explicit_targets() {
+        let post: ClientMessage = serde_json::from_str(
+            r#"{"type":"post_room_message","recipients":[{"member_id":"member-a","expected_version":3},{"member_id":"member-b","expected_version":5}],"content":"分别检查接口和界面","mode":"task","thread_key":"review","expected_room_version":8,"command_id":"command-1"}"#,
+        )
+        .unwrap();
+        match post {
+            ClientMessage::PostRoomMessage {
+                recipients,
+                content,
+                mode,
+                thread_key,
+                expected_room_version,
+                command_id,
+            } => {
+                assert_eq!(
+                    recipients,
+                    vec![
+                        MemberAddress {
+                            member_id: "member-a".into(),
+                            expected_version: 3,
+                        },
+                        MemberAddress {
+                            member_id: "member-b".into(),
+                            expected_version: 5,
+                        },
+                    ]
+                );
+                assert_eq!(content, "分别检查接口和界面");
+                assert_eq!(mode, RoomInputMode::Task);
+                assert_eq!(thread_key, "review");
+                assert_eq!(expected_room_version, 8);
+                assert_eq!(command_id, "command-1");
+            }
+            other => panic!("expected room message, got {other:?}"),
+        }
+
+        let interrupt: ClientMessage = serde_json::from_str(
+            r#"{"type":"interrupt_member_run","member_id":"member-a","run_id":"run-1","expected_version":11}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            interrupt,
+            ClientMessage::InterruptMemberRun { member_id, run_id, expected_version }
+                if member_id == "member-a" && run_id == "run-1" && expected_version == 11
+        ));
+
+        let join: ClientMessage =
+            serde_json::from_str(r#"{"type":"join_room","room_id":"room-1","after_sequence":42}"#)
+                .unwrap();
+        assert!(matches!(
+            join,
+            ClientMessage::JoinRoom { room_id, after_sequence }
+                if room_id == "room-1" && after_sequence == 42
+        ));
+    }
+
+    #[test]
     fn history_restore_stops_before_regenerated_user_turn() {
         let message = |id: &str, role: &str, content: &str| ChatMessage {
             id: id.into(),
@@ -979,5 +1587,123 @@ mod tests {
         assert_eq!(restored[0].content, "第一问");
         assert_eq!(restored[1].role, "assistant");
         assert_eq!(restored[1].content, "第一答");
+    }
+
+    #[test]
+    fn legacy_query_targets_the_authoritative_default_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = crate::web::collaboration::CollaborationRepository::new(
+            directory.path(),
+            crate::web::collaboration::CollaborationConfig::default(),
+        )
+        .unwrap();
+        let snapshot = repository.ensure_room("room-1", "Legacy", &[]).unwrap();
+
+        let target = default_member_address(&snapshot).unwrap();
+
+        assert_eq!(target.member_id, snapshot.room.default_member_id);
+        assert_eq!(target.expected_version, snapshot.members[0].version);
+        assert!(snapshot.inbox.is_empty());
+    }
+
+    #[test]
+    fn legacy_query_mirrors_only_its_bound_run_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = crate::web::collaboration::CollaborationRepository::new(
+            directory.path(),
+            crate::web::collaboration::CollaborationConfig::default(),
+        )
+        .unwrap();
+        let snapshot = repository.ensure_room("room-1", "Legacy", &[]).unwrap();
+        let posted = repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "兼容查询",
+                RoomInputMode::Chat,
+                "legacy-mirror-command",
+            )
+            .unwrap();
+        let claim = repository.claim_next().unwrap().unwrap();
+        let mut pending = Some(PendingLegacyQuery::from_post(&posted).unwrap());
+
+        let running_snapshot = WebProgressEvent::RoomSnapshot {
+            snapshot: repository.snapshot("room-1").unwrap(),
+        };
+        assert!(legacy_query_mirrors(&mut pending, &running_snapshot).is_empty());
+        assert_eq!(
+            pending.as_ref().and_then(|query| query.run_id.as_deref()),
+            Some(claim.run_id.as_str())
+        );
+
+        let unrelated = WebProgressEvent::MemberRunProgress {
+            room_id: "room-1".into(),
+            member_id: claim.member_id.clone(),
+            run_id: "run-unrelated".into(),
+            event: Box::new(WebProgressEvent::FinalAnswer {
+                content: "错误目标".into(),
+            }),
+        };
+        assert!(legacy_query_mirrors(&mut pending, &unrelated).is_empty());
+
+        let final_answer = WebProgressEvent::MemberRunProgress {
+            room_id: "room-1".into(),
+            member_id: claim.member_id.clone(),
+            run_id: claim.run_id.clone(),
+            event: Box::new(WebProgressEvent::FinalAnswer {
+                content: "兼容答案".into(),
+            }),
+        };
+        let mirrored = legacy_query_mirrors(&mut pending, &final_answer);
+        assert!(matches!(
+            mirrored.as_slice(),
+            [WebProgressEvent::FinalAnswer { content }] if content == "兼容答案"
+        ));
+
+        let done = WebProgressEvent::MemberRunProgress {
+            room_id: "room-1".into(),
+            member_id: claim.member_id,
+            run_id: claim.run_id,
+            event: Box::new(WebProgressEvent::Done),
+        };
+        assert!(matches!(
+            legacy_query_mirrors(&mut pending, &done).as_slice(),
+            [WebProgressEvent::Done]
+        ));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn legacy_query_recovers_completion_from_authoritative_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = crate::web::collaboration::CollaborationRepository::new(
+            directory.path(),
+            crate::web::collaboration::CollaborationConfig::default(),
+        )
+        .unwrap();
+        let snapshot = repository.ensure_room("room-1", "Legacy", &[]).unwrap();
+        let posted = repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "断线边界查询",
+                RoomInputMode::Chat,
+                "legacy-snapshot-command",
+            )
+            .unwrap();
+        let claim = repository.claim_next().unwrap().unwrap();
+        repository.complete_item(&claim, "持久答案").unwrap();
+        let mut pending = Some(PendingLegacyQuery::from_post(&posted).unwrap());
+
+        let completed_snapshot = WebProgressEvent::RoomSnapshot {
+            snapshot: repository.snapshot("room-1").unwrap(),
+        };
+        let mirrored = legacy_query_mirrors(&mut pending, &completed_snapshot);
+        assert!(matches!(
+            mirrored.as_slice(),
+            [WebProgressEvent::FinalAnswer { content }, WebProgressEvent::Done]
+                if content == "持久答案"
+        ));
+        assert!(pending.is_none());
     }
 }

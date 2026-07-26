@@ -44,18 +44,16 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
 - **精确单次搜索**（找某个函数定义、某个变量名）→ 直接用 grep_search，一次调用即可
 - **文件名查找**（找某个文件在哪里）→ 直接用 glob_search，按模式匹配
 - **多步骤开发任务**（需要同时修改多个文件、运行测试）→ 使用 Agent(subagent_type='general-purpose') 委托给通用子代理
-- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段、复盘）→ 识别任务后必须先调用 `Skill(skill='novel-writing-workflow')`，完整读取技能正文，再按技能流程定位材料并计算内容 hash、召回 Canon、构造任务环境包、调用 `novel_start_task` 与常驻小说脑协作。不得用 `Agent(subagent_type='Novel')`，也不得绕过审核状态机直接写正式正文或提交 Canon。
+- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段、复盘）→ 识别任务后必须先调用 `Skill(skill='novel-writing-workflow')`，完整读取技能正文，再只通过 `novel_project` 和 `novel_task` 高层应用入口工作。不得用 `Agent(subagent_type='Novel')`，也不得绕过应用服务直接写正式正文或提交 Canon。
 
-## 小说脑复审门禁
+## Novel 应用边界
 
-`novel-writing-workflow` 可以细化流程，但不能覆盖以下门禁：
+`novel-writing-workflow` 可以细化主脑准备和复审，但不能覆盖以下边界：
 
-1. 常驻小说脑只能读取任务合同中的 ContextRef 和由 MemoryBrain 返回的项目记忆；它不接收 memory root、graph path，也不直接响应用户。
-2. `novel_start_task` / `novel_resume_task` 返回的自检缺失或无效时不得进入主脑 Pass；修订必须沿用同一个 task_id。
-3. 主脑必须独立对照用户要求、前文、章纲和 Canon 复审，并通过 `novel_review_draft` 提交 typed review；不得把小说脑自检或通用评估脑当作主脑复审。
-4. 主脑 Pass 只产生待用户确认候选稿。默认必须把候选正文展示给用户，并在下一轮用 `novel_user_decision` 记录 accept/revise/reject；只有用户明确预先授权自动保存时才可使用 `auto_after_main_review`。
-5. 正式发布只能调用 `novel_publish(task_id, draft_version)`，不得再次传正文、不得用通用 `write_file` 代替，也不得调用或伪造 `novel_commit_delta`。
-6. revision 过期、ContextRef hash 变化或 Canon 冲突时不得静默覆盖，必须重新召回、复审并按技能流程处理。
+1. `novel_task` 应用服务拥有 TaskRun、候选稿、自检、review、用户决策、发布恢复和 Canon commit 的状态转换；主脑不得猜测或伪造内部阶段。
+2. 主脑必须独立对照用户要求、前文、章纲和 Canon 复审，且不得把 Writer 自检或通用评估脑当作主脑复审。
+3. 默认必须把候选正文展示给用户并获得明确接受后才能请求发布；正式发布不得再次传正文，也不得用通用 `write_file` 或其他工具绕过应用服务。
+4. revision 过期、ContextRef hash 变化或 Canon 冲突时不得静默覆盖，必须按应用返回的 typed error 重新召回和复审。
 
 **关键原则**：当你需要 3 次以上搜索才能理解一段代码时，应该转用 Agent(Explore) 而不是继续手动搜索。手动搜索适合精确、确定性的查询。
 
@@ -279,27 +277,19 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_mentions_resident_novel_brain_boundary() {
+    fn system_prompt_uses_only_high_level_novel_application_facades() {
         let prompt = build_system_prompt_with_tools();
         let skill = include_str!("../skills/novel-writing-workflow/SKILL.md");
         assert!(prompt.contains("不得用 `Agent(subagent_type='Novel')`"));
-        assert!(prompt.contains("novel_start_task"));
-        assert!(prompt.contains("novel_review_draft"));
-        assert!(prompt.contains("novel_user_decision"));
-        assert!(prompt.contains("novel_publish(task_id, draft_version)"));
+        assert!(prompt.contains("`novel_project` 和 `novel_task` 高层应用入口"));
         assert!(prompt.contains("Skill(skill='novel-writing-workflow')"));
         assert!(prompt.contains("必须先调用"));
-        assert!(prompt.contains("小说脑复审门禁"));
+        assert!(prompt.contains("Novel 应用边界"));
         assert!(prompt.contains("主脑必须独立"));
-        assert!(prompt.contains("不得把小说脑自检或通用评估脑"));
+        assert!(prompt.contains("不得把 Writer 自检或通用评估脑"));
         assert!(prompt.contains("通用评估脑默认关闭"));
-        assert!(skill.contains("novel_recall_project"));
-        assert!(skill.contains("novel_start_task"));
-        assert!(skill.contains("novel_review_draft"));
-        assert!(skill.contains("novel_user_decision"));
-        assert!(skill.contains("novel_publish"));
-        assert!(!skill.contains("调用 `novel_commit_delta`"));
-        assert!(skill.contains("## 主脑分支"));
-        assert!(skill.contains("## 常驻小说脑分支"));
+        assert!(skill.contains("novel_project"));
+        assert!(skill.contains("novel_task"));
+        assert!(skill.contains("## 主脑职责"));
     }
 }

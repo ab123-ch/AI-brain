@@ -23,6 +23,42 @@ fn general_eval_enabled(config: &HooksConfig) -> bool {
     config.enabled && config.eval_gate.enabled
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct MemberQueryError {
+    message: String,
+    execution_started: bool,
+}
+
+impl MemberQueryError {
+    fn before_execution(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            execution_started: false,
+        }
+    }
+
+    fn after_execution(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            execution_started: true,
+        }
+    }
+
+    pub(crate) const fn execution_started(&self) -> bool {
+        self.execution_started
+    }
+}
+
+fn resolve_member_reasoning_tokens(configured: u32, depth: &str) -> Result<u32, String> {
+    match depth {
+        "low" => Ok(configured.min(4_096)),
+        "medium" => Ok(configured.min(8_192)),
+        "high" => Ok(configured),
+        other => Err(format!("不支持的成员思考深度: {other}")),
+    }
+}
+
 const NOVEL_WRITING_SKILL_NAME: &str = "novel-writing-workflow";
 const NOVEL_WRITING_SKILL: &str =
     include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
@@ -57,6 +93,7 @@ use brain_evolver::{
     extract_cycle_metadata, target_id_from_candidate, CycleConfig, CycleRunner, EvoConfig,
     EvolutionCoordinator, EvolutionTrigger, SharedResources,
 };
+use brain_graph::generic::GenericGraphStore;
 use brain_hooks::config::HooksConfig;
 use brain_hooks::runner::HookRunner;
 use brain_hooks::types::{HookEvent, HookInput};
@@ -68,9 +105,9 @@ use brain_mcp::config::load_mcp_servers;
 use brain_mcp::McpClientPool;
 // [Task 16] 旧 analyzer::AnalysisLlm 已随旧模块清理，使用新版 concentration::AnalysisLlm
 use brain_memory::conversation_memory::{ConversationMemoryInvalidation, ConversationMemoryScope};
+use brain_memory::generic::GenericMemoryStore;
 use brain_memory::pyramid_memory_brain::{PyramidMemoryBrain, PyramidMemoryBrainConfig};
 use brain_motor::motor_brain::{MotorBrain, MotorConfig};
-use brain_novel::{NovelBrainConfig, NovelBrainHandle};
 use brain_plugin::{PluginManager, SkillCatalog};
 use brain_reasoning::reasoning_brain::{ReasoningBrain, ReasoningConfig};
 use brain_sensory::llm::LlmProvider as SensoryLlmProvider;
@@ -78,8 +115,68 @@ use brain_sensory::SensoryBrain;
 use brain_validation::validation_brain::ValidationConfig;
 use brain_validation::ValidationBrain;
 use chrono::Utc;
+use knowledge_core::{
+    ContentResolverRegistry, ContextBlockKind, ContextBuilder,
+    ContextSnapshot as KnowledgeContextSnapshot, GraphQueryPort, GraphQueryRequest,
+    GraphQueryResult, KnowledgeError, KnowledgeSchemaBundle, KnowledgeSchemaRegistry,
+    MemoryQueryPort, MemoryTypeId, MemoryTypeSchema, NamespaceId, ProjectionAdapterRegistry,
+    ResourceTypeId, ScopeTypeId,
+};
+use novel_application::{
+    LegacyNovelImporter, NovelApplicationService, NovelDomainStore, NovelProjectionWorker,
+    NovelResourcePort as ApplicationNovelResourcePort, StoreWorkflowEnvironment,
+    TaskApplicationPort,
+};
+use task_engine::{Scheduler, TaskCoordinator, TaskRepository};
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
+
+fn member_inputs_from_snapshot(
+    snapshot: &KnowledgeContextSnapshot,
+) -> Result<(String, Vec<ChatMessageRestore>, String), String> {
+    snapshot
+        .validate()
+        .map_err(|error| format!("成员上下文快照校验失败: {error}"))?;
+    let mut input = None;
+    let mut history = Vec::new();
+    let mut system_context = Vec::new();
+    for block in &snapshot.blocks {
+        match block.kind {
+            ContextBlockKind::SystemPolicy
+            | ContextBlockKind::Memory
+            | ContextBlockKind::GraphEvidence
+            | ContextBlockKind::Artifact => system_context.push(block.content.clone()),
+            ContextBlockKind::ConversationUser => history.push(ChatMessageRestore {
+                role: "user".into(),
+                content: block.content.clone(),
+            }),
+            ContextBlockKind::ConversationAssistant => history.push(ChatMessageRestore {
+                role: "assistant".into(),
+                content: block.content.clone(),
+            }),
+            ContextBlockKind::CurrentInput => {
+                if input.replace(block.content.clone()).is_some() {
+                    return Err("成员上下文包含多个 current_input block".into());
+                }
+            }
+        }
+    }
+    if !snapshot.degradations.is_empty() {
+        system_context.push(
+            snapshot
+                .degradations
+                .iter()
+                .map(|item| format!("上下文来源 {} 不完整：{}", item.source, item.reason))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    let input = input.ok_or_else(|| "成员上下文缺少 current_input block".to_string())?;
+    if system_context.is_empty() {
+        return Err("成员上下文缺少 system_policy block".into());
+    }
+    Ok((input, history, system_context.join("\n\n")))
+}
 
 // ─── LLM 适配器 ──────────────────────────────────────────────────
 
@@ -214,6 +311,16 @@ struct MasterState {
     result_rx: brain_bus::ResultReceiver,
 }
 
+struct UnavailableGraphQuery {
+    reason: String,
+}
+
+impl GraphQueryPort for UnavailableGraphQuery {
+    fn query(&self, _query: &GraphQueryRequest) -> knowledge_core::Result<GraphQueryResult> {
+        Err(KnowledgeError::Unavailable(self.reason.clone()))
+    }
+}
+
 // ─── 系统编排器 ──────────────────────────────────────────────────
 
 /// 系统编排器
@@ -228,6 +335,9 @@ pub struct Orchestrator {
     sensory: SensoryBrain,
     master_state: Arc<Mutex<MasterState>>,
     memory_brain: Arc<Mutex<PyramidMemoryBrain>>,
+    context_builder: Arc<ContextBuilder>,
+    #[allow(dead_code)]
+    projection_adapters: Arc<ProjectionAdapterRegistry>,
     evaluation_brain: EvaluationBrain,
     /// v2 评估脑（LLM 深度评估），None 表示 LLM 不可用
     eval_brain: Option<EvalBrain>,
@@ -258,8 +368,12 @@ pub struct Orchestrator {
     dispatch_output_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<brain_dispatch::MainLoopMessage>>>,
     /// Full runtime exchanges for WebSocket cockpit subscribers.
     runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
-    /// Stable resident NovelBrain service handle.
-    novel_brain: NovelBrainHandle,
+    /// Shared durable execution repository for Collaboration and domain workflows.
+    task_repository: Arc<TaskRepository>,
+    /// One admission boundary shared by every runtime workflow.
+    task_coordinator: TaskCoordinator,
+    /// High-level Novel task application boundary.
+    novel_application: Arc<dyn TaskApplicationPort>,
     /// 插件管理器
     #[allow(dead_code)] // Task 8 会使用
     plugin_mgr: Option<PluginManager>,
@@ -292,6 +406,36 @@ impl Orchestrator {
         let llm_config = LlmConfig::load_default().map_err(|e| {
             format!("LLM 配置加载失败: {e}\n请检查 ~/.config/ai-brain/config.toml 或设置 ZHIPU_API_KEY 环境变量")
         })?;
+
+        let runtime_dir = crate::web::collaboration::default_runtime_dir();
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|error| format!("创建运行时目录失败: {error}"))?;
+        let collaboration_config =
+            crate::web::collaboration::CollaborationConfig::load(&runtime_dir.join("config.toml"))
+                .map_err(|error| format!("加载统一执行配置失败: {error}"))?;
+        let task_database_path = runtime_dir.join("runtime.db");
+        let task_repository = Arc::new(
+            tokio::task::spawn_blocking(move || TaskRepository::open(task_database_path))
+                .await
+                .map_err(|error| format!("初始化 TaskEngine 线程失败: {error}"))?
+                .map_err(|error| format!("初始化 TaskEngine 失败: {error}"))?,
+        );
+        let recovery_repository = Arc::clone(&task_repository);
+        let recovery = tokio::task::spawn_blocking(move || recovery_repository.recover_inflight())
+            .await
+            .map_err(|error| format!("恢复 TaskEngine 线程失败: {error}"))?
+            .map_err(|error| format!("恢复 TaskEngine 失败: {error}"))?;
+        if recovery.interrupted > 0 {
+            tracing::warn!(
+                interrupted = recovery.interrupted,
+                requeued = recovery.requeued,
+                needs_input = recovery.needs_input,
+                "已恢复中断的 TaskEngine 节点"
+            );
+        }
+        let scheduler = Scheduler::new(collaboration_config.scheduler_limits())
+            .map_err(|error| format!("初始化统一 Scheduler 失败: {error}"))?;
+        let task_coordinator = TaskCoordinator::new(Arc::clone(&task_repository), scheduler);
 
         // 1. 三通道消息总线
         let bus = Arc::new(BrainBus::new(64, 64, 64));
@@ -440,31 +584,73 @@ impl Orchestrator {
             tokio::sync::mpsc::channel::<brain_dispatch::MainLoopMessage>(64);
         let (runtime_trace_tx, _) = broadcast::channel::<RuntimeExchange>(256);
 
-        // NovelBrain is a stable v2 domain service. It receives only typed Memory/Resource ports.
-        let (novel_llm, novel_startup_error): (Arc<dyn brain_llm::LlmProvider>, Option<String>) =
-            match llm_config.create_brain_client("novel") {
-                Ok(client) => (Arc::from(client), None),
-                Err(error) => (
-                    Arc::new(brain_llm::echo::EchoLlmProvider::new("novel-unavailable")),
-                    Some(error.to_string()),
-                ),
-            };
-        let novel_memory = Arc::new(crate::novel_adapters::PyramidNovelMemoryAdapter::new(
-            Arc::clone(&memory),
-        ));
+        // Novel Domain owns its durable database; legacy Pyramid files are read-only inputs.
+        let novel_base_dir = memory.lock().await.base_dir().to_path_buf();
+        let novel_store = Arc::new(
+            NovelDomainStore::open(novel_base_dir.join("novel.db"))
+                .map_err(|error| format!("初始化 Novel 领域库失败: {error}"))?,
+        );
+        let migration = LegacyNovelImporter::new(&novel_base_dir)
+            .import_into(&novel_store)
+            .map_err(|error| format!("迁移旧 Novel 数据失败: {error}"))?;
+        tracing::info!(
+            projects = migration.projects_imported,
+            checkpoints = migration.checkpoints_imported,
+            events = migration.events_imported,
+            publications = migration.publications_imported,
+            archived = migration.tasks_archived,
+            "Novel 数据切流检查完成"
+        );
         let workspace_root =
             std::env::current_dir().map_err(|error| format!("无法确定小说项目工作区: {error}"))?;
         let novel_resources = Arc::new(
             crate::novel_adapters::ScopedNovelResourceAdapter::new(&workspace_root)
                 .map_err(|error| format!("初始化小说资源端口失败: {error}"))?,
         );
-        let novel_config = NovelBrainConfig {
-            startup_error: novel_startup_error,
-            ..NovelBrainConfig::default()
+        let application_resources: Arc<dyn ApplicationNovelResourcePort> = novel_resources;
+        let novel_start_workflow = if let Ok(client) = llm_config.create_brain_client("main") {
+            let novel_llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
+            let (max_output_tokens, temperature) = llm_config.params_for_brain("main");
+            let model = novel_workflow::ProfileModel::new(
+                llm_config.provider_for_brain("main"),
+                llm_config.model_for_brain("main"),
+            );
+            let models = novel_workflow::NovelWorkflowModels {
+                writer: model.clone(),
+                reviewer: model.clone(),
+                canon_extractor: model,
+            };
+            let budget = novel_workflow::NovelWorkflowBudget {
+                input_tokens: collaboration_config.task_input_token_limit,
+                output_tokens: collaboration_config
+                    .task_output_token_limit
+                    .min(u64::from(max_output_tokens)),
+            };
+            let environment = Arc::new(StoreWorkflowEnvironment::new(
+                Arc::clone(&novel_store),
+                Arc::clone(&application_resources),
+            ));
+            let writer = Arc::new(crate::novel_adapters::LlmNovelWriterAdapter::new(
+                Arc::clone(&novel_llm),
+                temperature,
+            ));
+            Some(Arc::new(novel_workflow::NovelStartWorkflow::new(
+                Arc::clone(&task_repository),
+                task_coordinator.clone(),
+                environment,
+                writer,
+                models,
+                budget,
+            )))
+        } else {
+            None
         };
-        let (novel_brain, novel_task) =
-            brain_novel::spawn_novel_brain(novel_llm, novel_memory, novel_resources, novel_config);
-        tasks.push(novel_task);
+        let novel_application = Arc::new(NovelApplicationService::new(
+            Arc::clone(&novel_store),
+            novel_start_workflow,
+            application_resources,
+        ));
+        let novel_application_port: Arc<dyn TaskApplicationPort> = novel_application.clone();
 
         // 启动 dispatch loop
         {
@@ -486,7 +672,7 @@ impl Orchestrator {
             Some(Arc::clone(&memory)),
             dispatch.clone(),
             runtime_trace_tx.clone(),
-            novel_brain.clone(),
+            Arc::clone(&novel_application_port),
         );
 
         // 12.0 评估脑接入统一 SkillCatalog
@@ -682,11 +868,33 @@ impl Orchestrator {
             }));
         }
 
+        let (context_builder, projection_adapters, generic_memory, generic_graph) =
+            create_knowledge_runtime(&pending_base_dir)?;
+        if let Some(graph) = generic_graph {
+            let worker = Arc::new(NovelProjectionWorker::new(
+                Arc::clone(&novel_store),
+                generic_memory,
+                graph,
+            ));
+            let projection = worker
+                .drain(1_024)
+                .map_err(|error| format!("重建 Novel 通用知识失败: {error}"))?;
+            novel_application.attach_projection_worker(worker);
+            tracing::info!(
+                events = projection.completed_events,
+                memories = projection.memory_entries,
+                graph_batches = projection.graph_batches,
+                "Novel 通用知识 outbox 已收敛"
+            );
+        }
+
         Ok(Self {
             bus,
             sensory,
             master_state,
             memory_brain: memory,
+            context_builder,
+            projection_adapters,
             evaluation_brain: evaluation,
             eval_brain,
             hook_runner,
@@ -704,11 +912,21 @@ impl Orchestrator {
             dispatch,
             dispatch_output_rx: Arc::new(Mutex::new(dispatch_output_rx)),
             runtime_trace_tx,
-            novel_brain,
+            task_repository,
+            task_coordinator,
+            novel_application: novel_application_port,
             plugin_mgr,
             skill_catalog,
             mcp_pool,
         })
+    }
+
+    pub(crate) fn task_repository(&self) -> Arc<TaskRepository> {
+        Arc::clone(&self.task_repository)
+    }
+
+    pub(crate) fn task_coordinator(&self) -> TaskCoordinator {
+        self.task_coordinator.clone()
     }
 
     /// 提交查询
@@ -810,6 +1028,10 @@ impl Orchestrator {
         Arc::clone(&self.memory_brain)
     }
 
+    pub(crate) fn context_builder(&self) -> Arc<ContextBuilder> {
+        Arc::clone(&self.context_builder)
+    }
+
     pub fn subscribe_runtime_trace(&self) -> broadcast::Receiver<RuntimeExchange> {
         self.runtime_trace_tx.subscribe()
     }
@@ -841,10 +1063,10 @@ impl Orchestrator {
         };
 
         let cancelled_tasks = self
-            .novel_brain
+            .novel_application
             .invalidate_conversation_generations(
-                conversation_id,
-                generation_ids,
+                &conversation_id,
+                &generation_ids,
                 includes_legacy_unscoped,
             )
             .await
@@ -941,6 +1163,90 @@ impl Orchestrator {
         tokio_util::sync::CancellationToken,
     ) {
         self.query_streaming_with_memory_scope(input, Some(memory_scope))
+    }
+
+    /// Execute one collaboration-member run with a fresh MainBrain history.
+    ///
+    /// Provider/tool infrastructure is shared, while conversation state and
+    /// usage counters are isolated for this run. All model-visible content is
+    /// derived from the one frozen snapshot persisted by TaskEngine.
+    pub(crate) fn query_member_streaming_scoped(
+        self: &Arc<Self>,
+        context_snapshot: KnowledgeContextSnapshot,
+        memory_scope: ConversationMemoryScope,
+        model_policy: &str,
+        reasoning_depth: &str,
+        allow_tools: bool,
+    ) -> (
+        tokio::sync::mpsc::Receiver<ProgressEvent>,
+        tokio::task::JoinHandle<Result<MainBrainOutput, MemberQueryError>>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        self.query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let this = Arc::clone(self);
+        let model_policy = model_policy.to_string();
+        let reasoning_depth = reasoning_depth.to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_for_run = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            let (input, restore_history, member_context) =
+                member_inputs_from_snapshot(&context_snapshot)
+                    .map_err(MemberQueryError::before_execution)?;
+            let llm_config = LlmConfig::load_default().map_err(|error| {
+                MemberQueryError::before_execution(format!("加载成员模型配置失败: {error}"))
+            })?;
+            let policy_exists = model_policy == "main"
+                || llm_config.llm.brain_models.contains_key(&model_policy)
+                || llm_config.llm.brain_providers.contains_key(&model_policy)
+                || llm_config.llm.brain_params.contains_key(&model_policy);
+            if !policy_exists {
+                return Err(MemberQueryError::before_execution(format!(
+                    "成员模型策略未配置: {model_policy}"
+                )));
+            }
+            let client = llm_config
+                .create_brain_client(&model_policy)
+                .map_err(|error| {
+                    MemberQueryError::before_execution(format!("创建成员模型失败: {error}"))
+                })?;
+            let (configured_max_tokens, temperature) = llm_config.params_for_brain(&model_policy);
+            let max_tokens =
+                resolve_member_reasoning_tokens(configured_max_tokens, &reasoning_depth)
+                    .map_err(MemberQueryError::before_execution)?;
+
+            let mut brain = {
+                let template = this.v2_brain.lock().await;
+                let template = template.as_ref().ok_or_else(|| {
+                    MemberQueryError::before_execution("MainBrain 当前不可用，无法创建成员运行")
+                })?;
+                template.fork_isolated_with_llm(Arc::from(client), max_tokens, temperature)
+            };
+            if !allow_tools {
+                brain.register_tools(Vec::new());
+            }
+            brain.restore_history(restore_history);
+            brain.push_memory_context(&member_context);
+
+            let process = brain.process_input(&input, Some(&tx), Some(cancel_for_run));
+            let result =
+                crate::query_context::with_conversation_memory_scope(&memory_scope, process)
+                    .await
+                    .map_err(|error| MemberQueryError::after_execution(error.to_string()));
+
+            if let Ok(ref output) = result {
+                let memory = this.memory_brain.lock().await;
+                if let Err(error) = memory.store_turns_scoped(&output.turns, &memory_scope) {
+                    tracing::warn!("成员对话存入独立记忆代次失败: {error}");
+                }
+            }
+            result
+        });
+
+        (rx, handle, cancel)
     }
 
     fn query_streaming_with_memory_scope(
@@ -2059,7 +2365,6 @@ impl Orchestrator {
 
     /// 优雅关闭（含强制四步分析）
     pub fn shutdown(&self) {
-        self.novel_brain.request_shutdown();
         let _ = self.shutdown_tx.send(true);
         tracing::info!("AI Brain 正在关闭...");
     }
@@ -2071,9 +2376,6 @@ impl Orchestrator {
         // 记录会话结束时的 LLM 使用统计
         llm_usage_logger::log_session_summary();
 
-        if let Err(error) = self.novel_brain.shutdown().await {
-            tracing::warn!("常驻小说脑关停未确认: {error}");
-        }
         let _ = self.shutdown_tx.send(true);
         tracing::info!("AI Brain 正在关闭...");
     }
@@ -2447,7 +2749,7 @@ fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<PyramidMemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
     runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
-    novel_brain: NovelBrainHandle,
+    novel_application: Arc<dyn TaskApplicationPort>,
 ) -> (
     Arc<Mutex<Option<MainBrain>>>,
     Option<PluginManager>,
@@ -2539,7 +2841,7 @@ fn create_v2_main_brain(
             .with_skill_catalog(skill_catalog.clone())
             .with_mcp_pool(mcp_pool.clone())
             .with_runtime_trace_sender(runtime_trace_tx)
-            .with_novel_brain(novel_brain),
+            .with_novel_application(Some(novel_application)),
     );
 
     let brain_config = BrainConfig::default();
@@ -2568,6 +2870,93 @@ fn create_v2_main_brain(
         skill_catalog,
         mcp_pool,
     )
+}
+
+const NOVEL_KNOWLEDGE_SOURCE_TYPES: [&str; 4] = [
+    "novel.canon",
+    "novel.artifact",
+    "novel.memory",
+    "novel.project_resource",
+];
+
+fn create_knowledge_registries(
+) -> Result<(Arc<KnowledgeSchemaRegistry>, Arc<ProjectionAdapterRegistry>), String> {
+    let schemas = Arc::new(KnowledgeSchemaRegistry::new());
+    schemas
+        .register(
+            KnowledgeSchemaBundle::new("platform.core", NamespaceId::from("platform.core"), 1)
+                .with_memory_type(MemoryTypeSchema::new(
+                    MemoryTypeId::from("platform.note"),
+                    [
+                        ScopeTypeId::from("room"),
+                        ScopeTypeId::from("member"),
+                        ScopeTypeId::from("instance_run"),
+                    ],
+                ))
+                .with_memory_type(MemoryTypeSchema::new(
+                    MemoryTypeId::from("platform.summary"),
+                    [ScopeTypeId::from("room"), ScopeTypeId::from("member")],
+                )),
+        )
+        .map_err(|error| format!("注册平台知识 Schema 失败: {error}"))?;
+    schemas
+        .register(novel_knowledge_adapter::novel_schema_bundle())
+        .map_err(|error| format!("注册 Novel 知识 Schema 失败: {error}"))?;
+
+    let projection_adapters = Arc::new(ProjectionAdapterRegistry::new());
+    for source_type in NOVEL_KNOWLEDGE_SOURCE_TYPES {
+        projection_adapters
+            .register(Arc::new(
+                novel_knowledge_adapter::NovelKnowledgeAdapter::for_source_type(
+                    ResourceTypeId::from(source_type),
+                ),
+            ))
+            .map_err(|error| format!("注册 Novel 知识投影 Adapter 失败: {error}"))?;
+    }
+    Ok((schemas, projection_adapters))
+}
+
+fn create_knowledge_runtime(
+    base_dir: &Path,
+) -> Result<
+    (
+        Arc<ContextBuilder>,
+        Arc<ProjectionAdapterRegistry>,
+        Arc<GenericMemoryStore>,
+        Option<Arc<GenericGraphStore>>,
+    ),
+    String,
+> {
+    let (schemas, projection_adapters) = create_knowledge_registries()?;
+
+    let memory_store = Arc::new(
+        GenericMemoryStore::open(base_dir.join("memory.db"), Arc::clone(&schemas))
+            .map_err(|error| format!("初始化通用 MemoryStore 失败: {error}"))?,
+    );
+    let memory: Arc<dyn MemoryQueryPort> = memory_store.clone();
+    let (graph, graph_store): (Arc<dyn GraphQueryPort>, Option<Arc<GenericGraphStore>>) =
+        match GenericGraphStore::open(base_dir.join("graph.db"), Arc::clone(&schemas)) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                (store.clone(), Some(store))
+            }
+            Err(error) => {
+                tracing::warn!("初始化通用 GraphStore 失败，本次上下文将降级: {error}");
+                (
+                    Arc::new(UnavailableGraphQuery {
+                        reason: error.to_string(),
+                    }),
+                    None,
+                )
+            }
+        };
+    let resolvers = Arc::new(ContentResolverRegistry::new());
+    Ok((
+        Arc::new(ContextBuilder::new(memory, graph, resolvers)),
+        projection_adapters,
+        memory_store,
+        graph_store,
+    ))
 }
 
 /// 创建所有副脑
@@ -2600,6 +2989,7 @@ fn create_sub_brains() -> Result<
 mod tests {
     use super::*;
     use brain_core::types::TurnUsage;
+    use knowledge_core::{ContextBlock, ContextBlockInput};
 
     #[test]
     fn general_eval_brain_is_opt_in() {
@@ -2614,6 +3004,112 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_runtime_registers_novel_schema_and_all_source_adapters() {
+        let (schemas, adapters) = create_knowledge_registries().unwrap();
+        assert!(schemas.bundles().iter().any(|bundle| {
+            bundle.schema_id == novel_knowledge_adapter::NOVEL_SCHEMA_ID
+                && bundle.namespace.as_str() == novel_knowledge_adapter::NOVEL_NAMESPACE
+        }));
+        assert!(schemas
+            .memory_type(&MemoryTypeId::from("novel.chapter"))
+            .is_some());
+        assert!(schemas
+            .node_type(&knowledge_core::NodeTypeId::from("novel.character"))
+            .is_some());
+        assert!(schemas
+            .relation_type(&knowledge_core::RelationTypeId::from("novel.related_to"))
+            .is_some());
+
+        let namespace = NamespaceId::from(novel_knowledge_adapter::NOVEL_NAMESPACE);
+        for source_type in NOVEL_KNOWLEDGE_SOURCE_TYPES {
+            let source_type = ResourceTypeId::from(source_type);
+            let adapter = adapters
+                .get(&namespace, &source_type)
+                .unwrap_or_else(|| panic!("missing Novel adapter for {source_type}"));
+            assert_eq!(adapter.namespace(), namespace);
+            assert_eq!(adapter.source_type(), source_type);
+            assert_eq!(
+                adapter.version(),
+                novel_knowledge_adapter::NOVEL_SCHEMA_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn member_model_inputs_are_derived_only_from_the_frozen_snapshot() {
+        let snapshot = KnowledgeContextSnapshot::new(
+            "context-member-run",
+            vec![
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "policy",
+                    ContextBlockKind::SystemPolicy,
+                    "member policy",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "history-user",
+                    ContextBlockKind::ConversationUser,
+                    "earlier question",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "history-assistant",
+                    ContextBlockKind::ConversationAssistant,
+                    "earlier answer",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "memory",
+                    ContextBlockKind::Memory,
+                    "authorized memory",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "current",
+                    ContextBlockKind::CurrentInput,
+                    "current question",
+                ))
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let (input, history, system) = member_inputs_from_snapshot(&snapshot).unwrap();
+        assert_eq!(input, "current question");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, "earlier question");
+        assert_eq!(history[1].role, "assistant");
+        assert!(system.contains("member policy"));
+        assert!(system.contains("authorized memory"));
+
+        let mut tampered = snapshot;
+        tampered.blocks[0].content = "changed after freeze".into();
+        assert!(member_inputs_from_snapshot(&tampered).is_err());
+    }
+
+    #[test]
+    fn member_reasoning_depth_applies_bounded_output_policy() {
+        assert_eq!(
+            resolve_member_reasoning_tokens(32_768, "low").unwrap(),
+            4_096
+        );
+        assert_eq!(
+            resolve_member_reasoning_tokens(32_768, "medium").unwrap(),
+            8_192
+        );
+        assert_eq!(
+            resolve_member_reasoning_tokens(32_768, "high").unwrap(),
+            32_768
+        );
+        assert_eq!(
+            resolve_member_reasoning_tokens(2_048, "low").unwrap(),
+            2_048
+        );
+        assert!(resolve_member_reasoning_tokens(32_768, "max").is_err());
+    }
+
+    #[test]
     fn builtin_novel_writing_skill_is_seeded_and_loadable() {
         let dir = tempfile::tempdir().unwrap();
         let root = install_builtin_skills(dir.path()).unwrap();
@@ -2624,13 +3120,12 @@ mod tests {
         assert!(!skill.is_bootstrap);
         assert!(skill.description.contains("小说创作"));
         let body = catalog.load_content(skill).unwrap();
-        assert!(body.contains("## 主脑分支"));
-        assert!(body.contains("## 常驻小说脑分支"));
-        assert!(body.contains("novel_start_task"));
-        assert!(body.contains("novel_publish"));
+        assert!(body.contains("## 主脑职责"));
+        assert!(body.contains("novel_project"));
+        assert!(body.contains("novel_task"));
         let summary = catalog.summary_for_prompt();
         assert!(summary.contains("<name>novel-writing-workflow</name>"));
-        assert!(summary.contains("在调用常驻小说脑或发布作品前使用"));
+        assert!(summary.contains("在创建、修改、审校或发布作品前使用"));
 
         let skill_path = root.join(NOVEL_WRITING_SKILL_NAME).join("SKILL.md");
         std::fs::write(&skill_path, "stale").unwrap();
@@ -2669,8 +3164,8 @@ mod tests {
         let orch = orch.unwrap();
         assert_eq!(
             orch.task_count(),
-            5,
-            "应该有 5 个任务（3副脑+常驻小说脑+1dispatch_loop）"
+            4,
+            "应该有 4 个任务（3副脑+1dispatch_loop）"
         );
         orch.shutdown();
     }

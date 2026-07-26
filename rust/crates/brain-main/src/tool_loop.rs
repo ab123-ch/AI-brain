@@ -134,6 +134,8 @@ pub(crate) struct ToolLoopResult {
     pub(crate) context_overflow: bool,
 }
 
+const MAX_BLANK_RESPONSE_ATTEMPTS: u32 = 2;
+
 /// 运行 tool_loop — LLM ↔ 工具 循环直到 LLM 不再调用工具（默认参数的便捷入口）
 #[allow(dead_code)]
 pub async fn run_tool_loop(
@@ -178,6 +180,7 @@ pub async fn run_tool_loop_with_config(
     let mut total_prompt_tokens = 0u64;
     let mut last_prompt_tokens = 0u64; // 在循环内赋值
     let mut usage_records: Vec<brain_llm::types::TokenUsage> = Vec::new();
+    let mut blank_response_attempts = 0u32;
     // 记录最后一次 LLM 响应，用于取消时构建结果
     let mut last_response: Option<ChatResponse> = None;
 
@@ -338,8 +341,52 @@ pub async fn run_tool_loop_with_config(
         // === 日志：LLM 响应 ===
         let resp_text = response.text();
         let tool_calls = response.tool_calls();
+        tracing::info!(
+            "=== LLM 响应 [第{llm_calls}次] === text({}字){}{} finish_reason={:?}",
+            resp_text.chars().count(),
+            if resp_text.is_empty() {
+                String::new()
+            } else {
+                format!(": {resp_text}")
+            },
+            if tool_calls.is_empty() {
+                String::new()
+            } else {
+                format!(", tool_calls={}", tool_calls.len())
+            },
+            response.finish_reason,
+        );
 
-        // 保存最后一次 LLM 响应，用于取消时构建部分结果
+        // A provider may return HTTP 200 with no usable final content. Retrying
+        // is safe here because a tool-free response has caused no side effect.
+        if resp_text.trim().is_empty() && tool_calls.is_empty() {
+            blank_response_attempts += 1;
+            let reason = match response.finish_reason {
+                Some(FinishReason::MaxTokens) => "模型达到输出 token 上限但没有返回可展示正文",
+                Some(FinishReason::ToolUse) => "模型返回了工具调用标记但没有实际工具或正文",
+                _ => "模型没有返回可展示正文或工具调用",
+            };
+            if blank_response_attempts < MAX_BLANK_RESPONSE_ATTEMPTS {
+                tracing::warn!(
+                    "LLM 空响应，准备重试: {reason} ({blank_response_attempts}/{MAX_BLANK_RESPONSE_ATTEMPTS})"
+                );
+                send_progress(
+                    progress_tx,
+                    ProgressEvent::LlmRetry {
+                        attempt: blank_response_attempts + 1,
+                        max_attempts: MAX_BLANK_RESPONSE_ATTEMPTS,
+                        error: reason.into(),
+                    },
+                )
+                .await;
+                continue;
+            }
+            return Err(MainBrainError::LlmError(format!(
+                "{reason}，自动重试后仍为空"
+            )));
+        }
+
+        // 保存最后一次有效 LLM 响应，用于取消时构建部分结果
         last_response = Some(response.clone());
 
         // 将 LLM 的文本推理通过 TextDelta 发送到 TUI（让用户看到思考过程）
@@ -362,42 +409,6 @@ pub async fn run_tool_loop_with_config(
                 }
                 _ => {}
             }
-        }
-        tracing::info!(
-            "=== LLM 响应 [第{llm_calls}次] === text({}字){}{} finish_reason={:?}",
-            resp_text.chars().count(),
-            if resp_text.is_empty() {
-                String::new()
-            } else {
-                format!(": {resp_text}")
-            },
-            if tool_calls.is_empty() {
-                String::new()
-            } else {
-                format!(", tool_calls={}", tool_calls.len())
-            },
-            response.finish_reason,
-        );
-
-        // 空响应检测：无文本 + 无工具调用 → 可能是上下文超限或模型异常
-        if resp_text.is_empty() && tool_calls.is_empty() {
-            let reason = match response.finish_reason {
-                Some(FinishReason::MaxTokens) => {
-                    "模型因上下文长度限制截断，返回了空响应。请尝试缩短对话或开启压缩。"
-                }
-                Some(FinishReason::ToolUse) => {
-                    "模型返回了工具调用标记但无实际内容（API 响应格式异常）。"
-                }
-                _ => "模型返回了空响应（无文本无工具调用），可能是上下文过长或模型服务异常。",
-            };
-            tracing::warn!("LLM 空响应警告: {reason}");
-            send_progress(
-                progress_tx,
-                ProgressEvent::TextDelta {
-                    text: format!("\n⚠ {reason}\n"),
-                },
-            )
-            .await;
         }
         for (i, block) in response.content.iter().enumerate() {
             if let brain_llm::ContentBlock::ToolUse { name, input, .. } = block {
@@ -859,6 +870,7 @@ mod tests {
     use brain_llm::TokenUsage;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 简单 LLM stub：直接返回文本
     struct TextLlm;
@@ -895,5 +907,90 @@ mod tests {
 
         assert_eq!(result.response.text(), "最终回答");
         assert_eq!(result.llm_calls, 1);
+    }
+
+    struct BlankThenTextLlm {
+        calls: AtomicUsize,
+    }
+
+    impl LlmProvider for BlankThenTextLlm {
+        fn model(&self) -> &'static str {
+            "blank-then-text"
+        }
+
+        fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    content: if call == 0 {
+                        Vec::new()
+                    } else {
+                        vec![ContentBlock::text("重试后的有效回答")]
+                    },
+                    model: "blank-then-text".into(),
+                    usage: TokenUsage::default(),
+                    finish_reason: Some(brain_llm::FinishReason::EndTurn),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_retries_one_blank_response_before_succeeding() {
+        let llm = BlankThenTextLlm {
+            calls: AtomicUsize::new(0),
+        };
+        let executor = StubToolExecutor::new();
+        let mut messages = vec![ChatMessage::user("测试")];
+
+        let result = run_tool_loop(&llm, &executor, &mut messages, &[], None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.text(), "重试后的有效回答");
+        assert_eq!(result.llm_calls, 2);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct AlwaysBlankLlm {
+        calls: AtomicUsize,
+    }
+
+    impl LlmProvider for AlwaysBlankLlm {
+        fn model(&self) -> &'static str {
+            "always-blank"
+        }
+
+        fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ChatResponse {
+                    content: vec![ContentBlock::text(" \n\t")],
+                    model: "always-blank".into(),
+                    usage: TokenUsage::default(),
+                    finish_reason: Some(brain_llm::FinishReason::EndTurn),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_rejects_blank_response_after_retry_is_exhausted() {
+        let llm = AlwaysBlankLlm {
+            calls: AtomicUsize::new(0),
+        };
+        let executor = StubToolExecutor::new();
+        let mut messages = vec![ChatMessage::user("测试")];
+
+        let result = run_tool_loop(&llm, &executor, &mut messages, &[], None, None).await;
+
+        assert!(result.is_err());
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
     }
 }

@@ -10,6 +10,8 @@ brain-core = { path = "../brain-core" }
 brain-bus = { path = "../brain-bus" }
 brain-graph = { path = "../brain-graph" }
 brain-llm = { path = "../brain-llm" }
+knowledge-core = { path = "../knowledge-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

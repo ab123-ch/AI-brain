@@ -2,8 +2,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use agent_runtime::{
+    AgentProfileSnapshot, AgentRunOutcome, AgentRunSpec, AgentRunStatus, AgentRuntime,
+    AgentRuntimeError, AgentWorkerPool, ArtifactEnvelope, ArtifactSink, BudgetReservation,
+    ContextSnapshot, OutputContract, ReasoningPolicy, ResolvedModelPolicy, ToolGrant,
+};
 use api::{
     max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
@@ -19,8 +25,8 @@ use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, read_file, write_file, ApiClient,
     ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
+    GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeError,
+    ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -420,14 +426,14 @@ Use this when the task benefits from focused, independent work (e.g., codebase e
 code review, verification, research). Do NOT use for simple lookups — use read_file/grep/glob directly. \
 Available subagent_type values: 'Explore' (read-only research), 'Plan', 'Verification', \
 'general-purpose' (full tool access). \
-小说任务必须使用 novel_start_task / novel_resume_task 等常驻小说脑工具，不得使用 Agent。 \
+小说任务必须使用 novel_task 领域应用工具，不得使用 Agent。 \
 The sub-agent inherits your model and API credentials automatically — do NOT research how to launch it, just call this tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "description": "Short description of what the agent will do" },
                     "prompt": { "type": "string", "description": "Detailed instructions for the agent" },
-                    "subagent_type": { "type": "string", "enum": ["Explore", "Plan", "Verification", "general-purpose"], "description": "Temporary agent type. Novel is a resident brain and is not launched through Agent." },
+                    "subagent_type": { "type": "string", "enum": ["Explore", "Plan", "Verification", "general-purpose"], "description": "Temporary agent type. Novel work is handled by its domain workflow and is not launched through Agent." },
                     "name": { "type": "string", "description": "Optional short name for the agent" },
                     "model": { "type": "string", "description": "Optional model override (leave empty to use default)" },
                     "run_in_background": { "type": "boolean", "description": "Set to true to run this temporary agent in the background.", "default": false }
@@ -710,226 +716,129 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
-            name: "novel_create_project",
-            description: "创建隔离的小说项目级记忆空间。开始一部长篇小说且尚无 project_id 时调用。",
+            name: "novel_task",
+            description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。",
             input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string", "description": "稳定项目 ID，只能包含字母、数字、-、_" },
-                    "title": { "type": "string" },
-                    "genres": { "type": "array", "items": { "type": "string" } },
-                    "target_platform": { "type": "string" }
-                },
-                "required": ["project_id", "title"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "novel_list_projects",
-            description: "列出已有小说项目及其 project_id、当前卷章和 Canon revision，用于继续已有作品或避免重复建项目。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "novel_start_task",
-            description: "向常驻小说脑提交一个项目级写作任务环境包。小说脑会通过 MemoryBrain 读取 Canon，通过授权 ContextRef 读取正文、章纲、角色卡等材料，生成草稿并完成自检。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "本次小说任务的稳定 ID，只能包含字母、数字、-、_" },
-                    "project_id": { "type": "string" },
-                    "task_type": {
-                        "type": "string",
-                        "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"]
-                    },
-                    "task_brief": { "type": "string", "description": "主脑整理后的完整创作要求" },
-                    "target_chapter": { "type": "integer", "minimum": 1 },
-                    "expected_revision": { "type": "integer", "minimum": 0 },
-                    "output_path": { "type": "string", "description": "最终发布路径；草稿阶段不会写入" },
-                    "context_refs": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "role": {
-                                    "type": "string",
-                                    "enum": ["body", "previous_chapter", "chapter_outline", "volume_outline", "character_card", "world_setting", "style_sample", "other"]
-                                },
-                                "canonical_path": { "type": "string" },
-                                "sha256": { "type": "string" },
-                                "description": { "type": "string" }
-                            },
-                            "required": ["role", "canonical_path", "sha256"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "must_happen": { "type": "array", "items": { "type": "string" } },
-                    "must_not_change": { "type": "array", "items": { "type": "string" } },
-                    "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-                    "allow_web_research": { "type": "boolean", "default": false },
-                    "publication_policy": {
-                        "type": "string",
-                        "enum": ["require_user_acceptance", "auto_after_main_review"],
-                        "default": "require_user_acceptance"
-                    },
-                    "parent_task_id": { "type": "string" }
-                },
-                "required": ["task_id", "project_id", "task_type", "task_brief", "expected_revision", "output_path", "acceptance_criteria"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "novel_resume_task",
-            description: "把用户澄清、补充条件或可恢复的修订说明交回同一个常驻小说任务，不创建新 Agent 或新 task。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" },
-                    "input": { "type": "string" }
-                },
-                "required": ["task_id", "input"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "novel_review_draft",
-            description: "主脑对小说脑草稿提交独立复审。Pass 必须八项检查全通过、issues 为空并至少提供用户要求、章纲/前文、Canon 三类证据；Revise 必须给出具体 issues。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" },
-                    "draft_version": { "type": "integer", "minimum": 1 },
-                    "reviewed_canon_revision": { "type": "integer", "minimum": 0 },
-                    "verdict": { "type": "string", "enum": ["pass", "revise"] },
-                    "checks": {
+                "oneOf": [
+                    {
                         "type": "object",
                         "properties": {
-                            "user_requirements": { "type": "string", "enum": ["pass", "fail"] },
-                            "outline_alignment": { "type": "string", "enum": ["pass", "fail"] },
-                            "canon_consistency": { "type": "string", "enum": ["pass", "fail"] },
-                            "character_consistency": { "type": "string", "enum": ["pass", "fail"] },
-                            "timeline_consistency": { "type": "string", "enum": ["pass", "fail"] },
-                            "plot_and_foreshadowing": { "type": "string", "enum": ["pass", "fail"] },
-                            "style_quality": { "type": "string", "enum": ["pass", "fail"] },
-                            "pacing_and_hook": { "type": "string", "enum": ["pass", "fail"] }
-                        },
-                        "required": ["user_requirements", "outline_alignment", "canon_consistency", "character_consistency", "timeline_consistency", "plot_and_foreshadowing", "style_quality", "pacing_and_hook"],
-                        "additionalProperties": false
-                    },
-                    "issues": {
-                        "type": "array",
-                        "items": {
-                            "oneOf": [
-                                { "type": "string" },
-                                {
+                            "action": { "const": "start" },
+                            "task_id": { "type": "string" },
+                            "project_id": { "type": "string" },
+                            "task_type": { "type": "string", "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"] },
+                            "task_brief": { "type": "string" },
+                            "target_chapter": { "type": "integer", "minimum": 1 },
+                            "expected_revision": { "type": "integer", "minimum": 0 },
+                            "output_path": { "type": "string" },
+                            "context_refs": {
+                                "type": "array",
+                                "items": {
                                     "type": "object",
                                     "properties": {
-                                        "category": { "type": "string" },
-                                        "message": { "type": "string" },
-                                        "evidence_refs": { "type": "array", "items": { "type": "string" } }
+                                        "role": { "type": "string", "enum": ["body", "previous_chapter", "chapter_outline", "volume_outline", "character_card", "world_setting", "style_sample", "other"] },
+                                        "canonical_path": { "type": "string" },
+                                        "sha256": { "type": "string" },
+                                        "description": { "type": "string" }
                                     },
-                                    "required": ["category", "message"],
+                                    "required": ["role", "canonical_path", "sha256"],
                                     "additionalProperties": false
                                 }
-                            ]
-                        }
+                            },
+                            "must_happen": { "type": "array", "items": { "type": "string" } },
+                            "must_not_change": { "type": "array", "items": { "type": "string" } },
+                            "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                            "allow_web_research": { "type": "boolean", "default": false },
+                            "publication_policy": { "type": "string", "enum": ["require_user_acceptance", "auto_after_main_review"], "default": "require_user_acceptance" },
+                            "parent_task_id": { "type": "string" }
+                        },
+                        "required": ["action", "task_id", "project_id", "task_type", "task_brief", "expected_revision", "output_path", "acceptance_criteria"],
+                        "additionalProperties": false
                     },
-                    "evidence_refs": { "type": "array", "items": { "type": "string" } },
-                    "summary": { "type": "string" }
-                },
-                "required": ["task_id", "draft_version", "reviewed_canon_revision", "verdict", "checks", "issues", "evidence_refs", "summary"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "novel_user_decision",
-            description: "记录用户对主脑复审通过候选稿的接受、修改或拒绝决定。默认策略只有 accept 才允许发布；revise 会在原常驻 task 中继续。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" },
-                    "draft_version": { "type": "integer", "minimum": 1 },
-                    "decision": { "type": "string", "enum": ["accept", "revise", "reject"] },
-                    "feedback": { "type": "string" },
-                    "decided_at": { "type": "integer", "description": "可省略；服务端将使用当前时间" }
-                },
-                "required": ["task_id", "draft_version", "decision"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "novel_publish",
-            description: "发布已经通过小说脑自检、主脑复审和默认用户确认的精确草稿。只传 task_id 和 draft_version；正文由常驻小说脑从已审核状态读取，原子写入后由 MemoryBrain 提交 Canon。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string" },
-                    "draft_version": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["task_id", "draft_version"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::WorkspaceWrite,
-        },
-        ToolSpec {
-            name: "novel_status",
-            description: "查看常驻小说脑、项目工作区、活动 task、草稿版本、审核阶段和 pending publication 状态。",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "project_id": { "type": "string" } },
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "novel_recall_project",
-            description: "按大纲、章纲、正文、审稿或润色阶段召回指定小说项目的 Canon、人物状态、时间线、伏笔与写作经验。委派 Novel 小说脑前调用。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string" },
-                    "task_type": {
-                        "type": "string",
-                        "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"]
+                    {
+                        "type": "object",
+                        "properties": { "action": { "const": "resume" }, "task_id": { "type": "string" }, "input": { "type": "string" } },
+                        "required": ["action", "task_id", "input"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": { "const": "review" },
+                            "task_id": { "type": "string" },
+                            "draft_version": { "type": "integer", "minimum": 1 },
+                            "reviewed_canon_revision": { "type": "integer", "minimum": 0 },
+                            "verdict": { "type": "string", "enum": ["pass", "revise"] },
+                            "checks": {
+                                "type": "object",
+                                "properties": {
+                                    "user_requirements": { "type": "string", "enum": ["pass", "fail"] },
+                                    "outline_alignment": { "type": "string", "enum": ["pass", "fail"] },
+                                    "canon_consistency": { "type": "string", "enum": ["pass", "fail"] },
+                                    "character_consistency": { "type": "string", "enum": ["pass", "fail"] },
+                                    "timeline_consistency": { "type": "string", "enum": ["pass", "fail"] },
+                                    "plot_and_foreshadowing": { "type": "string", "enum": ["pass", "fail"] },
+                                    "style_quality": { "type": "string", "enum": ["pass", "fail"] },
+                                    "pacing_and_hook": { "type": "string", "enum": ["pass", "fail"] }
+                                },
+                                "required": ["user_requirements", "outline_alignment", "canon_consistency", "character_consistency", "timeline_consistency", "plot_and_foreshadowing", "style_quality", "pacing_and_hook"],
+                                "additionalProperties": false
+                            },
+                            "issues": { "type": "array", "items": { "oneOf": [{ "type": "string" }, { "type": "object", "properties": { "category": { "type": "string" }, "message": { "type": "string" }, "evidence_refs": { "type": "array", "items": { "type": "string" } } }, "required": ["category", "message"], "additionalProperties": false }] } },
+                            "evidence_refs": { "type": "array", "items": { "type": "string" } },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["action", "task_id", "draft_version", "reviewed_canon_revision", "verdict", "checks", "issues", "evidence_refs", "summary"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "action": { "const": "decide" }, "task_id": { "type": "string" }, "draft_version": { "type": "integer", "minimum": 1 }, "decision": { "type": "string", "enum": ["accept", "revise", "reject"] }, "feedback": { "type": "string" }, "decided_at": { "type": "integer" } },
+                        "required": ["action", "task_id", "draft_version", "decision"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "action": { "const": "publish" }, "task_id": { "type": "string" }, "draft_version": { "type": "integer", "minimum": 1 } },
+                        "required": ["action", "task_id", "draft_version"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "action": { "const": "status" }, "project_id": { "type": "string" } },
+                        "required": ["action"],
+                        "additionalProperties": false
                     }
-                },
-                "required": ["project_id", "task_type"],
-                "additionalProperties": false
+                ]
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
-            name: "novel_check_consistency",
-            description: "在章纲、正文或审稿前检查指定小说项目的未解决 Canon 冲突、重叠事实和逾期伏笔。",
+            name: "novel_project",
+            description: "管理 Novel 领域项目和 Canon 读模型。支持 create、list、recall、consistency 与 resolve_conflict。",
             input_schema: json!({
-                "type": "object",
-                "properties": { "project_id": { "type": "string" } },
-                "required": ["project_id"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "novel_resolve_conflict",
-            description: "在主脑或用户审查后标记一条小说 Canon 冲突已处理。该工具只保存审计结论，不直接修改事实；新的 Confirmed Canon 只通过 novel_publish 发布事务提交。",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "project_id": { "type": "string" },
-                    "conflict_id": { "type": "string" },
-                    "resolution": { "type": "string" }
-                },
-                "required": ["project_id", "conflict_id", "resolution"],
-                "additionalProperties": false
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": { "action": { "const": "create" }, "project_id": { "type": "string" }, "title": { "type": "string" }, "genres": { "type": "array", "items": { "type": "string" } }, "target_platform": { "type": "string" } },
+                        "required": ["action", "project_id", "title"],
+                        "additionalProperties": false
+                    },
+                    { "type": "object", "properties": { "action": { "const": "list" } }, "required": ["action"], "additionalProperties": false },
+                    {
+                        "type": "object",
+                        "properties": { "action": { "const": "recall" }, "project_id": { "type": "string" }, "task_type": { "type": "string", "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"] } },
+                        "required": ["action", "project_id", "task_type"],
+                        "additionalProperties": false
+                    },
+                    { "type": "object", "properties": { "action": { "const": "consistency" }, "project_id": { "type": "string" } }, "required": ["action", "project_id"], "additionalProperties": false },
+                    {
+                        "type": "object",
+                        "properties": { "action": { "const": "resolve_conflict" }, "project_id": { "type": "string" }, "conflict_id": { "type": "string" }, "resolution": { "type": "string" } },
+                        "required": ["action", "project_id", "conflict_id", "resolution"],
+                        "additionalProperties": false
+                    }
+                ]
             }),
             required_permission: PermissionMode::WorkspaceWrite,
         },
@@ -954,7 +863,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                 "properties": {
                     "db_path": { "type": "string", "description": "Optional path to the SQLite graph database file. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
                     "query": { "type": "string", "description": "Keyword query. Multiple words may be separated by spaces." },
-                    "graph_type": { "type": "string", "enum": ["Memory", "Code", "Novel", "Video"], "default": "Memory" },
+                    "graph_type": { "type": "string", "enum": ["Memory", "Code", "Video"], "default": "Memory" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
                 },
                 "required": ["query"],
@@ -1034,7 +943,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                     "db_path": { "type": "string", "description": "Optional graph DB path. Defaults to injected executor path, AI_BRAIN_GRAPH_DB, or ~/.ai-brain/graph/graph.db." },
                     "name": { "type": "string" },
                     "summary": { "type": "string" },
-                    "graph_type": { "type": "string", "enum": ["Memory", "Code", "Novel", "Video"], "default": "Memory" },
+                    "graph_type": { "type": "string", "enum": ["Memory", "Code", "Video"], "default": "Memory" },
                     "aliases": { "type": "array", "items": { "type": "string" } },
                     "importance": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.7 }
                 },
@@ -1136,17 +1045,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
-        "novel_create_project"
-        | "novel_list_projects"
-        | "novel_start_task"
-        | "novel_resume_task"
-        | "novel_review_draft"
-        | "novel_user_decision"
-        | "novel_publish"
-        | "novel_status"
-        | "novel_recall_project"
-        | "novel_check_consistency"
-        | "novel_resolve_conflict" => {
+        "novel_task" | "novel_project" => {
             Err(format!("{name} is handled by RealToolExecutor directly"))
         }
         "graph_search_catalog" => {
@@ -1977,7 +1876,8 @@ fn run_agent(input: AgentInput) -> Result<String, String> {
 
 pub struct AgentToolLaunch {
     pub output_json: String,
-    pub completion_rx: Option<std::sync::mpsc::Receiver<AgentCompletion>>,
+    pub completion_rx: Option<tokio::sync::oneshot::Receiver<AgentCompletion>>,
+    pub cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Debug, Clone)]
@@ -1990,33 +1890,44 @@ pub struct AgentCompletion {
     pub duration_ms: u64,
 }
 
-pub fn execute_agent_tool_with_completion(input: &Value) -> Result<AgentToolLaunch, String> {
+pub async fn execute_agent_tool_with_completion(input: &Value) -> Result<AgentToolLaunch, String> {
     let input = from_value::<AgentInput>(input)?;
-    let launch = execute_agent_launch_with_spawn(input, spawn_agent_job)?;
-    let output_json = to_pretty_json(launch.manifest.clone())?;
-    let completion_rx = launch.completion_rx.map(|rx| {
-        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
-        let manifest = launch.manifest.clone();
-        std::thread::spawn(move || {
-            let completion = match rx.recv() {
-                Ok(done) => AgentCompletion::from_done(&manifest, done),
-                Err(_) => AgentCompletion {
-                    agent_id: manifest.agent_id.clone(),
-                    name: manifest.name.clone(),
-                    status: "failed".into(),
-                    output: String::new(),
-                    error: Some("sub-agent channel closed unexpectedly".into()),
-                    duration_ms: 0,
-                },
-            };
-            let _ = completion_tx.send(completion);
+    let run_in_background = input.run_in_background;
+    let launch = start_agent(input).await?;
+    if !run_in_background {
+        let done = launch
+            .completion_rx
+            .await
+            .map_err(|_| String::from("sub-agent completion task closed unexpectedly"))?;
+        return Ok(AgentToolLaunch {
+            output_json: to_pretty_json(done.manifest)?,
+            completion_rx: None,
+            cancellation: None,
         });
-        completion_rx
+    }
+
+    let output_json = to_pretty_json(launch.manifest.clone())?;
+    let cancellation = launch.cancellation.clone();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let completion = match launch.completion_rx.await {
+            Ok(done) => AgentCompletion::from_done(done),
+            Err(_) => AgentCompletion {
+                agent_id: launch.manifest.agent_id,
+                name: launch.manifest.name,
+                status: "failed".into(),
+                output: String::new(),
+                error: Some("sub-agent completion task closed unexpectedly".into()),
+                duration_ms: 0,
+            },
+        };
+        let _ = completion_tx.send(completion);
     });
 
     Ok(AgentToolLaunch {
         output_json,
-        completion_rx,
+        completion_rx: Some(completion_rx),
+        cancellation: Some(cancellation),
     })
 }
 
@@ -2402,7 +2313,6 @@ fn parse_graph_type(value: &str) -> Result<GraphType, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "memory" => Ok(GraphType::Memory),
         "code" => Ok(GraphType::Code),
-        "novel" => Ok(GraphType::Novel),
         "video" => Ok(GraphType::Video),
         other => Err(format!("unsupported graph_type: {other}")),
     }
@@ -2505,6 +2415,16 @@ struct AgentOutput {
     #[serde(rename = "subagentType")]
     subagent_type: Option<String>,
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(rename = "profileId")]
+    profile_id: String,
+    #[serde(rename = "profileVersion")]
+    profile_version: u64,
+    #[serde(rename = "contextSnapshotId")]
+    context_snapshot_id: String,
+    #[serde(rename = "instanceRunId")]
+    instance_run_id: String,
     status: String,
     #[serde(rename = "outputFile")]
     output_file: String,
@@ -2520,24 +2440,27 @@ struct AgentOutput {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<String>,
+    #[serde(rename = "artifactId", skip_serializing_if = "Option::is_none")]
+    artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<runtime::TokenUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iterations: Option<usize>,
 }
 
-/// Agent 子代理执行结果（从子代理线程通过 channel 发送回来）
-pub(crate) struct AgentDone {
-    status: String,
-    final_text: Option<String>,
-    error: Option<String>,
+struct AgentDone {
+    manifest: AgentOutput,
     duration_ms: u64,
 }
 
 impl AgentCompletion {
-    fn from_done(manifest: &AgentOutput, done: AgentDone) -> Self {
+    fn from_done(done: AgentDone) -> Self {
         Self {
-            agent_id: manifest.agent_id.clone(),
-            name: manifest.name.clone(),
-            status: done.status,
-            output: done.final_text.unwrap_or_default(),
-            error: done.error,
+            agent_id: done.manifest.agent_id,
+            name: done.manifest.name,
+            status: done.manifest.status,
+            output: done.manifest.result.unwrap_or_default(),
+            error: done.manifest.error,
             duration_ms: done.duration_ms,
         }
     }
@@ -2545,15 +2468,26 @@ impl AgentCompletion {
 
 struct AgentLaunch {
     manifest: AgentOutput,
-    completion_rx: Option<std::sync::mpsc::Receiver<AgentDone>>,
+    completion_rx: tokio::sync::oneshot::Receiver<AgentDone>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Clone)]
-struct AgentJob {
+struct PreparedAgent {
     manifest: AgentOutput,
     prompt: String,
-    system_prompt: Vec<String>,
-    allowed_tools: BTreeSet<String>,
+    profile: AgentProfileSnapshot,
+}
+
+#[derive(Clone)]
+struct FileAgentArtifactSink {
+    manifest: AgentOutput,
+}
+
+impl ArtifactSink for FileAgentArtifactSink {
+    fn store(&self, artifact: &ArtifactEnvelope) -> Result<(), AgentRuntimeError> {
+        persist_agent_artifact(&self.manifest, artifact).map_err(AgentRuntimeError::ArtifactSink)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3127,6 +3061,7 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
+const DEFAULT_AGENT_MAX_WORKERS: usize = 4;
 
 /// 动态获取当前日期字符串（YYYY-MM-DD）
 fn current_date_str() -> String {
@@ -3134,20 +3069,43 @@ fn current_date_str() -> String {
 }
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(String::from(
+            "synchronous Agent compatibility entry cannot run inside a Tokio task; use execute_agent_tool_with_completion",
+        ));
+    }
+    agent_compat_runtime()?.block_on(async move {
+        let run_in_background = input.run_in_background;
+        let launch = start_agent(input).await?;
+        if run_in_background {
+            return Ok(launch.manifest);
+        }
+        launch
+            .completion_rx
+            .await
+            .map(|done| done.manifest)
+            .map_err(|_| String::from("sub-agent completion task closed unexpectedly"))
+    })
 }
 
-fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
-where
-    F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
-{
-    execute_agent_launch_with_spawn(input, spawn_fn).map(|launch| launch.manifest)
+fn agent_compat_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().map_err(|error| error.to_string()))
+    {
+        Ok(runtime) => Ok(runtime),
+        Err(error) => Err(error.clone()),
+    }
 }
 
-fn execute_agent_launch_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentLaunch, String>
-where
-    F: FnOnce(AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String>,
-{
+fn agent_worker_pool() -> &'static AgentWorkerPool {
+    static POOL: OnceLock<AgentWorkerPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        AgentWorkerPool::new(DEFAULT_AGENT_MAX_WORKERS)
+            .expect("default agent worker count must be non-zero")
+    })
+}
+
+fn prepare_agent(input: AgentInput) -> Result<PreparedAgent, String> {
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
@@ -3155,12 +3113,7 @@ where
         return Err(String::from("prompt must not be empty"));
     }
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    if normalized_subagent_type == "Novel" {
-        return Err(
-            "Agent(subagent_type=Novel) 已停用；小说任务必须通过常驻 novel_start_task / novel_resume_task 执行"
-                .into(),
-        );
-    }
+    let profile = build_agent_profile(&normalized_subagent_type)?;
 
     let agent_id = make_agent_id();
     let output_dir = agent_store_dir()?;
@@ -3175,9 +3128,9 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
     let agent_prompt = input.prompt.clone();
+    let context_snapshot_id = format!("context-{agent_id}");
+    let instance_run_id = format!("run-{agent_id}");
 
     let output_contents = format!(
         "# Agent Task
@@ -3202,6 +3155,11 @@ where
         description: input.description,
         subagent_type: Some(normalized_subagent_type),
         model: Some(model),
+        provider: None,
+        profile_id: profile.profile_id.clone(),
+        profile_version: profile.version,
+        context_snapshot_id,
+        instance_run_id,
         status: String::from("running"),
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
@@ -3210,202 +3168,128 @@ where
         completed_at: None,
         error: None,
         result: None,
+        artifact_id: None,
+        usage: None,
+        iterations: None,
     };
     write_agent_manifest(&manifest)?;
 
-    let manifest_for_spawn = manifest.clone();
-    let job = AgentJob {
-        manifest: manifest_for_spawn,
+    Ok(PreparedAgent {
+        manifest,
         prompt: agent_prompt,
-        system_prompt,
-        allowed_tools,
-    };
-    let result_rx = spawn_fn(job).map_err(|error| {
-        let err = format!("failed to spawn sub-agent: {error}");
-        let _ = persist_agent_terminal_state(&manifest, "failed", None, Some(err.clone()));
-        err
-    })?;
-
-    if input.run_in_background {
-        // 异步模式：立即返回 "running" manifest，不等待完成
-        // 子代理完成后由调用者通过 completion_rx 获取结果
-        return Ok(AgentLaunch {
-            manifest,
-            completion_rx: Some(result_rx),
-        });
-    }
-
-    // 同步模式：阻塞等待子代理完成
-    let agent_done = result_rx
-        .recv()
-        .map_err(|_| String::from("sub-agent channel closed unexpectedly (thread panicked?)"))?;
-
-    // 构建最终 manifest
-    let final_manifest = AgentOutput {
-        status: agent_done.status,
-        completed_at: Some(iso8601_now()),
-        error: agent_done.error,
-        result: agent_done.final_text,
-        ..manifest
-    };
-    Ok(AgentLaunch {
-        manifest: final_manifest,
-        completion_rx: None,
+        profile,
     })
 }
 
-fn spawn_agent_job(job: AgentJob) -> Result<std::sync::mpsc::Receiver<AgentDone>, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
-    std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let max_panics = 2u32; // 最多重试 1 次（首次 + 1 次重试）
-            let mut last_error = String::new();
-            let mut final_done = None;
+async fn start_agent(input: AgentInput) -> Result<AgentLaunch, String> {
+    let mut prepared = prepare_agent(input)?;
+    let allowed_tools = prepared
+        .profile
+        .tool_grant
+        .iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let client = ProviderRuntimeClient::new(
+        prepared.manifest.model.clone().unwrap_or_default(),
+        allowed_tools.clone(),
+    )
+    .map_err(|error| {
+        let message = format!("failed to initialize sub-agent provider: {error}");
+        let _ =
+            persist_agent_terminal_state(&prepared.manifest, "failed", None, Some(message.clone()));
+        message
+    })?;
+    let model = client.resolved_model_policy();
+    prepared.manifest.model = Some(model.model.clone());
+    prepared.manifest.provider = Some(model.provider.clone());
+    write_agent_manifest(&prepared.manifest)?;
 
-            for attempt in 0..max_panics {
-                let job_clone = job.clone();
-                let start = std::time::Instant::now();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-                    let job_ref = &job_clone;
-                    move || run_agent_job(job_ref)
-                }));
-                let duration_ms = start.elapsed().as_millis() as u64;
-                match result {
-                    Ok(Ok(())) => {
-                        let final_text = std::fs::read_to_string(&job.manifest.output_file)
-                            .ok()
-                            .and_then(|content| {
-                                content
-                                    .split("## Output\n")
-                                    .last()
-                                    .or_else(|| content.split("## Result\n").last())
-                                    .map(|s| s.trim().to_string())
-                            });
-                        final_done = Some(AgentDone {
-                            status: "completed".into(),
-                            final_text,
-                            error: None,
-                            duration_ms,
-                        });
-                        break;
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!(
-                            "[子代理] run_agent_job 失败 (attempt {}/{}): {error}",
-                            attempt + 1,
-                            max_panics
-                        );
-                        last_error = error;
-                        // 业务错误不重试，直接失败
-                        let _ = persist_agent_terminal_state(
-                            &job.manifest,
-                            "failed",
-                            None,
-                            Some(last_error.clone()),
-                        );
-                        final_done = Some(AgentDone {
-                            status: "failed".into(),
-                            final_text: None,
-                            error: Some(last_error.clone()),
-                            duration_ms,
-                        });
-                        break;
-                    }
-                    Err(panic_err) => {
-                        let panic_msg = if let Some(s) = panic_err.downcast_ref::<String>() {
-                            s.clone()
-                        } else if let Some(s) = panic_err.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else {
-                            String::from("unknown panic")
-                        };
-                        tracing::error!(
-                            "[子代理] 线程 panic (attempt {}/{}): {panic_msg}",
-                            attempt + 1,
-                            max_panics
-                        );
-                        last_error = format!("sub-agent thread panicked: {panic_msg}");
-                        if attempt + 1 < max_panics {
-                            tracing::info!("[子代理] 重试中...");
-                            continue;
-                        }
-                        // 重试耗尽
-                        let _ = persist_agent_terminal_state(
-                            &job.manifest,
-                            "failed",
-                            None,
-                            Some(last_error.clone()),
-                        );
-                        final_done = Some(AgentDone {
-                            status: "failed".into(),
-                            final_text: None,
-                            error: Some(last_error.clone()),
-                            duration_ms,
-                        });
-                    }
-                }
-            }
-
-            let done = final_done.unwrap_or_else(|| AgentDone {
-                status: "failed".into(),
-                final_text: None,
-                error: Some(last_error),
-                duration_ms: 0,
-            });
-            let _ = tx.send(done);
-        })
-        .map(|_| rx)
-        .map_err(|error| error.to_string())
-}
-
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    tracing::debug!(
-        "[子代理] run_agent_job 开始: agent={}, model={:?}",
-        job.manifest.agent_id,
-        job.manifest.model
-    );
-    // 迭代次数优先级：subagent.json 配置 > 默认常量
-    let max_iterations = load_subagent_config()
-        .and_then(|c| c.max_iterations)
-        .unwrap_or(DEFAULT_AGENT_MAX_ITERATIONS);
-    let mut runtime = build_agent_runtime(job)
-        .map_err(|e| {
-            tracing::error!("[子代理] build_agent_runtime 失败: {e}");
-            e
-        })?
-        .with_max_iterations(max_iterations);
-    tracing::debug!("[子代理] build_agent_runtime 成功，开始 run_turn");
-    let summary = runtime
-        .run_turn(job.prompt.clone(), None)
-        .map_err(|error| {
-            tracing::error!("[子代理] run_turn 失败: {error}");
-            error.to_string()
-        })?;
-    tracing::debug!("[子代理] run_turn 完成，迭代次数: {}", summary.iterations);
-    let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
-}
-
-fn build_agent_runtime(
-    job: &AgentJob,
-) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| resolve_agent_model(None, "general-purpose"));
-    let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let tool_executor = SubagentToolExecutor::new(allowed_tools);
-    Ok(ConversationRuntime::new(
-        Session::new(),
-        api_client,
-        tool_executor,
+    let context_snapshot = ContextSnapshot::from_text(
+        prepared.manifest.context_snapshot_id.clone(),
+        prepared.prompt,
+    )
+    .map_err(|error| error.to_string())?;
+    let spec = AgentRunSpec {
+        agent_instance_id: prepared.manifest.agent_id.clone(),
+        instance_run_id: prepared.manifest.instance_run_id.clone(),
+        member_id: None,
+        inbox_item_id: None,
+        task_run_id: format!("legacy-task-{}", prepared.manifest.agent_id),
+        node_id: "delegated-agent".into(),
+        profile: prepared.profile,
+        context_snapshot,
+        input_artifacts: Vec::new(),
+        model: model.clone(),
+        reasoning: ReasoningPolicy::medium(),
+        budget_reservation: BudgetReservation {
+            reservation_id: format!("budget-{}", prepared.manifest.instance_run_id),
+            max_input_tokens: u32::MAX,
+            max_output_tokens: model.max_output_tokens,
+        },
+        deadline_unix_ms: None,
+    };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let lease = agent_worker_pool()
+        .acquire(&cancellation)
+        .await
+        .map_err(|error| error.to_string())?;
+    let runtime = AgentRuntime::new(
+        client,
+        SubagentToolExecutor::new(allowed_tools),
         agent_permission_policy(),
-        job.system_prompt.clone(),
-    ))
+        FileAgentArtifactSink {
+            manifest: prepared.manifest.clone(),
+        },
+    );
+    let handle = runtime.spawn(spec, lease, cancellation.clone());
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let initial_manifest = prepared.manifest.clone();
+    tokio::spawn(async move {
+        let outcome = handle.wait().await;
+        let final_manifest = agent_manifest_from_outcome(&initial_manifest, &outcome);
+        if outcome.status != AgentRunStatus::Completed {
+            let _ = persist_agent_outcome(&initial_manifest, &outcome);
+        }
+        let _ = completion_tx.send(AgentDone {
+            manifest: final_manifest,
+            duration_ms: outcome.duration_ms,
+        });
+    });
+
+    Ok(AgentLaunch {
+        manifest: prepared.manifest,
+        completion_rx,
+        cancellation,
+    })
+}
+
+fn build_agent_profile(subagent_type: &str) -> Result<AgentProfileSnapshot, String> {
+    if !matches!(
+        subagent_type,
+        "general-purpose" | "Explore" | "Plan" | "Verification" | "claw-guide" | "statusline-setup"
+    ) {
+        return Err(format!("unsupported built-in agent role: {subagent_type}"));
+    }
+    let profile_slug = canonical_tool_token(subagent_type);
+    AgentProfileSnapshot::new(
+        format!(
+            "builtin.{}",
+            if profile_slug.is_empty() {
+                "general"
+            } else {
+                &profile_slug
+            }
+        ),
+        1,
+        subagent_type,
+        build_agent_system_prompt(subagent_type)?,
+        ToolGrant::new(allowed_tools_for_subagent(subagent_type)),
+        OutputContract::Text,
+        load_subagent_config()
+            .and_then(|config| config.max_iterations)
+            .unwrap_or(DEFAULT_AGENT_MAX_ITERATIONS),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -3565,6 +3449,60 @@ fn persist_agent_terminal_state(
     write_agent_manifest(&next_manifest)
 }
 
+fn agent_manifest_from_outcome(manifest: &AgentOutput, outcome: &AgentRunOutcome) -> AgentOutput {
+    let status = match outcome.status {
+        AgentRunStatus::Completed => "completed",
+        AgentRunStatus::Failed => "failed",
+        AgentRunStatus::Cancelled => "cancelled",
+        AgentRunStatus::DeadlineExceeded => "deadline_exceeded",
+    };
+    let artifact = outcome.artifact.as_ref();
+    AgentOutput {
+        status: status.into(),
+        completed_at: Some(iso8601_now()),
+        error: outcome.error.clone(),
+        result: artifact.map(|value| value.content.clone()),
+        artifact_id: artifact.map(|value| value.artifact_id.clone()),
+        usage: Some(outcome.usage),
+        iterations: Some(outcome.iterations),
+        ..manifest.clone()
+    }
+}
+
+fn persist_agent_outcome(manifest: &AgentOutput, outcome: &AgentRunOutcome) -> Result<(), String> {
+    let next_manifest = agent_manifest_from_outcome(manifest, outcome);
+    append_agent_output(
+        &manifest.output_file,
+        &format_agent_terminal_output(
+            &next_manifest.status,
+            next_manifest.result.as_deref(),
+            next_manifest.error.as_deref(),
+        ),
+    )?;
+    write_agent_manifest(&next_manifest)
+}
+
+fn persist_agent_artifact(
+    manifest: &AgentOutput,
+    artifact: &ArtifactEnvelope,
+) -> Result<(), String> {
+    let next_manifest = AgentOutput {
+        status: "completed".into(),
+        completed_at: Some(iso8601_now()),
+        error: None,
+        result: Some(artifact.content.clone()),
+        artifact_id: Some(artifact.artifact_id.clone()),
+        usage: Some(artifact.usage),
+        iterations: Some(artifact.iterations),
+        ..manifest.clone()
+    };
+    append_agent_output(
+        &manifest.output_file,
+        &format_agent_terminal_output("completed", Some(&artifact.content), None),
+    )?;
+    write_agent_manifest(&next_manifest)
+}
+
 fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -3616,7 +3554,10 @@ use brain_llm::config::LlmConfig;
 struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ProviderClient,
+    provider: String,
     model: String,
+    max_output_tokens: u32,
+    temperature: f64,
     allowed_tools: BTreeSet<String>,
 }
 
@@ -3706,13 +3647,28 @@ impl ProviderRuntimeClient {
             api::OpenAiCompatClient::new(api_key, openai_config).with_base_url(api_base.clone());
         let client = api::ProviderClient::OpenAi(openai_client);
         tracing::debug!("[子代理] 客户端就绪: model={model}, api_base={api_base}");
+        let max_output_tokens = max_tokens_for_model(&model);
+        let (_, temperature) = llm_config.params_for_brain("subagent");
 
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             client,
+            provider: provider_name.to_string(),
             model,
+            max_output_tokens,
+            temperature,
             allowed_tools,
         })
+    }
+
+    fn resolved_model_policy(&self) -> ResolvedModelPolicy {
+        ResolvedModelPolicy {
+            policy_id: "subagent".into(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            max_output_tokens: self.max_output_tokens,
+            temperature: self.temperature,
+        }
     }
 }
 
@@ -3729,7 +3685,7 @@ impl ApiClient for ProviderRuntimeClient {
             .collect::<Vec<_>>();
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: self.max_output_tokens,
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: (!tools.is_empty()).then_some(tools),
@@ -4062,6 +4018,7 @@ fn prompt_cache_record_to_runtime_event(
     })
 }
 
+#[cfg(test)]
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
     summary
         .assistant_messages
@@ -4288,20 +4245,10 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
     if trimmed.is_empty() {
         return String::from("general-purpose");
     }
-    if matches!(
-        trimmed,
-        "小说" | "小说副脑" | "写作" | "创作" | "网文" | "正文" | "续写"
-    ) {
-        return String::from("Novel");
-    }
-
     match canonical_tool_token(trimmed).as_str() {
         "general" | "generalpurpose" | "generalpurposeagent" => String::from("general-purpose"),
         "explore" | "explorer" | "exploreagent" => String::from("Explore"),
         "plan" | "planagent" => String::from("Plan"),
-        "novel" | "novelagent" | "fiction" | "fictionwriter" | "writer" | "writing" => {
-            String::from("Novel")
-        }
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
@@ -5369,10 +5316,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, execute_agent_launch_with_spawn,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block, AgentDone,
-        AgentInput, AgentJob, ProviderRuntimeClient, SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, build_agent_profile, execute_tool,
+        final_assistant_text, mvp_tool_specs, permission_mode_from_plugin, persist_agent_artifact,
+        persist_agent_terminal_state, prepare_agent, push_output_block, AgentInput,
+        ProviderRuntimeClient, SubagentToolExecutor,
+    };
+    use agent_runtime::{
+        AgentRunSpec, AgentRunStatus, AgentRuntime, AgentRuntimeError, AgentWorkerPool,
+        ArtifactEnvelope, ArtifactSink, BudgetReservation, ContextSnapshot, ReasoningPolicy,
+        ResolvedModelPolicy,
     };
     use api::OutputContentBlock;
     use brain_graph::{
@@ -5461,12 +5413,8 @@ mod tests {
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
-        assert!(names.contains(&"novel_start_task"));
-        assert!(names.contains(&"novel_resume_task"));
-        assert!(names.contains(&"novel_review_draft"));
-        assert!(names.contains(&"novel_user_decision"));
-        assert!(names.contains(&"novel_publish"));
-        assert!(names.contains(&"novel_status"));
+        assert!(names.contains(&"novel_task"));
+        assert!(names.contains(&"novel_project"));
         assert!(!names.contains(&"novel_commit_delta"));
         assert!(names.contains(&"graph_search_catalog"));
         assert!(names.contains(&"graph_get_node_detail"));
@@ -6137,42 +6085,27 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
-        let captured = Arc::new(Mutex::new(None::<AgentJob>));
-        let captured_for_spawn = Arc::clone(&captured);
-
-        let manifest = execute_agent_with_spawn(
-            AgentInput {
-                description: "Audit the branch".to_string(),
-                prompt: "Check tests and outstanding work.".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("ship-audit".to_string()),
-                model: None,
-                run_in_background: false,
-            },
-            move |job| {
-                *captured_for_spawn
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
-                let (tx, rx) = std::sync::mpsc::channel();
-                tx.send(AgentDone {
-                    status: "completed".into(),
-                    final_text: None,
-                    error: None,
-                    duration_ms: 0,
-                })
-                .expect("send AgentDone");
-                Ok(rx)
-            },
-        )
-        .expect("Agent should succeed");
+        let prepared = prepare_agent(AgentInput {
+            description: "Audit the branch".to_string(),
+            prompt: "Check tests and outstanding work.".to_string(),
+            subagent_type: Some("Explore".to_string()),
+            name: Some("ship-audit".to_string()),
+            model: None,
+            run_in_background: false,
+        })
+        .expect("Agent should be prepared");
         std::env::remove_var("CLAWD_AGENT_STORE");
 
+        let manifest = prepared.manifest;
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
-        assert_eq!(manifest.status, "completed");
+        assert_eq!(manifest.status, "running");
+        assert_eq!(manifest.profile_id, "builtin.explore");
+        assert!(manifest.context_snapshot_id.starts_with("context-agent-"));
+        assert!(manifest.instance_run_id.starts_with("run-agent-"));
         assert!(!manifest.created_at.is_empty());
         assert!(manifest.started_at.is_some());
-        assert!(manifest.completed_at.is_some());
+        assert!(manifest.completed_at.is_none());
         let contents = std::fs::read_to_string(&manifest.output_file).expect("agent file exists");
         let manifest_contents =
             std::fs::read_to_string(&manifest.manifest_file).expect("manifest file exists");
@@ -6180,14 +6113,9 @@ mod tests {
         assert!(contents.contains("Check tests and outstanding work."));
         assert!(manifest_contents.contains("\"subagentType\": \"Explore\""));
         assert!(manifest_contents.contains("\"status\": \"running\""));
-        let captured_job = captured
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("spawn job should be captured");
-        assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
-        assert!(captured_job.allowed_tools.contains("read_file"));
-        assert!(!captured_job.allowed_tools.contains("Agent"));
+        assert_eq!(prepared.prompt, "Check tests and outstanding work.");
+        assert!(prepared.profile.tool_grant.contains("read_file"));
+        assert!(!prepared.profile.tool_grant.contains("Agent"));
 
         assert_eq!(super::normalize_subagent_type(Some("explorer")), "Explore");
         assert_eq!(super::slugify_agent_name("Ship Audit!!!"), "ship-audit");
@@ -6195,79 +6123,82 @@ mod tests {
     }
 
     #[test]
-    fn agent_fake_runner_can_persist_completion_and_failure() {
+    fn agent_artifact_and_failure_states_are_persisted() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-runner");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
 
-        let completed = execute_agent_with_spawn(
-            AgentInput {
-                description: "Complete the task".to_string(),
-                prompt: "Do the work".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("complete-task".to_string()),
-                model: Some("claude-sonnet-4-6".to_string()),
-                run_in_background: false,
+        let completed = prepare_agent(AgentInput {
+            description: "Complete the task".to_string(),
+            prompt: "Do the work".to_string(),
+            subagent_type: Some("Explore".to_string()),
+            name: Some("complete-task".to_string()),
+            model: Some("claude-sonnet-4-6".to_string()),
+            run_in_background: false,
+        })
+        .expect("completed agent should prepare")
+        .manifest;
+        let artifact = ArtifactEnvelope {
+            artifact_id: "artifact-test".into(),
+            content: "Finished successfully".into(),
+            content_hash: "test-hash".into(),
+            output_contract: agent_runtime::OutputContract::Text,
+            context_snapshot_id: completed.context_snapshot_id.clone(),
+            producer_instance_id: completed.agent_id.clone(),
+            producer_instance_run_id: completed.instance_run_id.clone(),
+            producer_member_id: None,
+            task_run_id: "task-test".into(),
+            node_id: "node-test".into(),
+            profile_id: completed.profile_id.clone(),
+            profile_version: completed.profile_version,
+            model: ResolvedModelPolicy {
+                policy_id: "subagent".into(),
+                provider: "test".into(),
+                model: "claude-sonnet-4-6".into(),
+                max_output_tokens: 1_024,
+                temperature: 0.0,
             },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "completed",
-                    Some("Finished successfully"),
-                    None,
-                )?;
-                let (tx, rx) = std::sync::mpsc::channel();
-                tx.send(AgentDone {
-                    status: "completed".into(),
-                    final_text: Some("Finished successfully".into()),
-                    error: None,
-                    duration_ms: 0,
-                })
-                .expect("send AgentDone");
-                Ok(rx)
+            reasoning: ReasoningPolicy::medium(),
+            usage: runtime::TokenUsage {
+                input_tokens: 12,
+                output_tokens: 4,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
-        )
-        .expect("completed agent should succeed");
-        assert_eq!(completed.result.as_deref(), Some("Finished successfully"));
+            iterations: 1,
+            created_at_unix_ms: 1,
+        };
+        persist_agent_artifact(&completed, &artifact).expect("persist completed artifact");
 
         let completed_manifest = std::fs::read_to_string(&completed.manifest_file)
             .expect("completed manifest should exist");
         let completed_output =
             std::fs::read_to_string(&completed.output_file).expect("completed output should exist");
         assert!(completed_manifest.contains("\"status\": \"completed\""));
+        assert!(completed_manifest.contains("\"artifactId\": \"artifact-test\""));
+        assert!(completed_manifest.contains("\"input_tokens\": 12"));
         assert!(completed_manifest.contains("Finished successfully"));
         assert!(completed_output.contains("Finished successfully"));
 
-        let failed = execute_agent_with_spawn(
-            AgentInput {
-                description: "Fail the task".to_string(),
-                prompt: "Do the failing work".to_string(),
-                subagent_type: Some("Verification".to_string()),
-                name: Some("fail-task".to_string()),
-                model: None,
-                run_in_background: false,
-            },
-            |job| {
-                persist_agent_terminal_state(
-                    &job.manifest,
-                    "failed",
-                    None,
-                    Some(String::from("simulated failure")),
-                )?;
-                let (tx, rx) = std::sync::mpsc::channel();
-                tx.send(AgentDone {
-                    status: "failed".into(),
-                    final_text: None,
-                    error: Some("simulated failure".into()),
-                    duration_ms: 0,
-                })
-                .expect("send AgentDone");
-                Ok(rx)
-            },
+        let failed = prepare_agent(AgentInput {
+            description: "Fail the task".to_string(),
+            prompt: "Do the failing work".to_string(),
+            subagent_type: Some("Verification".to_string()),
+            name: Some("fail-task".to_string()),
+            model: None,
+            run_in_background: false,
+        })
+        .expect("failed agent should prepare")
+        .manifest;
+        persist_agent_terminal_state(
+            &failed,
+            "failed",
+            None,
+            Some(String::from("simulated failure")),
         )
-        .expect("failed agent should still spawn");
+        .expect("persist failed state");
 
         let failed_manifest =
             std::fs::read_to_string(&failed.manifest_file).expect("failed manifest should exist");
@@ -6277,84 +6208,20 @@ mod tests {
         assert!(failed_manifest.contains("simulated failure"));
         assert!(failed_output.contains("simulated failure"));
 
-        let spawn_error = execute_agent_with_spawn(
-            AgentInput {
-                description: "Spawn error task".to_string(),
-                prompt: "Never starts".to_string(),
-                subagent_type: None,
-                name: Some("spawn-error".to_string()),
-                model: None,
-                run_in_background: false,
-            },
-            |_| Err(String::from("thread creation failed")),
-        )
-        .expect_err("spawn errors should surface");
-        assert!(spawn_error.contains("failed to spawn sub-agent"));
-        let spawn_error_manifest = std::fs::read_dir(&dir)
-            .expect("agent dir should exist")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .find_map(|path| {
-                let contents = std::fs::read_to_string(&path).ok()?;
-                contents
-                    .contains("\"name\": \"spawn-error\"")
-                    .then_some(contents)
-            })
-            .expect("failed manifest should still be written");
-        assert!(spawn_error_manifest.contains("\"status\": \"failed\""));
-        assert!(spawn_error_manifest.contains("thread creation failed"));
-
         std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn background_agent_launch_returns_completion_receiver() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = temp_path("agent-background-receiver");
-        std::env::set_var("CLAWD_AGENT_STORE", &dir);
-
-        let launch = execute_agent_launch_with_spawn(
-            AgentInput {
-                description: "Run in background".to_string(),
-                prompt: "Do the background work".to_string(),
-                subagent_type: Some("Explore".to_string()),
-                name: Some("background-task".to_string()),
-                model: None,
-                run_in_background: true,
-            },
-            |_job| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    tx.send(AgentDone {
-                        status: "completed".into(),
-                        final_text: Some("Finished later".into()),
-                        error: None,
-                        duration_ms: 25,
-                    })
-                    .expect("send AgentDone");
-                });
-                Ok(rx)
-            },
-        )
-        .expect("background launch should succeed");
-
-        assert_eq!(launch.manifest.status, "running");
-        let completion_rx = launch
-            .completion_rx
-            .expect("background launch should keep completion receiver");
-        let done = completion_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("completion should arrive");
-        assert_eq!(done.status, "completed");
-        assert_eq!(done.final_text.as_deref(), Some("Finished later"));
-
-        std::env::remove_var("CLAWD_AGENT_STORE");
-        let _ = std::fs::remove_dir_all(dir);
+    fn agent_profiles_own_prompt_tool_grant_and_output_contract() {
+        for role in ["Explore", "Plan", "Verification"] {
+            let profile = build_agent_profile(role).expect("built-in profile");
+            assert_eq!(profile.role, role);
+            assert!(profile.system_prompt.join("\n").contains(role));
+            assert!(profile.tool_grant.contains("read_file"));
+            assert!(!profile.tool_grant.contains("Agent"));
+            assert_eq!(profile.output_contract, agent_runtime::OutputContract::Text);
+        }
     }
 
     #[test]
@@ -6381,7 +6248,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_novel_tools_replace_ephemeral_agent_schema() {
+    fn novel_workflow_tools_replace_ephemeral_agent_schema() {
         let specs = mvp_tool_specs();
         let agent = specs
             .iter()
@@ -6394,22 +6261,23 @@ mod tests {
             .unwrap();
         assert!(!agent_types.iter().any(|kind| kind == "Novel"));
 
-        for name in [
-            "novel_start_task",
-            "novel_resume_task",
-            "novel_review_draft",
-            "novel_user_decision",
-            "novel_publish",
-            "novel_status",
-        ] {
-            assert!(specs.iter().any(|spec| spec.name == name), "missing {name}");
-        }
-        let publish = specs
+        let mut novel_names = specs
             .iter()
-            .find(|spec| spec.name == "novel_publish")
+            .map(|spec| spec.name)
+            .filter(|name| name.starts_with("novel_"))
+            .collect::<Vec<_>>();
+        novel_names.sort_unstable();
+        assert_eq!(novel_names, vec!["novel_project", "novel_task"]);
+        let task = specs.iter().find(|spec| spec.name == "novel_task").unwrap();
+        let publish = task.input_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["action"]["const"] == "publish")
             .unwrap();
-        let publish_properties = publish.input_schema["properties"].as_object().unwrap();
-        assert_eq!(publish_properties.len(), 2);
+        let publish_properties = publish["properties"].as_object().unwrap();
+        assert_eq!(publish_properties.len(), 3);
+        assert!(publish_properties.contains_key("action"));
         assert!(publish_properties.contains_key("task_id"));
         assert!(publish_properties.contains_key("draft_version"));
         assert!(!publish_properties.contains_key("content"));
@@ -6426,30 +6294,18 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
 
-        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let spawned_for_call = Arc::clone(&spawned);
-        let result = execute_agent_launch_with_spawn(
-            AgentInput {
-                description: "续写第四章".into(),
-                prompt: "承接第三章并完成第四章正文。".into(),
-                subagent_type: Some("Novel".into()),
-                name: Some("chapter-four".into()),
-                model: None,
-                run_in_background: false,
-            },
-            move |_job| {
-                spawned_for_call.store(true, std::sync::atomic::Ordering::SeqCst);
-                let (tx, rx) = std::sync::mpsc::channel();
-                drop(tx);
-                Ok(rx)
-            },
-        );
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("ephemeral Novel launch must be rejected"),
+        let result = prepare_agent(AgentInput {
+            description: "续写第四章".into(),
+            prompt: "承接第三章并完成第四章正文。".into(),
+            subagent_type: Some("Novel".into()),
+            name: Some("chapter-four".into()),
+            model: None,
+            run_in_background: false,
+        });
+        let Err(error) = result else {
+            panic!("ephemeral Novel launch must be rejected");
         };
-        assert!(error.contains("常驻 novel_start_task"));
-        assert!(!spawned.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.contains("unsupported built-in agent role"));
         assert!(!agent_store.exists());
 
         std::env::remove_var("CLAWD_AGENT_STORE");
@@ -6479,6 +6335,15 @@ mod tests {
                 }
                 2 => {
                     assert!(request.messages.len() >= 3);
+                    assert!(request
+                        .messages
+                        .iter()
+                        .flat_map(|message| message.blocks.iter())
+                        .any(|block| matches!(
+                            block,
+                            runtime::ContentBlock::ToolResult { output, .. }
+                                if output.contains("hello from child")
+                        )));
                     Ok(vec![
                         AssistantEvent::TextDelta("Scope: completed mock review".to_string()),
                         AssistantEvent::MessageStop,
@@ -6489,43 +6354,83 @@ mod tests {
         }
     }
 
-    #[test]
-    fn subagent_runtime_executes_tool_loop_with_isolated_session() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[derive(Clone, Default)]
+    struct TestArtifactSink {
+        artifacts: Arc<Mutex<Vec<ArtifactEnvelope>>>,
+    }
+
+    impl ArtifactSink for TestArtifactSink {
+        fn store(&self, artifact: &ArtifactEnvelope) -> Result<(), AgentRuntimeError> {
+            self.artifacts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(artifact.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn built_in_agent_roles_execute_through_agent_runtime() {
         let path = temp_path("subagent-input.txt");
         std::fs::write(&path, "hello from child").expect("write input file");
+        let pool = AgentWorkerPool::new(1).expect("worker pool");
 
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            MockSubagentApiClient {
-                calls: 0,
-                input_path: path.display().to_string(),
-            },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
-            agent_permission_policy(),
-            vec![String::from("system prompt")],
-        );
+        for (index, role) in ["Explore", "Plan", "Verification"].into_iter().enumerate() {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let lease = pool.acquire(&cancellation).await.expect("worker lease");
+            let profile = build_agent_profile(role).expect("built-in profile");
+            let sink = TestArtifactSink::default();
+            let runtime = AgentRuntime::new(
+                MockSubagentApiClient {
+                    calls: 0,
+                    input_path: path.display().to_string(),
+                },
+                SubagentToolExecutor::new(profile.tool_grant.iter().map(str::to_string).collect()),
+                agent_permission_policy(),
+                sink.clone(),
+            );
+            let spec = AgentRunSpec {
+                agent_instance_id: format!("agent-{index}"),
+                instance_run_id: format!("run-{index}"),
+                member_id: None,
+                inbox_item_id: None,
+                task_run_id: "task-test".into(),
+                node_id: format!("node-{index}"),
+                profile,
+                context_snapshot: ContextSnapshot::from_text(
+                    format!("context-{index}"),
+                    "Inspect the delegated file",
+                )
+                .expect("context snapshot"),
+                input_artifacts: Vec::new(),
+                model: ResolvedModelPolicy {
+                    policy_id: "test".into(),
+                    provider: "mock".into(),
+                    model: "mock-model".into(),
+                    max_output_tokens: 1_024,
+                    temperature: 0.0,
+                },
+                reasoning: ReasoningPolicy::medium(),
+                budget_reservation: BudgetReservation {
+                    reservation_id: format!("budget-{index}"),
+                    max_input_tokens: 1_024,
+                    max_output_tokens: 1_024,
+                },
+                deadline_unix_ms: None,
+            };
 
-        let summary = runtime
-            .run_turn("Inspect the delegated file", None)
-            .expect("subagent loop should succeed");
+            let outcome = runtime.spawn(spec, lease, cancellation).wait().await;
 
-        assert_eq!(
-            final_assistant_text(&summary),
-            "Scope: completed mock review"
-        );
-        assert!(runtime
-            .session()
-            .messages
-            .iter()
-            .flat_map(|message| message.blocks.iter())
-            .any(|block| matches!(
-                block,
-                runtime::ContentBlock::ToolResult { output, .. }
-                    if output.contains("hello from child")
-            )));
+            assert_eq!(outcome.status, AgentRunStatus::Completed, "role={role}");
+            assert_eq!(
+                outcome
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| artifact.content.as_str()),
+                Some("Scope: completed mock review")
+            );
+            assert_eq!(sink.artifacts.lock().unwrap().len(), 1);
+        }
 
         let _ = std::fs::remove_file(path);
     }
@@ -7458,7 +7363,10 @@ printf 'pwsh:%s' "$1"
         let mut client = ProviderRuntimeClient {
             runtime: tokio::runtime::Runtime::new().expect("runtime"),
             client: api::ProviderClient::OpenAi(openai_client),
+            provider: default_provider.clone(),
             model: default_model.clone(),
+            max_output_tokens: api::max_tokens_for_model(&default_model),
+            temperature: 0.0,
             allowed_tools: BTreeSet::new(),
         };
 
@@ -7501,13 +7409,9 @@ printf 'pwsh:%s' "$1"
         }
     }
 
-    /// 端到端：用 default provider 跑一轮 run_turn（无工具，纯对话）
-    #[test]
-    fn subagent_real_run_turn_no_tools() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+    /// 端到端：用 default provider 通过 AgentRuntime 跑一轮（无工具，纯对话）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_real_run_turn_no_tools() {
         let config = brain_llm::config::LlmConfig::load_default().expect("config");
         let default_model = config.llm.default_model.clone();
         let default_provider = &config.llm.default_provider;
@@ -7528,38 +7432,65 @@ printf 'pwsh:%s' "$1"
         let api_client = ProviderRuntimeClient {
             runtime: tokio::runtime::Runtime::new().expect("runtime"),
             client: api::ProviderClient::OpenAi(openai_client),
+            provider: default_provider.clone(),
             model: default_model.clone(),
+            max_output_tokens: api::max_tokens_for_model(&default_model),
+            temperature: 0.0,
             allowed_tools: BTreeSet::new(),
         };
 
-        eprintln!("[测试] 创建 runtime, model={}", api_client.model);
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
+        eprintln!("[测试] 创建 AgentRuntime, model={}", api_client.model);
+        let model = api_client.resolved_model_policy();
+        let profile = build_agent_profile("Explore").expect("profile");
+        let sink = TestArtifactSink::default();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let pool = AgentWorkerPool::new(1).expect("worker pool");
+        let lease = pool.acquire(&cancellation).await.expect("worker lease");
+        let runtime = AgentRuntime::new(
             api_client,
             SubagentToolExecutor::new(BTreeSet::new()),
             agent_permission_policy(),
-            vec![String::from(
-                "You are a helpful assistant. Reply in one short sentence.",
-            )],
+            sink,
         );
+        let spec = AgentRunSpec {
+            agent_instance_id: "real-agent".into(),
+            instance_run_id: "real-run".into(),
+            member_id: None,
+            inbox_item_id: None,
+            task_run_id: "real-task".into(),
+            node_id: "real-node".into(),
+            profile,
+            context_snapshot: ContextSnapshot::from_text(
+                "real-context",
+                "What is the capital of France? Reply in one short sentence.",
+            )
+            .expect("context"),
+            input_artifacts: Vec::new(),
+            model: model.clone(),
+            reasoning: ReasoningPolicy::medium(),
+            budget_reservation: BudgetReservation {
+                reservation_id: "real-budget".into(),
+                max_input_tokens: u32::MAX,
+                max_output_tokens: model.max_output_tokens,
+            },
+            deadline_unix_ms: None,
+        };
 
-        let result = runtime.run_turn("What is the capital of France?", None);
+        let outcome = runtime.spawn(spec, lease, cancellation).wait().await;
 
-        match &result {
-            Ok(summary) => {
-                let text = final_assistant_text(summary);
-                eprintln!(
-                    "[测试] run_turn 成功, iterations={}, answer={}",
-                    summary.iterations,
-                    &text[..text.len().min(200)]
-                );
-                assert!(!text.is_empty(), "run_turn 应该返回非空文本");
-            }
-            Err(e) => {
-                panic!("run_turn 失败: {e}\n这就是子代理卡死的根因");
-            }
-        }
+        assert_eq!(
+            outcome.status,
+            AgentRunStatus::Completed,
+            "AgentRuntime 失败: {:?}",
+            outcome.error
+        );
+        assert!(
+            outcome
+                .artifact
+                .as_ref()
+                .is_some_and(|artifact| !artifact.content.is_empty()),
+            "AgentRuntime 应该返回非空 Artifact"
+        );
     }
 
     /// 诊断测试：用全部 MVP 工具定义（和子代理完全一致）测 MiMo

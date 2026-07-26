@@ -15,7 +15,6 @@ pub enum SubagentType {
     GeneralPurpose,
     Plan,
     Verification,
-    Novel,
 }
 
 /// Status of an agent execution.

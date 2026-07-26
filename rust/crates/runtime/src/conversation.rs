@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
+use tokio_util::sync::CancellationToken;
 
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
@@ -80,6 +81,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    cancelled: bool,
 }
 
 impl RuntimeError {
@@ -87,7 +89,21 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            cancelled: false,
         }
+    }
+
+    #[must_use]
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            cancelled: true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -125,6 +141,7 @@ pub struct ConversationRuntime<C, T> {
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
+    cancellation_token: CancellationToken,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
 }
@@ -174,6 +191,7 @@ where
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
+            cancellation_token: CancellationToken::new(),
             hook_progress_reporter: None,
             session_tracer: None,
         }
@@ -194,6 +212,12 @@ where
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancellation_token(mut self, cancellation_token: CancellationToken) -> Self {
+        self.cancellation_token = cancellation_token;
         self
     }
 
@@ -289,6 +313,7 @@ where
         user_input: impl Into<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
+        self.ensure_not_cancelled()?;
         let user_input = user_input.into();
         self.record_turn_started(&user_input);
         self.session
@@ -301,6 +326,7 @@ where
         let mut iterations = 0;
 
         loop {
+            self.ensure_not_cancelled()?;
             iterations += 1;
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -321,6 +347,7 @@ where
                     return Err(error);
                 }
             };
+            self.ensure_not_cancelled()?;
             let (assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
@@ -359,6 +386,7 @@ where
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                self.ensure_not_cancelled()?;
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -413,6 +441,7 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             };
+                        self.ensure_not_cancelled()?;
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {
@@ -460,6 +489,7 @@ where
             }
         }
 
+        self.ensure_not_cancelled()?;
         let auto_compaction = self.maybe_auto_compact();
 
         let summary = TurnSummary {
@@ -473,6 +503,13 @@ where
         self.record_turn_completed(&summary);
 
         Ok(summary)
+    }
+
+    fn ensure_not_cancelled(&self) -> Result<(), RuntimeError> {
+        if self.cancellation_token.is_cancelled() {
+            return Err(RuntimeError::cancelled("conversation run cancelled"));
+        }
+        Ok(())
     }
 
     #[must_use]
