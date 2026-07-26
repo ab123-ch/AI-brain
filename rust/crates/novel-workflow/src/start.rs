@@ -253,14 +253,52 @@ impl NovelStartWorkflow {
         let mut state = NovelTaskState::from_checkpoint(&checkpoint)?;
         state.begin_drafting()?;
         let execution_id = format!("{task_id}-draft-{}", state.draft_version + 1);
-        let task_run_id = task_run_id(&execution_id);
-        if let Some(task) = load_task_optional(Arc::clone(&self.repository), &task_run_id).await? {
+        let base_task_run_id = task_run_id(&execution_id);
+        if let Some(task) =
+            load_task_optional(Arc::clone(&self.repository), &base_task_run_id).await?
+        {
+            if task.state == TaskRunState::Failed {
+                let mut attempt = 1_u32;
+                loop {
+                    let retry_execution_id = format!("{execution_id}-retry-{attempt}");
+                    let retry_task_run_id = task_run_id(&retry_execution_id);
+                    match load_task_optional(Arc::clone(&self.repository), &retry_task_run_id)
+                        .await?
+                    {
+                        Some(retry_task) if retry_task.state == TaskRunState::Failed => {}
+                        Some(retry_task) => {
+                            let retry_frozen = frozen_contract(&retry_task)?;
+                            let frozen_instruction = retry_frozen.revision_instruction.clone();
+                            return self
+                                .resume_existing_execution(
+                                    retry_task,
+                                    &state.request,
+                                    &retry_execution_id,
+                                    frozen_instruction.as_deref(),
+                                )
+                                .await;
+                        }
+                        None => {
+                            return self
+                                .start_iteration(state, retry_execution_id, revision_instruction)
+                                .await;
+                        }
+                    }
+                    attempt = attempt.checked_add(1).ok_or_else(|| {
+                        NovelWorkflowPortError::TaskEngine(format!(
+                            "task {task_id} exhausted writer retry identities"
+                        ))
+                    })?;
+                }
+            }
+            let frozen = frozen_contract(&task)?;
+            let frozen_instruction = frozen.revision_instruction.clone();
             return self
                 .resume_existing_execution(
                     task,
                     &state.request,
                     &execution_id,
-                    Some(revision_instruction),
+                    frozen_instruction.as_deref(),
                 )
                 .await;
         }
@@ -1005,10 +1043,18 @@ fn validate_task_binding(
         frozen.request.task_id,
         initial.draft_version + 1
     );
+    let retry_execution = frozen
+        .execution_id
+        .strip_prefix(&format!("{expected_revision_execution}-retry-"))
+        .is_some_and(|attempt| {
+            !attempt.is_empty() && attempt.chars().all(|ch| ch.is_ascii_digit())
+        });
     if initial.request != frozen.request
         || initial.phase != NovelTaskPhase::Drafting
         || (initial_execution && (initial.draft.is_some() || initial.draft_version != 0))
-        || (!initial_execution && frozen.execution_id != expected_revision_execution)
+        || (!initial_execution
+            && frozen.execution_id != expected_revision_execution
+            && !retry_execution)
     {
         return Err(NovelWorkflowPortError::InvalidRequest(format!(
             "task {} has an invalid initial Domain checkpoint",

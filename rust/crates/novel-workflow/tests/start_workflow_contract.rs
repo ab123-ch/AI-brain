@@ -103,6 +103,7 @@ impl NovelWorkflowEnvironmentPort for FakeEnvironment {
 
 struct FakeWriter {
     calls: AtomicUsize,
+    failures_remaining: AtomicUsize,
     branch_id: &'static str,
 }
 
@@ -113,6 +114,12 @@ impl NovelWriterPort for FakeWriter {
         invocation: NovelWriterInvocation,
     ) -> Result<NovelWriterExecution, NovelWorkflowPortError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.failures_remaining.load(Ordering::SeqCst) > 0 {
+            self.failures_remaining.fetch_sub(1, Ordering::SeqCst);
+            return Err(NovelWorkflowPortError::InvalidWriterOutput(
+                "injected writer serialization failure".into(),
+            ));
+        }
         let outcome = NovelOutcome::DraftReady(NovelDraftEnvelope {
             task_id: invocation.request.task_id.clone(),
             draft_version: invocation.next_draft_version,
@@ -236,6 +243,7 @@ async fn start_is_task_backed_and_replays_without_a_second_model_call() {
     *environment.project.lock().unwrap() = Some(NovelProject::new("project-1", "Project"));
     let writer = Arc::new(FakeWriter {
         calls: AtomicUsize::new(0),
+        failures_remaining: AtomicUsize::new(0),
         branch_id: "main",
     });
     let service = NovelStartWorkflow::new(
@@ -301,6 +309,7 @@ async fn revision_is_a_separate_restart_safe_writer_task_run() {
     *environment.project.lock().unwrap() = Some(NovelProject::new("project-1", "Project"));
     let writer = Arc::new(FakeWriter {
         calls: AtomicUsize::new(0),
+        failures_remaining: AtomicUsize::new(0),
         branch_id: "main",
     });
     let service = NovelStartWorkflow::new(
@@ -343,6 +352,82 @@ async fn revision_is_a_separate_restart_safe_writer_task_run() {
 }
 
 #[tokio::test]
+async fn failed_frozen_iteration_can_retry_with_a_new_resume_instruction() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+    let environment = Arc::new(FakeEnvironment::default());
+    *environment.project.lock().unwrap() = Some(NovelProject::new("project-1", "Project"));
+    let writer = Arc::new(FakeWriter {
+        calls: AtomicUsize::new(0),
+        failures_remaining: AtomicUsize::new(2),
+        branch_id: "main",
+    });
+    let service = NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        coordinator(Arc::clone(&repository)),
+        environment,
+        writer.clone(),
+        models(),
+        NovelWorkflowBudget {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+        },
+    );
+
+    service.start_task(request()).await.unwrap_err();
+    service
+        .continue_task("task-1", "第一次恢复")
+        .await
+        .unwrap_err();
+    let recovered = service
+        .continue_task("task-1", "第二次恢复，使用兼容解析")
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.checkpoint.draft_version, 1);
+    assert_eq!(writer.calls.load(Ordering::SeqCst), 3);
+    assert!(recovered.task_run_id.contains("retry-"));
+}
+
+#[tokio::test]
+async fn completed_frozen_iteration_replays_before_allocating_another_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+    let environment = Arc::new(FakeEnvironment::default());
+    environment
+        .fail_final_checkpoint_once
+        .store(true, Ordering::SeqCst);
+    *environment.project.lock().unwrap() = Some(NovelProject::new("project-1", "Project"));
+    let writer = Arc::new(FakeWriter {
+        calls: AtomicUsize::new(0),
+        failures_remaining: AtomicUsize::new(1),
+        branch_id: "main",
+    });
+    let service = NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        coordinator(Arc::clone(&repository)),
+        environment,
+        writer.clone(),
+        models(),
+        NovelWorkflowBudget {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+        },
+    );
+
+    service.start_task(request()).await.unwrap_err();
+    service
+        .continue_task("task-1", "第一次恢复")
+        .await
+        .unwrap_err();
+    let replayed = service.continue_task("task-1", "第二次恢复").await.unwrap();
+
+    assert!(replayed.replayed);
+    assert_eq!(replayed.task_run_id, "novel-task-task-1-draft-1");
+    assert_eq!(writer.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn writer_delta_must_match_the_frozen_active_branch() {
     let dir = tempfile::tempdir().unwrap();
     let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
@@ -350,6 +435,7 @@ async fn writer_delta_must_match_the_frozen_active_branch() {
     *environment.project.lock().unwrap() = Some(NovelProject::new("project-1", "Project"));
     let writer = Arc::new(FakeWriter {
         calls: AtomicUsize::new(0),
+        failures_remaining: AtomicUsize::new(0),
         branch_id: "alternate",
     });
     let service = NovelStartWorkflow::new(
@@ -396,6 +482,7 @@ async fn assert_completed_reconciliation(fail_checkpoint: bool, fail_event: bool
         .store(fail_event, Ordering::SeqCst);
     let writer = Arc::new(FakeWriter {
         calls: AtomicUsize::new(0),
+        failures_remaining: AtomicUsize::new(0),
         branch_id: "main",
     });
     let service = NovelStartWorkflow::new(
