@@ -152,7 +152,6 @@ pub async fn ws_upgrade(
 
 enum QueryAction {
     Edit { message_id: String, content: String },
-    Retry { message_id: String },
 }
 
 struct PreparedWebQuery {
@@ -215,12 +214,6 @@ async fn prepare_web_query(
         } => {
             prepare_conversation_fork(state, &session_id, |sessions| {
                 sessions.edit_user_message(&message_id, &content)
-            })
-            .await
-        }
-        QueryAction::Retry { message_id } => {
-            prepare_conversation_fork(state, &session_id, |sessions| {
-                sessions.retry_last_user_message(&message_id)
             })
             .await
         }
@@ -679,7 +672,41 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         Some(QueryAction::Edit { message_id, content })
                                     }
                                     ClientMessage::RetryLastUserMessage { message_id } => {
-                                        Some(QueryAction::Retry { message_id })
+                                        if message_id.trim().is_empty() {
+                                            send_event(
+                                                &mut sender,
+                                                WebProgressEvent::Error {
+                                                    message: "重试消息 ID 不能为空".into(),
+                                                },
+                                            )
+                                            .await
+                                            .ok();
+                                        } else {
+                                            let room_id = active_room_id(&state).await;
+                                            match state
+                                                .collaboration
+                                                .retry_last_user_message(room_id, message_id)
+                                                .await
+                                            {
+                                                Ok(snapshot) => {
+                                                    send_event(
+                                                        &mut sender,
+                                                        WebProgressEvent::RoomSnapshot { snapshot },
+                                                    )
+                                                    .await
+                                                    .ok();
+                                                }
+                                                Err(message) => {
+                                                    send_event(
+                                                        &mut sender,
+                                                        WebProgressEvent::Error { message },
+                                                    )
+                                                    .await
+                                                    .ok();
+                                                }
+                                            }
+                                        }
+                                        None
                                     }
                                     ClientMessage::Cancel => {
                                         let direct_query = cancel_token.is_some()
@@ -1504,6 +1531,15 @@ mod tests {
             }
             other => panic!("expected retry message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn room_timeline_exposes_retry_only_for_last_user_event() {
+        let script = include_str!("static/app.js");
+
+        assert!(script.contains("lastVisibleUserEventId"));
+        assert!(script.contains("candidate.sequence <= event.sequence"));
+        assert!(script.contains("send('retry_last_user_message', { message_id: event.event_id })"));
     }
 
     #[test]

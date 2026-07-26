@@ -129,6 +129,7 @@ impl CollaborationRuntime {
                 reconcile_durable_result(
                     &result_repository,
                     &result.origin_id,
+                    &result.task_run_id,
                     &result.instance_run_id,
                     &result.artifact.content,
                 )
@@ -217,6 +218,31 @@ impl CollaborationRuntime {
         .await
         .map_err(|error| format!("重放协作房间事件失败: {error}"))?
         .map_err(|error| error.to_string())
+    }
+
+    pub async fn retry_last_user_message(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<RoomSnapshot, String> {
+        let repository = Arc::clone(&self.repository);
+        let room_for_retry = room_id.clone();
+        let (snapshot, active_runs) = tokio::task::spawn_blocking(move || {
+            repository.retry_last_user_event_with_runs(&room_for_retry, &event_id)
+        })
+        .await
+        .map_err(|error| format!("重试协作消息线程失败: {error}"))?
+        .map_err(|error| error.to_string())?;
+        for (member_id, run_id) in active_runs {
+            self.cancel_task_and_runtime(&room_id, &member_id, &run_id)
+                .await;
+        }
+        let snapshot = self.with_model_policy_details(snapshot);
+        self.dispatcher_notify.notify_waiters();
+        self.broadcast(WebProgressEvent::RoomSnapshot {
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
     }
 
     fn with_model_policy_details(&self, mut snapshot: RoomSnapshot) -> RoomSnapshot {
@@ -770,7 +796,7 @@ impl CollaborationRuntime {
         &self,
         claim: &ClaimedInboxItem,
     ) -> Result<(TaskRun, ContextSnapshot, MemberExecutionPolicy), String> {
-        let task_run_id = format!("task-{}", claim.inbox_item_id);
+        let task_run_id = claim.task_run_id.clone();
         let tasks = Arc::clone(&self.task_repository);
         let task_id_for_lookup = task_run_id.clone();
         let existing = match tokio::task::spawn_blocking(move || tasks.task(&task_id_for_lookup))
@@ -1156,11 +1182,12 @@ impl CollaborationRuntime {
     async fn reconcile_durable_claim(&self, claim: &ClaimedInboxItem) {
         let tasks = Arc::clone(&self.task_repository);
         let origin_id = claim.inbox_item_id.clone();
+        let task_run_id = claim.task_run_id.clone();
         let result = tokio::task::spawn_blocking(move || {
             tasks.completed_results("member_inbox").map(|results| {
-                results
-                    .into_iter()
-                    .find(|result| result.origin_id == origin_id)
+                results.into_iter().find(|result| {
+                    result.origin_id == origin_id && result.task_run_id == task_run_id
+                })
             })
         })
         .await;
@@ -1400,10 +1427,13 @@ fn parse_participation_answer(answer: &str) -> Option<String> {
 fn reconcile_durable_result(
     repository: &CollaborationRepository,
     inbox_item_id: &str,
+    task_run_id: &str,
     durable_run_id: &str,
     artifact_content: &str,
 ) -> std::result::Result<Option<ParticipationCompletion>, CollaborationError> {
-    let Some(claim) = repository.claim_for_reconciliation(inbox_item_id, durable_run_id)? else {
+    let Some(claim) =
+        repository.claim_for_reconciliation(inbox_item_id, task_run_id, durable_run_id)?
+    else {
         return Ok(None);
     };
     let answer = if claim.purpose == InboxPurpose::Participation {
@@ -1613,7 +1643,7 @@ fn task_request_for_claim(
     model: &ResolvedModelPolicy,
     context_snapshot: &ContextSnapshot,
 ) -> NewTaskRun {
-    let task_run_id = format!("task-{}", claim.inbox_item_id);
+    let task_run_id = claim.task_run_id.clone();
     NewTaskRun {
         task_run_id: task_run_id.clone(),
         workflow: if claim.purpose == InboxPurpose::Participation {
@@ -1832,6 +1862,48 @@ mod tests {
     }
 
     #[test]
+    fn retried_inbox_uses_the_new_persisted_task_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Retry Room", &[])
+            .unwrap();
+        let posted = collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&room.room.default_member_id),
+                "重新执行这个输入",
+                RoomInputMode::Chat,
+                "retry-task-identity",
+            )
+            .unwrap();
+        let first = collaboration.claim_next().unwrap().unwrap();
+        collaboration.complete_item(&first, "旧回答").unwrap();
+
+        let retried = collaboration
+            .retry_last_user_event("room-1", &posted.event.event_id)
+            .unwrap();
+        let expected_task_run_id = retried.inbox[0].task_run_id.clone().unwrap();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+        let llm = LlmConfig::default_config();
+        let model = llm.resolve_model_policy(&claim.model_policy);
+        let context = task_context_snapshot("context-retry", &claim.input);
+        let request = task_request_for_claim(&claim, &config, &model, &context);
+
+        assert_eq!(request.task_run_id, expected_task_run_id);
+        assert!(reconcile_durable_result(
+            &collaboration,
+            &claim.inbox_item_id,
+            &first.task_run_id,
+            "old-durable-run",
+            "旧回答",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
     fn durable_silent_participation_reconciles_without_a_room_reply() {
         let directory = tempfile::tempdir().unwrap();
         let collaboration =
@@ -1857,6 +1929,7 @@ mod tests {
         let completion = reconcile_durable_result(
             &collaboration,
             &participation.inbox_item_id,
+            &participation.task_run_id,
             "durable-participation-run",
             "[[NO_REPLY]]",
         )

@@ -619,6 +619,9 @@ function renderRoomTimeline() {
     if (!roomSnapshot) return;
     $messages.innerHTML = '';
     const entries = [];
+    const lastVisibleUserEventId = roomSnapshot.events
+        .filter((event) => event.kind === 'user_message' && event.sender_kind === 'user')
+        .at(-1)?.event_id || null;
     roomSnapshot.events
         .filter((event) => event.kind !== 'member_message' || String(event.content || '').trim())
         .forEach((event) => {
@@ -635,7 +638,9 @@ function renderRoomTimeline() {
         });
     entries.sort((left, right) => left.at - right.at || (left.kind === 'event' ? -1 : 1));
     entries.forEach((entry) => {
-        if (entry.kind === 'event') renderRoomEvent(entry.value);
+        if (entry.kind === 'event') {
+            renderRoomEvent(entry.value, entry.value.event_id === lastVisibleUserEventId);
+        }
         else renderRunItem(entry.value);
     });
     if (entries.length === 0) {
@@ -648,7 +653,7 @@ function renderRoomTimeline() {
     scrollToBottom();
 }
 
-function renderRoomEvent(event) {
+function renderRoomEvent(event, isLastUserEvent = false) {
     if (event.kind !== 'user_message' && event.kind !== 'member_message') {
         const service = document.createElement('div');
         service.className = 'service-event';
@@ -679,6 +684,22 @@ function renderRoomEvent(event) {
     }
     message.appendChild(metadata);
     message.appendChild(content);
+    if (isLastUserEvent) {
+        const actions = document.createElement('div');
+        actions.className = 'msg-actions';
+        actions.appendChild(createMessageAction('rotate-ccw', '重试最后一条消息', () => {
+            roomSnapshot.events = roomSnapshot.events.filter(
+                (candidate) => candidate.sequence <= event.sequence,
+            );
+            roomSnapshot.inbox = [];
+            memberRunStates.clear();
+            renderCollaborationRoom();
+            showToast('正在重试最后一条消息');
+            send('retry_last_user_message', { message_id: event.event_id });
+        }));
+        message.classList.add('has-actions');
+        message.appendChild(actions);
+    }
     $messages.appendChild(message);
 }
 

@@ -17,7 +17,7 @@ use task_engine::SchedulerLimits;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const DEFAULT_PROFILE_ID: &str = "general_member";
 pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
@@ -709,6 +709,7 @@ pub struct ClaimedInboxItem {
     pub input: String,
     pub mode: RoomInputMode,
     pub run_id: String,
+    pub task_run_id: String,
     pub version: u64,
 }
 
@@ -838,6 +839,7 @@ impl CollaborationRepository {
                  conversation_mode TEXT NOT NULL DEFAULT 'chat',
                  idempotency_key TEXT NOT NULL,
                  created_at TEXT NOT NULL,
+                 invalidated_at TEXT,
                  UNIQUE(room_id, sequence),
                  UNIQUE(room_id, idempotency_key)
              );
@@ -1088,6 +1090,16 @@ impl CollaborationRepository {
             )?;
             version = 4;
         }
+        if version == 4 {
+            if !table_has_column(&connection, "room_events", "invalidated_at")? {
+                connection.execute("ALTER TABLE room_events ADD COLUMN invalidated_at TEXT", [])?;
+            }
+            connection.execute(
+                "UPDATE collaboration_schema SET version = 5 WHERE singleton = 1",
+                [],
+            )?;
+            version = 5;
+        }
         if version != SCHEMA_VERSION {
             return Err(CollaborationError::Config(format!(
                 "不支持的协作存储版本 {version}"
@@ -1101,7 +1113,9 @@ impl CollaborationRepository {
                  WHERE purpose = 'participation'
                    AND state IN ('pending', 'leased', 'running');
              CREATE INDEX IF NOT EXISTS room_event_deliveries_member_idx
-                 ON room_event_deliveries(member_id, state, updated_at);",
+                 ON room_event_deliveries(member_id, state, updated_at);
+             CREATE INDEX IF NOT EXISTS room_events_visible_sequence_idx
+                 ON room_events(room_id, invalidated_at, sequence);",
         )?;
         let now = Utc::now().to_rfc3339();
         let allowed_models = serde_json::to_string(&self.config.allowed_model_policies)
@@ -2145,7 +2159,7 @@ impl CollaborationRepository {
             .query_row(
                 "SELECT i.inbox_item_id, e.room_id, i.member_id, m.display_name,
                         m.profile_id, m.model_policy, m.reasoning_depth,
-                        i.source_event_id, e.sequence, e.content, i.mode, i.version,
+                        i.source_event_id, e.sequence, e.content, i.mode, i.task_run_id, i.version,
                         i.thread_key, i.purpose,
                         COALESCE(i.conversation_root_event_id, i.source_event_id),
                         CASE WHEN i.purpose = 'participation'
@@ -2161,6 +2175,7 @@ impl CollaborationRepository {
                                   = COALESCE(i.conversation_root_event_id, i.source_event_id)
                               AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
                                   THEN i.context_through_seq ELSE room.latest_event_seq END
+                              AND delivered.invalidated_at IS NULL
                             ORDER BY delivered.sequence DESC LIMIT 1
                         ), i.source_event_id) ELSE i.source_event_id END,
                         e.group_enabled
@@ -2169,6 +2184,7 @@ impl CollaborationRepository {
                  JOIN room_events e ON e.event_id = i.source_event_id
                  JOIN collaboration_rooms room ON room.room_id = e.room_id
                  WHERE i.state = 'pending'
+                   AND e.invalidated_at IS NULL
                    AND m.availability = 'active'
                    AND NOT EXISTS (
                        SELECT 1 FROM member_inbox_items active
@@ -2193,13 +2209,14 @@ impl CollaborationRepository {
                         row.get::<_, u64>(8)?,
                         row.get::<_, String>(9)?,
                         row.get::<_, String>(10)?,
-                        row.get::<_, u64>(11)?,
-                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, u64>(12)?,
                         row.get::<_, String>(13)?,
                         row.get::<_, String>(14)?,
-                        row.get::<_, u64>(15)?,
-                        row.get::<_, String>(16)?,
-                        row.get::<_, bool>(17)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, u64>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, bool>(18)?,
                     ))
                 },
             )
@@ -2216,6 +2233,7 @@ impl CollaborationRepository {
             source_event_seq,
             input,
             mode,
+            task_run_id,
             version,
             thread_key,
             purpose,
@@ -2284,6 +2302,7 @@ impl CollaborationRepository {
                 RoomInputMode::Chat
             },
             run_id,
+            task_run_id,
             version: version + 1,
         }))
     }
@@ -2291,6 +2310,7 @@ impl CollaborationRepository {
     pub fn claim_for_reconciliation(
         &self,
         inbox_item_id: &str,
+        task_run_id: &str,
         durable_run_id: &str,
     ) -> Result<Option<ClaimedInboxItem>> {
         let connection = self.connect()?;
@@ -2298,7 +2318,7 @@ impl CollaborationRepository {
             .query_row(
                 "SELECT i.inbox_item_id, e.room_id, i.member_id, m.display_name,
                         m.profile_id, m.model_policy, m.reasoning_depth,
-                        i.source_event_id, e.sequence, e.content, i.mode, i.version,
+                        i.source_event_id, e.sequence, e.content, i.mode, i.task_run_id, i.version,
                         i.thread_key, i.purpose,
                         COALESCE(i.conversation_root_event_id, i.source_event_id),
                         CASE WHEN i.purpose = 'participation' AND i.context_through_seq > 0
@@ -2312,14 +2332,17 @@ impl CollaborationRepository {
                                   = COALESCE(i.conversation_root_event_id, i.source_event_id)
                               AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
                                   THEN i.context_through_seq ELSE e.sequence END
+                              AND delivered.invalidated_at IS NULL
                             ORDER BY delivered.sequence DESC LIMIT 1
                         ), i.source_event_id) ELSE i.source_event_id END,
                         e.group_enabled
                  FROM member_inbox_items i
                  JOIN brain_members m ON m.member_id = i.member_id
                  JOIN room_events e ON e.event_id = i.source_event_id
-                 WHERE i.inbox_item_id = ?1 AND i.state NOT IN ('completed', 'cancelled')",
-                [inbox_item_id],
+                 WHERE i.inbox_item_id = ?1 AND i.task_run_id = ?2
+                   AND i.state NOT IN ('completed', 'cancelled')
+                   AND e.invalidated_at IS NULL",
+                params![inbox_item_id, task_run_id],
                 |row| {
                     let mode: String = row.get(10)?;
                     Ok(ClaimedInboxItem {
@@ -2339,13 +2362,14 @@ impl CollaborationRepository {
                             RoomInputMode::Chat
                         },
                         run_id: durable_run_id.into(),
-                        version: row.get(11)?,
-                        thread_key: row.get(12)?,
-                        purpose: InboxPurpose::from_db(&row.get::<_, String>(13)?),
-                        conversation_root_event_id: row.get(14)?,
-                        context_through_seq: row.get(15)?,
-                        response_to_event_id: row.get(16)?,
-                        group_enabled: row.get(17)?,
+                        task_run_id: row.get(11)?,
+                        version: row.get(12)?,
+                        thread_key: row.get(13)?,
+                        purpose: InboxPurpose::from_db(&row.get::<_, String>(14)?),
+                        conversation_root_event_id: row.get(15)?,
+                        context_through_seq: row.get(16)?,
+                        response_to_event_id: row.get(17)?,
+                        group_enabled: row.get(18)?,
                     })
                 },
             )
@@ -2417,6 +2441,7 @@ impl CollaborationRepository {
                  FROM room_events e
                  WHERE e.room_id = ?1
                    AND e.sequence <= ?2
+                   AND e.invalidated_at IS NULL
                    AND e.kind IN ('user_message', 'member_message')
                    AND COALESCE(e.conversation_root_event_id, e.event_id) = ?3
                    AND (
@@ -2473,6 +2498,7 @@ impl CollaborationRepository {
                  FROM room_events e
                  WHERE e.room_id = ?1
                    AND e.sequence < ?2
+                   AND e.invalidated_at IS NULL
                    AND e.kind IN ('user_message', 'member_message')
                    AND (
                        (e.sender_kind = 'member' AND e.sender_id = ?3)
@@ -2525,6 +2551,7 @@ impl CollaborationRepository {
              FROM room_events e
              WHERE e.room_id = ?1
                AND e.sequence < ?2
+               AND e.invalidated_at IS NULL
                AND e.kind IN ('user_message', 'member_message')
                AND (
                    (e.sender_kind = 'member' AND e.sender_id = ?3)
@@ -2672,7 +2699,8 @@ impl CollaborationRepository {
             "SELECT COUNT(*) FROM room_events
              WHERE room_id = ?1
                AND COALESCE(conversation_root_event_id, event_id) = ?2
-               AND kind = 'member_message'",
+               AND kind = 'member_message'
+               AND invalidated_at IS NULL",
             params![claim.room_id, event.conversation_root_event_id],
             |row| row.get(0),
         )?;
@@ -2693,7 +2721,8 @@ impl CollaborationRepository {
                      WHERE response.room_id = m.room_id
                        AND COALESCE(response.conversation_root_event_id, response.event_id) = ?2
                        AND response.kind = 'member_message'
-                       AND response.sender_id = m.member_id),
+                       AND response.sender_id = m.member_id
+                       AND response.invalidated_at IS NULL),
                     EXISTS(
                         SELECT 1 FROM member_inbox_items active
                         WHERE active.member_id = m.member_id
@@ -2812,6 +2841,7 @@ impl CollaborationRepository {
                    AND delivered.room_id = ?2
                    AND COALESCE(delivered.conversation_root_event_id, delivered.event_id) = ?3
                    AND delivered.sequence > ?4
+                   AND delivered.invalidated_at IS NULL
                  ORDER BY delivered.sequence DESC LIMIT 1",
                 params![
                     claim.member_id,
@@ -2870,12 +2900,14 @@ impl CollaborationRepository {
                  (SELECT COUNT(*) FROM room_events response
                   WHERE response.room_id = ?1
                     AND COALESCE(response.conversation_root_event_id, response.event_id) = ?2
-                    AND response.kind = 'member_message'),
+                    AND response.kind = 'member_message'
+                    AND response.invalidated_at IS NULL),
                  (SELECT COUNT(*) FROM room_events response
                   WHERE response.room_id = ?1
                     AND COALESCE(response.conversation_root_event_id, response.event_id) = ?2
                     AND response.kind = 'member_message'
-                    AND response.sender_id = ?3)",
+                    AND response.sender_id = ?3
+                    AND response.invalidated_at IS NULL)",
             params![
                 claim.room_id,
                 claim.conversation_root_event_id,
@@ -3021,15 +3053,18 @@ impl CollaborationRepository {
                              WHERE response.room_id = parent.room_id
                                AND COALESCE(response.conversation_root_event_id, response.event_id)
                                    = COALESCE(parent.conversation_root_event_id, parent.event_id)
-                               AND response.kind = 'member_message'),
+                               AND response.kind = 'member_message'
+                               AND response.invalidated_at IS NULL),
                             (SELECT COUNT(*) FROM room_events response
                              WHERE response.room_id = parent.room_id
                                AND COALESCE(response.conversation_root_event_id, response.event_id)
                                    = COALESCE(parent.conversation_root_event_id, parent.event_id)
                                AND response.kind = 'member_message'
-                               AND response.sender_id = ?3)
+                               AND response.sender_id = ?3
+                               AND response.invalidated_at IS NULL)
                      FROM room_events parent
-                     WHERE parent.room_id = ?1 AND parent.event_id = ?2",
+                     WHERE parent.room_id = ?1 AND parent.event_id = ?2
+                       AND parent.invalidated_at IS NULL",
                     params![claim.room_id, claim.response_to_event_id, claim.member_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
@@ -3200,8 +3235,9 @@ impl CollaborationRepository {
                  FROM member_inbox_items i
                  JOIN room_events e ON e.event_id = i.source_event_id
                  JOIN brain_members m ON m.member_id = i.member_id
-                 WHERE i.inbox_item_id = ?1",
-                [inbox_item_id],
+                 WHERE i.inbox_item_id = ?1 AND i.run_id = ?2
+                   AND e.invalidated_at IS NULL",
+                params![inbox_item_id, run_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -3604,6 +3640,116 @@ impl CollaborationRepository {
             RoomCapability::RoomRead,
         )?;
         events_after_from_connection(&connection, room_id, after_sequence, limit)
+    }
+
+    pub fn retry_last_user_event(&self, room_id: &str, event_id: &str) -> Result<RoomSnapshot> {
+        self.retry_last_user_event_with_runs(room_id, event_id)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    pub fn retry_last_user_event_with_runs(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(RoomSnapshot, Vec<(String, String)>)> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_room_exists(&transaction, room_id)?;
+        let retained = transaction
+            .query_row(
+                "SELECT event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                        kind, content, run_id, parent_event_id,
+                        COALESCE(conversation_root_event_id, event_id), debate_depth,
+                        group_enabled, conversation_mode, created_at
+                 FROM room_events
+                 WHERE room_id = ?1 AND event_id = ?2 AND invalidated_at IS NULL",
+                params![room_id, event_id],
+                event_from_row_without_recipients,
+            )
+            .optional()?
+            .ok_or_else(|| CollaborationError::Config("待重试的用户消息不存在或已经失效".into()))?;
+        if retained.sender_kind != "user" {
+            return Err(CollaborationError::Config(
+                "只能重试最后一条用户消息".into(),
+            ));
+        }
+        let last_user_event_id: String = transaction.query_row(
+            "SELECT event_id FROM room_events
+             WHERE room_id = ?1 AND sender_kind = 'user' AND invalidated_at IS NULL
+             ORDER BY sequence DESC LIMIT 1",
+            [room_id],
+            |row| row.get(0),
+        )?;
+        if last_user_event_id != retained.event_id {
+            return Err(CollaborationError::Config(
+                "只能重试最后一条用户消息".into(),
+            ));
+        }
+
+        let replaced_runs = {
+            let mut statement = transaction.prepare(
+                "SELECT i.member_id, i.run_id
+                 FROM member_inbox_items i
+                 JOIN brain_members m ON m.member_id = i.member_id
+                 WHERE m.room_id = ?1
+                   AND i.state IN ('leased', 'running')
+                   AND i.run_id IS NOT NULL",
+            )?;
+            let runs = statement
+                .query_map([room_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            runs
+        };
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        transaction.execute(
+            "UPDATE room_events
+             SET invalidated_at = ?1
+             WHERE room_id = ?2 AND sequence > ?3 AND invalidated_at IS NULL",
+            params![now_text, room_id, retained.sequence],
+        )?;
+        transaction.execute(
+            "UPDATE member_inbox_items
+             SET state = 'cancelled', cancel_requested = 1,
+                 completed_at = COALESCE(completed_at, ?1),
+                 lease_expires_at = NULL, version = version + 1
+             WHERE source_event_id IN (
+                 SELECT event_id FROM room_events
+                 WHERE room_id = ?2 AND invalidated_at IS NOT NULL
+             ) AND state NOT IN ('completed', 'cancelled')",
+            params![now_text, room_id],
+        )?;
+
+        let retry_key = format!("retry-{}", Uuid::new_v4());
+        transaction.execute(
+            "UPDATE member_inbox_items
+             SET state = 'pending', task_run_id = ?1 || '-' || inbox_item_id,
+                 run_id = NULL, idempotency_key = ?1 || ':' || member_id,
+                 cancel_requested = 0, reply_event_id = NULL, error = NULL,
+                 started_at = NULL, completed_at = NULL, lease_expires_at = NULL,
+                 version = version + 1
+             WHERE source_event_id = ?2",
+            params![retry_key, retained.event_id],
+        )?;
+        transaction.execute(
+            "UPDATE room_event_deliveries
+             SET state = 'queued', decision_reason = NULL, updated_at = ?1
+             WHERE event_id = ?2 AND inbox_item_id IS NOT NULL",
+            params![now_text, retained.event_id],
+        )?;
+        transaction.execute(
+            "UPDATE collaboration_rooms SET version = version + 1 WHERE room_id = ?1",
+            [room_id],
+        )?;
+        enqueue_room_changed(
+            &transaction,
+            room_id,
+            "room_event",
+            &retained.event_id,
+            &format!("room-retry:{room_id}:{retry_key}"),
+        )?;
+        transaction.commit()?;
+        Ok((self.snapshot(room_id)?, replaced_runs))
     }
 
     pub fn advance_member_cursor(
@@ -4306,7 +4452,9 @@ fn events_from_connection(
                 kind, content, run_id, parent_event_id,
                 COALESCE(conversation_root_event_id, event_id), debate_depth,
                 group_enabled, conversation_mode, created_at
-         FROM room_events WHERE room_id = ?1 ORDER BY sequence DESC LIMIT ?2",
+         FROM room_events
+         WHERE room_id = ?1 AND invalidated_at IS NULL
+         ORDER BY sequence DESC LIMIT ?2",
     )?;
     let rows = statement
         .query_map(params![room_id, limit], event_from_row_without_recipients)?
@@ -4335,7 +4483,7 @@ fn events_after_from_connection(
                 COALESCE(conversation_root_event_id, event_id), debate_depth,
                 group_enabled, conversation_mode, created_at
          FROM room_events
-         WHERE room_id = ?1 AND sequence > ?2
+         WHERE room_id = ?1 AND sequence > ?2 AND invalidated_at IS NULL
          ORDER BY sequence LIMIT ?3",
     )?;
     let events = statement
@@ -4366,7 +4514,8 @@ fn inbox_from_connection(
                 i.created_at, i.started_at, i.completed_at, i.version
          FROM member_inbox_items i
          JOIN brain_members m ON m.member_id = i.member_id
-         WHERE m.room_id = ?1
+         JOIN room_events e ON e.event_id = i.source_event_id
+         WHERE m.room_id = ?1 AND e.invalidated_at IS NULL
          ORDER BY i.created_at DESC, i.rowid DESC LIMIT ?2",
     )?;
     let mut items = statement
@@ -4442,7 +4591,7 @@ fn deliveries_from_connection(
                 d.decision_reason, d.created_at, d.updated_at
          FROM room_event_deliveries d
          JOIN room_events e ON e.event_id = d.event_id
-         WHERE e.room_id = ?1
+         WHERE e.room_id = ?1 AND e.invalidated_at IS NULL
          ORDER BY e.sequence DESC, d.member_id
          LIMIT ?2",
     )?;
@@ -4812,6 +4961,135 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn retry_last_user_event_keeps_user_and_invalidates_later_results() {
+        let (directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        let posted = repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "请重新回答",
+                RoomInputMode::Chat,
+                "retry-source",
+            )
+            .unwrap();
+        let claim = repository.claim_next().unwrap().unwrap();
+        repository
+            .reconcile_completed_item(
+                &posted.inbox_items[0].inbox_item_id,
+                &claim.run_id,
+                "旧回答",
+            )
+            .unwrap();
+
+        let retried = repository
+            .retry_last_user_event("room-1", &posted.event.event_id)
+            .unwrap();
+
+        assert_eq!(
+            retried
+                .events
+                .iter()
+                .filter(|event| event.sender_kind == "user")
+                .count(),
+            1
+        );
+        assert_eq!(retried.events[0].event_id, posted.event.event_id);
+        assert!(retried.events.iter().all(|event| event.content != "旧回答"));
+        assert_eq!(
+            retried
+                .inbox
+                .iter()
+                .filter(|item| item.source_event_id == posted.event.event_id)
+                .filter(|item| item.state == InboxState::Pending)
+                .count(),
+            1
+        );
+
+        drop(repository);
+        let reopened =
+            CollaborationRepository::new(directory.path(), CollaborationConfig::default()).unwrap();
+        assert!(reopened
+            .snapshot("room-1")
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event.content != "旧回答"));
+    }
+
+    #[test]
+    fn retry_rejects_a_user_event_that_is_not_last() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        let first = repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "第一条",
+                RoomInputMode::Chat,
+                "retry-first",
+            )
+            .unwrap();
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "第二条",
+                RoomInputMode::Chat,
+                "retry-second",
+            )
+            .unwrap();
+        let before = repository.snapshot("room-1").unwrap();
+
+        let error = repository
+            .retry_last_user_event("room-1", &first.event.event_id)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("最后一条用户消息"));
+        assert_eq!(
+            repository.snapshot("room-1").unwrap().events.len(),
+            before.events.len()
+        );
+    }
+
+    #[test]
+    fn retry_rejects_a_late_result_from_the_superseded_run() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let posted = repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "重新执行",
+                RoomInputMode::Chat,
+                "retry-late-result",
+            )
+            .unwrap();
+        let old_claim = repository.claim_next().unwrap().unwrap();
+
+        repository
+            .retry_last_user_event("room-1", &posted.event.event_id)
+            .unwrap();
+        let error = repository
+            .reconcile_completed_item(
+                &old_claim.inbox_item_id,
+                &old_claim.run_id,
+                "不应写回的旧结果",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, CollaborationError::RunNotActive(_)));
+        assert!(repository
+            .snapshot("room-1")
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event.content != "不应写回的旧结果"));
     }
 
     #[test]
@@ -5416,7 +5694,7 @@ mod tests {
     }
 
     #[test]
-    fn group_deliberation_schema_extends_phase_four_without_replacing_it() {
+    fn retry_invalidation_schema_extends_phase_five_without_replacing_it() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let connection = repository.connect().unwrap();
@@ -5427,7 +5705,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+        assert!(table_has_column(&connection, "room_events", "invalidated_at").unwrap());
 
         for table in [
             "room_principal_memberships",
