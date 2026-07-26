@@ -1879,6 +1879,18 @@ mod tests {
             )
             .unwrap();
         let first = collaboration.claim_next().unwrap().unwrap();
+        let llm = LlmConfig::default_config();
+        let model = llm.resolve_model_policy(&first.model_policy);
+        let tasks = TaskRepository::open(collaboration.database_path()).unwrap();
+        let first_context = task_context_snapshot("context-first", &first.input);
+        tasks
+            .create_task(task_request_for_claim(
+                &first,
+                &config,
+                &model,
+                &first_context,
+            ))
+            .unwrap();
         collaboration.complete_item(&first, "旧回答").unwrap();
 
         let retried = collaboration
@@ -1886,12 +1898,12 @@ mod tests {
             .unwrap();
         let expected_task_run_id = retried.inbox[0].task_run_id.clone().unwrap();
         let claim = collaboration.lease_next().unwrap().unwrap();
-        let llm = LlmConfig::default_config();
-        let model = llm.resolve_model_policy(&claim.model_policy);
         let context = task_context_snapshot("context-retry", &claim.input);
         let request = task_request_for_claim(&claim, &config, &model, &context);
 
+        assert_ne!(claim.inbox_item_id, first.inbox_item_id);
         assert_eq!(request.task_run_id, expected_task_run_id);
+        tasks.create_task(request).unwrap();
         assert!(reconcile_durable_result(
             &collaboration,
             &claim.inbox_item_id,

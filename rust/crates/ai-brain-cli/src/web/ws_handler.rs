@@ -689,6 +689,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                                 .await
                                             {
                                                 Ok(snapshot) => {
+                                                    pending_legacy_query = None;
                                                     send_event(
                                                         &mut sender,
                                                         WebProgressEvent::RoomSnapshot { snapshot },
@@ -1540,6 +1541,20 @@ mod tests {
         assert!(script.contains("lastVisibleUserEventId"));
         assert!(script.contains("candidate.sequence <= event.sequence"));
         assert!(script.contains("send('retry_last_user_message', { message_id: event.event_id })"));
+    }
+
+    #[test]
+    fn successful_retry_releases_the_legacy_query_binding() {
+        let source = include_str!("ws_handler.rs");
+
+        let retry_branch = source
+            .split("ClientMessage::RetryLastUserMessage { message_id } =>")
+            .nth(1)
+            .unwrap()
+            .split("ClientMessage::Cancel =>")
+            .next()
+            .unwrap();
+        assert!(retry_branch.contains("Ok(snapshot) => {\n                                                    pending_legacy_query = None;"));
     }
 
     #[test]

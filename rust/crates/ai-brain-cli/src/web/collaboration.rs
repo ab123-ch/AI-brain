@@ -3721,16 +3721,44 @@ impl CollaborationRepository {
         )?;
 
         let retry_key = format!("retry-{}", Uuid::new_v4());
-        transaction.execute(
-            "UPDATE member_inbox_items
-             SET state = 'pending', task_run_id = ?1 || '-' || inbox_item_id,
-                 run_id = NULL, idempotency_key = ?1 || ':' || member_id,
-                 cancel_requested = 0, reply_event_id = NULL, error = NULL,
-                 started_at = NULL, completed_at = NULL, lease_expires_at = NULL,
-                 version = version + 1
-             WHERE source_event_id = ?2",
-            params![retry_key, retained.event_id],
-        )?;
+        let retained_inbox_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT inbox_item_id
+                 FROM member_inbox_items
+                 WHERE source_event_id = ?1
+                 ORDER BY created_at, inbox_item_id",
+            )?;
+            let inbox_ids = statement
+                .query_map([retained.event_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            inbox_ids
+        };
+        for old_inbox_item_id in retained_inbox_ids {
+            let new_inbox_item_id = format!("inbox-{}", Uuid::new_v4());
+            let new_task_run_id = format!("task-{new_inbox_item_id}");
+            transaction.execute(
+                "UPDATE room_event_deliveries
+                 SET inbox_item_id = ?1, state = 'queued',
+                     decision_reason = NULL, updated_at = ?2
+                 WHERE inbox_item_id = ?3",
+                params![new_inbox_item_id, now_text, old_inbox_item_id],
+            )?;
+            transaction.execute(
+                "UPDATE member_inbox_items
+                 SET inbox_item_id = ?1, state = 'pending', task_run_id = ?2,
+                     run_id = NULL, idempotency_key = ?3 || ':' || member_id,
+                     cancel_requested = 0, reply_event_id = NULL, error = NULL,
+                     started_at = NULL, completed_at = NULL, lease_expires_at = NULL,
+                     version = version + 1
+                 WHERE inbox_item_id = ?4",
+                params![
+                    new_inbox_item_id,
+                    new_task_run_id,
+                    retry_key,
+                    old_inbox_item_id
+                ],
+            )?;
+        }
         transaction.execute(
             "UPDATE room_event_deliveries
              SET state = 'queued', decision_reason = NULL, updated_at = ?1
