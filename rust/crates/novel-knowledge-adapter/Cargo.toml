@@ -1,0 +1,18 @@
+[package]
+name = "novel-knowledge-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+knowledge-core = { path = "../knowledge-core" }
+novel-domain = { path = "../novel-domain" }
+serde_json = "1"
+
+[dev-dependencies]
+brain-graph = { path = "../brain-graph" }
+tempfile = "3"
+
+[lints]
+workspace = true

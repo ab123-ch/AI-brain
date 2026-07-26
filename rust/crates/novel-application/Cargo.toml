@@ -1,0 +1,29 @@
+[package]
+name = "novel-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+brain-graph = { path = "../brain-graph" }
+brain-memory = { path = "../brain-memory" }
+knowledge-core = { path = "../knowledge-core" }
+novel-domain = { path = "../novel-domain" }
+novel-knowledge-adapter = { path = "../novel-knowledge-adapter" }
+novel-workflow = { path = "../novel-workflow" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
