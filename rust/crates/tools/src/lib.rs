@@ -719,6 +719,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             name: "novel_task",
             description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。",
             input_schema: json!({
+                "type": "object",
                 "oneOf": [
                     {
                         "type": "object",
@@ -817,6 +818,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             name: "novel_project",
             description: "管理 Novel 领域项目和 Canon 读模型。支持 create、list、recall、consistency 与 resolve_conflict。",
             input_schema: json!({
+                "type": "object",
                 "oneOf": [
                     {
                         "type": "object",
@@ -6282,6 +6284,19 @@ mod tests {
         assert!(publish_properties.contains_key("draft_version"));
         assert!(!publish_properties.contains_key("content"));
         assert!(!specs.iter().any(|spec| spec.name == "novel_commit_delta"));
+    }
+
+    #[test]
+    fn novel_application_tools_have_object_root_schemas() {
+        let specs = mvp_tool_specs();
+
+        for name in ["novel_task", "novel_project"] {
+            let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+            assert_eq!(
+                spec.input_schema["type"], "object",
+                "{name} 顶层 schema 必须声明为 object"
+            );
+        }
     }
 
     #[test]
