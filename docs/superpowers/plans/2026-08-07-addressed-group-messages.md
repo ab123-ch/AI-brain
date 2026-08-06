@@ -301,7 +301,7 @@ ToolDescriptor {
 
 - [ ] **Step 5: 验证并提交**
 
-Run: `cargo test -p ai-brain-cli read_room_messages scoped_collaboration_tool`  
+Run: `cargo test -p ai-brain-cli read_room_messages scoped_collaboration_tool`
 Run: `cargo test -p brain-main fork_isolated`
 
 Expected: PASS；工具无副作用、无法越界、既有 fork 仍通过。
@@ -364,7 +364,7 @@ test('selection changes only its own marker', () => {
 
 - [ ] **Step 5: 运行并提交**
 
-Run: `node --test rust/crates/ai-brain-cli/src/web/static/app.test.js`  
+Run: `node --test rust/crates/ai-brain-cli/src/web/static/app.test.js`
 Run: `cargo test -p ai-brain-cli active_member_display_names_are_unique_within_a_room`
 
 Expected: PASS；重复提及只保留一个 ID，选择器/文本双向同步，活跃重名被拒绝。
@@ -387,16 +387,16 @@ git commit -m "feat(web): synchronize addressed member mentions"
 
 - [ ] **Step 2: 格式化、静态检查与全量测试**
 
-Run: `cargo fmt --check`  
+Run: `cargo fmt --check`
 Expected: PASS.
 
-Run: `cargo clippy --workspace --all-targets -- -D warnings`  
+Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: PASS；如有历史警告，记录准确包/行号，不能降低 lint 级别。
 
-Run: `cargo test --workspace`  
+Run: `cargo test --workspace`
 Expected: PASS.
 
-Run: `node --test rust/crates/ai-brain-cli/src/web/static/app.test.js`  
+Run: `node --test rust/crates/ai-brain-cli/src/web/static/app.test.js`
 Expected: PASS.
 
 - [ ] **Step 3: 人工 Web 验收**
