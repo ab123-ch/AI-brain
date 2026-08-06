@@ -6,6 +6,7 @@ archive/
 .claude/settings.local.json
 .claude/sessions/
 .sandbox-home/
+.worktrees/
 
 # 本地运行数据与项目级上下文，不提交到远程
 AGENTS.md
