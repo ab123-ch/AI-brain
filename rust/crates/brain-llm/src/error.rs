@@ -14,7 +14,7 @@ pub enum LlmError {
     #[error("stream error: {0}")]
     StreamError(String),
 
-    #[error("API key not found: env var {0} not set")]
+    #[error("API key not found: {0}")]
     ApiKeyNotFound(String),
 
     #[error("provider not found: {0}")]

@@ -62,6 +62,38 @@ fn resolve_member_reasoning_tokens(configured: u32, depth: &str) -> Result<u32, 
     }
 }
 
+fn resolve_member_model_policy(
+    llm_config: &LlmConfig,
+    policy_id: &str,
+) -> Result<brain_llm::config::ResolvedModelPolicy, MemberQueryError> {
+    llm_config
+        .available_instance_model_policies()
+        .into_iter()
+        .find(|policy| policy.policy_id == policy_id)
+        .ok_or_else(|| {
+            MemberQueryError::before_execution(format!("成员模型策略未配置: {policy_id}"))
+        })
+}
+
+fn create_member_execution_client(
+    llm_config: &LlmConfig,
+    policy_id: &str,
+) -> Result<
+    (
+        Box<dyn brain_llm::LlmProvider>,
+        brain_llm::config::ResolvedModelPolicy,
+    ),
+    MemberQueryError,
+> {
+    let policy = resolve_member_model_policy(llm_config, policy_id)?;
+    let client = llm_config
+        .create_model_policy_client(policy_id)
+        .map_err(|error| {
+            MemberQueryError::before_execution(format!("创建成员模型失败: {error}"))
+        })?;
+    Ok((client, policy))
+}
+
 const NOVEL_WRITING_SKILL_NAME: &str = "novel-writing-workflow";
 const NOVEL_WRITING_SKILL: &str =
     include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
@@ -1177,6 +1209,7 @@ impl Orchestrator {
         self: &Arc<Self>,
         context_snapshot: KnowledgeContextSnapshot,
         memory_scope: ConversationMemoryScope,
+        llm_config: Arc<LlmConfig>,
         model_policy: &str,
         reasoning_depth: &str,
         allow_tools: bool,
@@ -1200,27 +1233,14 @@ impl Orchestrator {
             let (input, restore_history, member_context) =
                 member_inputs_from_snapshot(&context_snapshot)
                     .map_err(MemberQueryError::before_execution)?;
-            let llm_config = LlmConfig::load_default().map_err(|error| {
-                MemberQueryError::before_execution(format!("加载成员模型配置失败: {error}"))
-            })?;
-            let policy_exists = model_policy == "main"
-                || llm_config.llm.brain_models.contains_key(&model_policy)
-                || llm_config.llm.brain_providers.contains_key(&model_policy)
-                || llm_config.llm.brain_params.contains_key(&model_policy);
-            if !policy_exists {
-                return Err(MemberQueryError::before_execution(format!(
-                    "成员模型策略未配置: {model_policy}"
-                )));
-            }
-            let client = llm_config
-                .create_brain_client(&model_policy)
-                .map_err(|error| {
-                    MemberQueryError::before_execution(format!("创建成员模型失败: {error}"))
-                })?;
-            let (configured_max_tokens, temperature) = llm_config.params_for_brain(&model_policy);
-            let max_tokens =
-                resolve_member_reasoning_tokens(configured_max_tokens, &reasoning_depth)
-                    .map_err(MemberQueryError::before_execution)?;
+            let (client, resolved_model_policy) =
+                create_member_execution_client(&llm_config, &model_policy)?;
+            let max_tokens = resolve_member_reasoning_tokens(
+                resolved_model_policy.max_output_tokens,
+                &reasoning_depth,
+            )
+            .map_err(MemberQueryError::before_execution)?;
+            let temperature = resolved_model_policy.temperature;
 
             let mut brain = {
                 let template = this.v2_brain.lock().await;
@@ -3010,6 +3030,7 @@ fn create_sub_brains() -> Result<
 mod tests {
     use super::*;
     use brain_core::types::TurnUsage;
+    use brain_llm::config::{InstanceModelConfig, ProviderConfig};
     use knowledge_core::{ContextBlock, ContextBlockInput};
 
     #[test]
@@ -3128,6 +3149,38 @@ mod tests {
             2_048
         );
         assert!(resolve_member_reasoning_tokens(32_768, "max").is_err());
+    }
+
+    #[test]
+    fn member_execution_uses_injected_catalog_config_and_rejects_unknown_policy() {
+        let mut config = LlmConfig::default_config();
+        config.llm.providers.insert(
+            "relay".into(),
+            ProviderConfig {
+                api_base: "https://relay.example.com/v1".into(),
+                api_key: Some("test-key".into()),
+                ..ProviderConfig::default()
+            },
+        );
+        config.llm.instance_models = vec![InstanceModelConfig {
+            id: "gemini-2-5-flash".into(),
+            label: "Gemini 2.5 Flash".into(),
+            provider: "relay".into(),
+            model: "gemini-2.5-flash".into(),
+        }];
+
+        let (client, policy) = create_member_execution_client(&config, "gemini-2-5-flash").unwrap();
+        assert_eq!(policy.label, "Gemini 2.5 Flash");
+        assert_eq!(client.model(), "gemini-2.5-flash");
+
+        let error = match create_member_execution_client(&config, "not-configured") {
+            Ok(_) => panic!("未知成员模型策略不应创建客户端"),
+            Err(error) => error,
+        };
+        assert!(!error.execution_started());
+        assert!(error
+            .to_string()
+            .contains("成员模型策略未配置: not-configured"));
     }
 
     #[test]

@@ -106,6 +106,7 @@ pub struct CollaborationRuntime {
     events: broadcast::Sender<WebProgressEvent>,
     dispatcher_notify: Arc<Notify>,
     active_runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
+    llm_config: Arc<LlmConfig>,
     model_policy_details: Vec<ResolvedModelPolicy>,
 }
 
@@ -113,6 +114,8 @@ impl CollaborationRuntime {
     pub async fn start(
         repository: Arc<CollaborationRepository>,
         orchestrator: Arc<Orchestrator>,
+        llm_config: Arc<LlmConfig>,
+        model_policy_details: Vec<ResolvedModelPolicy>,
     ) -> Result<Arc<Self>, String> {
         let task_repository = orchestrator.task_repository();
         let coordinator = orchestrator.task_coordinator();
@@ -154,12 +157,6 @@ impl CollaborationRuntime {
         }
 
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let llm_config = LlmConfig::load_default().unwrap_or_else(|error| {
-            tracing::warn!("解析协作模型展示信息失败，使用默认 LLM 配置: {error}");
-            LlmConfig::default_config()
-        });
-        let model_policy_details =
-            resolve_model_policy_details(&repository.config().allowed_model_policies, &llm_config);
         let runtime = Arc::new(Self {
             repository,
             task_repository,
@@ -168,6 +165,7 @@ impl CollaborationRuntime {
             events,
             dispatcher_notify: Arc::new(Notify::new()),
             active_runs: Arc::new(Mutex::new(HashMap::new())),
+            llm_config,
             model_policy_details,
         });
         let dispatcher = Arc::clone(&runtime);
@@ -246,11 +244,8 @@ impl CollaborationRuntime {
         Ok(snapshot)
     }
 
-    fn with_model_policy_details(&self, mut snapshot: RoomSnapshot) -> RoomSnapshot {
-        snapshot
-            .model_policy_details
-            .clone_from(&self.model_policy_details);
-        snapshot
+    fn with_model_policy_details(&self, snapshot: RoomSnapshot) -> RoomSnapshot {
+        with_model_policy_details(snapshot, &self.model_policy_details)
     }
 
     pub async fn post_message(
@@ -897,6 +892,7 @@ impl CollaborationRuntime {
         let (mut progress, handle, cancel) = self.orchestrator.query_member_streaming_scoped(
             context_snapshot,
             memory_scope,
+            Arc::clone(&self.llm_config),
             &execution_policy.model_policy,
             &execution_policy.reasoning_depth,
             execution_policy.allow_tools,
@@ -1409,14 +1405,12 @@ enum AvailabilityCommand {
     Restore,
 }
 
-fn resolve_model_policy_details(
-    policy_ids: &[String],
-    llm_config: &LlmConfig,
-) -> Vec<ResolvedModelPolicy> {
-    policy_ids
-        .iter()
-        .map(|policy_id| llm_config.resolve_model_policy(policy_id))
-        .collect()
+fn with_model_policy_details(
+    mut snapshot: RoomSnapshot,
+    model_policy_details: &[ResolvedModelPolicy],
+) -> RoomSnapshot {
+    snapshot.model_policy_details = model_policy_details.to_vec();
+    snapshot
 }
 
 #[cfg(test)]
@@ -1719,14 +1713,14 @@ mod tests {
 
     use super::{
         context_request_for_claim, context_snapshot_from_task, parse_participation_answer,
-        reconcile_durable_result, resolve_model_policy_details, scheduler_limits,
-        task_request_for_claim,
+        reconcile_durable_result, scheduler_limits, task_request_for_claim,
+        with_model_policy_details,
     };
     use crate::web::collaboration::{
         CollaborationConfig, CollaborationRepository, InboxPurpose, InboxState,
         MemberHistoryMessage, ParticipationDisposition, RoomInputMode,
     };
-    use brain_llm::config::LlmConfig;
+    use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
     use knowledge_core::{
         ContentResolverRegistry, ContextBlock, ContextBlockInput, ContextBlockKind, ContextBuilder,
         ContextSnapshot, GraphQueryPort, GraphQueryRequest, GraphQueryResult, KnowledgeError,
@@ -1779,15 +1773,39 @@ mod tests {
     }
 
     #[test]
-    fn main_route_alias_resolves_to_concrete_web_model_metadata() {
-        let config = LlmConfig::default_config();
-        let details = resolve_model_policy_details(&[String::from("main")], &config);
+    fn resolved_instance_model_details_are_attached_to_room_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = CollaborationRepository::new(
+            directory.path(),
+            CollaborationConfig::default()
+                .with_available_model_policies([String::from("gemini-2-5-flash")]),
+        )
+        .unwrap();
+        let snapshot = repository.ensure_room("room-1", "Test Room", &[]).unwrap();
+        let details = vec![
+            ResolvedModelPolicy {
+                policy_id: "main".into(),
+                label: "main".into(),
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                max_output_tokens: 1_024,
+                temperature: 0.5,
+            },
+            ResolvedModelPolicy {
+                policy_id: "gemini-2-5-flash".into(),
+                label: "Gemini 2.5 Flash".into(),
+                provider: "gemini".into(),
+                model: "gemini-2.5-flash".into(),
+                max_output_tokens: 1_024,
+                temperature: 0.5,
+            },
+        ];
 
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].policy_id, "main");
-        assert_eq!(details[0].provider, config.provider_for_brain("main"));
-        assert_eq!(details[0].model, config.model_for_brain("main"));
-        assert_ne!(details[0].model, details[0].policy_id);
+        let snapshot = with_model_policy_details(snapshot, &details);
+
+        assert_eq!(snapshot.model_policies, vec!["main", "gemini-2-5-flash"]);
+        assert_eq!(snapshot.model_policy_details, details);
+        assert_eq!(snapshot.model_policy_details[1].label, "Gemini 2.5 Flash");
     }
 
     #[test]

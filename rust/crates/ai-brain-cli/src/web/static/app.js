@@ -30,6 +30,7 @@ let roomSnapshot = null;
 let roomMode = 'chat';
 const selectedMemberIds = new Set();
 const memberRunStates = new Map();
+const modelCatalog = window.ModelCatalog;
 
 // ── Typewriter State ──────────────────────────────────────────
 let thinkingFullContent = '';
@@ -499,9 +500,11 @@ function renderMemberList() {
         row.dataset.memberId = member.member_id;
         const selectable = member.availability === 'active';
         const modelDetail = resolvedMemberModel(member);
-        const modelLabel = modelDetail?.model || member.model_policy;
+        const modelLabel = modelDetail
+            ? modelCatalog.compactLabel(modelDetail)
+            : member.model_policy;
         const modelTitle = modelDetail
-            ? `${modelDetail.provider} · ${modelDetail.model} · ${member.model_policy}`
+            ? modelPolicyTitle(modelDetail)
             : member.model_policy;
         row.innerHTML = `
             <input class="member-select" type="checkbox" aria-label="选择 ${escapeHtml(member.display_name)}" ${selectedMemberIds.has(member.member_id) ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
@@ -529,6 +532,15 @@ function renderMemberList() {
 function resolvedMemberModel(member) {
     return (roomSnapshot?.model_policy_details || [])
         .find((policy) => policy.policy_id === member.model_policy) || null;
+}
+
+function modelPolicyTitle(policy) {
+    return [
+        policy.label || policy.model || policy.policy_id,
+        policy.provider,
+        policy.model,
+        policy.policy_id,
+    ].filter(Boolean).join(' · ');
 }
 
 function memberActionButtons(member) {
@@ -961,8 +973,11 @@ function fillModelSelect(select, selected) {
         const detail = details.find((policy) => policy.policy_id === policyId);
         const option = document.createElement('option');
         option.value = policyId;
-        option.textContent = detail ? `${detail.model} · ${detail.provider}` : policyId;
-        option.title = detail ? `${detail.provider} · ${detail.model} · ${policyId}` : policyId;
+        const optionLabel = detail
+            ? modelCatalog.optionText(detail)
+            : modelCatalog.optionTextOrFallback(detail, policyId);
+        option.textContent = optionLabel;
+        option.title = optionLabel;
         option.selected = policyId === selected;
         select.appendChild(option);
     });

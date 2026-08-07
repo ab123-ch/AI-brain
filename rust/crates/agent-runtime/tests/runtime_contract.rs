@@ -95,6 +95,7 @@ fn run_spec(role: &str) -> AgentRunSpec {
         input_artifacts: Vec::new(),
         model: ResolvedModelPolicy {
             policy_id: "subagent".into(),
+            label: "subagent".into(),
             provider: "mock".into(),
             model: "mock-model".into(),
             max_output_tokens: 1_024,

@@ -3666,6 +3666,7 @@ impl ProviderRuntimeClient {
     fn resolved_model_policy(&self) -> ResolvedModelPolicy {
         ResolvedModelPolicy {
             policy_id: "subagent".into(),
+            label: "subagent".into(),
             provider: self.provider.clone(),
             model: self.model.clone(),
             max_output_tokens: self.max_output_tokens,
@@ -6157,6 +6158,7 @@ mod tests {
             profile_version: completed.profile_version,
             model: ResolvedModelPolicy {
                 policy_id: "subagent".into(),
+                label: "subagent".into(),
                 provider: "test".into(),
                 model: "claude-sonnet-4-6".into(),
                 max_output_tokens: 1_024,
@@ -6420,6 +6422,7 @@ mod tests {
                 input_artifacts: Vec::new(),
                 model: ResolvedModelPolicy {
                     policy_id: "test".into(),
+                    label: "test".into(),
                     provider: "mock".into(),
                     model: "mock-model".into(),
                     max_output_tokens: 1_024,

@@ -29,6 +29,12 @@ api_key_env = "DEEPSEEK_API_KEY"
 api_base = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
 
+[llm.providers.gemini]
+# Gemini 通过 OpenAI 兼容中转调用
+api_base = "https://ai.xfws88.com/v1"
+api_key_env = "GEMINI_API_KEY"
+kind = "openai"
+
 # ── 每脑独立厂商（未配置的脑走 default_provider）────
 [llm.brain_providers]
 main = "xiaomi"
@@ -43,6 +49,32 @@ reasoning = "mimo-7b"
 memory = "mimo-7b"
 eval = "deepseek-chat"
 evolver = "mimo-7b"
+
+# ── Web 实例可选模型目录（修改后重启生效）────────────
+# 每个协作实例保存条目的 id，并按该条目指定的 provider/model 调用。
+[[llm.instance_models]]
+id = "deepseek-v4-pro"
+label = "DeepSeek V4 Pro"
+provider = "deepseek"
+model = "deepseek-v4-pro"
+
+[[llm.instance_models]]
+id = "deepseek-v4-flash"
+label = "DeepSeek V4 Flash"
+provider = "deepseek"
+model = "deepseek-v4-flash"
+
+[[llm.instance_models]]
+id = "gemini-2-5-pro"
+label = "Gemini 2.5 Pro"
+provider = "gemini"
+model = "gemini-2.5-pro"
+
+[[llm.instance_models]]
+id = "gemini-2-5-flash"
+label = "Gemini 2.5 Flash"
+provider = "gemini"
+model = "gemini-2.5-flash"
 
 [llm.defaults]
 max_tokens = 4096
@@ -200,4 +232,17 @@ pub fn base_dir() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".ai-brain")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONFIG_TEMPLATE;
+
+    #[test]
+    fn config_template_documents_instance_model_catalog_and_compatible_gemini_proxy() {
+        assert!(CONFIG_TEMPLATE.contains("[[llm.instance_models]]"));
+        assert!(CONFIG_TEMPLATE.contains("id = \"gemini-2-5-flash\""));
+        assert!(CONFIG_TEMPLATE.contains("api_base = \"https://ai.xfws88.com/v1\""));
+        assert!(CONFIG_TEMPLATE.contains("kind = \"openai\""));
+    }
 }

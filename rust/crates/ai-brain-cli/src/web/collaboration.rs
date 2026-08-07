@@ -328,6 +328,33 @@ impl CollaborationConfig {
         Ok(config)
     }
 
+    /// 使用已经验证可执行的实例模型目录覆盖协作成员模板的模型白名单。
+    ///
+    /// `main` 保留为兼容既有成员的策略；已有成员记录不会因此被改写。
+    #[must_use]
+    pub fn with_available_model_policies<I>(mut self, policies: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut seen = HashSet::from([String::from("main")]);
+        let mut available = vec![String::from("main")];
+        for policy in policies {
+            let policy = policy.trim();
+            if !policy.is_empty() && seen.insert(policy.to_owned()) {
+                available.push(policy.to_owned());
+            }
+        }
+        self.allowed_model_policies = available;
+        if !self
+            .allowed_model_policies
+            .iter()
+            .any(|policy| policy == &self.default_model_policy)
+        {
+            self.default_model_policy = "main".into();
+        }
+        self
+    }
+
     #[must_use]
     pub(crate) const fn scheduler_limits(&self) -> SchedulerLimits {
         SchedulerLimits {
@@ -4677,6 +4704,59 @@ mod tests {
 
     fn ensure(repository: &CollaborationRepository) -> RoomSnapshot {
         repository.ensure_room("room-1", "Test Room", &[]).unwrap()
+    }
+
+    #[test]
+    fn verified_instance_policies_refresh_template_allowlist_without_migrating_members() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial =
+            CollaborationRepository::new(directory.path(), CollaborationConfig::default()).unwrap();
+        let room = ensure(&initial);
+        let existing = initial
+            .create_member("room-1", "保留的智脑", None, None)
+            .unwrap();
+        drop(initial);
+
+        let config = CollaborationConfig::default().with_available_model_policies([
+            String::from("gemini-2-5-flash"),
+            String::from("deepseek-v4-pro"),
+            String::from("gemini-2-5-flash"),
+        ]);
+        assert_eq!(config.default_model_policy, "main");
+        let repository = CollaborationRepository::new(directory.path(), config).unwrap();
+        let snapshot = repository.snapshot("room-1").unwrap();
+
+        assert_eq!(
+            snapshot.model_policies,
+            vec!["main", "gemini-2-5-flash", "deepseek-v4-pro"]
+        );
+        assert_eq!(
+            snapshot
+                .members
+                .iter()
+                .find(|member| member.member_id == existing.member_id)
+                .unwrap()
+                .model_policy,
+            "main"
+        );
+
+        let configured = repository
+            .create_member("room-1", "Gemini 智脑", Some("gemini-2-5-flash"), None)
+            .unwrap();
+        assert_eq!(configured.model_policy, "gemini-2-5-flash");
+        assert!(matches!(
+            repository.configure_member(
+                "room-1",
+                &configured.member_id,
+                "Gemini 智脑",
+                "not-configured",
+                &configured.reasoning_depth,
+                configured.version,
+            ),
+            Err(CollaborationError::ModelPolicyNotAllowed(policy)) if policy == "not-configured"
+        ));
+
+        assert_eq!(room.room.default_member_id, snapshot.room.default_member_id);
     }
 
     fn acknowledge_pending_outbox(repository: &CollaborationRepository) {

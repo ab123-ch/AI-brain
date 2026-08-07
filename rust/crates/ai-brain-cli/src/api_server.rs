@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
+use brain_llm::config::LlmConfig;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -23,6 +24,7 @@ static INDEX_HTML: &str = include_str!("web/static/index.html");
 static STYLE_CSS: &str = include_str!("web/static/style.css");
 static APP_JS: &str = include_str!("web/static/app.js");
 static MENTIONS_JS: &str = include_str!("web/static/mentions.js");
+static MODEL_CATALOG_JS: &str = include_str!("web/static/model_catalog.js");
 
 // ─── 请求/响应类型 ───────────────────────────────────────────────
 
@@ -371,13 +373,26 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         .join("ai-brain");
     let sessions = Arc::new(Mutex::new(SessionManager::new(&base_dir)));
     let runtime_dir = default_runtime_dir();
+    let llm_config = Arc::new(match LlmConfig::load_default() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!("加载实例模型目录失败，仅保留 main 策略: {error}");
+            LlmConfig::default_config()
+        }
+    });
+    let model_policy_details = llm_config.available_instance_model_policies();
     let collaboration_config = match CollaborationConfig::load(&runtime_dir.join("config.toml")) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!("加载协作配置失败: {error}");
             return;
         }
-    };
+    }
+    .with_available_model_policies(
+        model_policy_details
+            .iter()
+            .map(|policy| policy.policy_id.clone()),
+    );
     let collaboration_repository =
         match CollaborationRepository::new(&runtime_dir, collaboration_config) {
             Ok(repository) => Arc::new(repository),
@@ -387,16 +402,20 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
             }
         };
     let orch = Arc::new(orch);
-    let collaboration =
-        match CollaborationRuntime::start(Arc::clone(&collaboration_repository), Arc::clone(&orch))
-            .await
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                tracing::error!("启动协作运行时失败: {error}");
-                return;
-            }
-        };
+    let collaboration = match CollaborationRuntime::start(
+        Arc::clone(&collaboration_repository),
+        Arc::clone(&orch),
+        Arc::clone(&llm_config),
+        model_policy_details,
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!("启动协作运行时失败: {error}");
+            return;
+        }
+    };
     let state = Arc::new(AppState {
         orch,
         sessions,
@@ -411,6 +430,7 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         .route("/style.css", get(serve_css))
         .route("/app.js", get(serve_js))
         .route("/mentions.js", get(serve_mentions_js))
+        .route("/model_catalog.js", get(serve_model_catalog_js))
         .route(
             "/api/local-file",
             get(serve_local_file).post(save_local_file),
@@ -526,6 +546,16 @@ async fn serve_mentions_js() -> impl IntoResponse {
     )
 }
 
+async fn serve_model_catalog_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        MODEL_CATALOG_JS,
+    )
+}
+
 #[derive(Deserialize)]
 struct LocalFileQuery {
     path: String,
@@ -635,6 +665,32 @@ async fn save_local_file(
             Json(serde_json::json!({"error": format!("保存失败: {error}")})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod static_asset_tests {
+    use axum::body::to_bytes;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::IntoResponse;
+
+    use super::serve_model_catalog_js;
+
+    #[tokio::test]
+    async fn model_catalog_script_returns_javascript_content_type_and_catalog_api() {
+        let response = serve_model_catalog_js().await.into_response();
+
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("ModelCatalog"));
+        assert!(body.contains("optionText"));
     }
 }
 

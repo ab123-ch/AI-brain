@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,9 @@ pub struct LlmSection {
     pub default_model: String,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// 可供实例直接选择的模型目录，保持 TOML 声明顺序。
+    #[serde(default)]
+    pub instance_models: Vec<InstanceModelConfig>,
     #[serde(default)]
     pub brain_models: HashMap<String, String>,
     /// 每个脑独立的生成参数（max_tokens / temperature），未配置的脑走 defaults
@@ -55,6 +58,15 @@ pub struct LlmSection {
     pub brain_providers: HashMap<String, String>,
     #[serde(default)]
     pub defaults: LlmDefaults,
+}
+
+/// 单个实例可选择的模型配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceModelConfig {
+    pub id: String,
+    pub label: String,
+    pub provider: String,
+    pub model: String,
 }
 
 /// 单个脑的生成参数
@@ -69,6 +81,8 @@ pub struct BrainParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedModelPolicy {
     pub policy_id: String,
+    #[serde(default)]
+    pub label: String,
     pub provider: String,
     pub model: String,
     pub max_output_tokens: u32,
@@ -190,11 +204,105 @@ impl LlmConfig {
         let (max_output_tokens, temperature) = self.params_for_brain(policy_id);
         ResolvedModelPolicy {
             policy_id: policy_id.to_string(),
+            label: policy_id.to_string(),
             provider: self.provider_for_brain(policy_id).to_string(),
             model: self.model_for_brain(policy_id).to_string(),
             max_output_tokens,
             temperature,
         }
+    }
+
+    /// 解析实例模型目录中的一个模型策略。
+    pub fn resolve_instance_model_policy(&self, policy_id: &str) -> Result<ResolvedModelPolicy> {
+        let instance_model = self
+            .llm
+            .instance_models
+            .iter()
+            .find(|model| model.id == policy_id)
+            .ok_or_else(|| {
+                LlmError::Config(format!("实例模型目录中不存在模型策略: {policy_id}"))
+            })?;
+
+        if instance_model.id.trim().is_empty() {
+            return Err(LlmError::Config("实例模型目录项的 id 不能为空".into()));
+        }
+        if instance_model.id != instance_model.id.trim() {
+            return Err(LlmError::Config(
+                "实例模型目录项的 id 不能包含首尾空白字符".into(),
+            ));
+        }
+        if instance_model.label.trim().is_empty() {
+            return Err(LlmError::Config("实例模型目录项的 label 不能为空".into()));
+        }
+        if instance_model.model.trim().is_empty() {
+            return Err(LlmError::Config("实例模型目录项的 model 不能为空".into()));
+        }
+
+        self.resolve_api_key(&instance_model.provider)?;
+
+        Ok(ResolvedModelPolicy {
+            policy_id: instance_model.id.clone(),
+            label: instance_model.label.clone(),
+            provider: instance_model.provider.clone(),
+            model: instance_model.model.clone(),
+            max_output_tokens: self.llm.defaults.max_tokens,
+            temperature: self.llm.defaults.temperature,
+        })
+    }
+
+    /// 返回 Web 实例可选择的模型策略。
+    ///
+    /// 始终保留遗留的 `main` 策略；目录项则按 TOML 声明顺序追加。
+    #[must_use]
+    pub fn available_instance_model_policies(&self) -> Vec<ResolvedModelPolicy> {
+        let mut policies = vec![self.resolve_model_policy("main")];
+        let mut seen_ids = HashSet::from(["main".to_string()]);
+
+        for instance_model in &self.llm.instance_models {
+            let id = instance_model.id.trim();
+            if id.is_empty() {
+                tracing::warn!("跳过实例模型目录项：模型 id 为空");
+                continue;
+            }
+
+            if instance_model.id != id {
+                tracing::warn!(
+                    model_id = id,
+                    "跳过实例模型目录项：模型 id 包含首尾空白字符"
+                );
+                continue;
+            }
+
+            if instance_model.label.trim().is_empty() {
+                tracing::warn!(model_id = id, "跳过实例模型目录项：模型 label 为空");
+                continue;
+            }
+
+            if instance_model.model.trim().is_empty() {
+                tracing::warn!(model_id = id, "跳过实例模型目录项：模型名称为空");
+                continue;
+            }
+
+            if !seen_ids.insert(id.to_string()) {
+                tracing::warn!(model_id = id, "跳过实例模型目录项：模型 id 重复");
+                continue;
+            }
+
+            match self.resolve_instance_model_policy(&instance_model.id) {
+                Ok(policy) => policies.push(policy),
+                Err(LlmError::ProviderNotFound(_)) => {
+                    tracing::warn!(model_id = id, "跳过实例模型目录项：provider 不存在");
+                }
+                Err(LlmError::ApiKeyNotFound(_)) => {
+                    tracing::warn!(model_id = id, "跳过实例模型目录项：provider 未配置 API Key");
+                }
+                Err(error) => {
+                    tracing::warn!(model_id = id, error = %error, "跳过实例模型目录项：配置无效");
+                }
+            }
+        }
+
+        policies
     }
 
     /// 解析 API Key（优先环境变量，其次直接配置）
@@ -208,18 +316,22 @@ impl LlmConfig {
         // 优先环境变量
         if !provider.api_key_env.is_empty() {
             if let Ok(key) = std::env::var(&provider.api_key_env) {
-                return Ok(key);
+                if !key.trim().is_empty() {
+                    return Ok(key);
+                }
             }
         }
 
         // 其次直接配置
         if let Some(key) = &provider.api_key {
-            return Ok(key.clone());
+            if !key.trim().is_empty() {
+                return Ok(key.clone());
+            }
         }
 
         Err(LlmError::ApiKeyNotFound(
             if provider.api_key_env.is_empty() {
-                provider.api_key.clone().unwrap_or_default()
+                "未配置 api_key 或 api_key_env".into()
             } else {
                 provider.api_key_env.clone()
             },
@@ -248,35 +360,59 @@ impl LlmConfig {
     ///
     /// 如果副脑不需要 LLM（不在 brain_models 中且不在 defaults 中），返回 None
     pub fn create_brain_client(&self, brain_name: &str) -> Result<Box<dyn LlmProvider>> {
-        let model = self.model_for_brain(brain_name);
-        let provider_name = self.provider_for_brain(brain_name);
-        let api_key = self.resolve_api_key(provider_name)?;
-        let (max_tokens, temperature) = self.params_for_brain(brain_name);
+        let policy = self.resolve_model_policy(brain_name);
+        self.create_resolved_model_policy_client(&policy)
+    }
+
+    /// 为实例模型策略构建 LLM 客户端。
+    ///
+    /// 目录中没有该策略时兼容遗留副脑策略，沿用原有的默认回退规则。
+    pub fn create_model_policy_client(&self, policy_id: &str) -> Result<Box<dyn LlmProvider>> {
+        let policy = if policy_id != "main"
+            && self
+                .llm
+                .instance_models
+                .iter()
+                .any(|model| model.id == policy_id)
+        {
+            self.resolve_instance_model_policy(policy_id)?
+        } else {
+            self.resolve_model_policy(policy_id)
+        };
+
+        self.create_resolved_model_policy_client(&policy)
+    }
+
+    fn create_resolved_model_policy_client(
+        &self,
+        policy: &ResolvedModelPolicy,
+    ) -> Result<Box<dyn LlmProvider>> {
+        let api_key = self.resolve_api_key(&policy.provider)?;
 
         let provider_config = self
             .llm
             .providers
-            .get(provider_name)
-            .ok_or_else(|| LlmError::ProviderNotFound(provider_name.to_string()))?;
+            .get(&policy.provider)
+            .ok_or_else(|| LlmError::ProviderNotFound(policy.provider.clone()))?;
 
-        let proxy_url = self.resolve_proxy(provider_name)?;
+        let proxy_url = self.resolve_proxy(&policy.provider)?;
         match provider_config.kind {
             ProviderKind::OpenAi => Ok(Box::new(
                 OpenAiCompatClient::new(
                     provider_config.api_base.clone(),
                     api_key,
-                    model.to_string(),
-                    max_tokens,
-                    temperature,
+                    policy.model.clone(),
+                    policy.max_output_tokens,
+                    policy.temperature,
                 )
                 .with_proxy(proxy_url),
             )),
             ProviderKind::Gemini => Ok(Box::new(GeminiClient::try_new(
                 provider_config.api_base.clone(),
                 api_key,
-                model.to_string(),
-                max_tokens,
-                temperature,
+                policy.model.clone(),
+                policy.max_output_tokens,
+                policy.temperature,
                 proxy_url,
             )?)),
         }
@@ -356,6 +492,7 @@ impl LlmConfig {
                 default_provider: "xiaomi".into(),
                 default_model: "mimo-7b".into(),
                 providers,
+                instance_models: Vec::new(),
                 brain_models,
                 brain_params,
                 brain_providers,
@@ -430,6 +567,7 @@ mod tests {
         let config = LlmConfig::default_config();
         assert_eq!(config.llm.default_provider, "xiaomi");
         assert_eq!(config.llm.default_model, "mimo-7b");
+        assert!(config.llm.instance_models.is_empty());
         assert!(config.llm.brain_providers.contains_key("main"));
         assert!(!config.llm.brain_providers.contains_key("novel"));
         assert!(!config.llm.brain_models.contains_key("novel"));
@@ -438,6 +576,7 @@ mod tests {
         assert_eq!(config.model_for_brain("eval"), "deepseek-chat");
         let main_policy = config.resolve_model_policy("main");
         assert_eq!(main_policy.policy_id, "main");
+        assert_eq!(main_policy.label, "main");
         assert_eq!(main_policy.provider, "xiaomi");
         assert_eq!(main_policy.model, "mimo-7b");
         assert_eq!(
@@ -474,6 +613,12 @@ api_key_env = "ZHIPU_API_KEY"
 api_base = "http://localhost:11434/v1"
 api_key_env = ""
 
+[[llm.instance_models]]
+id = "glm-5-1"
+label = "GLM 5.1"
+provider = "zhipu"
+model = "glm-5.1"
+
 [llm.brain_models]
 reasoning = "glm-5.1"
 motor = "glm-5.1"
@@ -492,6 +637,277 @@ temperature = 0.5
         assert_eq!(config.llm.defaults.max_tokens, 2048);
         assert!((config.llm.defaults.temperature - 0.5).abs() < f64::EPSILON);
         assert!(config.llm.providers.contains_key("local"));
+        assert_eq!(config.llm.instance_models.len(), 1);
+        assert_eq!(config.llm.instance_models[0].id, "glm-5-1");
+    }
+
+    #[test]
+    fn instance_model_entries_round_trip_from_toml_in_declared_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[llm]
+default_provider = "relay"
+default_model = "default-model"
+
+[llm.providers.relay]
+api_base = "https://relay.example.com/v1"
+api_key = "fake-key"
+
+[[llm.instance_models]]
+id = "deepseek-v4-pro"
+label = "DeepSeek V4 Pro"
+provider = "relay"
+model = "deepseek-v4-pro"
+
+[[llm.instance_models]]
+id = "gemini-2-5-flash"
+label = "Gemini 2.5 Flash"
+provider = "relay"
+model = "gemini-2.5-flash"
+"#,
+        )
+        .unwrap();
+
+        let config = LlmConfig::load(&path).unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let deepseek = encoded.find("deepseek-v4-pro").unwrap();
+        let gemini = encoded.find("gemini-2-5-flash").unwrap();
+
+        assert!(deepseek < gemini);
+        assert!(encoded.contains("DeepSeek V4 Pro"));
+        assert!(encoded.contains("Gemini 2.5 Flash"));
+    }
+
+    fn config_with_instance_models() -> LlmConfig {
+        let mut config = LlmConfig::default_config();
+        config.llm.providers.insert(
+            "catalog".into(),
+            ProviderConfig {
+                api_base: "https://relay.example.com/v1".into(),
+                api_key: Some("fake-key".into()),
+                ..Default::default()
+            },
+        );
+        config.llm.providers.insert(
+            "without-key".into(),
+            ProviderConfig {
+                api_base: "https://relay.example.com/v1".into(),
+                api_key_env: "BRAIN_LLM_INSTANCE_MODEL_MISSING_KEY".into(),
+                ..Default::default()
+            },
+        );
+        config.llm.providers.insert(
+            "blank-key".into(),
+            ProviderConfig {
+                api_base: "https://relay.example.com/v1".into(),
+                api_key: Some("   ".into()),
+                ..Default::default()
+            },
+        );
+        config.llm.instance_models = vec![
+            InstanceModelConfig {
+                id: "deepseek-v4-pro".into(),
+                label: "DeepSeek V4 Pro".into(),
+                provider: "catalog".into(),
+                model: "deepseek-v4-pro".into(),
+            },
+            InstanceModelConfig {
+                id: "gemini-2-5-flash".into(),
+                label: "Gemini 2.5 Flash".into(),
+                provider: "catalog".into(),
+                model: "gemini-2.5-flash".into(),
+            },
+        ];
+        config
+    }
+
+    #[test]
+    fn available_instance_model_policies_keep_main_then_toml_order() {
+        let config = config_with_instance_models();
+
+        let policies = config.available_instance_model_policies();
+
+        assert_eq!(
+            policies
+                .iter()
+                .map(|policy| policy.policy_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main", "deepseek-v4-pro", "gemini-2-5-flash"]
+        );
+        assert_eq!(policies[0].label, "main");
+        assert_eq!(policies[1].label, "DeepSeek V4 Pro");
+        assert_eq!(policies[1].provider, "catalog");
+        assert_eq!(policies[1].model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn available_instance_model_policies_skip_invalid_catalog_entries() {
+        let mut config = config_with_instance_models();
+        config.llm.instance_models.extend([
+            InstanceModelConfig {
+                id: " ".into(),
+                label: "空标识".into(),
+                provider: "catalog".into(),
+                model: "empty-id".into(),
+            },
+            InstanceModelConfig {
+                id: "deepseek-v4-pro".into(),
+                label: "重复标识".into(),
+                provider: "catalog".into(),
+                model: "duplicate".into(),
+            },
+            InstanceModelConfig {
+                id: "unknown-provider".into(),
+                label: "未知厂商".into(),
+                provider: "does-not-exist".into(),
+                model: "unknown".into(),
+            },
+            InstanceModelConfig {
+                id: "without-key".into(),
+                label: "无密钥".into(),
+                provider: "without-key".into(),
+                model: "without-key".into(),
+            },
+            InstanceModelConfig {
+                id: "blank-key".into(),
+                label: "空白密钥".into(),
+                provider: "blank-key".into(),
+                model: "blank-key".into(),
+            },
+            InstanceModelConfig {
+                id: "blank-label".into(),
+                label: " \t".into(),
+                provider: "catalog".into(),
+                model: "blank-label".into(),
+            },
+            InstanceModelConfig {
+                id: "blank-model".into(),
+                label: "空白模型".into(),
+                provider: "catalog".into(),
+                model: " \t".into(),
+            },
+            InstanceModelConfig {
+                id: " spaced-id ".into(),
+                label: "空白边界 ID".into(),
+                provider: "catalog".into(),
+                model: "spaced-id-model".into(),
+            },
+        ]);
+
+        let policies = config.available_instance_model_policies();
+
+        assert_eq!(
+            policies
+                .iter()
+                .map(|policy| policy.policy_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main", "deepseek-v4-pro", "gemini-2-5-flash"]
+        );
+    }
+
+    #[test]
+    fn resolved_model_policy_without_label_remains_json_compatible() {
+        let policy: ResolvedModelPolicy = serde_json::from_str(
+            r#"{
+                "policy_id": "main",
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "max_output_tokens": 4096,
+                "temperature": 0.7
+            }"#,
+        )
+        .unwrap();
+
+        assert!(policy.label.is_empty());
+    }
+
+    #[test]
+    fn resolve_api_key_without_configured_source_has_clear_error() {
+        let mut config = LlmConfig::default_config();
+        config.llm.providers.insert(
+            "no-key-source".into(),
+            ProviderConfig {
+                api_base: "https://relay.example.com/v1".into(),
+                ..Default::default()
+            },
+        );
+
+        let error = config.resolve_api_key("no-key-source").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "API key not found: 未配置 api_key 或 api_key_env"
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_ignores_blank_values_without_changing_nonempty_priority() {
+        let mut config = LlmConfig::default_config();
+        let provider = config.llm.providers.get_mut("xiaomi").unwrap();
+        provider.api_key_env = "BRAIN_LLM_BLANK_API_KEY".into();
+        provider.api_key = Some("direct-key".into());
+        std::env::set_var("BRAIN_LLM_BLANK_API_KEY", " \t");
+
+        let resolved = config.resolve_api_key("xiaomi").unwrap();
+
+        assert_eq!(resolved, "direct-key");
+        config.llm.providers.get_mut("xiaomi").unwrap().api_key = Some(" \n".into());
+        assert!(config.resolve_api_key("xiaomi").is_err());
+        std::env::remove_var("BRAIN_LLM_BLANK_API_KEY");
+    }
+
+    #[test]
+    fn resolve_instance_model_policy_keeps_catalog_label_and_defaults() {
+        let config = config_with_instance_models();
+
+        let policy = config
+            .resolve_instance_model_policy("gemini-2-5-flash")
+            .unwrap();
+
+        assert_eq!(policy.policy_id, "gemini-2-5-flash");
+        assert_eq!(policy.label, "Gemini 2.5 Flash");
+        assert_eq!(policy.provider, "catalog");
+        assert_eq!(policy.model, "gemini-2.5-flash");
+        assert_eq!(policy.max_output_tokens, config.llm.defaults.max_tokens);
+        assert!((policy.temperature - config.llm.defaults.temperature).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn create_model_policy_client_uses_openai_compatible_catalog_model() {
+        let config = config_with_instance_models();
+
+        let client = config
+            .create_model_policy_client("deepseek-v4-pro")
+            .unwrap();
+
+        assert_eq!(client.model(), "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn create_model_policy_client_routes_gemini_catalog_model() {
+        let mut config = config_with_instance_models();
+        let provider = config.llm.providers.get_mut("catalog").unwrap();
+        provider.api_base = "https://generativelanguage.googleapis.com/v1beta".into();
+        provider.kind = ProviderKind::Gemini;
+
+        let client = config
+            .create_model_policy_client("gemini-2-5-flash")
+            .unwrap();
+
+        assert_eq!(client.model(), "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn create_model_policy_client_keeps_main_compatible() {
+        let mut config = config_with_instance_models();
+        config.llm.providers.get_mut("xiaomi").unwrap().api_key = Some("fake-key".into());
+
+        let client = config.create_model_policy_client("main").unwrap();
+
+        assert_eq!(client.model(), "mimo-7b");
     }
 
     #[test]
