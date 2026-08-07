@@ -22,6 +22,7 @@ use crate::web::ws_handler::{ws_upgrade, AppState};
 static INDEX_HTML: &str = include_str!("web/static/index.html");
 static STYLE_CSS: &str = include_str!("web/static/style.css");
 static APP_JS: &str = include_str!("web/static/app.js");
+static MENTIONS_JS: &str = include_str!("web/static/mentions.js");
 
 // ─── 请求/响应类型 ───────────────────────────────────────────────
 
@@ -409,6 +410,7 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
         .route("/app.js", get(serve_js))
+        .route("/mentions.js", get(serve_mentions_js))
         .route(
             "/api/local-file",
             get(serve_local_file).post(save_local_file),
@@ -511,6 +513,16 @@ async fn serve_js() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         APP_JS,
+    )
+}
+
+async fn serve_mentions_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        MENTIONS_JS,
     )
 }
 

@@ -459,25 +459,13 @@ function applyRoomSnapshot(snapshot) {
 }
 
 function reconcileSelectedMembers() {
-    if (!roomSnapshot) return;
-    const selectable = new Set(
-        roomSnapshot.members
-            .filter((member) => member.availability === 'active')
-            .map((member) => member.member_id),
-    );
-    [...selectedMemberIds].forEach((memberId) => {
-        if (!selectable.has(memberId)) selectedMemberIds.delete(memberId);
-    });
-    if (selectedMemberIds.size === 0) {
-        const defaultMember = roomSnapshot.members.find(
-            (member) => member.member_id === roomSnapshot.room.default_member_id
-                && member.availability === 'active',
-        );
-        const fallback = defaultMember || roomSnapshot.members.find(
-            (member) => member.availability === 'active',
-        );
-        if (fallback) selectedMemberIds.add(fallback.member_id);
-    }
+    if (!roomSnapshot) return false;
+    const next = MentionRecipients.recipientMemberIds($input.value, roomSnapshot.members);
+    const changed = next.size !== selectedMemberIds.size
+        || [...next].some((memberId) => !selectedMemberIds.has(memberId));
+    selectedMemberIds.clear();
+    next.forEach((memberId) => selectedMemberIds.add(memberId));
+    return changed;
 }
 
 function renderCollaborationRoom() {
@@ -591,25 +579,21 @@ function renderRecipientSelector() {
 }
 
 function setMemberSelected(memberId, selected) {
-    if (selected) selectedMemberIds.add(memberId);
-    else selectedMemberIds.delete(memberId);
+    const member = roomSnapshot?.members.find((candidate) => candidate.member_id === memberId);
+    if (!member || member.availability !== 'active') return;
+    $input.value = selected
+        ? MentionRecipients.appendMention($input.value, member.display_name)
+        : MentionRecipients.removeMention($input.value, member.display_name);
+    $input.style.height = 'auto';
+    $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
+    reconcileSelectedMembers();
     renderMemberList();
     renderRecipientSelector();
+    $input.focus();
 }
 
 function syncMentionRecipients() {
-    if (!roomSnapshot) return;
-    const value = $input.value;
-    let changed = false;
-    roomSnapshot.members.forEach((member) => {
-        if (member.availability === 'active'
-            && value.includes(`@${member.display_name}`)
-            && !selectedMemberIds.has(member.member_id)) {
-            selectedMemberIds.add(member.member_id);
-            changed = true;
-        }
-    });
-    if (changed) {
+    if (reconcileSelectedMembers()) {
         renderMemberList();
         renderRecipientSelector();
     }
@@ -1020,6 +1004,7 @@ function submitMemberForm() {
 function submitCollaborationMessage() {
     const content = $input.value.trim();
     if (!content) return;
+    syncMentionRecipients();
     const recipients = [...selectedMemberIds]
         .map((memberId) => roomSnapshot.members.find((member) => member.member_id === memberId))
         .filter(Boolean)
@@ -1044,6 +1029,9 @@ function submitCollaborationMessage() {
     });
     $input.value = '';
     $input.style.height = 'auto';
+    selectedMemberIds.clear();
+    renderMemberList();
+    renderRecipientSelector();
 }
 
 // ── Streaming Text (Typewriter) ─────────────────────────────────

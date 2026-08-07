@@ -29,6 +29,7 @@ use crate::web::collaboration::{
     ParticipationCompletion, ParticipationDisposition, PostMessageResult, RoomEventView,
     RoomInputMode, RoomSnapshot,
 };
+use crate::web::collaboration_tools::GroupMessageToolScope;
 use crate::web::progress_adapter::WebProgressEvent;
 
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -886,12 +887,20 @@ impl CollaborationRuntime {
                 ClaimRunError::pre_execution(format!("创建成员记忆作用域失败: {error}"))
             })?;
         let participation = claim.purpose == InboxPurpose::Participation;
+        let group_message_scope = claim.group_enabled.then(|| {
+            GroupMessageToolScope::new(
+                Arc::clone(&self.repository),
+                claim.room_id.clone(),
+                claim.context_through_seq,
+            )
+        });
         let (mut progress, handle, cancel) = self.orchestrator.query_member_streaming_scoped(
             context_snapshot,
             memory_scope,
             &execution_policy.model_policy,
             &execution_policy.reasoning_depth,
             execution_policy.allow_tools,
+            group_message_scope,
         );
         self.active_runs.lock().await.insert(
             claim.run_id.clone(),
@@ -1805,7 +1814,7 @@ mod tests {
     }
 
     #[test]
-    fn participation_task_snapshot_carries_group_lineage_and_purpose() {
+    fn direct_group_task_snapshot_carries_group_lineage_and_purpose() {
         let directory = tempfile::tempdir().unwrap();
         let config = CollaborationConfig::default();
         let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
@@ -1813,29 +1822,25 @@ mod tests {
             .ensure_room("room-1", "Task Room", &[])
             .unwrap();
         collaboration
-            .create_member("room-1", "智脑 B", None, None)
-            .unwrap();
-        collaboration
             .post_group_message(
                 "room-1",
                 std::slice::from_ref(&room.room.default_member_id),
                 "一起判断",
                 RoomInputMode::Chat,
-                "participation-task",
+                "direct-group-task",
             )
             .unwrap();
-        let _direct = collaboration.lease_next().unwrap().unwrap();
-        let participation = collaboration.lease_next().unwrap().unwrap();
-        assert_eq!(participation.purpose, InboxPurpose::Participation);
+        let direct = collaboration.lease_next().unwrap().unwrap();
+        assert_eq!(direct.purpose, InboxPurpose::Direct);
 
         let llm = LlmConfig::default_config();
-        let model = llm.resolve_model_policy(&participation.model_policy);
-        let context = task_context_snapshot("context-participation", "decide whether to reply");
-        let request = task_request_for_claim(&participation, &config, &model, &context);
+        let model = llm.resolve_model_policy(&direct.model_policy);
+        let context = task_context_snapshot("context-direct", "处理明确发给你的消息");
+        let request = task_request_for_claim(&direct, &config, &model, &context);
 
-        assert_eq!(request.workflow, "collaboration.member-participation");
+        assert_eq!(request.workflow, "collaboration.member-chat");
         assert_eq!(request.config_version, "collaboration-task-v3");
-        assert_eq!(request.resolved_config["purpose"], "participation");
+        assert_eq!(request.resolved_config["purpose"], "direct");
         assert_eq!(
             request.resolved_config["context_snapshot_id"],
             context.context_snapshot_id
@@ -1853,11 +1858,11 @@ mod tests {
         );
         assert_eq!(
             request.resolved_config["conversation_root_event_id"],
-            participation.conversation_root_event_id
+            direct.conversation_root_event_id
         );
         assert_eq!(
             request.resolved_config["context_through_sequence"],
-            participation.context_through_seq
+            direct.context_through_seq
         );
     }
 
@@ -1916,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_silent_participation_reconciles_without_a_room_reply() {
+    fn durable_direct_group_result_appends_a_public_room_reply() {
         let directory = tempfile::tempdir().unwrap();
         let collaboration =
             CollaborationRepository::new(directory.path(), CollaborationConfig::default()).unwrap();
@@ -1924,37 +1929,34 @@ mod tests {
             .ensure_room("room-1", "Task Room", &[])
             .unwrap();
         collaboration
-            .create_member("room-1", "智脑 B", None, None)
-            .unwrap();
-        collaboration
             .post_group_message(
                 "room-1",
                 std::slice::from_ref(&room.room.default_member_id),
-                "是否需要补充",
+                "请直接回答",
                 RoomInputMode::Chat,
-                "durable-silent",
+                "durable-direct",
             )
             .unwrap();
-        let _direct = collaboration.lease_next().unwrap().unwrap();
-        let participation = collaboration.lease_next().unwrap().unwrap();
+        let direct = collaboration.lease_next().unwrap().unwrap();
 
         let completion = reconcile_durable_result(
             &collaboration,
-            &participation.inbox_item_id,
-            &participation.task_run_id,
-            "durable-participation-run",
-            "[[NO_REPLY]]",
+            &direct.inbox_item_id,
+            &direct.task_run_id,
+            "durable-direct-run",
+            "明确的回复",
         )
         .unwrap()
         .unwrap();
 
-        assert_eq!(completion.disposition, ParticipationDisposition::Silent);
-        assert!(completion.event.is_none());
+        assert_eq!(completion.disposition, ParticipationDisposition::Replied);
+        assert_eq!(completion.event.as_ref().unwrap().content, "明确的回复");
+        assert!(completion.event.as_ref().unwrap().audience.is_empty());
         let persisted = collaboration.snapshot("room-1").unwrap();
         assert!(persisted
             .events
             .iter()
-            .all(|event| event.kind != "member_message"));
+            .any(|event| event.kind == "member_message" && event.content == "明确的回复"));
     }
 
     #[test]
