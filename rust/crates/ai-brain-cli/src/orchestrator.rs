@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use crate::llm_usage_logger;
 use crate::runtime_trace::{ExchangeKind, ExchangePhase, ExchangeStatus, RuntimeExchange};
+use crate::web::collaboration_tools::{
+    group_message_tool_definition, GroupMessageToolExecutor, GroupMessageToolScope,
+};
 
 /// 按字符数安全截断 UTF-8 字符串（不会在多字节字符中间切割）
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
@@ -1177,6 +1180,7 @@ impl Orchestrator {
         model_policy: &str,
         reasoning_depth: &str,
         allow_tools: bool,
+        group_message_scope: Option<GroupMessageToolScope>,
     ) -> (
         tokio::sync::mpsc::Receiver<ProgressEvent>,
         tokio::task::JoinHandle<Result<MainBrainOutput, MemberQueryError>>,
@@ -1223,7 +1227,24 @@ impl Orchestrator {
                 let template = template.as_ref().ok_or_else(|| {
                     MemberQueryError::before_execution("MainBrain 当前不可用，无法创建成员运行")
                 })?;
-                template.fork_isolated_with_llm(Arc::from(client), max_tokens, temperature)
+                if allow_tools {
+                    if let Some(scope) = group_message_scope {
+                        template.fork_isolated_with_llm_and_executor(
+                            Arc::from(client),
+                            Arc::new(GroupMessageToolExecutor::new(
+                                template.tool_executor(),
+                                scope,
+                            )),
+                            vec![group_message_tool_definition()],
+                            max_tokens,
+                            temperature,
+                        )
+                    } else {
+                        template.fork_isolated_with_llm(Arc::from(client), max_tokens, temperature)
+                    }
+                } else {
+                    template.fork_isolated_with_llm(Arc::from(client), max_tokens, temperature)
+                }
             };
             if !allow_tools {
                 brain.register_tools(Vec::new());

@@ -84,24 +84,53 @@ impl MainBrain {
     /// Durable collaboration members call this for every admitted run. The
     /// returned runtime can safely execute alongside other forks because no
     /// mutable conversation state is shared.
+    #[must_use]
     pub fn fork_isolated_with_llm(
         &self,
         llm: Arc<dyn LlmProvider>,
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
-        let mut fork = Self::new(
+        self.fork_isolated_with_llm_and_executor(
             llm,
             Arc::clone(&self.tool_executor),
+            Vec::new(),
+            llm_max_tokens,
+            llm_temperature,
+        )
+    }
+
+    /// Create an isolated runtime with a request-scoped tool executor.
+    ///
+    /// The fork keeps the template's tool definitions and can append narrowly
+    /// scoped definitions that are valid only for this execution.
+    #[must_use]
+    pub fn fork_isolated_with_llm_and_executor(
+        &self,
+        llm: Arc<dyn LlmProvider>,
+        tool_executor: Arc<dyn ToolExecutor>,
+        additional_tools: Vec<ToolDefinition>,
+        llm_max_tokens: u32,
+        llm_temperature: f64,
+    ) -> Self {
+        let mut fork = Self::new(
+            llm,
+            tool_executor,
             self.config.clone(),
             llm_max_tokens,
             llm_temperature,
         );
-        fork.tools = self.tools.clone();
+        fork.tools.clone_from(&self.tools);
+        fork.tools.extend(additional_tools);
         fork.memory_context.clone_from(&self.memory_context);
         fork.skill_summary.clone_from(&self.skill_summary);
         fork.bootstrap_content.clone_from(&self.bootstrap_content);
         fork
+    }
+
+    /// 返回可复用的工具执行基础设施，供请求专属执行器进行受控包装。
+    pub fn tool_executor(&self) -> Arc<dyn ToolExecutor> {
+        Arc::clone(&self.tool_executor)
     }
 
     /// 注册可用工具

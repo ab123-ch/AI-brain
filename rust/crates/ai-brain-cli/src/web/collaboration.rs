@@ -4,6 +4,7 @@
 //! tool execution happens in `collaboration_runtime` after a claim has been
 //! committed and every database handle has been released.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use task_engine::SchedulerLimits;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const DEFAULT_PROFILE_ID: &str = "general_member";
 pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
@@ -62,6 +63,8 @@ pub enum CollaborationError {
     EmptyMemberReply,
     #[error("成员名称不能为空")]
     EmptyMemberName,
+    #[error("房间内已存在同名的活动成员: {0}")]
+    DuplicateMemberName(String),
     #[error("不允许使用模型策略: {0}")]
     ModelPolicyNotAllowed(String),
     #[error("不允许使用思考深度: {0}")]
@@ -1100,6 +1103,19 @@ impl CollaborationRepository {
             )?;
             version = 5;
         }
+        if version == 5 {
+            normalize_active_member_display_names(&connection)?;
+            connection.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS brain_members_active_display_name_idx
+                     ON brain_members(room_id, display_name COLLATE NOCASE)
+                     WHERE availability != 'archived';",
+            )?;
+            connection.execute(
+                "UPDATE collaboration_schema SET version = 6 WHERE singleton = 1",
+                [],
+            )?;
+            version = 6;
+        }
         if version != SCHEMA_VERSION {
             return Err(CollaborationError::Config(format!(
                 "不支持的协作存储版本 {version}"
@@ -1347,6 +1363,7 @@ impl CollaborationRepository {
                 self.config.max_members_per_room,
             ));
         }
+        ensure_unique_active_member_display_name(&transaction, room_id, display_name, None)?;
         let member_id = format!("member-{}", Uuid::new_v4());
         let now = Utc::now();
         transaction.execute(
@@ -1461,6 +1478,12 @@ impl CollaborationRepository {
                 RoomCapability::OverrideMemberReasoning,
             )?;
         }
+        ensure_unique_active_member_display_name(
+            &transaction,
+            room_id,
+            display_name,
+            Some(member_id),
+        )?;
         let updated = transaction.execute(
             "UPDATE brain_members
              SET display_name = ?1, model_policy = ?2, reasoning_depth = ?3, version = version + 1
@@ -1601,12 +1624,12 @@ impl CollaborationRepository {
             }
         };
         require_capability(&transaction, actor, room_id, capability)?;
-        let (current, actual_version): (String, u64) = transaction
+        let (current, display_name, actual_version): (String, String, u64) = transaction
             .query_row(
-                "SELECT availability, version FROM brain_members
+                "SELECT availability, display_name, version FROM brain_members
                  WHERE room_id = ?1 AND member_id = ?2",
                 params![room_id, member_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
             .ok_or_else(|| CollaborationError::MemberNotFound(member_id.into()))?;
@@ -1643,6 +1666,14 @@ impl CollaborationRepository {
                 }
             }
         };
+        if current == MemberAvailability::Archived && next == MemberAvailability::Active {
+            ensure_unique_active_member_display_name(
+                &transaction,
+                room_id,
+                &display_name,
+                Some(member_id),
+            )?;
+        }
         let now = Utc::now().to_rfc3339();
         let updated = transaction.execute(
             "UPDATE brain_members
@@ -1951,32 +1982,6 @@ impl CollaborationRepository {
             }
         }
 
-        let audience_members = if group_enabled {
-            let mut statement = transaction.prepare(
-                "SELECT member_id, availability, version,
-                        (SELECT COUNT(*) FROM member_inbox_items i
-                         WHERE i.member_id = brain_members.member_id
-                           AND i.state IN ('pending', 'leased', 'running'))
-                 FROM brain_members
-                 WHERE room_id = ?1 AND availability != 'archived'
-                 ORDER BY created_at, member_id",
-            )?;
-            let members = statement
-                .query_map([room_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        MemberAvailability::from_db(&row.get::<_, String>(1)?),
-                        row.get::<_, u64>(2)?,
-                        row.get::<_, usize>(3)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(statement);
-            members
-        } else {
-            Vec::new()
-        };
-
         let event_id = format!("event-{}", Uuid::new_v4());
         let sequence = allocate_room_sequence(&transaction, room_id)?;
         let now = Utc::now();
@@ -2000,11 +2005,7 @@ impl CollaborationRepository {
                 now.to_rfc3339(),
             ],
         )?;
-        let mut inbox_items = Vec::with_capacity(if group_enabled {
-            audience_members.len()
-        } else {
-            recipient_list.len()
-        });
+        let mut inbox_items = Vec::with_capacity(recipient_list.len());
         for recipient in &recipient_list {
             let member_id = &recipient.member_id;
             transaction.execute(
@@ -2038,65 +2039,6 @@ impl CollaborationRepository {
             inbox_items.push(item);
         }
 
-        let mut room_pending_after_insert = room_pending + recipient_list.len();
-        if group_enabled {
-            for (member_id, _availability, member_version, member_pending) in &audience_members {
-                if recipient_list
-                    .iter()
-                    .any(|recipient| recipient.member_id == *member_id)
-                {
-                    continue;
-                }
-                let can_participate = mode == RoomInputMode::Chat
-                    && *member_pending < self.config.max_pending_items_per_member
-                    && room_pending_after_insert < self.config.max_pending_items_per_room;
-                if can_participate {
-                    let item = insert_inbox_item(
-                        &transaction,
-                        member_id,
-                        &event_id,
-                        thread_key,
-                        mode,
-                        InboxPurpose::Participation,
-                        &event_id,
-                        *member_version,
-                        &format!("{idempotency_key}:participation:{member_id}"),
-                        &now,
-                    )?;
-                    insert_delivery(
-                        &transaction,
-                        &event_id,
-                        member_id,
-                        DeliveryKind::Ambient,
-                        DeliveryState::Queued,
-                        Some(&item.inbox_item_id),
-                        None,
-                        &now,
-                    )?;
-                    room_pending_after_insert += 1;
-                    inbox_items.push(item);
-                } else {
-                    insert_delivery(
-                        &transaction,
-                        &event_id,
-                        member_id,
-                        DeliveryKind::Ambient,
-                        if mode == RoomInputMode::Task {
-                            DeliveryState::Observed
-                        } else {
-                            DeliveryState::Suppressed
-                        },
-                        None,
-                        Some(if mode == RoomInputMode::Task {
-                            "task_observer"
-                        } else {
-                            "inbox_capacity"
-                        }),
-                        &now,
-                    )?;
-                }
-            }
-        }
         transaction.execute(
             "UPDATE collaboration_rooms
              SET title = CASE WHEN title = 'New Session' THEN ?1 ELSE title END,
@@ -2122,10 +2064,7 @@ impl CollaborationRepository {
                 .into_iter()
                 .map(|recipient| recipient.member_id)
                 .collect(),
-            audience: audience_members
-                .into_iter()
-                .map(|(member_id, _, _, _)| member_id)
-                .collect(),
+            audience: Vec::new(),
             kind: "user_message".into(),
             content: content.into(),
             run_id: None,
@@ -2493,30 +2432,35 @@ impl CollaborationRepository {
         }
         if claim.group_enabled {
             let mut statement = connection.prepare(
-                "SELECT e.event_id, e.sequence, e.sender_kind, e.sender_id,
+                "WITH recent_user_events AS (
+                    SELECT e.sequence
+                    FROM room_events e
+                    WHERE e.room_id = ?1
+                      AND e.sequence <= ?2
+                      AND e.invalidated_at IS NULL
+                      AND e.kind = 'user_message'
+                    ORDER BY e.sequence DESC
+                    LIMIT 3
+                 ), window_start AS (
+                    SELECT MIN(sequence) AS sequence FROM recent_user_events
+                 )
+                 SELECT e.event_id, e.sequence, e.sender_kind, e.sender_id,
                         e.sender_name, e.content
                  FROM room_events e
+                 CROSS JOIN window_start w
                  WHERE e.room_id = ?1
+                   AND e.sequence >= w.sequence
                    AND e.sequence < ?2
                    AND e.invalidated_at IS NULL
                    AND e.kind IN ('user_message', 'member_message')
                    AND (
-                       (e.sender_kind = 'member' AND e.sender_id = ?3)
-                       OR EXISTS (
-                           SELECT 1 FROM room_event_deliveries d
-                           WHERE d.event_id = e.event_id AND d.member_id = ?3
-                       )
+                       e.sender_kind = 'user'
+                       OR (e.sender_kind = 'member' AND e.sender_id = ?3)
                    )
-                 ORDER BY e.sequence DESC
-                 LIMIT ?4",
+                 ORDER BY e.sequence ASC",
             )?;
             let rows = statement.query_map(
-                params![
-                    claim.room_id,
-                    claim.source_event_seq,
-                    claim.member_id,
-                    self.config.max_history_events_per_run,
-                ],
+                params![claim.room_id, claim.source_event_seq, claim.member_id],
                 |row| {
                     let event_id: String = row.get(0)?;
                     let sequence: u64 = row.get(1)?;
@@ -2542,9 +2486,9 @@ impl CollaborationRepository {
                     })
                 },
             )?;
-            let mut history = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-            history.reverse();
-            return Ok(history);
+            return rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into);
         }
         let mut statement = connection.prepare(
             "SELECT e.event_id, e.sequence, e.sender_kind, e.content
@@ -2661,7 +2605,7 @@ impl CollaborationRepository {
                 now.to_rfc3339(),
             ],
         )?;
-        let mut event = RoomEventView {
+        let event = RoomEventView {
             event_id: event_id.clone(),
             room_id: claim.room_id.clone(),
             sequence,
@@ -2680,148 +2624,7 @@ impl CollaborationRepository {
             conversation_mode,
             created_at: *now,
         };
-        if group_enabled {
-            event.audience =
-                self.expand_member_reply_deliveries(transaction, claim, &event, now)?;
-        }
         Ok(event)
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn expand_member_reply_deliveries(
-        &self,
-        transaction: &Transaction<'_>,
-        claim: &ClaimedInboxItem,
-        event: &RoomEventView,
-        now: &DateTime<Utc>,
-    ) -> Result<Vec<String>> {
-        let total_replies: usize = transaction.query_row(
-            "SELECT COUNT(*) FROM room_events
-             WHERE room_id = ?1
-               AND COALESCE(conversation_root_event_id, event_id) = ?2
-               AND kind = 'member_message'
-               AND invalidated_at IS NULL",
-            params![claim.room_id, event.conversation_root_event_id],
-            |row| row.get(0),
-        )?;
-        let mut room_pending: usize = transaction.query_row(
-            "SELECT COUNT(*)
-             FROM member_inbox_items i
-             JOIN brain_members m ON m.member_id = i.member_id
-             WHERE m.room_id = ?1 AND i.state IN ('pending', 'leased', 'running')",
-            [claim.room_id.as_str()],
-            |row| row.get(0),
-        )?;
-        let mut statement = transaction.prepare(
-            "SELECT m.member_id, m.version,
-                    (SELECT COUNT(*) FROM member_inbox_items i
-                     WHERE i.member_id = m.member_id
-                       AND i.state IN ('pending', 'leased', 'running')),
-                    (SELECT COUNT(*) FROM room_events response
-                     WHERE response.room_id = m.room_id
-                       AND COALESCE(response.conversation_root_event_id, response.event_id) = ?2
-                       AND response.kind = 'member_message'
-                       AND response.sender_id = m.member_id
-                       AND response.invalidated_at IS NULL),
-                    EXISTS(
-                        SELECT 1 FROM member_inbox_items active
-                        WHERE active.member_id = m.member_id
-                          AND COALESCE(active.conversation_root_event_id, active.source_event_id) = ?2
-                          AND active.purpose = 'participation'
-                          AND active.state IN ('pending', 'leased', 'running')
-                    )
-             FROM brain_members m
-             WHERE m.room_id = ?1 AND m.availability != 'archived' AND m.member_id != ?3
-             ORDER BY m.created_at, m.member_id",
-        )?;
-        let members = statement
-            .query_map(
-                params![
-                    claim.room_id,
-                    event.conversation_root_event_id,
-                    claim.member_id
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, u64>(1)?,
-                        row.get::<_, usize>(2)?,
-                        row.get::<_, usize>(3)?,
-                        row.get::<_, bool>(4)?,
-                    ))
-                },
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
-
-        let mut audience = Vec::with_capacity(members.len());
-        for (member_id, member_version, member_pending, response_count, already_pending) in members
-        {
-            audience.push(member_id.clone());
-            let within_limits = event.conversation_mode == RoomInputMode::Chat
-                && event.debate_depth < self.config.max_debate_depth
-                && total_replies < self.config.max_group_replies_per_conversation
-                && response_count < self.config.max_group_replies_per_member;
-            if already_pending {
-                insert_delivery(
-                    transaction,
-                    &event.event_id,
-                    &member_id,
-                    DeliveryKind::Ambient,
-                    DeliveryState::Deferred,
-                    None,
-                    Some("participation_already_pending"),
-                    now,
-                )?;
-            } else if within_limits
-                && member_pending < self.config.max_pending_items_per_member
-                && room_pending < self.config.max_pending_items_per_room
-            {
-                let item = insert_inbox_item(
-                    transaction,
-                    &member_id,
-                    &event.event_id,
-                    &claim.thread_key,
-                    event.conversation_mode,
-                    InboxPurpose::Participation,
-                    &event.conversation_root_event_id,
-                    member_version,
-                    &format!("participation:{}:{member_id}", event.event_id),
-                    now,
-                )?;
-                insert_delivery(
-                    transaction,
-                    &event.event_id,
-                    &member_id,
-                    DeliveryKind::Ambient,
-                    DeliveryState::Queued,
-                    Some(&item.inbox_item_id),
-                    None,
-                    now,
-                )?;
-                room_pending += 1;
-            } else {
-                insert_delivery(
-                    transaction,
-                    &event.event_id,
-                    &member_id,
-                    DeliveryKind::Ambient,
-                    if event.conversation_mode == RoomInputMode::Task {
-                        DeliveryState::Observed
-                    } else {
-                        DeliveryState::Suppressed
-                    },
-                    None,
-                    Some(if within_limits {
-                        "inbox_capacity"
-                    } else {
-                        "debate_limit"
-                    }),
-                    now,
-                )?;
-            }
-        }
-        Ok(audience)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3642,6 +3445,23 @@ impl CollaborationRepository {
         events_after_from_connection(&connection, room_id, after_sequence, limit)
     }
 
+    /// 返回不晚于指定上下文边界的公共群消息，按发送顺序排列。
+    pub fn events_through(
+        &self,
+        room_id: &str,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<RoomEventView>> {
+        let connection = self.connect()?;
+        require_capability(
+            &connection,
+            &CollaborationActor::local(),
+            room_id,
+            RoomCapability::RoomRead,
+        )?;
+        events_through_from_connection(&connection, room_id, through_sequence, limit)
+    }
+
     pub fn retry_last_user_event(&self, room_id: &str, event_id: &str) -> Result<RoomSnapshot> {
         self.retry_last_user_event_with_runs(room_id, event_id)
             .map(|(snapshot, _)| snapshot)
@@ -4018,6 +3838,79 @@ fn ensure_version(entity: &'static str, id: &str, expected: u64, actual: u64) ->
             actual,
         })
     }
+}
+
+fn normalize_active_member_display_names(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT room_id, member_id, display_name
+         FROM brain_members
+         WHERE availability != 'archived'
+         ORDER BY room_id, created_at, member_id",
+    )?;
+    let members = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut names_by_room = std::collections::HashMap::<String, Vec<(String, String)>>::new();
+    for (room_id, member_id, display_name) in members {
+        names_by_room
+            .entry(room_id)
+            .or_default()
+            .push((member_id, display_name));
+    }
+    for (room_id, members) in names_by_room {
+        let mut used = members
+            .iter()
+            .map(|(_, display_name)| display_name.to_lowercase())
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        for (member_id, display_name) in members {
+            if seen.insert(display_name.to_lowercase()) {
+                continue;
+            }
+            let mut suffix = 2_u32;
+            let replacement = loop {
+                let candidate = format!("{display_name} ({suffix})");
+                if used.insert(candidate.to_lowercase()) {
+                    break candidate;
+                }
+                suffix += 1;
+            };
+            connection.execute(
+                "UPDATE brain_members SET display_name = ?1 WHERE room_id = ?2 AND member_id = ?3",
+                params![replacement, room_id, member_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unique_active_member_display_name(
+    connection: &Connection,
+    room_id: &str,
+    display_name: &str,
+    excluding_member_id: Option<&str>,
+) -> Result<()> {
+    let duplicate: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM brain_members
+             WHERE room_id = ?1
+               AND availability != 'archived'
+               AND display_name = ?2 COLLATE NOCASE
+               AND (?3 IS NULL OR member_id != ?3)
+         )",
+        params![room_id, display_name, excluding_member_id],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(CollaborationError::DuplicateMemberName(display_name.into()));
+    }
+    Ok(())
 }
 
 fn member_version(connection: &Connection, room_id: &str, member_id: &str) -> Result<u64> {
@@ -4528,6 +4421,39 @@ fn events_after_from_connection(
             Ok(event)
         })
         .collect()
+}
+
+fn events_through_from_connection(
+    connection: &Connection,
+    room_id: &str,
+    through_sequence: u64,
+    limit: usize,
+) -> Result<Vec<RoomEventView>> {
+    let mut statement = connection.prepare(
+        "SELECT event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                kind, content, run_id, parent_event_id,
+                COALESCE(conversation_root_event_id, event_id), debate_depth,
+                group_enabled, conversation_mode, created_at
+         FROM room_events
+         WHERE room_id = ?1 AND sequence <= ?2 AND invalidated_at IS NULL
+         ORDER BY sequence DESC LIMIT ?3",
+    )?;
+    let rows = statement
+        .query_map(
+            params![room_id, through_sequence, limit],
+            event_from_row_without_recipients,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut events = rows
+        .into_iter()
+        .map(|mut event| {
+            event.recipients = recipients_for_event(connection, &event.event_id)?;
+            event.audience = audience_for_event(connection, &event.event_id)?;
+            Ok(event)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    events.reverse();
+    Ok(events)
 }
 
 fn inbox_from_connection(
@@ -5302,7 +5228,306 @@ mod tests {
     }
 
     #[test]
-    fn group_message_separates_direct_targets_from_all_member_delivery() {
+    fn group_member_history_keeps_three_latest_user_messages_and_own_replies() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        let b = repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap()
+            .member_id;
+
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "用户消息 1",
+                RoomInputMode::Chat,
+                "history-1",
+            )
+            .unwrap();
+        let first = repository.claim_next().unwrap().unwrap();
+        repository
+            .complete_item(&first, "A 对消息 1 的回复")
+            .unwrap();
+
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&b),
+                "用户消息 2",
+                RoomInputMode::Chat,
+                "history-2",
+            )
+            .unwrap();
+        let second = repository.claim_next().unwrap().unwrap();
+        repository
+            .complete_item(&second, "B 对消息 2 的回复")
+            .unwrap();
+
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "用户消息 3",
+                RoomInputMode::Chat,
+                "history-3",
+            )
+            .unwrap();
+        let third = repository.claim_next().unwrap().unwrap();
+        repository
+            .complete_item(&third, "A 对消息 3 的回复")
+            .unwrap();
+
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&b),
+                "用户消息 4",
+                RoomInputMode::Chat,
+                "history-4",
+            )
+            .unwrap();
+        let fourth = repository.claim_next().unwrap().unwrap();
+        repository
+            .complete_item(&fourth, "B 对消息 4 的回复")
+            .unwrap();
+
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "用户消息 5",
+                RoomInputMode::Chat,
+                "history-5",
+            )
+            .unwrap();
+        let fifth = repository.claim_next().unwrap().unwrap();
+        assert_eq!(fifth.member_id, a);
+        assert_eq!(fifth.input, "用户消息 5");
+
+        let history = repository.member_history(&fifth).unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(history
+            .iter()
+            .any(|message| message.content.contains("用户消息 3")));
+        assert!(history
+            .iter()
+            .any(|message| message.content.contains("A 对消息 3 的回复")));
+        assert!(history
+            .iter()
+            .any(|message| message.content.contains("用户消息 4")));
+        for unexpected in [
+            "用户消息 1",
+            "A 对消息 1 的回复",
+            "用户消息 2",
+            "B 对消息 2 的回复",
+            "B 对消息 4 的回复",
+        ] {
+            assert!(!history
+                .iter()
+                .any(|message| message.content.contains(unexpected)));
+        }
+    }
+
+    #[test]
+    fn events_through_stops_at_the_claim_context_boundary() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        let first = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "边界内消息",
+                RoomInputMode::Chat,
+                "tool-boundary-1",
+            )
+            .unwrap();
+        let second = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "边界外消息",
+                RoomInputMode::Chat,
+                "tool-boundary-2",
+            )
+            .unwrap();
+
+        let events = repository
+            .events_through("room-1", first.event.sequence, 10)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, first.event.event_id);
+        assert!(!events
+            .iter()
+            .any(|event| event.event_id == second.event.event_id));
+    }
+
+    #[test]
+    fn group_message_only_queues_explicit_recipients() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        let b = repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap()
+            .member_id;
+        let c = repository
+            .create_member("room-1", "智脑 C", None, None)
+            .unwrap()
+            .member_id;
+
+        let posted = repository
+            .post_group_message(
+                "room-1",
+                &[a.clone(), b.clone()],
+                "@A @B 只唤醒指定实例",
+                RoomInputMode::Chat,
+                "addressed-only",
+            )
+            .unwrap();
+
+        let mut recipients = posted.event.recipients.clone();
+        recipients.sort();
+        let mut expected_recipients = vec![a.clone(), b.clone()];
+        expected_recipients.sort();
+        assert_eq!(recipients, expected_recipients);
+        assert!(posted.event.audience.is_empty());
+        assert_eq!(posted.inbox_items.len(), 2);
+        assert!(posted
+            .inbox_items
+            .iter()
+            .all(|item| item.purpose == InboxPurpose::Direct));
+        assert!(posted.inbox_items.iter().all(|item| item.member_id != c));
+        assert!(repository.claim_next().unwrap().is_some());
+        assert!(repository.claim_next().unwrap().is_some());
+        assert!(repository.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn active_member_display_names_are_unique_within_a_room() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        let b = repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap();
+
+        assert!(matches!(
+            repository.create_member("room-1", "智脑 B", None, None),
+            Err(CollaborationError::DuplicateMemberName(name)) if name == "智脑 B"
+        ));
+        assert!(matches!(
+            repository.configure_member(
+                "room-1",
+                &b.member_id,
+                &snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == a)
+                    .unwrap()
+                    .display_name,
+                &b.model_policy,
+                &b.reasoning_depth,
+                b.version,
+            ),
+            Err(CollaborationError::DuplicateMemberName(_))
+        ));
+        repository.archive_member("room-1", &b.member_id).unwrap();
+        repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap();
+        assert!(matches!(
+            repository.restore_member("room-1", &b.member_id),
+            Err(CollaborationError::DuplicateMemberName(name)) if name == "智脑 B"
+        ));
+    }
+
+    #[test]
+    fn version_five_migration_normalizes_duplicate_active_member_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            CollaborationRepository::new(directory.path(), CollaborationConfig::default()).unwrap();
+        ensure(&repository);
+        let first = repository
+            .create_member("room-1", "重复名称", None, None)
+            .unwrap();
+        let second = repository
+            .create_member("room-1", "待替换名称", None, None)
+            .unwrap();
+        let connection = repository.connect().unwrap();
+        connection
+            .execute("DROP INDEX brain_members_active_display_name_idx", [])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE brain_members SET display_name = '重复名称' WHERE member_id = ?1",
+                [&second.member_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE collaboration_schema SET version = 5 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated =
+            CollaborationRepository::new(directory.path(), CollaborationConfig::default())
+                .unwrap()
+                .snapshot("room-1")
+                .unwrap();
+        assert!(
+            migrated
+                .members
+                .iter()
+                .any(|member| member.member_id == first.member_id
+                    && member.display_name == "重复名称")
+        );
+        assert!(migrated.members.iter().any(|member| {
+            member.member_id == second.member_id && member.display_name == "重复名称 (2)"
+        }));
+    }
+
+    #[test]
+    fn direct_member_reply_is_appended_without_waking_other_members() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        let b = repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap()
+            .member_id;
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "只问 A",
+                RoomInputMode::Chat,
+                "only-a",
+            )
+            .unwrap();
+
+        let claim = repository.claim_next().unwrap().unwrap();
+        let reply = repository
+            .complete_item(&claim, "A 的答复")
+            .unwrap()
+            .unwrap();
+        assert!(reply.audience.is_empty());
+        assert!(reply.recipients.is_empty());
+        assert!(repository.claim_next().unwrap().is_none());
+        assert!(!repository
+            .snapshot("room-1")
+            .unwrap()
+            .inbox
+            .iter()
+            .any(|item| item.member_id == b));
+    }
+
+    #[test]
+    fn group_message_queues_only_explicit_recipients() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
@@ -5326,12 +5551,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(posted.event.recipients, vec![a.clone()]);
-        let mut audience = posted.event.audience.clone();
-        audience.sort();
-        let mut expected_audience = vec![a.clone(), b.clone(), c.clone()];
-        expected_audience.sort();
-        assert_eq!(audience, expected_audience);
-        assert_eq!(posted.inbox_items.len(), 3);
+        assert!(posted.event.audience.is_empty());
+        assert_eq!(posted.inbox_items.len(), 1);
         assert_eq!(
             posted
                 .inbox_items
@@ -5340,28 +5561,20 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            posted
-                .inbox_items
-                .iter()
-                .filter(|item| item.purpose == InboxPurpose::Participation)
-                .count(),
-            2
-        );
         let room = repository.snapshot("room-1").unwrap();
         let deliveries = room
             .deliveries
             .iter()
             .filter(|delivery| delivery.event_id == posted.event.event_id)
             .collect::<Vec<_>>();
-        assert_eq!(deliveries.len(), 3);
-        assert!(deliveries.iter().all(|delivery| {
-            delivery.member_id == a || delivery.member_id == b || delivery.member_id == c
-        }));
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].member_id, a);
+        assert!(!room.inbox.iter().any(|item| item.member_id == b));
+        assert!(!room.inbox.iter().any(|item| item.member_id == c));
     }
 
     #[test]
-    fn ambient_member_can_choose_silence_without_publishing_a_reply() {
+    fn unmentioned_member_does_not_receive_a_group_message() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
@@ -5373,46 +5586,25 @@ mod tests {
             .post_group_message(
                 "room-1",
                 std::slice::from_ref(&a),
-                "只在能补充新观点时发言",
+                "只唤醒被 @ 的实例",
                 RoomInputMode::Chat,
-                "group-silence",
+                "only-mentioned",
             )
             .unwrap();
 
         let direct = repository.claim_next().unwrap().unwrap();
         assert_eq!(direct.member_id, a);
         assert_eq!(direct.purpose, InboxPurpose::Direct);
-        let ambient = repository.claim_next().unwrap().unwrap();
-        assert_eq!(ambient.member_id, b);
-        assert_eq!(ambient.purpose, InboxPurpose::Participation);
-
-        let completion = repository
-            .complete_participation_item(&ambient, None)
-            .unwrap();
-        assert_eq!(completion.disposition, ParticipationDisposition::Silent);
-        assert!(completion.event.is_none());
-
         let persisted = repository.snapshot("room-1").unwrap();
-        let ambient_item = persisted
-            .inbox
-            .iter()
-            .find(|item| item.inbox_item_id == ambient.inbox_item_id)
-            .unwrap();
-        assert_eq!(ambient_item.state, InboxState::Completed);
-        assert!(persisted
-            .events
-            .iter()
-            .all(|event| event.kind != "member_message"));
-        let delivery = persisted
-            .deliveries
-            .iter()
-            .find(|delivery| delivery.event_id == posted.event.event_id && delivery.member_id == b)
-            .unwrap();
-        assert_eq!(delivery.state, DeliveryState::Silent);
+        assert!(!persisted.inbox.iter().any(|item| item.member_id == b));
+        assert!(!persisted.deliveries.iter().any(|delivery| {
+            delivery.event_id == posted.event.event_id && delivery.member_id == b
+        }));
+        assert!(repository.claim_next().unwrap().is_none());
     }
 
     #[test]
-    fn member_reply_reaches_other_members_and_latest_context_is_used_after_deferral() {
+    fn member_reply_is_public_but_does_not_wake_other_members() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
@@ -5441,12 +5633,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(reply.recipients.is_empty());
-        let mut reply_audience = reply.audience.clone();
-        reply_audience.sort();
-        let mut expected = vec![b.clone(), c.clone()];
-        expected.sort();
-        assert_eq!(reply_audience, expected);
-        assert!(!reply.audience.contains(&a));
+        assert!(reply.audience.is_empty());
         assert_eq!(reply.conversation_root_event_id, posted.event.event_id);
         assert_eq!(
             reply.parent_event_id.as_deref(),
@@ -5454,64 +5641,37 @@ mod tests {
         );
         assert_eq!(reply.debate_depth, 1);
 
-        let claim_b = repository.claim_next().unwrap().unwrap();
-        assert_eq!(claim_b.member_id, b);
-        assert_eq!(claim_b.purpose, InboxPurpose::Participation);
-        assert_eq!(claim_b.context_through_seq, reply.sequence);
-        let history = repository.member_history(&claim_b).unwrap();
-        assert!(history
-            .iter()
-            .any(|message| message.content.contains("评估发布方案")));
-        assert!(history
-            .iter()
-            .any(|message| message.content.contains("智脑 A")
-                && message.content.contains("我建议先灰度发布")));
-        assert_eq!(history.first().unwrap().event_id, posted.event.event_id);
-        assert_eq!(history.first().unwrap().sequence, posted.event.sequence);
-        assert!(!history.first().unwrap().content_hash.is_empty());
-        assert_eq!(history.last().unwrap().event_id, reply.event_id);
-        assert_eq!(history.last().unwrap().sequence, reply.sequence);
-        assert!(!history.last().unwrap().content_hash.is_empty());
-
         let persisted = repository.snapshot("room-1").unwrap();
-        assert_eq!(
-            persisted
-                .inbox
-                .iter()
-                .filter(|item| {
-                    item.purpose == InboxPurpose::Participation
-                        && item.conversation_root_event_id
-                            == posted.event.conversation_root_event_id
-                })
-                .count(),
-            2
-        );
+        assert!(persisted
+            .events
+            .iter()
+            .any(|event| event.event_id == reply.event_id));
+        assert!(!persisted.inbox.iter().any(|item| item.member_id == b));
+        assert!(!persisted.inbox.iter().any(|item| item.member_id == c));
+        assert!(repository.claim_next().unwrap().is_none());
     }
 
     #[test]
-    fn later_direct_group_work_sees_messages_previously_delivered_by_other_members() {
+    fn later_direct_group_work_excludes_other_members_replies() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
-        let _b = repository
+        let b = repository
             .create_member("room-1", "智脑 B", None, None)
             .unwrap()
             .member_id;
         repository
             .post_group_message(
                 "room-1",
-                std::slice::from_ref(&a),
+                std::slice::from_ref(&b),
                 "第一轮",
                 RoomInputMode::Chat,
                 "group-history-1",
             )
             .unwrap();
-        let claim_a = repository.claim_next().unwrap().unwrap();
-        repository.complete_item(&claim_a, "A 先回答").unwrap();
         let claim_b = repository.claim_next().unwrap().unwrap();
-        repository
-            .complete_participation_item(&claim_b, Some("B 补充了风险"))
-            .unwrap();
+        assert_eq!(claim_b.member_id, b);
+        repository.complete_item(&claim_b, "B 补充了风险").unwrap();
         repository
             .post_group_message(
                 "room-1",
@@ -5527,13 +5687,13 @@ mod tests {
         assert_eq!(later_direct.purpose, InboxPurpose::Direct);
         assert!(later_direct.group_enabled);
         let history = repository.member_history(&later_direct).unwrap();
-        assert!(history.iter().any(|message| {
-            message.content.contains("智脑 B") && message.content.contains("B 补充了风险")
-        }));
+        assert!(!history
+            .iter()
+            .any(|message| message.content.contains("B 补充了风险")));
     }
 
     #[test]
-    fn busy_member_keeps_group_participation_pending_until_current_lane_finishes() {
+    fn busy_unmentioned_member_is_not_queued_for_group_work() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
@@ -5567,10 +5727,7 @@ mod tests {
         assert!(repository.claim_next().unwrap().is_none());
 
         repository.complete_item(&busy, "B 原任务完成").unwrap();
-        let deferred = repository.claim_next().unwrap().unwrap();
-        assert_eq!(deferred.member_id, b);
-        assert_eq!(deferred.purpose, InboxPurpose::Participation);
-        assert!(deferred.context_through_seq > deferred.source_event_seq);
+        assert!(repository.claim_next().unwrap().is_none());
     }
 
     #[test]
@@ -5598,7 +5755,7 @@ mod tests {
             .unwrap();
         let event = completion.event.unwrap();
         assert_eq!(event.run_id.as_deref(), Some("durable-instance-run"));
-        assert_eq!(event.audience, vec![b]);
+        assert!(event.audience.is_empty());
         let persisted = repository.snapshot("room-1").unwrap();
         let item = persisted
             .inbox
@@ -5607,10 +5764,11 @@ mod tests {
             .unwrap();
         assert_eq!(item.run_id.as_deref(), Some("durable-instance-run"));
         assert_eq!(item.state, InboxState::Completed);
+        assert!(!persisted.inbox.iter().any(|item| item.member_id == b));
     }
 
     #[test]
-    fn messages_arriving_during_participation_coalesce_into_one_follow_up() {
+    fn explicitly_mentioned_busy_member_receives_one_pending_direct_item() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
@@ -5618,54 +5776,47 @@ mod tests {
             .create_member("room-1", "智脑 B", None, None)
             .unwrap()
             .member_id;
-        let c = repository
-            .create_member("room-1", "智脑 C", None, None)
-            .unwrap()
-            .member_id;
         repository
-            .post_group_message(
+            .post_message(
                 "room-1",
-                std::slice::from_ref(&a),
-                "讨论发布策略",
-                RoomInputMode::Chat,
-                "group-coalesce",
+                std::slice::from_ref(&b),
+                "B 正在执行的任务",
+                RoomInputMode::Task,
+                "busy-b",
             )
             .unwrap();
+        let busy = repository.claim_next().unwrap().unwrap();
+        assert_eq!(busy.member_id, b);
+
+        let posted = repository
+            .post_group_message(
+                "room-1",
+                &[a.clone(), b.clone()],
+                "同时 @ A 和 B",
+                RoomInputMode::Chat,
+                "direct-while-busy",
+            )
+            .unwrap();
+        assert_eq!(posted.inbox_items.len(), 2);
+
         let claim_a = repository.claim_next().unwrap().unwrap();
-        repository
-            .complete_item(&claim_a, "A：先灰度")
-            .unwrap()
-            .unwrap();
-        let claim_b = repository.claim_next().unwrap().unwrap();
-        let claim_c = repository.claim_next().unwrap().unwrap();
-        assert_eq!(claim_b.member_id, b);
-        assert_eq!(claim_c.member_id, c);
+        assert_eq!(claim_a.member_id, a);
+        assert!(repository.claim_next().unwrap().is_none());
 
-        let c_reply = repository
-            .complete_participation_item(&claim_c, Some("C：灰度前还要压测"))
-            .unwrap()
-            .event
-            .unwrap();
-        repository
-            .complete_participation_item(&claim_b, None)
-            .unwrap();
-
+        repository.complete_item(&busy, "B 原任务完成").unwrap();
         let persisted = repository.snapshot("room-1").unwrap();
         let b_items = persisted
             .inbox
             .iter()
-            .filter(|item| item.member_id == b && item.purpose == InboxPurpose::Participation)
+            .filter(|item| item.member_id == b && item.source_event_id == posted.event.event_id)
             .collect::<Vec<_>>();
-        assert_eq!(b_items.len(), 2);
-        let follow_up = b_items
-            .iter()
-            .find(|item| item.state == InboxState::Pending)
-            .unwrap();
-        assert_eq!(follow_up.source_event_id, c_reply.event_id);
+        assert_eq!(b_items.len(), 1);
+        assert_eq!(b_items[0].purpose, InboxPurpose::Direct);
+        assert_eq!(b_items[0].state, InboxState::Pending);
     }
 
     #[test]
-    fn per_member_debate_limit_suppresses_work_but_keeps_delivery() {
+    fn direct_group_messages_ignore_legacy_debate_limit() {
         let directory = tempfile::tempdir().unwrap();
         let repository = CollaborationRepository::new(
             directory.path(),
@@ -5679,46 +5830,51 @@ mod tests {
             },
         )
         .unwrap();
-        let snapshot = ensure(&repository);
-        let a = snapshot.room.default_member_id;
-        let _b = repository
+        ensure(&repository);
+        let b = repository
             .create_member("room-1", "智脑 B", None, None)
             .unwrap()
             .member_id;
         repository
             .post_group_message(
                 "room-1",
-                std::slice::from_ref(&a),
-                "给出不同观点",
+                std::slice::from_ref(&b),
+                "第一条定向消息",
                 RoomInputMode::Chat,
                 "group-limit",
             )
             .unwrap();
-        let claim_a = repository.claim_next().unwrap().unwrap();
-        repository.complete_item(&claim_a, "A 的观点").unwrap();
-        let claim_b = repository.claim_next().unwrap().unwrap();
-        let b_reply = repository
-            .complete_participation_item(&claim_b, Some("B 的反驳"))
-            .unwrap()
-            .event
+        let first = repository.claim_next().unwrap().unwrap();
+        assert_eq!(first.member_id, b);
+        repository.complete_item(&first, "B 的第一条回复").unwrap();
+
+        let second_post = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&b),
+                "第二条定向消息",
+                RoomInputMode::Chat,
+                "group-limit-2",
+            )
             .unwrap();
+        let second = repository.claim_next().unwrap().unwrap();
+        assert_eq!(second.member_id, b);
+        assert_eq!(second.purpose, InboxPurpose::Direct);
+        repository.complete_item(&second, "B 的第二条回复").unwrap();
 
         let persisted = repository.snapshot("room-1").unwrap();
         assert_eq!(
             persisted
                 .inbox
                 .iter()
-                .filter(|item| item.member_id == a)
+                .filter(|item| item.source_event_id == second_post.event.event_id)
                 .count(),
             1
         );
-        let delivery = persisted
+        assert!(persisted
             .deliveries
             .iter()
-            .find(|delivery| delivery.event_id == b_reply.event_id && delivery.member_id == a)
-            .unwrap();
-        assert_eq!(delivery.state, DeliveryState::Suppressed);
-        assert_eq!(delivery.decision_reason.as_deref(), Some("debate_limit"));
+            .all(|delivery| delivery.kind == DeliveryKind::Direct));
     }
 
     #[test]
@@ -5733,8 +5889,19 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert!(table_has_column(&connection, "room_events", "invalidated_at").unwrap());
+        let member_name_index: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND name = 'brain_members_active_display_name_idx'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(member_name_index);
 
         for table in [
             "room_principal_memberships",
