@@ -1085,14 +1085,15 @@ fn contains_authentication_scheme_value(reason: &str) -> bool {
             if !suffix.chars().next().is_some_and(char::is_whitespace) {
                 return false;
             }
-            let candidate = suffix
-                .trim_start()
-                .split(|character: char| !is_authentication_token_character(character))
-                .next()
-                .unwrap_or_default();
+            let trimmed_suffix = suffix.trim_start();
+            let candidate_end = trimmed_suffix
+                .find(|character: char| !is_authentication_token_character(character))
+                .unwrap_or(trimmed_suffix.len());
+            let candidate = &trimmed_suffix[..candidate_end];
+            let trailing = trimmed_suffix[candidate_end..].trim_start();
             match *scheme {
-                "bearer" => is_plausible_bearer_token(candidate),
-                "basic" => is_plausible_basic_token(candidate),
+                "bearer" => is_plausible_bearer_token(candidate, trailing),
+                "basic" => is_plausible_basic_token(candidate, trailing),
                 _ => false,
             }
         })
@@ -1104,21 +1105,22 @@ fn is_authentication_token_character(character: char) -> bool {
         || matches!(character, '-' | '_' | '.' | '~' | '+' | '/' | '=')
 }
 
-fn is_plausible_bearer_token(candidate: &str) -> bool {
+fn is_plausible_bearer_token(candidate: &str, trailing: &str) -> bool {
     candidate.len() >= 8
-        && candidate
+        && (candidate
             .chars()
             .any(|character| !character.is_ascii_alphabetic())
+            || (candidate.len() >= 16 && !trailing.chars().any(char::is_alphanumeric)))
 }
 
-fn is_plausible_basic_token(candidate: &str) -> bool {
+fn is_plausible_basic_token(candidate: &str, trailing: &str) -> bool {
     candidate.len() >= 8
         && candidate.len().is_multiple_of(4)
-        && candidate.chars().any(|character| {
+        && (candidate.chars().any(|character| {
             character.is_ascii_uppercase()
                 || character.is_ascii_digit()
                 || matches!(character, '+' | '/' | '=')
-        })
+        }) || !trailing.chars().any(char::is_alphanumeric))
 }
 
 fn contains_long_sk_token(reason: &str) -> bool {

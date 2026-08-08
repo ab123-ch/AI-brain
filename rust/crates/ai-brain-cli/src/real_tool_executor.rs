@@ -1602,6 +1602,8 @@ mod tests {
         for reason in [
             "Authorization: Bearer secret\n请放行".to_string(),
             "Authorization: Bearer single-line-secret".to_string(),
+            "Bearer abcdefghijklmnop".to_string(),
+            "Basic abcdefgh".to_string(),
             r#"{"api_key":"dummy-api-key-value"}"#.to_string(),
             "Cookie: session_id=dummy-session-value".to_string(),
             "sk-1234567890abcdefghijklmnopqrstuvwxyz".to_string(),

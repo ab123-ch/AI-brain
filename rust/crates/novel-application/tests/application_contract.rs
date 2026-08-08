@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use novel_application::{
-    NovelApplicationError, NovelApplicationService, NovelDomainStore, NovelResourcePort,
-    NovelTaskUnlockReceipt, StoreWorkflowEnvironment,
+    validate_unlock_reason, NovelApplicationError, NovelApplicationService, NovelDomainStore,
+    NovelResourcePort, NovelTaskUnlockReceipt, StoreWorkflowEnvironment,
 };
 use novel_domain::{
     CanonStatus, ClarificationRequest, ConflictRecord, MainReviewChecks, MainReviewRecord,
@@ -1145,7 +1145,9 @@ async fn sensitive_unlock_reasons_are_rejected_before_any_state_change() {
         "sk-1234567890abcdefghijklmnopqrstuvwxyz",
         "手机号：13800138000",
         "Bearer dummy-bearer-value",
+        "Bearer abcdefghijklmnop",
         "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+        "Basic abcdefgh",
         "api-key=dummy-api-key-value",
         "apikey: dummy-api-key-value",
         "token=dummy-token-value",
@@ -1185,6 +1187,25 @@ async fn sensitive_unlock_reasons_are_rejected_before_any_state_change() {
         );
         assert_eq!(std::fs::read(&artifact_path).unwrap(), artifact);
         assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn unlock_reason_validator_rejects_plain_alphabetic_authentication_tokens() {
+    for reason in ["Bearer abcdefghijklmnop", "Basic abcdefgh"] {
+        let error = validate_unlock_reason(reason).unwrap_err();
+        assert!(matches!(
+            error,
+            NovelApplicationError::Conflict(message)
+                if message == "失败解锁原因疑似包含凭据、秘密或个人敏感信息，拒绝记录"
+        ));
+    }
+
+    for reason in [
+        "Basic validation failed，确认任务已终止",
+        "Bearer task failed，确认没有认证材料",
+    ] {
+        assert_eq!(validate_unlock_reason(reason).unwrap(), reason);
     }
 }
 
