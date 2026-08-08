@@ -436,6 +436,40 @@ impl NovelTaskState {
         self.updated_at = now_millis();
     }
 
+    pub fn unlock_failed_execution(&mut self) -> Result<()> {
+        if self.phase.is_terminal() {
+            return Err(NovelDomainError::InvalidTransition(format!(
+                "任务 {} 已是终态，不能执行失败解锁",
+                self.request.task_id
+            )));
+        }
+        if matches!(
+            self.phase,
+            NovelTaskPhase::PublicationPending | NovelTaskPhase::ArtifactSavedMemoryPending
+        ) || self.publication_id.is_some()
+            || self.artifact.is_some()
+            || self.commit_report.is_some()
+        {
+            return Err(NovelDomainError::InvalidTransition(
+                "任务处于发布流程或已有发布产物，拒绝解锁".into(),
+            ));
+        }
+        if self.draft_version != 0
+            || self.draft.is_some()
+            || self.candidate.is_some()
+            || !self.candidate_reviews.is_empty()
+            || self.main_review.is_some()
+            || self.user_decision.is_some()
+        {
+            return Err(NovelDomainError::InvalidTransition(
+                "任务已有草稿或候选版本，拒绝解锁；请继续 review/decide/publish 流程".into(),
+            ));
+        }
+        self.phase = NovelTaskPhase::Cancelled;
+        self.updated_at = now_millis();
+        Ok(())
+    }
+
     pub fn cancel_for_conversation_fork(&mut self) -> Result<()> {
         if self.phase.is_terminal() {
             return Err(NovelDomainError::InvalidTransition(format!(

@@ -4,8 +4,9 @@ use novel_domain::{
     apply_canon_delta, sha256_hex, CandidateReview, CandidateReviewVerdict, CanonStatus,
     MainReviewChecks, MainReviewRecord, MainReviewVerdict, NovelDraftEnvelope, NovelFactKind,
     NovelMemoryDelta, NovelOutcome, NovelProject, NovelSelfReview, NovelSelfReviewChecks,
-    NovelSelfReviewVerdict, NovelTaskRequest, NovelTaskState, NovelTaskType, NovelTransition,
-    ProposedFact, PublicationPolicy, ReviewCheckStatus, UserDecision, UserDecisionRecord,
+    NovelSelfReviewVerdict, NovelTaskPhase, NovelTaskRequest, NovelTaskState, NovelTaskType,
+    NovelTransition, ProposedFact, PublicationPolicy, ReviewCheckStatus, UserDecision,
+    UserDecisionRecord,
 };
 
 fn request() -> NovelTaskRequest {
@@ -196,4 +197,63 @@ fn checkpoint_roundtrip_preserves_domain_state_shape() {
     assert_eq!(restored.request.task_id, state.request.task_id);
     assert_eq!(restored.phase, state.phase);
     assert_eq!(restored.draft_version, state.draft_version);
+}
+
+#[test]
+fn failed_execution_unlock_cancels_blank_drafting_task() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+
+    state.unlock_failed_execution().unwrap();
+
+    assert_eq!(state.phase, NovelTaskPhase::Cancelled);
+    assert!(state.phase.is_terminal());
+}
+
+#[test]
+fn failed_execution_unlock_rejects_terminal_tasks_without_mutation() {
+    for phase in [
+        NovelTaskPhase::Completed,
+        NovelTaskPhase::Rejected,
+        NovelTaskPhase::Cancelled,
+        NovelTaskPhase::Failed,
+    ] {
+        let mut state = NovelTaskState::new(request()).unwrap();
+        state.phase = phase;
+        let checkpoint = state.checkpoint().unwrap();
+
+        let error = state.unlock_failed_execution().unwrap_err();
+
+        assert!(error.to_string().contains("已是终态"));
+        assert_eq!(state.checkpoint().unwrap(), checkpoint);
+    }
+}
+
+#[test]
+fn failed_execution_unlock_prioritizes_publication_guard_without_mutation() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+    state.publication_id = Some("publication-1".into());
+    state.draft_version = 1;
+    let checkpoint = state.checkpoint().unwrap();
+
+    let error = state.unlock_failed_execution().unwrap_err();
+
+    assert!(error.to_string().contains("发布流程或已有发布产物"));
+    assert_eq!(state.checkpoint().unwrap(), checkpoint);
+}
+
+#[test]
+fn failed_execution_unlock_rejects_draft_history_without_mutation() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+    state
+        .apply_outcome(NovelOutcome::DraftReady(draft(1)))
+        .unwrap();
+    let checkpoint = state.checkpoint().unwrap();
+
+    let error = state.unlock_failed_execution().unwrap_err();
+
+    assert!(error.to_string().contains("已有草稿或候选版本"));
+    assert_eq!(state.checkpoint().unwrap(), checkpoint);
 }
