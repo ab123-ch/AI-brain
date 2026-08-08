@@ -410,7 +410,7 @@ fn bounded_parse_error(error: &str) -> String {
     bounded_sensitive_text(error, 512)
 }
 
-fn bounded_sensitive_text(value: &str, max_chars: usize) -> String {
+pub(crate) fn bounded_sensitive_text(value: &str, max_chars: usize) -> String {
     escape_control_chars(&redact_writer_output(value))
         .chars()
         .take(max_chars)

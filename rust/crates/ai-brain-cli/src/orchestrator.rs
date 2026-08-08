@@ -2764,21 +2764,44 @@ struct NovelWriterClient {
     temperature: f64,
 }
 
+const NOVEL_WRITER_ROUTE_ERROR_CHARS: usize = 128;
+const NOVEL_WRITER_DETAIL_ERROR_CHARS: usize = 2_048;
+
 /// 创建 Novel Writer 的显式路由；配置错误直接阻止启动，不进入不可用占位状态。
 fn create_novel_writer_client(config: &LlmConfig) -> Result<NovelWriterClient, String> {
     let provider_name = config.provider_for_brain("main");
     let model_name = config.model_for_brain("main");
-    let route = format!("provider={provider_name}, model={model_name}");
+    let route_provider = crate::novel_adapters::bounded_sensitive_text(
+        provider_name,
+        NOVEL_WRITER_ROUTE_ERROR_CHARS,
+    );
+    let route_model =
+        crate::novel_adapters::bounded_sensitive_text(model_name, NOVEL_WRITER_ROUTE_ERROR_CHARS);
+    let route = format!("provider={route_provider}, model={route_model}");
     let provider = config
         .create_brain_client("main")
         .map_err(|error| match error {
             brain_llm::LlmError::ProviderNotFound(name) => {
+                let name = crate::novel_adapters::bounded_sensitive_text(
+                    &name,
+                    NOVEL_WRITER_ROUTE_ERROR_CHARS,
+                );
                 format!("初始化 Novel Writer LLM 失败 ({route}): Provider 不存在: {name}")
             }
             brain_llm::LlmError::ApiKeyNotFound(name) => {
+                let name = crate::novel_adapters::bounded_sensitive_text(
+                    &name,
+                    NOVEL_WRITER_ROUTE_ERROR_CHARS,
+                );
                 format!("初始化 Novel Writer LLM 失败 ({route}): API Key 未配置: {name}")
             }
-            other => format!("初始化 Novel Writer LLM 失败 ({route}): {other}"),
+            other => {
+                let detail = crate::novel_adapters::bounded_sensitive_text(
+                    &other.to_string(),
+                    NOVEL_WRITER_DETAIL_ERROR_CHARS,
+                );
+                format!("初始化 Novel Writer LLM 失败 ({route}): {detail}")
+            }
         })?;
     let (max_output_tokens, temperature) = config.params_for_brain("main");
     Ok(NovelWriterClient {
@@ -3056,7 +3079,7 @@ fn create_sub_brains() -> Result<
 mod tests {
     use super::*;
     use brain_core::types::TurnUsage;
-    use brain_llm::config::{InstanceModelConfig, ProviderConfig};
+    use brain_llm::config::{InstanceModelConfig, ProviderConfig, ProviderKind};
     use knowledge_core::{ContextBlock, ContextBlockInput};
 
     #[test]
@@ -3263,6 +3286,52 @@ mod tests {
                 "error missing {required}: {error}"
             );
         }
+
+        let route_secret = "NOVEL_WRITER_ROUTE_SECRET";
+        let mut malicious_route = LlmConfig::default_config();
+        malicious_route.llm.brain_providers.insert(
+            "main".into(),
+            format!("missing\nAuthorization: Bearer {route_secret}"),
+        );
+        malicious_route.llm.brain_models.insert(
+            "main".into(),
+            format!("model\r\napi_key=\"{route_secret}\""),
+        );
+        let error = match create_novel_writer_client(&malicious_route) {
+            Ok(_) => panic!("恶意 route 不应创建 Novel Writer"),
+            Err(error) => error,
+        };
+        assert!(!error.contains(route_secret), "启动错误泄漏 route: {error}");
+        assert!(!error.contains('\n'), "启动错误允许换行注入: {error}");
+        assert!(!error.contains('\r'), "启动错误允许回车注入: {error}");
+
+        let proxy_secret = "NOVEL_WRITER_PROXY_SECRET";
+        let mut invalid_proxy = LlmConfig::default_config();
+        invalid_proxy.llm.providers.insert(
+            "writer-invalid-proxy".into(),
+            ProviderConfig {
+                api_base: "https://writer.invalid/v1".into(),
+                api_key: Some("test-key".into()),
+                kind: ProviderKind::Gemini,
+                proxy: Some(format!("not-a-url\nAuthorization: Bearer {proxy_secret}")),
+                ..ProviderConfig::default()
+            },
+        );
+        invalid_proxy
+            .llm
+            .brain_providers
+            .insert("main".into(), "writer-invalid-proxy".into());
+        invalid_proxy
+            .llm
+            .brain_models
+            .insert("main".into(), "writer-model".into());
+        let error = match create_novel_writer_client(&invalid_proxy) {
+            Ok(_) => panic!("无效 proxy 不应创建 Novel Writer"),
+            Err(error) => error,
+        };
+        assert!(!error.contains(proxy_secret), "启动错误泄漏 proxy: {error}");
+        assert!(!error.contains('\n'), "启动错误允许换行注入: {error}");
+        assert!(error.chars().count() < 2_500, "启动错误未限长");
     }
 
     #[test]
