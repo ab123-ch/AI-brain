@@ -18,7 +18,7 @@ mod session;
 mod sse;
 mod usage;
 
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bash::{execute_bash, execute_bash_in_dir, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
@@ -38,7 +38,8 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
+    edit_file, edit_file_in_dir, glob_search, glob_search_in_dir, grep_search, grep_search_in_dir,
+    read_file, read_file_in_dir, write_file, write_file_in_dir, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
     WriteFileOutput,
 };

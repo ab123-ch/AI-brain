@@ -1,5 +1,6 @@
 use std::env;
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -66,10 +67,14 @@ pub struct BashCommandOutput {
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
-    let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    execute_bash_in_dir(input, &cwd)
+}
+
+pub fn execute_bash_in_dir(input: BashCommandInput, cwd: &Path) -> io::Result<BashCommandOutput> {
+    let sandbox_status = sandbox_status_for_input(&input, cwd);
 
     if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let mut child = prepare_command(&input.command, cwd, &sandbox_status, false);
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -96,7 +101,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    runtime.block_on(execute_bash_async(input, sandbox_status, cwd.to_path_buf()))
 }
 
 async fn execute_bash_async(
@@ -245,8 +250,18 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{execute_bash, execute_bash_in_dir, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
 
     #[test]
     fn executes_simple_command() {
@@ -284,5 +299,50 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn explicit_directory_controls_shell_working_directory() {
+        let original_cwd = std::env::current_dir().expect("current directory should be readable");
+        let workspace = temp_path("explicit-directory-shell");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let outside_marker = original_cwd.join("shell-cwd.txt");
+        let outside_marker_before = std::fs::read(&outside_marker).ok();
+
+        let output = match execute_bash_in_dir(
+            BashCommandInput {
+                command: String::from("printf 'from-shell' > shell-cwd.txt"),
+                timeout: Some(1_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(true),
+                namespace_restrictions: None,
+                isolate_network: None,
+                filesystem_mode: None,
+                allowed_mounts: None,
+            },
+            &workspace,
+        ) {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("shell command should execute: {error}"),
+        };
+
+        assert!(!output.interrupted, "shell command should not time out");
+        assert_eq!(
+            output.return_code_interpretation, None,
+            "shell command failed: {}",
+            output.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("shell-cwd.txt"))
+                .expect("marker should be written in the explicit directory"),
+            "from-shell"
+        );
+        assert_eq!(std::fs::read(&outside_marker).ok(), outside_marker_before);
+        assert_eq!(
+            std::env::current_dir().expect("current directory should remain readable"),
+            original_cwd
+        );
     }
 }

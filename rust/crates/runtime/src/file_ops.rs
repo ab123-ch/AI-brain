@@ -134,7 +134,17 @@ pub fn read_file(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let cwd = std::env::current_dir()?;
+    read_file_in_dir(&cwd, path, offset, limit)
+}
+
+pub fn read_file_in_dir(
+    base: &Path,
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> io::Result<ReadFileOutput> {
+    let absolute_path = normalize_path_from(base, path)?;
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
@@ -156,7 +166,12 @@ pub fn read_file(
 }
 
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
-    let absolute_path = normalize_path_allow_missing(path)?;
+    let cwd = std::env::current_dir()?;
+    write_file_in_dir(&cwd, path, content)
+}
+
+pub fn write_file_in_dir(base: &Path, path: &str, content: &str) -> io::Result<WriteFileOutput> {
+    let absolute_path = normalize_path_allow_missing_from(base, path)?;
     let original_file = fs::read_to_string(&absolute_path).ok();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
@@ -183,7 +198,18 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let cwd = std::env::current_dir()?;
+    edit_file_in_dir(&cwd, path, old_string, new_string, replace_all)
+}
+
+pub fn edit_file_in_dir(
+    base: &Path,
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<EditFileOutput> {
+    let absolute_path = normalize_path_from(base, path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
     if old_string == new_string {
         // 文件内容已经是目标状态，无需修改，直接返回成功
@@ -225,11 +251,20 @@ pub fn edit_file(
 }
 
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
+    let cwd = std::env::current_dir()?;
+    glob_search_in_dir(&cwd, pattern, path)
+}
+
+pub fn glob_search_in_dir(
+    base: &Path,
+    pattern: &str,
+    path: Option<&str>,
+) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
-        .map(normalize_path)
+        .map(|path| normalize_path_from(base, path))
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or_else(|| base.to_path_buf());
     let search_pattern = if Path::new(pattern).is_absolute() {
         pattern.to_owned()
     } else {
@@ -269,15 +304,21 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 
 #[allow(clippy::too_many_lines)]
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    let cwd = std::env::current_dir()?;
+    grep_search_in_dir(&cwd, input)
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn grep_search_in_dir(base: &Path, input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let started = Instant::now();
     let deadline = started + std::time::Duration::from_secs(GREP_SEARCH_TIMEOUT_SECS);
 
     let base_path = input
         .path
         .as_deref()
-        .map(normalize_path)
+        .map(|path| normalize_path_from(base, path))
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or_else(|| base.to_path_buf());
 
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
@@ -487,20 +528,20 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
-fn normalize_path(path: &str) -> io::Result<PathBuf> {
+fn normalize_path_from(base: &Path, path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()?.join(path)
+        base.join(path)
     };
     candidate.canonicalize()
 }
 
-fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
+fn normalize_path_allow_missing_from(base: &Path, path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()?.join(path)
+        base.join(path)
     };
 
     if let Ok(canonical) = candidate.canonicalize() {
@@ -523,7 +564,11 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput};
+    use super::{
+        edit_file, edit_file_in_dir, glob_search, glob_search_in_dir, grep_search,
+        grep_search_in_dir, read_file, read_file_in_dir, write_file, write_file_in_dir,
+        GrepSearchInput,
+    };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -588,5 +633,172 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn explicit_directory_read_and_write_are_isolated() {
+        let workspace_a = temp_path("explicit-directory-read-write-a");
+        let workspace_b = temp_path("explicit-directory-read-write-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace_a should be created");
+        std::fs::create_dir_all(&workspace_b).expect("workspace_b should be created");
+        std::fs::write(workspace_a.join("same.txt"), "from-a")
+            .expect("workspace_a file should be written");
+        std::fs::write(workspace_b.join("same.txt"), "from-b")
+            .expect("workspace_b file should be written");
+
+        let a = read_file_in_dir(&workspace_a, "same.txt", None, None)
+            .expect("workspace_a file should be read");
+        let b = read_file_in_dir(&workspace_b, "same.txt", None, None)
+            .expect("workspace_b file should be read");
+        assert_eq!(a.file.content, "from-a");
+        assert_eq!(b.file.content, "from-b");
+
+        write_file_in_dir(&workspace_a, "created.txt", "only-a")
+            .expect("workspace_a file should be created");
+        assert!(workspace_a.join("created.txt").is_file());
+        assert!(!workspace_b.join("created.txt").exists());
+    }
+
+    #[test]
+    fn explicit_directory_edit_is_isolated() {
+        let workspace_a = temp_path("explicit-directory-edit-a");
+        let workspace_b = temp_path("explicit-directory-edit-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace_a should be created");
+        std::fs::create_dir_all(&workspace_b).expect("workspace_b should be created");
+        std::fs::write(workspace_a.join("same.txt"), "from-a")
+            .expect("workspace_a file should be written");
+        std::fs::write(workspace_b.join("same.txt"), "from-b")
+            .expect("workspace_b file should be written");
+
+        edit_file_in_dir(&workspace_a, "same.txt", "from-a", "edited-a", false)
+            .expect("workspace_a file should be edited");
+
+        assert_eq!(
+            std::fs::read_to_string(workspace_a.join("same.txt"))
+                .expect("workspace_a file should be readable"),
+            "edited-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_b.join("same.txt"))
+                .expect("workspace_b file should be readable"),
+            "from-b"
+        );
+    }
+
+    #[test]
+    fn explicit_directory_concurrent_searches_are_isolated() {
+        let original_cwd = std::env::current_dir().expect("current directory should be readable");
+        let workspace_a = temp_path("explicit-directory-search-a");
+        let workspace_b = temp_path("explicit-directory-search-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace_a should be created");
+        std::fs::create_dir_all(&workspace_b).expect("workspace_b should be created");
+        std::fs::write(workspace_a.join("same.txt"), "from-a")
+            .expect("workspace_a file should be written");
+        std::fs::write(workspace_b.join("same.txt"), "from-b")
+            .expect("workspace_b file should be written");
+
+        let workspace_a_for_thread = workspace_a.clone();
+        let thread_a = std::thread::spawn(move || {
+            let read = read_file_in_dir(&workspace_a_for_thread, "same.txt", None, None)
+                .expect("workspace_a file should be read");
+            let glob = glob_search_in_dir(&workspace_a_for_thread, "*.txt", None)
+                .expect("workspace_a glob should succeed");
+            let grep = grep_search_in_dir(
+                &workspace_a_for_thread,
+                &GrepSearchInput {
+                    pattern: String::from("from-a"),
+                    path: None,
+                    glob: Some(String::from("*.txt")),
+                    output_mode: Some(String::from("files_with_matches")),
+                    before: None,
+                    after: None,
+                    context_short: None,
+                    context: None,
+                    line_numbers: None,
+                    case_insensitive: None,
+                    file_type: None,
+                    head_limit: None,
+                    offset: None,
+                    multiline: None,
+                },
+            )
+            .expect("workspace_a grep should succeed");
+            (read, glob, grep)
+        });
+
+        let workspace_b_for_thread = workspace_b.clone();
+        let thread_b = std::thread::spawn(move || {
+            let read = read_file_in_dir(&workspace_b_for_thread, "same.txt", None, None)
+                .expect("workspace_b file should be read");
+            let glob = glob_search_in_dir(&workspace_b_for_thread, "*.txt", None)
+                .expect("workspace_b glob should succeed");
+            let grep = grep_search_in_dir(
+                &workspace_b_for_thread,
+                &GrepSearchInput {
+                    pattern: String::from("from-b"),
+                    path: None,
+                    glob: Some(String::from("*.txt")),
+                    output_mode: Some(String::from("files_with_matches")),
+                    before: None,
+                    after: None,
+                    context_short: None,
+                    context: None,
+                    line_numbers: None,
+                    case_insensitive: None,
+                    file_type: None,
+                    head_limit: None,
+                    offset: None,
+                    multiline: None,
+                },
+            )
+            .expect("workspace_b grep should succeed");
+            (read, glob, grep)
+        });
+
+        let (read_a, glob_a, grep_a) = thread_a.join().expect("workspace_a thread should finish");
+        let (read_b, glob_b, grep_b) = thread_b.join().expect("workspace_b thread should finish");
+        let expected_a = workspace_a
+            .join("same.txt")
+            .canonicalize()
+            .expect("workspace_a file should canonicalize");
+        let expected_b = workspace_b
+            .join("same.txt")
+            .canonicalize()
+            .expect("workspace_b file should canonicalize");
+
+        assert_eq!(read_a.file.content, "from-a");
+        assert_eq!(glob_a.num_files, 1);
+        assert_eq!(
+            std::path::PathBuf::from(&glob_a.filenames[0])
+                .canonicalize()
+                .expect("workspace_a glob result should canonicalize"),
+            expected_a
+        );
+        assert_eq!(grep_a.num_files, 1);
+        assert_eq!(
+            std::path::PathBuf::from(&grep_a.filenames[0])
+                .canonicalize()
+                .expect("workspace_a grep result should canonicalize"),
+            expected_a
+        );
+        assert_eq!(read_b.file.content, "from-b");
+        assert_eq!(glob_b.num_files, 1);
+        assert_eq!(
+            std::path::PathBuf::from(&glob_b.filenames[0])
+                .canonicalize()
+                .expect("workspace_b glob result should canonicalize"),
+            expected_b
+        );
+        assert_eq!(grep_b.num_files, 1);
+        assert_eq!(
+            std::path::PathBuf::from(&grep_b.filenames[0])
+                .canonicalize()
+                .expect("workspace_b grep result should canonicalize"),
+            expected_b
+        );
+        assert_eq!(
+            std::env::current_dir().expect("current directory should remain readable"),
+            original_cwd
+        );
     }
 }
