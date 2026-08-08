@@ -1066,11 +1066,27 @@ pub fn execute_tool_in_directory(
             .and_then(|value| run_repl_in_directory(value, working_directory)),
         "PowerShell" => from_value::<PowerShellInput>(input)
             .and_then(|value| run_powershell_in_directory(value, working_directory)),
+        "graph_search_catalog" => from_value::<GraphSearchCatalogInput>(input)
+            .and_then(|value| run_graph_search_catalog_in_directory(value, working_directory)),
+        "graph_get_node_detail" => from_value::<GraphGetNodeDetailInput>(input)
+            .and_then(|value| run_graph_get_node_detail_in_directory(value, working_directory)),
+        "graph_trace_memory" => from_value::<GraphTraceMemoryInput>(input)
+            .and_then(|value| run_graph_trace_memory_in_directory(value, working_directory)),
+        "graph_list_domains" => from_value::<GraphListDomainsInput>(input)
+            .and_then(|value| run_graph_list_domains_in_directory(value, working_directory)),
+        "graph_add_memory" => from_value::<GraphAddMemoryInput>(input)
+            .and_then(|value| run_graph_add_memory_in_directory(value, working_directory)),
+        "graph_add_concept" => from_value::<GraphAddConceptInput>(input)
+            .and_then(|value| run_graph_add_concept_in_directory(value, working_directory)),
+        "graph_add_code_node" => from_value::<GraphAddCodeNodeInput>(input)
+            .and_then(|value| run_graph_add_code_node_in_directory(value, working_directory)),
         "graph_index_code_workspace" => {
             from_value::<GraphIndexCodeWorkspaceInput>(input).and_then(|value| {
                 run_graph_index_code_workspace_in_directory(value, working_directory)
             })
         }
+        "graph_link_nodes" => from_value::<GraphLinkNodesInput>(input)
+            .and_then(|value| run_graph_link_nodes_in_directory(value, working_directory)),
         _ => execute_non_workspace_tool(name, input),
     }
 }
@@ -1102,30 +1118,6 @@ fn execute_non_workspace_tool(name: &str, input: &Value) -> Result<String, Strin
         }
         "novel_task" | "novel_project" => {
             Err(format!("{name} is handled by RealToolExecutor directly"))
-        }
-        "graph_search_catalog" => {
-            from_value::<GraphSearchCatalogInput>(input).and_then(run_graph_search_catalog)
-        }
-        "graph_get_node_detail" => {
-            from_value::<GraphGetNodeDetailInput>(input).and_then(run_graph_get_node_detail)
-        }
-        "graph_trace_memory" => {
-            from_value::<GraphTraceMemoryInput>(input).and_then(run_graph_trace_memory)
-        }
-        "graph_list_domains" => {
-            from_value::<GraphListDomainsInput>(input).and_then(run_graph_list_domains)
-        }
-        "graph_add_memory" => {
-            from_value::<GraphAddMemoryInput>(input).and_then(run_graph_add_memory)
-        }
-        "graph_add_concept" => {
-            from_value::<GraphAddConceptInput>(input).and_then(run_graph_add_concept)
-        }
-        "graph_add_code_node" => {
-            from_value::<GraphAddCodeNodeInput>(input).and_then(run_graph_add_code_node)
-        }
-        "graph_link_nodes" => {
-            from_value::<GraphLinkNodesInput>(input).and_then(run_graph_link_nodes)
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -1217,8 +1209,11 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_search_catalog(input: GraphSearchCatalogInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_search_catalog_in_directory(
+    input: GraphSearchCatalogInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let mut query = CatalogQuery::new(split_keywords(&input.query));
     query.graph_type = input
@@ -1236,8 +1231,11 @@ fn run_graph_search_catalog(input: GraphSearchCatalogInput) -> Result<String, St
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_get_node_detail(input: GraphGetNodeDetailInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_get_node_detail_in_directory(
+    input: GraphGetNodeDetailInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     to_pretty_json(
         store
@@ -1247,8 +1245,11 @@ fn run_graph_get_node_detail(input: GraphGetNodeDetailInput) -> Result<String, S
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_trace_memory(input: GraphTraceMemoryInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_trace_memory_in_directory(
+    input: GraphTraceMemoryInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let mut query = TraceQuery::new(input.root_id);
     query.direction = input
@@ -1267,15 +1268,21 @@ fn run_graph_trace_memory(input: GraphTraceMemoryInput) -> Result<String, String
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_list_domains(input: GraphListDomainsInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_list_domains_in_directory(
+    input: GraphListDomainsInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     to_pretty_json(store.list_domains().map_err(|error| error.to_string())?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_add_memory(input: GraphAddMemoryInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_add_memory_in_directory(
+    input: GraphAddMemoryInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let title = required_non_empty("title", &input.title)?;
     let now = chrono::Utc::now().timestamp_millis();
@@ -1317,8 +1324,11 @@ fn run_graph_add_memory(input: GraphAddMemoryInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_add_concept(input: GraphAddConceptInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_add_concept_in_directory(
+    input: GraphAddConceptInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let name = required_non_empty("name", &input.name)?;
     let graph_type = input
@@ -1360,8 +1370,11 @@ fn run_graph_add_concept(input: GraphAddConceptInput) -> Result<String, String> 
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_add_code_node(input: GraphAddCodeNodeInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_add_code_node_in_directory(
+    input: GraphAddCodeNodeInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let path = required_non_empty("path", &input.path)?;
     let now = chrono::Utc::now().timestamp_millis();
@@ -1831,8 +1844,11 @@ fn stable_code_node_id(kind: &str, value: &str) -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_link_nodes(input: GraphLinkNodesInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_link_nodes_in_directory(
+    input: GraphLinkNodesInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let src = required_non_empty("src", &input.src)?;
     let dst = required_non_empty("dst", &input.dst)?;
@@ -2390,21 +2406,6 @@ struct GraphLinkNodesInput {
     edge_kind: String,
     weight: Option<f64>,
     props: Option<Value>,
-}
-
-fn resolve_graph_db_path(input_path: Option<&str>) -> Result<PathBuf, String> {
-    let path = if let Some(path) = input_path.filter(|path| !path.trim().is_empty()) {
-        PathBuf::from(path)
-    } else if let Some(path) = std::env::var_os("AI_BRAIN_GRAPH_DB").filter(|path| !path.is_empty())
-    {
-        PathBuf::from(path)
-    } else {
-        default_graph_db_path()?
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    Ok(path)
 }
 
 fn resolve_graph_db_path_in_directory(
@@ -5608,6 +5609,20 @@ mod tests {
         }
     }
 
+    struct DirectoryCleanup(PathBuf);
+
+    impl DirectoryCleanup {
+        fn new(path: PathBuf) -> Self {
+            Self(path)
+        }
+    }
+
+    impl Drop for DirectoryCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn explicit_working_directory_scopes_workspace_tools() {
@@ -6064,6 +6079,75 @@ mod tests {
             .starts_with(workspace.join("agent-output")));
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn explicit_working_directory_scopes_relative_graph_input_paths() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ignored_env_dir = PathBuf::from(
+            temp_path("ignored-graph-env")
+                .file_name()
+                .expect("relative env directory"),
+        );
+        let _graph_db = EnvVarGuard::set("AI_BRAIN_GRAPH_DB", ignored_env_dir.join("ignored.db"));
+        let relative_db_dir = PathBuf::from(
+            temp_path("relative-graph-input")
+                .file_name()
+                .expect("relative DB directory"),
+        );
+        let relative_db_path = relative_db_dir.join("graph.db");
+        let process_cwd = test_working_directory();
+        let _process_db_cleanup = DirectoryCleanup::new(process_cwd.join(&relative_db_dir));
+        let _process_env_cleanup = DirectoryCleanup::new(process_cwd.join(&ignored_env_dir));
+        let root = temp_path("relative-graph-input-workspaces");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create graph workspace A");
+        fs::create_dir_all(&workspace_b).expect("create graph workspace B");
+
+        for workspace in [&workspace_a, &workspace_b] {
+            super::execute_tool_in_directory(
+                "graph_list_domains",
+                &json!({"db_path": relative_db_path}),
+                workspace,
+            )
+            .expect("list domains in scoped relative graph DB");
+            assert!(workspace.join(&relative_db_path).exists());
+            assert!(!workspace.join(&ignored_env_dir).join("ignored.db").exists());
+        }
+        assert!(!process_cwd.join(relative_db_path).exists());
+    }
+
+    #[test]
+    fn explicit_working_directory_scopes_relative_graph_environment_paths() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let relative_db_dir = PathBuf::from(
+            temp_path("relative-graph-env")
+                .file_name()
+                .expect("relative env DB directory"),
+        );
+        let relative_db_path = relative_db_dir.join("graph.db");
+        let _graph_db = EnvVarGuard::set("AI_BRAIN_GRAPH_DB", &relative_db_path);
+        let process_cwd = test_working_directory();
+        let _process_db_cleanup = DirectoryCleanup::new(process_cwd.join(&relative_db_dir));
+        let root = temp_path("relative-graph-env-workspaces");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create graph workspace A");
+        fs::create_dir_all(&workspace_b).expect("create graph workspace B");
+
+        for workspace in [&workspace_a, &workspace_b] {
+            super::execute_tool_in_directory("graph_list_domains", &json!({}), workspace)
+                .expect("list domains in scoped env graph DB");
+            assert!(workspace.join(&relative_db_path).exists());
+        }
+        assert!(!process_cwd.join(relative_db_path).exists());
     }
 
     #[test]
