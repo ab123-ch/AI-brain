@@ -563,3 +563,117 @@ fn validate_request(request: &NovelTaskRequest) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::{CandidateReviewVerdict, MainReviewChecks, NovelTaskType, ReviewCheckStatus};
+
+    fn blank_drafting_state() -> NovelTaskState {
+        let request = NovelTaskRequest {
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            task_type: NovelTaskType::Body,
+            task_brief: "Write chapter one".into(),
+            target_chapter: Some(1),
+            expected_revision: 0,
+            output_path: PathBuf::from("chapters/0001.md"),
+            context_refs: Vec::new(),
+            must_happen: Vec::new(),
+            must_not_change: Vec::new(),
+            acceptance_criteria: vec!["Complete chapter one".into()],
+            allow_web_research: false,
+            publication_policy: PublicationPolicy::RequireUserAcceptance,
+            parent_task_id: None,
+            source_conversation_id: None,
+            source_generation_id: None,
+        };
+        let mut state = NovelTaskState::new(request).unwrap();
+        state.begin_drafting().unwrap();
+        state
+    }
+
+    fn assert_content_guard(mut state: NovelTaskState) {
+        let checkpoint = state.checkpoint().unwrap();
+
+        let error = state.unlock_failed_execution().unwrap_err();
+
+        assert!(error.to_string().contains("已有草稿或候选版本"));
+        assert_eq!(state.checkpoint().unwrap(), checkpoint);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_candidate_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.candidate = Some(NovelCandidate {
+            candidate_id: "candidate-1".into(),
+            task_id: state.request.task_id.clone(),
+            project_id: state.request.project_id.clone(),
+            draft_version: 1,
+            canon_revision: 0,
+            artifact_id: "artifact-1".into(),
+            content_hash: "hash-1".into(),
+            created_at: 1,
+        });
+
+        assert_content_guard(state);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_candidate_reviews_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.candidate_reviews.push(CandidateReview {
+            review_id: "review-1".into(),
+            candidate_id: "candidate-1".into(),
+            candidate_content_hash: "hash-1".into(),
+            reviewer_artifact_id: "reviewer-1".into(),
+            verdict: CandidateReviewVerdict::Approve,
+            evidence_refs: Vec::new(),
+            summary: "approved".into(),
+        });
+
+        assert_content_guard(state);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_main_review_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.main_review = Some(MainReviewRecord {
+            task_id: state.request.task_id.clone(),
+            draft_version: 1,
+            reviewed_canon_revision: 0,
+            verdict: MainReviewVerdict::Pass,
+            checks: MainReviewChecks {
+                user_requirements: ReviewCheckStatus::Pass,
+                outline_alignment: ReviewCheckStatus::Pass,
+                canon_consistency: ReviewCheckStatus::Pass,
+                character_consistency: ReviewCheckStatus::Pass,
+                timeline_consistency: ReviewCheckStatus::Pass,
+                plot_and_foreshadowing: ReviewCheckStatus::Pass,
+                style_quality: ReviewCheckStatus::Pass,
+                pacing_and_hook: ReviewCheckStatus::Pass,
+            },
+            issues: Vec::new(),
+            evidence_refs: Vec::new(),
+            summary: "approved".into(),
+        });
+
+        assert_content_guard(state);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_user_decision_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.user_decision = Some(UserDecisionRecord {
+            task_id: state.request.task_id.clone(),
+            draft_version: 1,
+            decision: UserDecision::Accept,
+            feedback: None,
+            decided_at: 1,
+        });
+
+        assert_content_guard(state);
+    }
+}
