@@ -717,7 +717,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
         },
         ToolSpec {
             name: "novel_task",
-            description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。仅在 needs_clarification 后调用 resume，且 input 必须非空。start 遇到 ContextRef hash 变化时更新原调用；resume 遇到变化时必须在 context_refs 中保持原 role/path，仅替换为 actual hash，并只重试一次。",
+            description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。仅在 needs_clarification 后调用 resume，且 input 必须非空。start 遇到 ContextRef hash 变化时更新原调用；resume 遇到变化时必须在 context_refs 中保持原 role/path，仅替换为 actual hash，并只重试一次。当 start 报告 project already has active work 时，先调用 status 找到旧 task 并检查最新工作流错误；该锁用于防止同项目并发写作造成 Canon 冲突、重复产物、重复审核或重复发布。只有 Task Engine 为 failed 或 cancelled，且旧 checkpoint 非终态、没有草稿/候选/审核决定/发布物时才能调用 unlock_failed。运行中、paused_budget、needs_input、completed、未知或已有产物时工具会拒绝，模型必须直接告知，不能循环解锁。unlock_failed 不调用 Writer/LLM、不重试、不删除历史；成功后仅在用户仍要求继续创作时另行显式调用 start。reason 会长期写入审计，不得包含密钥、Authorization、个人敏感信息。",
             input_schema: json!({
                 "type": "object",
                 "oneOf": [
@@ -821,6 +821,21 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                         "type": "object",
                         "properties": { "action": { "const": "publish" }, "task_id": { "type": "string" }, "draft_version": { "type": "integer", "minimum": 1 } },
                         "required": ["action", "task_id", "draft_version"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": { "const": "unlock_failed" },
+                            "task_id": { "type": "string", "minLength": 1 },
+                            "reason": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256,
+                                "description": "人工解锁原因；不得包含换行等控制字符，也不得包含凭据或个人敏感信息。"
+                            }
+                        },
+                        "required": ["action", "task_id", "reason"],
                         "additionalProperties": false
                     },
                     {
@@ -6300,6 +6315,18 @@ mod tests {
             "actual hash",
             "原 role/path",
             "只重试一次",
+            "project already has active work",
+            "先调用 status 找到旧 task 并检查最新工作流错误",
+            "防止同项目并发写作造成 Canon 冲突",
+            "Task Engine 为 failed 或 cancelled",
+            "旧 checkpoint 非终态",
+            "没有草稿/候选/审核决定/发布物",
+            "运行中、paused_budget、needs_input、completed、未知或已有产物时工具会拒绝",
+            "模型必须直接告知，不能循环解锁",
+            "unlock_failed 不调用 Writer/LLM、不重试、不删除历史",
+            "成功后仅在用户仍要求继续创作时另行显式调用 start",
+            "reason 会长期写入审计",
+            "不得包含密钥、Authorization、个人敏感信息",
         ] {
             assert!(
                 task.description.contains(guidance),
@@ -6331,6 +6358,36 @@ mod tests {
         assert!(publish_properties.contains_key("task_id"));
         assert!(publish_properties.contains_key("draft_version"));
         assert!(!publish_properties.contains_key("content"));
+
+        let unlock_failed = task.input_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["action"]["const"] == "unlock_failed")
+            .expect("unlock_failed schema branch");
+        let unlock_properties = unlock_failed["properties"].as_object().unwrap();
+        let mut unlock_property_names = unlock_properties
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        unlock_property_names.sort_unstable();
+        assert_eq!(unlock_property_names, vec!["action", "reason", "task_id"]);
+        assert_eq!(
+            unlock_failed["required"],
+            json!(["action", "task_id", "reason"])
+        );
+        assert_eq!(unlock_failed["additionalProperties"], false);
+        assert_eq!(unlock_properties["task_id"]["minLength"], 1);
+        assert_eq!(unlock_properties["reason"]["minLength"], 1);
+        assert_eq!(unlock_properties["reason"]["maxLength"], 256);
+        let reason_description = unlock_properties["reason"]["description"].as_str().unwrap();
+        for guidance in ["不得包含换行等控制字符", "不得包含凭据或个人敏感信息"]
+        {
+            assert!(
+                reason_description.contains(guidance),
+                "unlock_failed reason description missing {guidance}"
+            );
+        }
         assert!(!specs.iter().any(|spec| spec.name == "novel_commit_delta"));
     }
 

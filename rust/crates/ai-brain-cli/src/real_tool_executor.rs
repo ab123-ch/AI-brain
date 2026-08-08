@@ -701,6 +701,13 @@ struct NovelPublishToolInput {
     draft_version: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NovelUnlockFailedToolInput {
+    task_id: String,
+    reason: String,
+}
+
 async fn execute_application_novel_tool(
     application: &dyn TaskApplicationPort,
     name: &str,
@@ -712,7 +719,8 @@ async fn execute_application_novel_tool(
         .ok_or_else(|| "Novel facade input must be an object".to_string())?
         .remove("action");
     validate_novel_action_input(name, &action, &input)?;
-    if name == "novel_task" && action != "start" {
+    if name == "novel_task" && matches!(action.as_str(), "resume" | "review" | "decide" | "publish")
+    {
         if let (Some(scope), Some(task_id)) = (
             crate::query_context::current_conversation_memory_scope(),
             input.get("task_id").and_then(serde_json::Value::as_str),
@@ -772,6 +780,16 @@ async fn execute_application_novel_tool(
             serde_json::to_value(
                 application
                     .publish(&input.task_id, input.draft_version)
+                    .await
+                    .map_err(novel_error_mapper(&action))?,
+            )
+        }
+        ("novel_task", "unlock_failed") => {
+            let input: NovelUnlockFailedToolInput = serde_json::from_value(input)
+                .map_err(|error| format!("novel_task unlock_failed 格式错误: {error}"))?;
+            serde_json::to_value(
+                application
+                    .unlock_failed_task(&input.task_id, &input.reason)
                     .await
                     .map_err(novel_error_mapper(&action))?,
             )
@@ -880,7 +898,10 @@ fn validate_novel_action_input(
     if name != "novel_task" {
         return Ok(());
     }
-    if matches!(action, "resume" | "review" | "decide" | "publish") {
+    if matches!(
+        action,
+        "resume" | "review" | "decide" | "publish" | "unlock_failed"
+    ) {
         required_string(input, "task_id")?;
     }
     match action {
@@ -904,6 +925,18 @@ fn validate_novel_action_input(
         "publish" => serde_json::from_value::<NovelPublishToolInput>(input.clone())
             .map(|_| ())
             .map_err(|error| format!("novel_task publish 格式错误: {error}")),
+        "unlock_failed" => {
+            let reason = required_string(input, "reason")?;
+            if reason.chars().count() > 256 {
+                return Err("novel_task unlock_failed 的 reason 超过 256 个字符".into());
+            }
+            if reason.chars().any(char::is_control) {
+                return Err("novel_task unlock_failed 的 reason 包含不允许的控制字符".into());
+            }
+            serde_json::from_value::<NovelUnlockFailedToolInput>(input.clone())
+                .map(|_| ())
+                .map_err(|error| format!("novel_task unlock_failed 格式错误: {error}"))
+        }
         "start" => serde_json::from_value::<NovelTaskRequest>(input.clone())
             .map(|_| ())
             .map_err(|error| format!("NovelTaskRequest 格式错误: {error}")),
@@ -1041,12 +1074,14 @@ mod tests {
         NovelTransition, PublicationReceipt, ReviewCheckStatus,
     };
     use novel_workflow::{
-        NovelStartWorkflow, NovelWorkflowBudget, NovelWorkflowModels, NovelWorkflowPortError,
-        NovelWriterExecution, NovelWriterInvocation, NovelWriterPort, ProfileModel,
+        NovelStartWorkflow, NovelTaskExecutionState, NovelWorkflowBudget, NovelWorkflowModels,
+        NovelWorkflowPortError, NovelWriterExecution, NovelWriterInvocation, NovelWriterPort,
+        ProfileModel,
     };
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use task_engine::{
         ActualUsage, Scheduler, SchedulerLimits, TaskCoordinator, TaskRepository, TaskRunState,
     };
@@ -1060,6 +1095,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingTaskApplication {
         association_calls: AtomicUsize,
+        unlock_calls: AtomicUsize,
+        unlock_arguments: Mutex<Option<(String, String)>>,
         start_context_error: Option<String>,
     }
 
@@ -1119,15 +1156,29 @@ mod tests {
             _task_id: &str,
             _input: NovelResumeInput,
         ) -> novel_application::Result<NovelOutcome> {
-            panic!("unexpected resume_task")
+            Err(NovelApplicationError::NotFound("recorded resume".into()))
         }
 
         async fn unlock_failed_task(
             &self,
-            _task_id: &str,
-            _reason: &str,
+            task_id: &str,
+            reason: &str,
         ) -> novel_application::Result<novel_application::NovelTaskUnlockReceipt> {
-            panic!("unexpected unlock_failed_task")
+            self.unlock_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .unlock_arguments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((task_id.to_owned(), reason.to_owned()));
+            Ok(novel_application::NovelTaskUnlockReceipt {
+                task_id: task_id.to_owned(),
+                project_id: "project-1".into(),
+                previous_phase: NovelTaskPhase::Drafting,
+                phase: NovelTaskPhase::Cancelled,
+                execution_state: NovelTaskExecutionState::Failed,
+                already_unlocked: false,
+                reason: reason.to_owned(),
+            })
         }
 
         async fn review_draft(
@@ -1156,7 +1207,10 @@ mod tests {
             &self,
             _project_id: Option<&str>,
         ) -> novel_application::Result<NovelApplicationStatus> {
-            panic!("unexpected status")
+            Ok(NovelApplicationStatus {
+                projects: Vec::new(),
+                pending_publications: Vec::new(),
+            })
         }
 
         async fn invalidate_conversation_generations(
@@ -1279,10 +1333,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn novel_unlock_failed_dispatches_once_without_conversation_association() {
+        let application = RecordingTaskApplication::default();
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        let output = crate::query_context::with_conversation_memory_scope(&scope, async {
+            execute_application_novel_tool(
+                &application,
+                "novel_task",
+                json!({
+                    "action": "unlock_failed",
+                    "task_id": "task-1",
+                    "reason": " 人工确认执行失败 "
+                }),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            application
+                .unlock_arguments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(&("task-1".into(), " 人工确认执行失败 ".into()))
+        );
+        let receipt: novel_application::NovelTaskUnlockReceipt =
+            serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt.task_id, "task-1");
+        assert_eq!(receipt.project_id, "project-1");
+        assert_eq!(receipt.previous_phase, NovelTaskPhase::Drafting);
+        assert_eq!(receipt.phase, NovelTaskPhase::Cancelled);
+        assert_eq!(receipt.execution_state, NovelTaskExecutionState::Failed);
+        assert!(!receipt.already_unlocked);
+        assert_eq!(receipt.reason, " 人工确认执行失败 ");
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_rejects_invalid_input_before_port_calls() {
+        let application = RecordingTaskApplication::default();
+        let malicious_reason = "Authorization: Bearer secret\n请放行";
+        let invalid_inputs = [
+            json!({}),
+            json!({"action": "  "}),
+            json!({"action": "unlock_failed", "reason": "合法原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1"}),
+            json!({"action": "unlock_failed", "task_id": "  ", "reason": "合法原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "  "}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "x".repeat(257)}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": malicious_reason}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "合法\t原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "合法\u{007f}原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "合法原因", "extra": true}),
+        ];
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        for input in invalid_inputs {
+            let error = crate::query_context::with_conversation_memory_scope(&scope, async {
+                execute_application_novel_tool(&application, "novel_task", input)
+                    .await
+                    .unwrap_err()
+            })
+            .await;
+            assert!(
+                !error.contains(malicious_reason),
+                "错误不得回显恶意 reason: {error}"
+            );
+            assert!(
+                !error.contains("Bearer secret"),
+                "错误不得泄露恶意 reason 片段: {error}"
+            );
+        }
+
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_keeps_resume_conversation_association_behavior() {
+        let application = RecordingTaskApplication::default();
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        let _error = crate::query_context::with_conversation_memory_scope(&scope, async {
+            execute_application_novel_tool(
+                &application,
+                "novel_task",
+                json!({"action": "resume", "task_id": "task-1", "input": "继续"}),
+            )
+            .await
+            .unwrap_err()
+        })
+        .await;
+
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_does_not_expand_conversation_association_to_status() {
+        let application = RecordingTaskApplication::default();
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        crate::query_context::with_conversation_memory_scope(&scope, async {
+            execute_application_novel_tool(
+                &application,
+                "novel_task",
+                json!({"action": "status", "task_id": "must-not-associate"}),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn novel_context_change_error_contains_finite_recovery_instruction() {
         let application = RecordingTaskApplication {
-            association_calls: AtomicUsize::new(0),
             start_context_error: Some("outline.md".into()),
+            ..Default::default()
         };
 
         let error = execute_application_novel_tool(
