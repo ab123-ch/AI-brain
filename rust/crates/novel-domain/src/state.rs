@@ -38,6 +38,14 @@ pub struct NovelTaskState {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlockBlocker {
+    Terminal,
+    Publication,
+    Content,
+    Phase,
+}
+
 impl NovelTaskState {
     pub fn new(request: NovelTaskRequest) -> Result<Self> {
         validate_request(&request)?;
@@ -436,6 +444,85 @@ impl NovelTaskState {
         self.updated_at = now_millis();
     }
 
+    pub fn unlock_failed_execution(&mut self) -> Result<()> {
+        match self.unlock_blocker() {
+            Some(UnlockBlocker::Terminal) => {
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务已是终态，不能执行失败解锁".into(),
+                ));
+            }
+            Some(UnlockBlocker::Publication) => {
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务处于发布流程或已有发布产物，拒绝解锁".into(),
+                ));
+            }
+            Some(UnlockBlocker::Content) => {
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务已有草稿、候选、评审或用户决定，拒绝解锁；请继续 review/decide/publish 流程"
+                        .into(),
+                ));
+            }
+            Some(UnlockBlocker::Phase) => {
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务当前阶段不允许失败解锁".into(),
+                ));
+            }
+            None => {}
+        }
+        self.phase = NovelTaskPhase::Cancelled;
+        self.updated_at = now_millis();
+        Ok(())
+    }
+
+    fn unlock_blocker(&self) -> Option<UnlockBlocker> {
+        let Self {
+            request: _,
+            phase,
+            draft_version,
+            draft,
+            candidate,
+            candidate_reviews,
+            main_review,
+            user_decision,
+            publication_id,
+            artifact,
+            commit_report,
+            conversation_sources: _,
+            created_at: _,
+            updated_at: _,
+        } = self;
+
+        if phase.is_terminal() {
+            Some(UnlockBlocker::Terminal)
+        } else if matches!(
+            phase,
+            NovelTaskPhase::PublicationPending | NovelTaskPhase::ArtifactSavedMemoryPending
+        ) || publication_id.is_some()
+            || artifact.is_some()
+            || commit_report.is_some()
+        {
+            Some(UnlockBlocker::Publication)
+        } else if *draft_version != 0
+            || draft.is_some()
+            || candidate.is_some()
+            || !candidate_reviews.is_empty()
+            || main_review.is_some()
+            || user_decision.is_some()
+        {
+            Some(UnlockBlocker::Content)
+        } else if matches!(
+            phase,
+            NovelTaskPhase::Preparing
+                | NovelTaskPhase::Drafting
+                | NovelTaskPhase::NeedsClarification
+                | NovelTaskPhase::StaleRevision
+        ) {
+            None
+        } else {
+            Some(UnlockBlocker::Phase)
+        }
+    }
+
     pub fn cancel_for_conversation_fork(&mut self) -> Result<()> {
         if self.phase.is_terminal() {
             return Err(NovelDomainError::InvalidTransition(format!(
@@ -528,4 +615,118 @@ fn validate_request(request: &NovelTaskRequest) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::{CandidateReviewVerdict, MainReviewChecks, NovelTaskType, ReviewCheckStatus};
+
+    fn blank_drafting_state() -> NovelTaskState {
+        let request = NovelTaskRequest {
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            task_type: NovelTaskType::Body,
+            task_brief: "Write chapter one".into(),
+            target_chapter: Some(1),
+            expected_revision: 0,
+            output_path: PathBuf::from("chapters/0001.md"),
+            context_refs: Vec::new(),
+            must_happen: Vec::new(),
+            must_not_change: Vec::new(),
+            acceptance_criteria: vec!["Complete chapter one".into()],
+            allow_web_research: false,
+            publication_policy: PublicationPolicy::RequireUserAcceptance,
+            parent_task_id: None,
+            source_conversation_id: None,
+            source_generation_id: None,
+        };
+        let mut state = NovelTaskState::new(request).unwrap();
+        state.begin_drafting().unwrap();
+        state
+    }
+
+    fn assert_content_guard(mut state: NovelTaskState) {
+        let checkpoint = state.checkpoint().unwrap();
+
+        let error = state.unlock_failed_execution().unwrap_err();
+
+        assert!(error.to_string().contains("已有草稿、候选、评审或用户决定"));
+        assert_eq!(state.checkpoint().unwrap(), checkpoint);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_candidate_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.candidate = Some(NovelCandidate {
+            candidate_id: "candidate-1".into(),
+            task_id: state.request.task_id.clone(),
+            project_id: state.request.project_id.clone(),
+            draft_version: 1,
+            canon_revision: 0,
+            artifact_id: "artifact-1".into(),
+            content_hash: "hash-1".into(),
+            created_at: 1,
+        });
+
+        assert_content_guard(state);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_candidate_reviews_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.candidate_reviews.push(CandidateReview {
+            review_id: "review-1".into(),
+            candidate_id: "candidate-1".into(),
+            candidate_content_hash: "hash-1".into(),
+            reviewer_artifact_id: "reviewer-1".into(),
+            verdict: CandidateReviewVerdict::Approve,
+            evidence_refs: Vec::new(),
+            summary: "approved".into(),
+        });
+
+        assert_content_guard(state);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_main_review_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.main_review = Some(MainReviewRecord {
+            task_id: state.request.task_id.clone(),
+            draft_version: 1,
+            reviewed_canon_revision: 0,
+            verdict: MainReviewVerdict::Pass,
+            checks: MainReviewChecks {
+                user_requirements: ReviewCheckStatus::Pass,
+                outline_alignment: ReviewCheckStatus::Pass,
+                canon_consistency: ReviewCheckStatus::Pass,
+                character_consistency: ReviewCheckStatus::Pass,
+                timeline_consistency: ReviewCheckStatus::Pass,
+                plot_and_foreshadowing: ReviewCheckStatus::Pass,
+                style_quality: ReviewCheckStatus::Pass,
+                pacing_and_hook: ReviewCheckStatus::Pass,
+            },
+            issues: Vec::new(),
+            evidence_refs: Vec::new(),
+            summary: "approved".into(),
+        });
+
+        assert_content_guard(state);
+    }
+
+    #[test]
+    fn failed_execution_unlock_rejects_user_decision_without_mutation() {
+        let mut state = blank_drafting_state();
+        state.user_decision = Some(UserDecisionRecord {
+            task_id: state.request.task_id.clone(),
+            draft_version: 1,
+            decision: UserDecision::Accept,
+            feedback: None,
+            decided_at: 1,
+        });
+
+        assert_content_guard(state);
+    }
 }

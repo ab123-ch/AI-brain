@@ -114,6 +114,32 @@ impl From<knowledge_core::KnowledgeError> for NovelWorkflowPortError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NovelTaskExecutionState {
+    Queued,
+    Running,
+    PausedBudget,
+    NeedsInput,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<TaskRunState> for NovelTaskExecutionState {
+    fn from(state: TaskRunState) -> Self {
+        match state {
+            TaskRunState::Queued => Self::Queued,
+            TaskRunState::Running => Self::Running,
+            TaskRunState::PausedBudget => Self::PausedBudget,
+            TaskRunState::NeedsInput => Self::NeedsInput,
+            TaskRunState::Completed => Self::Completed,
+            TaskRunState::Failed => Self::Failed,
+            TaskRunState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NovelContextDocument {
     pub reference: ContextRef,
@@ -234,6 +260,22 @@ impl NovelStartWorkflow {
             budget,
             task_locks: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub async fn task_execution_state(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<NovelTaskExecutionState>, NovelWorkflowPortError> {
+        if task_id.trim().is_empty() {
+            return Err(NovelWorkflowPortError::InvalidRequest(
+                "task id is required for execution state lookup".into(),
+            ));
+        }
+        Ok(
+            load_task_optional(Arc::clone(&self.repository), &task_run_id(task_id))
+                .await?
+                .map(|task| task.state.into()),
+        )
     }
 
     pub async fn start_task(

@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["sync"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+task-engine = { path = "../task-engine" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

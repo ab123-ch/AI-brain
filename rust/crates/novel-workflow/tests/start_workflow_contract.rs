@@ -11,12 +11,13 @@ use novel_domain::{
     UserDecisionRecord,
 };
 use novel_workflow::{
-    NovelContextDocument, NovelStartWorkflow, NovelWorkflowBudget, NovelWorkflowEnvironmentPort,
-    NovelWorkflowModels, NovelWorkflowPortError, NovelWriterExecution, NovelWriterInvocation,
-    NovelWriterPort, ProfileModel,
+    NovelContextDocument, NovelStartWorkflow, NovelTaskExecutionState, NovelWorkflowBudget,
+    NovelWorkflowEnvironmentPort, NovelWorkflowModels, NovelWorkflowPortError,
+    NovelWriterExecution, NovelWriterInvocation, NovelWriterPort, ProfileModel,
 };
 use task_engine::{
-    ActualUsage, Scheduler, SchedulerLimits, TaskCoordinator, TaskRepository, TaskRunState,
+    ActualUsage, Scheduler, SchedulerLimits, TaskCoordinator, TaskEngineError, TaskRepository,
+    TaskRunState,
 };
 
 #[derive(Default)]
@@ -346,6 +347,105 @@ async fn failed_writer_persists_known_actual_usage() {
             input_tokens: 52,
             output_tokens: 11,
         })
+    );
+}
+
+#[tokio::test]
+async fn task_execution_state_reports_failed_and_missing_task_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+    let environment = Arc::new(FakeEnvironment::default());
+    *environment.project.lock().unwrap() = Some(NovelProject::new("project-1", "Project"));
+    let service = NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        coordinator(Arc::clone(&repository)),
+        environment,
+        Arc::new(UsageFailingWriter),
+        models(),
+        NovelWorkflowBudget {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+        },
+    );
+
+    service.start_task(request()).await.unwrap_err();
+
+    assert_eq!(
+        service.task_execution_state("task-1").await.unwrap(),
+        Some(NovelTaskExecutionState::Failed)
+    );
+    assert_eq!(
+        service.task_execution_state("missing-task").await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn task_execution_state_rejects_blank_task_ids_without_creating_task_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+    let service = NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        coordinator(Arc::clone(&repository)),
+        Arc::new(FakeEnvironment::default()),
+        Arc::new(UsageFailingWriter),
+        models(),
+        NovelWorkflowBudget {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+        },
+    );
+
+    for task_id in ["", "  \t"] {
+        let error = service.task_execution_state(task_id).await.unwrap_err();
+        match error {
+            NovelWorkflowPortError::InvalidRequest(message) => {
+                assert!(message.contains("execution state lookup"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    for task_run_id in ["novel-task-", "novel-task-  \t"] {
+        assert!(matches!(
+            repository.task(task_run_id),
+            Err(TaskEngineError::NotFound {
+                entity: "task run",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn task_execution_state_maps_every_task_engine_state() {
+    assert_eq!(
+        NovelTaskExecutionState::from(TaskRunState::Queued),
+        NovelTaskExecutionState::Queued
+    );
+    assert_eq!(
+        NovelTaskExecutionState::from(TaskRunState::Running),
+        NovelTaskExecutionState::Running
+    );
+    assert_eq!(
+        NovelTaskExecutionState::from(TaskRunState::PausedBudget),
+        NovelTaskExecutionState::PausedBudget
+    );
+    assert_eq!(
+        NovelTaskExecutionState::from(TaskRunState::NeedsInput),
+        NovelTaskExecutionState::NeedsInput
+    );
+    assert_eq!(
+        NovelTaskExecutionState::from(TaskRunState::Completed),
+        NovelTaskExecutionState::Completed
+    );
+    assert_eq!(
+        NovelTaskExecutionState::from(TaskRunState::Failed),
+        NovelTaskExecutionState::Failed
+    );
+    assert_eq!(
+        NovelTaskExecutionState::from(TaskRunState::Cancelled),
+        NovelTaskExecutionState::Cancelled
     );
 }
 

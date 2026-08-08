@@ -717,14 +717,14 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
         },
         ToolSpec {
             name: "novel_task",
-            description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。仅在 needs_clarification 后调用 resume，且 input 必须非空。start 遇到 ContextRef hash 变化时更新原调用；resume 遇到变化时必须在 context_refs 中保持原 role/path，仅替换为 actual hash，并只重试一次。",
+            description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。仅在 needs_clarification 后调用 resume，且 input 必须非空。start 遇到 ContextRef hash 变化时更新原调用；resume 遇到变化时必须在 context_refs 中保持原 role/path，仅替换为 actual hash，并只重试一次。当 start 报告 project already has active work 时，先调用 status 找到旧 task；status 只用于查找旧 task，最新工作流错误需从当前工具结果或运行日志确认。该锁用于防止同项目并发写作造成 Canon 冲突、重复产物、重复审核或重复发布。只有 Task Engine 为 failed 或 cancelled，且旧 checkpoint 非终态、没有草稿/候选/审核决定/发布物时才能调用 unlock_failed。queued、运行中、paused_budget、needs_input、completed、未知或已有产物时工具会拒绝，模型必须直接告知，不能循环解锁。unlock_failed 不调用 Writer/LLM、不重试、不删除历史；成功后仅在用户仍要求继续创作时另行显式调用 start。reason 会长期写入审计，不得包含密钥、Authorization、个人敏感信息。",
             input_schema: json!({
                 "type": "object",
                 "oneOf": [
                     {
                         "type": "object",
                         "properties": {
-                            "action": { "const": "start" },
+                            "action": { "type": "string", "enum": ["start"] },
                             "task_id": { "type": "string" },
                             "project_id": { "type": "string" },
                             "task_type": { "type": "string", "enum": ["outline", "volume_outline", "chapter_plan", "body", "continuation", "review", "polish", "retrospective"] },
@@ -759,7 +759,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                     {
                         "type": "object",
                         "properties": {
-                            "action": { "const": "resume" },
+                            "action": { "type": "string", "enum": ["resume"] },
                             "task_id": { "type": "string", "minLength": 1 },
                             "input": { "type": "string", "minLength": 1 },
                             "context_refs": {
@@ -784,7 +784,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                     {
                         "type": "object",
                         "properties": {
-                            "action": { "const": "review" },
+                            "action": { "type": "string", "enum": ["review"] },
                             "task_id": { "type": "string" },
                             "draft_version": { "type": "integer", "minimum": 1 },
                             "reviewed_canon_revision": { "type": "integer", "minimum": 0 },
@@ -813,19 +813,40 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                     },
                     {
                         "type": "object",
-                        "properties": { "action": { "const": "decide" }, "task_id": { "type": "string" }, "draft_version": { "type": "integer", "minimum": 1 }, "decision": { "type": "string", "enum": ["accept", "revise", "reject"] }, "feedback": { "type": "string" }, "decided_at": { "type": "integer" } },
+                        "properties": { "action": { "type": "string", "enum": ["decide"] }, "task_id": { "type": "string" }, "draft_version": { "type": "integer", "minimum": 1 }, "decision": { "type": "string", "enum": ["accept", "revise", "reject"] }, "feedback": { "type": "string" }, "decided_at": { "type": "integer" } },
                         "required": ["action", "task_id", "draft_version", "decision"],
                         "additionalProperties": false
                     },
                     {
                         "type": "object",
-                        "properties": { "action": { "const": "publish" }, "task_id": { "type": "string" }, "draft_version": { "type": "integer", "minimum": 1 } },
+                        "properties": { "action": { "type": "string", "enum": ["publish"] }, "task_id": { "type": "string" }, "draft_version": { "type": "integer", "minimum": 1 } },
                         "required": ["action", "task_id", "draft_version"],
                         "additionalProperties": false
                     },
                     {
                         "type": "object",
-                        "properties": { "action": { "const": "status" }, "project_id": { "type": "string" } },
+                        "properties": {
+                            "action": { "type": "string", "enum": ["unlock_failed"] },
+                            "task_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[A-Za-z0-9_-]+$",
+                                "description": "失败任务标识；长度 1 到 128 个 ASCII 字符，仅允许字母、数字、下划线和连字符，不得包含空白、Unicode、路径分隔符或控制字符。"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256,
+                                "description": "人工解锁原因；不得包含换行等控制字符，也不得包含凭据或个人敏感信息。"
+                            }
+                        },
+                        "required": ["action", "task_id", "reason"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "action": { "type": "string", "enum": ["status"] }, "project_id": { "type": "string" } },
                         "required": ["action"],
                         "additionalProperties": false
                     }
@@ -6271,6 +6292,40 @@ mod tests {
     }
 
     #[test]
+    fn novel_workflow_skill_documents_failed_unlock() {
+        let skill = include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
+
+        for required_text in [
+            "unlock_failed",
+            "project already has active work",
+            "failed",
+            "cancelled",
+            "queued",
+            "paused_budget",
+            "needs_input",
+            "completed",
+            "不得自动重试 LLM",
+            "显式调用 start",
+            "不得包含密钥",
+            "status",
+            "reason",
+            "status 只能 project_id，不能 task_id",
+            "running/unknown 拒绝解锁",
+            "无 draft/candidate/review/decision/publication",
+            "不调用 Writer/LLM、不删除、不归档",
+            "不自动启动，不复用旧失败 task_id 冒充 resume",
+            "reason 必须非空，最多 256 字符",
+            "禁止控制字符、token、API key、Authorization、cookie、其他凭据、个人敏感信息",
+            "不猜 decide，不循环解锁",
+        ] {
+            assert!(
+                skill.contains(required_text),
+                "novel workflow skill missing {required_text}"
+            );
+        }
+    }
+
+    #[test]
     fn novel_workflow_tools_replace_ephemeral_agent_schema() {
         let specs = mvp_tool_specs();
         let agent = specs
@@ -6300,17 +6355,54 @@ mod tests {
             "actual hash",
             "原 role/path",
             "只重试一次",
+            "project already has active work",
+            "先调用 status 找到旧 task",
+            "status 只用于查找旧 task",
+            "最新工作流错误需从当前工具结果或运行日志确认",
+            "防止同项目并发写作造成 Canon 冲突",
+            "Task Engine 为 failed 或 cancelled",
+            "旧 checkpoint 非终态",
+            "没有草稿/候选/审核决定/发布物",
+            "queued、运行中、paused_budget、needs_input、completed、未知或已有产物时工具会拒绝",
+            "模型必须直接告知，不能循环解锁",
+            "unlock_failed 不调用 Writer/LLM、不重试、不删除历史",
+            "成功后仅在用户仍要求继续创作时另行显式调用 start",
+            "reason 会长期写入审计",
+            "不得包含密钥、Authorization、个人敏感信息",
         ] {
             assert!(
                 task.description.contains(guidance),
                 "novel_task description missing {guidance}"
             );
         }
-        let resume = task.input_schema["oneOf"]
-            .as_array()
-            .unwrap()
+        let task_branches = task.input_schema["oneOf"].as_array().unwrap();
+        let serialized_task_schema = serde_json::to_string(&task.input_schema).unwrap();
+        assert!(!serialized_task_schema.contains("\"const\""));
+        let mut actions = Vec::new();
+        for branch in task_branches {
+            let action = &branch["properties"]["action"];
+            assert_eq!(action["type"], "string");
+            let action_values = action["enum"].as_array().expect("action enum");
+            assert_eq!(action_values.len(), 1, "action enum 必须恰好一个值");
+            actions.push(action_values[0].as_str().unwrap());
+        }
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            vec![
+                "decide",
+                "publish",
+                "resume",
+                "review",
+                "start",
+                "status",
+                "unlock_failed"
+            ]
+        );
+
+        let resume = task_branches
             .iter()
-            .find(|branch| branch["properties"]["action"]["const"] == "resume")
+            .find(|branch| branch["properties"]["action"]["enum"][0] == "resume")
             .unwrap();
         assert_eq!(resume["properties"]["task_id"]["minLength"], 1);
         assert_eq!(resume["properties"]["input"]["minLength"], 1);
@@ -6319,11 +6411,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("只把 sha256 更新为 actual hash"));
-        let publish = task.input_schema["oneOf"]
-            .as_array()
-            .unwrap()
+        let publish = task_branches
             .iter()
-            .find(|branch| branch["properties"]["action"]["const"] == "publish")
+            .find(|branch| branch["properties"]["action"]["enum"][0] == "publish")
             .unwrap();
         let publish_properties = publish["properties"].as_object().unwrap();
         assert_eq!(publish_properties.len(), 3);
@@ -6331,6 +6421,47 @@ mod tests {
         assert!(publish_properties.contains_key("task_id"));
         assert!(publish_properties.contains_key("draft_version"));
         assert!(!publish_properties.contains_key("content"));
+
+        let unlock_failed = task_branches
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"][0] == "unlock_failed")
+            .expect("unlock_failed schema branch");
+        let unlock_properties = unlock_failed["properties"].as_object().unwrap();
+        let mut unlock_property_names = unlock_properties
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        unlock_property_names.sort_unstable();
+        assert_eq!(unlock_property_names, vec!["action", "reason", "task_id"]);
+        assert_eq!(
+            unlock_failed["required"],
+            json!(["action", "task_id", "reason"])
+        );
+        assert_eq!(unlock_failed["additionalProperties"], false);
+        assert_eq!(unlock_properties["task_id"]["minLength"], 1);
+        assert_eq!(unlock_properties["task_id"]["maxLength"], 128);
+        assert_eq!(unlock_properties["task_id"]["pattern"], "^[A-Za-z0-9_-]+$");
+        let task_id_description = unlock_properties["task_id"]["description"]
+            .as_str()
+            .unwrap();
+        for guidance in [
+            "1 到 128",
+            "ASCII",
+            "字母、数字、下划线和连字符",
+            "不得包含空白、Unicode、路径分隔符或控制字符",
+        ] {
+            assert!(task_id_description.contains(guidance));
+        }
+        assert_eq!(unlock_properties["reason"]["minLength"], 1);
+        assert_eq!(unlock_properties["reason"]["maxLength"], 256);
+        let reason_description = unlock_properties["reason"]["description"].as_str().unwrap();
+        for guidance in ["不得包含换行等控制字符", "不得包含凭据或个人敏感信息"]
+        {
+            assert!(
+                reason_description.contains(guidance),
+                "unlock_failed reason description missing {guidance}"
+            );
+        }
         assert!(!specs.iter().any(|spec| spec.name == "novel_commit_delta"));
     }
 

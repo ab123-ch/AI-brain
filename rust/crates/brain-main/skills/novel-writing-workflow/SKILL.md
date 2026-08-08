@@ -10,7 +10,7 @@ description: 统筹中文长篇小说的大纲、卷纲、章纲、正文、续�
 ## 应用入口
 
 - `novel_project(action=create|list|recall|consistency|resolve_conflict)`：创建或查找项目、按任务类型召回 Canon、检查一致性、记录冲突处理结论。
-- `novel_task(action=start|resume|review|decide|publish|status)`：启动或继续 durable task、提交主脑复审、记录用户决定、发布已封存候选稿、查询持久化状态。
+- `novel_task(action=start|resume|review|decide|publish|status|unlock_failed)`：启动或继续 durable task、提交主脑复审、记录用户决定、发布已封存候选稿、查询持久化状态或恢复失败锁。
 - 始终使用稳定的 `project_id` 和 `task_id`。同一任务的澄清与修订沿用原 `task_id`。
 - 严禁调用 `Agent(subagent_type='Novel')`，也不得直接写正式产物、提交 Canon 或操作 Memory/Graph 数据库。
 
@@ -30,6 +30,20 @@ description: 统筹中文长篇小说的大纲、卷纲、章纲、正文、续�
 3. 调用 `novel_task(action=start)`，提交稳定 ID、任务合同、当前 revision、输出路径、ContextRef、约束和验收标准。默认使用 `publication_policy=require_user_acceptance`。
 4. 仅当应用明确返回 `needs_clarification` 时，才向用户询问并调用 `novel_task(action=resume)`；沿用同一 `task_id`，且 `input` 必须是用户给出的非空澄清内容。其他错误不得用 `resume` 猜测恢复。
 5. 若 `start` 报告 ContextRef hash 已变化，重新读取该资源，在原 `start` 请求中使用错误的 `actual` hash，保持同一 `task_id` 并只重试一次。若仅在 `needs_clarification` 后的 `resume` 报告变化，则再次 `resume` 时同时提供完整 `context_refs`：保持原 role、canonical_path 和顺序，只把对应 `sha256` 换成 `actual`；不得借机更换资料或重复提交旧 hash。其他 action 的 ContextChanged 直接告知用户，不猜测恢复。
+
+### 失败锁恢复
+
+当 `start` 返回精确症状 `project already has active work`，先调用合法的 `novel_task(action=status, project_id=...)`。status 只能 project_id，不能 task_id；它只用于找旧 task 和当前 phase，也不包含 Task Engine 状态或错误；再从当前工具错误或最新运行日志确认旧 Task Engine 状态和最新工作流错误。
+
+该锁防止同项目并发写作造成 Canon 冲突、重复产物、审核错配和重复发布，不能无条件清除。仅当旧 Task Engine 为 `failed` 或 `cancelled`、Novel checkpoint 仍非终态，且无 draft/candidate/review/decision/publication 时，才调用：
+
+```json
+{"action":"unlock_failed","task_id":"旧 task_id","reason":"简短、可审计的失败原因"}
+```
+
+reason 必须非空，最多 256 字符；不得包含密钥；禁止控制字符、token、API key、Authorization、cookie、其他凭据、个人敏感信息；它会长期审计。若状态为 `queued`、`running`、`paused_budget`、`needs_input`、`completed` 或 `unknown`，或已有任何内容、审核或发布物，禁止解锁；running/unknown 拒绝解锁。按当前合法 phase 继续 `review`、`decide` 或 `publish`，或直接向用户报告拒绝原因。不猜 decide，不循环解锁。
+
+`unlock_failed` 不调用 Writer/LLM、不删除、不归档；任何拒绝直接告知，**不得自动重试 LLM**。成功后，仅在用户仍要求继续创作时，对原本待启动的新任务显式调用 start 一次；不自动启动，不复用旧失败 task_id 冒充 resume。
 
 ### 独立复审
 

@@ -12,7 +12,7 @@ use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
 use brain_plugin::SkillCatalog;
-use novel_application::{NovelApplicationError, TaskApplicationPort};
+use novel_application::{validate_unlock_reason, NovelApplicationError, TaskApplicationPort};
 use novel_domain::{
     MainReviewRecord, NovelConversationSource, NovelProject, NovelResumeInput, NovelTaskRequest,
     NovelTaskType, UserDecisionRecord,
@@ -297,8 +297,23 @@ impl ToolExecutor for RealToolExecutor {
         }
 
         if is_novel_application_tool(&name) {
+            if let Err(error) = preflight_novel_application_tool(&name, &input) {
+                return Box::pin(async move {
+                    ToolExecutionResult {
+                        tool_name: tool_name_owned,
+                        output: error,
+                        is_error: true,
+                        duration_ms: 0,
+                    }
+                });
+            }
             let novel_application = self.novel_application.clone();
             let trace = self.runtime_trace_tx.clone();
+            let trace_input = redact_novel_trace_input(&name, &input);
+            let novel_action = input
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             return Box::pin(async move {
                 let start = std::time::Instant::now();
                 let exchange_id = format!("novel-{}", Uuid::new_v4());
@@ -313,7 +328,8 @@ impl ToolExecutor for RealToolExecutor {
                         ExchangeKind::Delegation,
                         ExchangePhase::Request,
                         &name,
-                        serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string()),
+                        serde_json::to_string_pretty(&trace_input)
+                            .unwrap_or_else(|_| trace_input.to_string()),
                         ExchangeStatus::Running,
                         None,
                     ));
@@ -327,9 +343,11 @@ impl ToolExecutor for RealToolExecutor {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 if let Some(sender) = &trace {
                     let (content, status) = match &result {
-                        Ok(output) => (output.as_str(), ExchangeStatus::Completed),
-                        Err(error) => (error.as_str(), ExchangeStatus::Failed),
+                        Ok(output) => (output, ExchangeStatus::Completed),
+                        Err(error) => (error, ExchangeStatus::Failed),
                     };
+                    let trace_content =
+                        novel_trace_response_content(novel_action.as_deref(), content, status);
                     let _ = sender.send(RuntimeExchange::new(
                         &exchange_id,
                         novel_participant,
@@ -339,7 +357,7 @@ impl ToolExecutor for RealToolExecutor {
                         ExchangeKind::Delegation,
                         ExchangePhase::Response,
                         &name,
-                        content,
+                        trace_content,
                         status,
                         Some(duration_ms),
                     ));
@@ -701,6 +719,62 @@ struct NovelPublishToolInput {
     draft_version: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NovelUnlockFailedToolInput {
+    task_id: String,
+    reason: String,
+}
+
+const NOVEL_UNLOCK_REASON_TRACE_PLACEHOLDER: &str = "【已脱敏：人工解锁原因】";
+
+fn preflight_novel_application_tool(name: &str, input: &serde_json::Value) -> Result<(), String> {
+    let action = required_string(input, "action")?;
+    let mut action_input = input.clone();
+    action_input
+        .as_object_mut()
+        .ok_or_else(|| "Novel facade input must be an object".to_string())?
+        .remove("action");
+    validate_novel_action_input(name, action, &action_input)
+}
+
+fn redact_novel_trace_input(name: &str, input: &serde_json::Value) -> serde_json::Value {
+    let mut trace_input = input.clone();
+    if name == "novel_task"
+        && input.get("action").and_then(serde_json::Value::as_str) == Some("unlock_failed")
+    {
+        if let Some(object) = trace_input.as_object_mut() {
+            object.insert(
+                "reason".into(),
+                serde_json::Value::String(NOVEL_UNLOCK_REASON_TRACE_PLACEHOLDER.into()),
+            );
+        }
+    }
+    trace_input
+}
+
+fn novel_trace_response_content(
+    action: Option<&str>,
+    content: &str,
+    status: ExchangeStatus,
+) -> String {
+    if action != Some("unlock_failed") {
+        return content.to_owned();
+    }
+    let status = match status {
+        ExchangeStatus::Completed => "completed",
+        ExchangeStatus::Failed => "failed",
+        ExchangeStatus::Running => "running",
+        ExchangeStatus::Empty => "empty",
+    };
+    serde_json::json!({
+        "action": "unlock_failed",
+        "status": status,
+        "details": "[响应已脱敏]",
+    })
+    .to_string()
+}
+
 async fn execute_application_novel_tool(
     application: &dyn TaskApplicationPort,
     name: &str,
@@ -712,7 +786,8 @@ async fn execute_application_novel_tool(
         .ok_or_else(|| "Novel facade input must be an object".to_string())?
         .remove("action");
     validate_novel_action_input(name, &action, &input)?;
-    if name == "novel_task" && action != "start" {
+    if name == "novel_task" && matches!(action.as_str(), "resume" | "review" | "decide" | "publish")
+    {
         if let (Some(scope), Some(task_id)) = (
             crate::query_context::current_conversation_memory_scope(),
             input.get("task_id").and_then(serde_json::Value::as_str),
@@ -772,6 +847,16 @@ async fn execute_application_novel_tool(
             serde_json::to_value(
                 application
                     .publish(&input.task_id, input.draft_version)
+                    .await
+                    .map_err(novel_error_mapper(&action))?,
+            )
+        }
+        ("novel_task", "unlock_failed") => {
+            let input: NovelUnlockFailedToolInput =
+                serde_json::from_value(input).map_err(|_| invalid_novel_unlock_format_error())?;
+            serde_json::to_value(
+                application
+                    .unlock_failed_task(&input.task_id, &input.reason)
                     .await
                     .map_err(novel_error_mapper(&action))?,
             )
@@ -904,6 +989,28 @@ fn validate_novel_action_input(
         "publish" => serde_json::from_value::<NovelPublishToolInput>(input.clone())
             .map(|_| ())
             .map_err(|error| format!("novel_task publish 格式错误: {error}")),
+        "unlock_failed" => {
+            let task_id = input
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid_novel_unlock_task_id_error)?;
+            if task_id.len() > 128
+                || task_id.is_empty()
+                || !task_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(invalid_novel_unlock_task_id_error());
+            }
+            let reason = input
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid_novel_unlock_reason_error)?;
+            validate_unlock_reason(reason).map_err(|_| invalid_novel_unlock_reason_error())?;
+            serde_json::from_value::<NovelUnlockFailedToolInput>(input.clone())
+                .map(|_| ())
+                .map_err(|_| invalid_novel_unlock_format_error())
+        }
         "start" => serde_json::from_value::<NovelTaskRequest>(input.clone())
             .map(|_| ())
             .map_err(|error| format!("NovelTaskRequest 格式错误: {error}")),
@@ -912,6 +1019,19 @@ fn validate_novel_action_input(
             "unsupported Novel application command: {name} action={other}"
         )),
     }
+}
+
+fn invalid_novel_unlock_task_id_error() -> String {
+    "novel_task unlock_failed 的 task_id 无效；必须为 1 到 128 个 ASCII 字母、数字、下划线或连字符"
+        .into()
+}
+
+fn invalid_novel_unlock_format_error() -> String {
+    "novel_task unlock_failed 格式错误；仅允许 task_id 和 reason 字段".into()
+}
+
+fn invalid_novel_unlock_reason_error() -> String {
+    "novel_task unlock_failed 的 reason 不符合安全审计要求".into()
 }
 
 fn novel_error_mapper(action: &str) -> impl FnOnce(NovelApplicationError) -> String + '_ {
@@ -1041,12 +1161,14 @@ mod tests {
         NovelTransition, PublicationReceipt, ReviewCheckStatus,
     };
     use novel_workflow::{
-        NovelStartWorkflow, NovelWorkflowBudget, NovelWorkflowModels, NovelWorkflowPortError,
-        NovelWriterExecution, NovelWriterInvocation, NovelWriterPort, ProfileModel,
+        NovelStartWorkflow, NovelTaskExecutionState, NovelWorkflowBudget, NovelWorkflowModels,
+        NovelWorkflowPortError, NovelWriterExecution, NovelWriterInvocation, NovelWriterPort,
+        ProfileModel,
     };
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use task_engine::{
         ActualUsage, Scheduler, SchedulerLimits, TaskCoordinator, TaskRepository, TaskRunState,
     };
@@ -1060,6 +1182,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingTaskApplication {
         association_calls: AtomicUsize,
+        unlock_calls: AtomicUsize,
+        unlock_arguments: Mutex<Option<(String, String)>>,
+        unlock_error: Option<String>,
+        unlock_receipt_reason: Option<String>,
         start_context_error: Option<String>,
     }
 
@@ -1119,21 +1245,49 @@ mod tests {
             _task_id: &str,
             _input: NovelResumeInput,
         ) -> novel_application::Result<NovelOutcome> {
-            panic!("unexpected resume_task")
+            Err(NovelApplicationError::NotFound("recorded resume".into()))
+        }
+
+        async fn unlock_failed_task(
+            &self,
+            task_id: &str,
+            reason: &str,
+        ) -> novel_application::Result<novel_application::NovelTaskUnlockReceipt> {
+            self.unlock_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .unlock_arguments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((task_id.to_owned(), reason.to_owned()));
+            if let Some(error) = &self.unlock_error {
+                return Err(NovelApplicationError::Conflict(error.clone()));
+            }
+            Ok(novel_application::NovelTaskUnlockReceipt {
+                task_id: task_id.to_owned(),
+                project_id: "project-1".into(),
+                previous_phase: NovelTaskPhase::Drafting,
+                phase: NovelTaskPhase::Cancelled,
+                execution_state: NovelTaskExecutionState::Failed,
+                already_unlocked: false,
+                reason: self
+                    .unlock_receipt_reason
+                    .clone()
+                    .unwrap_or_else(|| reason.to_owned()),
+            })
         }
 
         async fn review_draft(
             &self,
             _review: MainReviewRecord,
         ) -> novel_application::Result<NovelTransition> {
-            panic!("unexpected review_draft")
+            Err(NovelApplicationError::NotFound("recorded review".into()))
         }
 
         async fn user_decision(
             &self,
             _decision: UserDecisionRecord,
         ) -> novel_application::Result<NovelTransition> {
-            panic!("unexpected user_decision")
+            Err(NovelApplicationError::NotFound("recorded decision".into()))
         }
 
         async fn publish(
@@ -1141,14 +1295,17 @@ mod tests {
             _task_id: &str,
             _draft_version: u32,
         ) -> novel_application::Result<PublicationReceipt> {
-            panic!("unexpected publish")
+            Err(NovelApplicationError::NotFound("recorded publish".into()))
         }
 
         async fn status(
             &self,
             _project_id: Option<&str>,
         ) -> novel_application::Result<NovelApplicationStatus> {
-            panic!("unexpected status")
+            Ok(NovelApplicationStatus {
+                projects: Vec::new(),
+                pending_publications: Vec::new(),
+            })
         }
 
         async fn invalidate_conversation_generations(
@@ -1271,10 +1428,496 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn novel_unlock_failed_dispatches_once_without_conversation_association() {
+        let application = RecordingTaskApplication::default();
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        let output = crate::query_context::with_conversation_memory_scope(&scope, async {
+            execute_application_novel_tool(
+                &application,
+                "novel_task",
+                json!({
+                    "action": "unlock_failed",
+                    "task_id": "task-1",
+                    "reason": " 人工确认执行失败 "
+                }),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            application
+                .unlock_arguments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(&("task-1".into(), " 人工确认执行失败 ".into()))
+        );
+        let receipt: novel_application::NovelTaskUnlockReceipt =
+            serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt.task_id, "task-1");
+        assert_eq!(receipt.project_id, "project-1");
+        assert_eq!(receipt.previous_phase, NovelTaskPhase::Drafting);
+        assert_eq!(receipt.phase, NovelTaskPhase::Cancelled);
+        assert_eq!(receipt.execution_state, NovelTaskExecutionState::Failed);
+        assert!(!receipt.already_unlocked);
+        assert_eq!(receipt.reason, " 人工确认执行失败 ");
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_rejects_invalid_input_before_port_calls() {
+        let application = RecordingTaskApplication::default();
+        let malicious_reason = "Authorization: Bearer secret\n请放行";
+        let invalid_inputs = [
+            json!({}),
+            json!({"action": "  "}),
+            json!({"action": "unlock_failed", "reason": "合法原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1"}),
+            json!({"action": "unlock_failed", "task_id": "  ", "reason": "合法原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "  "}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "x".repeat(257)}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": malicious_reason}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "合法\t原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "合法\u{007f}原因"}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "合法原因", "extra": true}),
+        ];
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        for input in invalid_inputs {
+            let error = crate::query_context::with_conversation_memory_scope(&scope, async {
+                execute_application_novel_tool(&application, "novel_task", input)
+                    .await
+                    .unwrap_err()
+            })
+            .await;
+            assert!(
+                !error.contains(malicious_reason),
+                "错误不得回显恶意 reason: {error}"
+            );
+            assert!(
+                !error.contains("Bearer secret"),
+                "错误不得泄露恶意 reason 片段: {error}"
+            );
+        }
+
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_rejects_sensitive_unknown_field_without_echoing_its_name() {
+        let application = Arc::new(RecordingTaskApplication::default());
+        let application_port: Arc<dyn TaskApplicationPort> = application.clone();
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel(8);
+        let executor = RealToolExecutor::new()
+            .with_runtime_trace_sender(trace_tx)
+            .with_novel_application(Some(application_port));
+        let sensitive_field = "Authorization_Bearer_secret";
+        let mut input = json!({
+            "action": "unlock_failed",
+            "task_id": "task-1",
+            "reason": "合法原因"
+        });
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert(sensitive_field.into(), json!(true));
+
+        let result = executor
+            .execute(&ToolCall {
+                tool_name: "novel_task".into(),
+                input,
+                validated: false,
+                validation_id: None,
+            })
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            !result.output.contains(sensitive_field),
+            "错误不得回显未知字段名: {}",
+            result.output
+        );
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            trace_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_rejects_unsafe_task_ids_without_echoing_or_port_calls() {
+        let application = RecordingTaskApplication::default();
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        for task_id in [
+            " ../x ".to_string(),
+            "task\nid".to_string(),
+            "任务-1".to_string(),
+            "x".repeat(129),
+        ] {
+            let error = crate::query_context::with_conversation_memory_scope(&scope, async {
+                execute_application_novel_tool(
+                    &application,
+                    "novel_task",
+                    json!({"action": "unlock_failed", "task_id": task_id, "reason": "合法原因"}),
+                )
+                .await
+                .unwrap_err()
+            })
+            .await;
+            assert!(!error.contains(&task_id), "错误不得回显 task_id: {error}");
+        }
+
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_preflight_blocks_invalid_input_before_runtime_trace() {
+        let application = Arc::new(RecordingTaskApplication::default());
+        let application_port: Arc<dyn TaskApplicationPort> = application.clone();
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel(8);
+        let executor = RealToolExecutor::new()
+            .with_runtime_trace_sender(trace_tx)
+            .with_novel_application(Some(application_port));
+
+        for reason in [
+            "Authorization: Bearer secret\n请放行".to_string(),
+            "Authorization: Bearer single-line-secret".to_string(),
+            "Bearer abcdefghijklmnop".to_string(),
+            "Basic abcdefgh".to_string(),
+            r#"{"api_key":"dummy-api-key-value"}"#.to_string(),
+            "Cookie: session_id=dummy-session-value".to_string(),
+            "sk-1234567890abcdefghijklmnopqrstuvwxyz".to_string(),
+            "身份证号：110101199001011234".to_string(),
+            "x".repeat(257),
+        ] {
+            let result = executor
+                .execute(&ToolCall {
+                    tool_name: "novel_task".into(),
+                    input: json!({
+                        "action": "unlock_failed",
+                        "task_id": "task-1",
+                        "reason": reason,
+                    }),
+                    validated: false,
+                    validation_id: None,
+                })
+                .await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.output,
+                "novel_task unlock_failed 的 reason 不符合安全审计要求"
+            );
+            assert!(!result.output.contains(&reason));
+            assert!(matches!(
+                trace_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+        }
+
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            trace_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_runtime_trace_redacts_legal_reason_but_port_receives_original() {
+        let application = Arc::new(RecordingTaskApplication::default());
+        let application_port: Arc<dyn TaskApplicationPort> = application.clone();
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel(8);
+        let executor = RealToolExecutor::new()
+            .with_runtime_trace_sender(trace_tx)
+            .with_novel_application(Some(application_port));
+        let reason = " 人工确认执行失败 ";
+
+        let result = executor
+            .execute(&ToolCall {
+                tool_name: "novel_task".into(),
+                input: json!({
+                    "action": "unlock_failed",
+                    "task_id": "task-1",
+                    "reason": reason,
+                }),
+                validated: false,
+                validation_id: None,
+            })
+            .await;
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains(reason));
+        let exchanges = std::iter::from_fn(|| trace_rx.try_recv().ok()).collect::<Vec<_>>();
+        let request = exchanges
+            .iter()
+            .find(|exchange| exchange.phase == ExchangePhase::Request)
+            .expect("novel request trace");
+        let request_value: serde_json::Value = serde_json::from_str(&request.content).unwrap();
+        let mut request_fields = request_value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        request_fields.sort_unstable();
+        assert_eq!(request_fields, vec!["action", "reason", "task_id"]);
+        assert_eq!(request_value["action"], "unlock_failed");
+        assert_eq!(request_value["task_id"], "task-1");
+        assert_eq!(request_value["reason"], "【已脱敏：人工解锁原因】");
+        assert!(exchanges
+            .iter()
+            .all(|exchange| !exchange.content.contains(reason)));
+        let response = exchanges
+            .iter()
+            .find(|exchange| exchange.phase == ExchangePhase::Response)
+            .expect("novel response trace");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.content).unwrap(),
+            json!({
+                "action": "unlock_failed",
+                "status": "completed",
+                "details": "[响应已脱敏]"
+            })
+        );
+        assert_eq!(application.unlock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            application
+                .unlock_arguments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(&("task-1".into(), reason.into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_response_trace_is_fixed_when_application_trims_receipt_reason() {
+        let raw_reason = " 原因 ";
+        let trimmed_reason = "原因";
+        let application = Arc::new(RecordingTaskApplication {
+            unlock_receipt_reason: Some(trimmed_reason.into()),
+            ..Default::default()
+        });
+        let application_port: Arc<dyn TaskApplicationPort> = application.clone();
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel(8);
+        let executor = RealToolExecutor::new()
+            .with_runtime_trace_sender(trace_tx)
+            .with_novel_application(Some(application_port));
+
+        let result = executor
+            .execute(&ToolCall {
+                tool_name: "novel_task".into(),
+                input: json!({
+                    "action": "unlock_failed",
+                    "task_id": "task-1",
+                    "reason": raw_reason,
+                }),
+                validated: false,
+                validation_id: None,
+            })
+            .await;
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains(trimmed_reason));
+        let exchanges = std::iter::from_fn(|| trace_rx.try_recv().ok()).collect::<Vec<_>>();
+        let response = exchanges
+            .iter()
+            .find(|exchange| exchange.phase == ExchangePhase::Response)
+            .expect("novel response trace");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.content).unwrap(),
+            json!({
+                "action": "unlock_failed",
+                "status": "completed",
+                "details": "[响应已脱敏]"
+            })
+        );
+        assert!(!response.content.contains(raw_reason));
+        assert!(!response.content.contains(trimmed_reason));
+        assert_eq!(
+            application
+                .unlock_arguments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(&("task-1".into(), raw_reason.into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_runtime_trace_redacts_reason_from_non_json_port_error() {
+        let reason = "人工解锁审计原因";
+        let application = Arc::new(RecordingTaskApplication {
+            unlock_error: Some(format!("端口拒绝：{reason}")),
+            ..Default::default()
+        });
+        let application_port: Arc<dyn TaskApplicationPort> = application.clone();
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel(8);
+        let executor = RealToolExecutor::new()
+            .with_runtime_trace_sender(trace_tx)
+            .with_novel_application(Some(application_port));
+
+        let result = executor
+            .execute(&ToolCall {
+                tool_name: "novel_task".into(),
+                input: json!({
+                    "action": "unlock_failed",
+                    "task_id": "task-1",
+                    "reason": reason,
+                }),
+                validated: false,
+                validation_id: None,
+            })
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains(reason));
+        let exchanges = std::iter::from_fn(|| trace_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(exchanges
+            .iter()
+            .all(|exchange| !exchange.content.contains(reason)));
+        let response = exchanges
+            .iter()
+            .find(|exchange| exchange.phase == ExchangePhase::Response)
+            .expect("novel response trace");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.content).unwrap(),
+            json!({
+                "action": "unlock_failed",
+                "status": "failed",
+                "details": "[响应已脱敏]"
+            })
+        );
+    }
+
+    #[test]
+    fn novel_unlock_failed_runtime_trace_is_fixed_for_nested_and_non_json_success() {
+        let reason = "嵌套敏感原因";
+        let nested_content = json!({
+            "outer": {
+                "reason": reason,
+                "message": format!("拒绝：{reason}")
+            }
+        })
+        .to_string();
+        let expected = json!({
+            "action": "unlock_failed",
+            "status": "completed",
+            "details": "[响应已脱敏]"
+        });
+
+        for content in [&nested_content, "非 JSON 敏感响应"] {
+            let redacted = novel_trace_response_content(
+                Some("unlock_failed"),
+                content,
+                ExchangeStatus::Completed,
+            );
+
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&redacted).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn novel_unlock_failed_conversation_association_uses_exact_action_allowlist() {
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+        let associated_inputs = [
+            json!({"action": "resume", "task_id": "task-1", "input": "继续"}),
+            json!({
+                "action": "review",
+                "task_id": "task-1",
+                "draft_version": 1,
+                "reviewed_canon_revision": 0,
+                "verdict": "pass",
+                "checks": {
+                    "user_requirements": "pass",
+                    "outline_alignment": "pass",
+                    "canon_consistency": "pass",
+                    "character_consistency": "pass",
+                    "timeline_consistency": "pass",
+                    "plot_and_foreshadowing": "pass",
+                    "style_quality": "pass",
+                    "pacing_and_hook": "pass"
+                },
+                "issues": [],
+                "evidence_refs": [],
+                "summary": "通过"
+            }),
+            json!({"action": "decide", "task_id": "task-1", "draft_version": 1, "decision": "accept"}),
+            json!({"action": "publish", "task_id": "task-1", "draft_version": 1}),
+        ];
+        for input in associated_inputs {
+            let application = RecordingTaskApplication::default();
+            let _ = crate::query_context::with_conversation_memory_scope(&scope, async {
+                execute_application_novel_tool(&application, "novel_task", input).await
+            })
+            .await;
+            assert_eq!(application.association_calls.load(Ordering::SeqCst), 1);
+        }
+
+        let unassociated_inputs = [
+            json!({"action": "status"}),
+            json!({"action": "unlock_failed", "task_id": "task-1", "reason": "合法原因"}),
+            json!({
+                "action": "start",
+                "task_id": "task-1",
+                "project_id": "project-1",
+                "task_type": "body",
+                "task_brief": "写第一章",
+                "expected_revision": 0,
+                "output_path": "chapters/0001.md",
+                "context_refs": [],
+                "must_happen": [],
+                "must_not_change": [],
+                "acceptance_criteria": ["完成第一章"],
+                "allow_web_research": false,
+                "publication_policy": "require_user_acceptance"
+            }),
+        ];
+        for input in unassociated_inputs {
+            let application = RecordingTaskApplication {
+                start_context_error: Some("outline.md".into()),
+                ..Default::default()
+            };
+            let _ = crate::query_context::with_conversation_memory_scope(&scope, async {
+                execute_application_novel_tool(&application, "novel_task", input).await
+            })
+            .await;
+            assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn novel_context_change_error_contains_finite_recovery_instruction() {
         let application = RecordingTaskApplication {
-            association_calls: AtomicUsize::new(0),
             start_context_error: Some("outline.md".into()),
+            ..Default::default()
         };
 
         let error = execute_application_novel_tool(

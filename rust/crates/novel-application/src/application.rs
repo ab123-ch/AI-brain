@@ -12,7 +12,8 @@ use novel_domain::{
     NovelTransition, PublicationReceipt, UserDecision, UserDecisionRecord,
 };
 use novel_workflow::{
-    NovelContextDocument, NovelStartWorkflow, NovelWorkflowEnvironmentPort, NovelWorkflowPortError,
+    NovelContextDocument, NovelStartWorkflow, NovelTaskExecutionState,
+    NovelWorkflowEnvironmentPort, NovelWorkflowPortError,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
@@ -122,6 +123,25 @@ pub struct NovelApplicationStatus {
     pub pending_publications: Vec<NovelPublicationRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NovelTaskUnlockReceipt {
+    pub task_id: String,
+    pub project_id: String,
+    pub previous_phase: NovelTaskPhase,
+    pub phase: NovelTaskPhase,
+    pub execution_state: NovelTaskExecutionState,
+    pub already_unlocked: bool,
+    pub reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualUnlockDetails {
+    reason: String,
+    previous_phase: NovelTaskPhase,
+    execution_state: NovelTaskExecutionState,
+}
+
 #[async_trait]
 pub trait TaskApplicationPort: Send + Sync {
     async fn create_project(&self, project: NovelProject) -> Result<NovelProject>;
@@ -140,6 +160,11 @@ pub trait TaskApplicationPort: Send + Sync {
     ) -> Result<NovelProject>;
     async fn start_task(&self, request: NovelTaskRequest) -> Result<NovelOutcome>;
     async fn resume_task(&self, task_id: &str, input: NovelResumeInput) -> Result<NovelOutcome>;
+    async fn unlock_failed_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<NovelTaskUnlockReceipt>;
     async fn review_draft(&self, review: MainReviewRecord) -> Result<NovelTransition>;
     async fn user_decision(&self, decision: UserDecisionRecord) -> Result<NovelTransition>;
     async fn publish(&self, task_id: &str, draft_version: u32) -> Result<PublicationReceipt>;
@@ -270,6 +295,92 @@ impl NovelApplicationService {
         Ok(Box::pin(workflow.continue_task(task_id, &input.input))
             .await?
             .outcome)
+    }
+
+    pub async fn unlock_failed_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<NovelTaskUnlockReceipt> {
+        let reason = validate_unlock_reason(reason)?;
+        let task_lock = self.task_lock(task_id);
+        let _guard = task_lock.lock().await;
+        let expected_checkpoint = self
+            .store
+            .load_checkpoint(task_id)?
+            .ok_or_else(|| NovelApplicationError::NotFound(format!("task {task_id}")))?;
+        let mut state = NovelTaskState::from_checkpoint(&expected_checkpoint)?;
+        let workflow = self.workflow()?;
+        let execution_state = workflow
+            .task_execution_state(task_id)
+            .await?
+            .ok_or_else(|| {
+                NovelApplicationError::NotFound(format!(
+                    "Task Engine 运行记录 novel-task-{task_id}"
+                ))
+            })?;
+        if !matches!(
+            execution_state,
+            NovelTaskExecutionState::Failed | NovelTaskExecutionState::Cancelled
+        ) {
+            return Err(NovelApplicationError::Conflict(format!(
+                "Task Engine 状态 {execution_state:?} 不允许执行失败解锁，拒绝失败解锁"
+            )));
+        }
+        if state.phase == NovelTaskPhase::Cancelled {
+            return self.trusted_manual_unlock_receipt(&state)?.ok_or_else(|| {
+                NovelApplicationError::Conflict(
+                    "Cancelled checkpoint 缺少可信 manual_unlock 审计来源，拒绝失败解锁".into(),
+                )
+            });
+        }
+
+        let previous_phase = state.phase;
+        state.unlock_failed_execution()?;
+        let event = NovelTaskEvent {
+            event_id: manual_unlock_event_id(task_id),
+            task_id: state.request.task_id.clone(),
+            project_id: state.request.project_id.clone(),
+            actor: NovelLifecycleActor::System,
+            phase: state.phase,
+            summary: "manual_unlock".into(),
+            details: serde_json::json!({
+                "reason": reason,
+                "previous_phase": previous_phase,
+                "execution_state": execution_state,
+            }),
+            created_at: state.updated_at,
+        };
+        if self.store.persist_state_event_if_checkpoint_unchanged(
+            &expected_checkpoint,
+            &state,
+            &event,
+        )? {
+            return Ok(NovelTaskUnlockReceipt {
+                task_id: state.request.task_id,
+                project_id: state.request.project_id,
+                previous_phase,
+                phase: state.phase,
+                execution_state,
+                already_unlocked: false,
+                reason: reason.to_owned(),
+            });
+        }
+
+        let current_checkpoint = self.store.load_checkpoint(task_id)?.ok_or_else(|| {
+            NovelApplicationError::Conflict("失败解锁期间 checkpoint 已发生并发变化".into())
+        })?;
+        let current = NovelTaskState::from_checkpoint(&current_checkpoint).map_err(|_| {
+            NovelApplicationError::Conflict("失败解锁期间 checkpoint 已发生并发变化".into())
+        })?;
+        if current.phase == NovelTaskPhase::Cancelled {
+            if let Some(receipt) = self.trusted_manual_unlock_receipt(&current)? {
+                return Ok(receipt);
+            }
+        }
+        Err(NovelApplicationError::Conflict(
+            "失败解锁期间 checkpoint 已发生并发变化".into(),
+        ))
     }
 
     pub async fn review_draft(&self, review: MainReviewRecord) -> Result<NovelTransition> {
@@ -433,9 +544,15 @@ impl NovelApplicationService {
             .map(String::as_str)
             .collect::<HashSet<_>>();
         let mut cancelled = Vec::new();
-        for checkpoint in self.store.active_checkpoints()? {
-            let task_lock = self.task_lock(&checkpoint.task_id);
+        for snapshot in self.store.active_checkpoints()? {
+            let task_lock = self.task_lock(&snapshot.task_id);
             let _guard = task_lock.lock().await;
+            let Some(checkpoint) = self.store.load_checkpoint(&snapshot.task_id)? else {
+                continue;
+            };
+            if checkpoint.phase.is_terminal() {
+                continue;
+            }
             let mut state = NovelTaskState::from_checkpoint(&checkpoint)?;
             if !state.matches_conversation_generations(
                 conversation_id,
@@ -642,6 +759,57 @@ impl NovelApplicationService {
         NovelTaskState::from_checkpoint(&checkpoint).map_err(Into::into)
     }
 
+    fn trusted_manual_unlock_receipt(
+        &self,
+        state: &NovelTaskState,
+    ) -> Result<Option<NovelTaskUnlockReceipt>> {
+        if state.phase != NovelTaskPhase::Cancelled {
+            return Ok(None);
+        }
+        let event_id = manual_unlock_event_id(&state.request.task_id);
+        let Some(event) = self
+            .store
+            .load_task_events(&state.request.task_id)?
+            .into_iter()
+            .find(|event| event.event_id == event_id)
+        else {
+            return Ok(None);
+        };
+        if event.task_id != state.request.task_id
+            || event.project_id != state.request.project_id
+            || event.actor != NovelLifecycleActor::System
+            || event.phase != NovelTaskPhase::Cancelled
+            || event.summary != "manual_unlock"
+            || event.created_at != state.updated_at
+        {
+            return Ok(None);
+        }
+        let Ok(details) = serde_json::from_value::<ManualUnlockDetails>(event.details) else {
+            return Ok(None);
+        };
+        let Ok(validated_reason) = validate_unlock_reason(&details.reason) else {
+            return Ok(None);
+        };
+        if validated_reason != details.reason
+            || details.previous_phase.is_terminal()
+            || !matches!(
+                details.execution_state,
+                NovelTaskExecutionState::Failed | NovelTaskExecutionState::Cancelled
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(NovelTaskUnlockReceipt {
+            task_id: state.request.task_id.clone(),
+            project_id: state.request.project_id.clone(),
+            previous_phase: details.previous_phase,
+            phase: NovelTaskPhase::Cancelled,
+            execution_state: details.execution_state,
+            already_unlocked: true,
+            reason: details.reason,
+        }))
+    }
+
     fn task_lock(&self, task_id: &str) -> Arc<AsyncMutex<()>> {
         let mut locks = self
             .task_locks
@@ -703,6 +871,14 @@ impl TaskApplicationPort for NovelApplicationService {
 
     async fn resume_task(&self, task_id: &str, input: NovelResumeInput) -> Result<NovelOutcome> {
         Box::pin(NovelApplicationService::resume_task(self, task_id, input)).await
+    }
+
+    async fn unlock_failed_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<NovelTaskUnlockReceipt> {
+        NovelApplicationService::unlock_failed_task(self, task_id, reason).await
     }
 
     async fn review_draft(&self, review: MainReviewRecord) -> Result<NovelTransition> {
@@ -767,6 +943,278 @@ fn current_time_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
+}
+
+pub fn validate_unlock_reason(reason: &str) -> Result<&str> {
+    let trimmed_reason = reason.trim();
+    if trimmed_reason.is_empty() {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因不能为空".into(),
+        ));
+    }
+    if reason.chars().count() > 256 {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因不能超过 256 个 Unicode 字符".into(),
+        ));
+    }
+    if reason.chars().any(char::is_control) {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因不能包含 Unicode 控制字符".into(),
+        ));
+    }
+    if contains_sensitive_unlock_material(trimmed_reason) {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因疑似包含凭据、秘密或个人敏感信息，拒绝记录".into(),
+        ));
+    }
+    Ok(trimmed_reason)
+}
+
+fn contains_sensitive_unlock_material(reason: &str) -> bool {
+    let normalized = reason.to_lowercase();
+    contains_labeled_sensitive_value(&normalized)
+        || contains_authentication_scheme_value(&normalized)
+        || contains_long_sk_token(&normalized)
+        || contains_private_key_block(&normalized)
+        || contains_bare_personal_identifier(&normalized)
+}
+
+fn contains_bare_personal_identifier(reason: &str) -> bool {
+    reason
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '@' && character != '.'
+        })
+        .any(|token| {
+            contains_email_shape(token)
+                || contains_mobile_shape(token)
+                || contains_identity_card_shape(token)
+                || contains_luhn_card_shape(token)
+        })
+}
+
+fn contains_email_shape(token: &str) -> bool {
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.split_once('.').is_some_and(|(host, suffix)| {
+            !host.is_empty()
+                && suffix.len() >= 2
+                && host.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '.')
+                })
+                && suffix
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+        })
+}
+
+fn contains_mobile_shape(token: &str) -> bool {
+    token.len() == 11
+        && token.as_bytes()[0] == b'1'
+        && matches!(token.as_bytes()[1], b'3'..=b'9')
+        && token.bytes().all(|character| character.is_ascii_digit())
+}
+
+fn contains_identity_card_shape(token: &str) -> bool {
+    if token.len() != 18
+        || !token.as_bytes()[..17].iter().all(u8::is_ascii_digit)
+        || !token.as_bytes()[17].is_ascii_digit() && !matches!(token.as_bytes()[17], b'x' | b'X')
+    {
+        return false;
+    }
+    let year = token[6..10].parse::<u16>().unwrap_or_default();
+    let month = token[10..12].parse::<u8>().unwrap_or_default();
+    let day = token[12..14].parse::<u8>().unwrap_or_default();
+    (1900..=2100).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+fn contains_luhn_card_shape(token: &str) -> bool {
+    if !(13..=19).contains(&token.len())
+        || !token.bytes().all(|character| character.is_ascii_digit())
+    {
+        return false;
+    }
+    let mut sum = 0u32;
+    let mut double = false;
+    for character in token.bytes().rev() {
+        let mut digit = u32::from(character - b'0');
+        if double {
+            digit *= 2;
+            if digit > 9 {
+                digit -= 9;
+            }
+        }
+        sum += digit;
+        double = !double;
+    }
+    sum.is_multiple_of(10)
+}
+
+fn contains_labeled_sensitive_value(reason: &str) -> bool {
+    const SENSITIVE_LABELS: &[&str] = &[
+        "authorization",
+        "api_key",
+        "api-key",
+        "api key",
+        "apikey",
+        "token",
+        "secret",
+        "cookie",
+        "set-cookie",
+        "set_cookie",
+        "set cookie",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
+        "private_key",
+        "private-key",
+        "private key",
+        "access_key",
+        "access-key",
+        "access key",
+        "client_secret",
+        "client-secret",
+        "client secret",
+        "身份证号码",
+        "身份证号",
+        "身份证",
+        "手机号码",
+        "手机号",
+        "电话号码",
+        "银行卡号码",
+        "银行卡号",
+        "银行卡",
+        "邮箱地址",
+        "电子邮箱",
+        "邮箱",
+        "social security number",
+        "ssn",
+        "identity_card",
+        "identity-card",
+        "identity card",
+        "id_card",
+        "id-card",
+        "id card",
+        "phone_number",
+        "phone-number",
+        "phone number",
+        "phone",
+        "mobile",
+        "bank_card",
+        "bank-card",
+        "bank card",
+        "credit_card",
+        "credit-card",
+        "credit card",
+        "debit_card",
+        "debit-card",
+        "debit card",
+        "email",
+        "e-mail",
+    ];
+
+    SENSITIVE_LABELS.iter().any(|label| {
+        reason.match_indices(label).any(|(index, _)| {
+            is_label_boundary(reason[..index].chars().next_back())
+                && has_value_after_label(&reason[index + label.len()..])
+        })
+    })
+}
+
+fn is_label_boundary(previous: Option<char>) -> bool {
+    previous.is_none_or(|character| !character.is_alphanumeric())
+}
+
+fn has_value_after_label(suffix: &str) -> bool {
+    let suffix = trim_optional_quote(suffix.trim_start());
+    let Some(delimiter) = suffix.chars().next() else {
+        return false;
+    };
+    if !matches!(delimiter, ':' | '=' | '：' | '＝') {
+        return false;
+    }
+    let value = trim_optional_quote(suffix[delimiter.len_utf8()..].trim_start());
+    value.chars().any(|character| {
+        !character.is_whitespace() && !matches!(character, '\'' | '"' | ',' | '}' | ']')
+    })
+}
+
+fn trim_optional_quote(value: &str) -> &str {
+    match value.chars().next() {
+        Some(character @ ('\'' | '"')) => value[character.len_utf8()..].trim_start(),
+        _ => value,
+    }
+}
+
+fn contains_authentication_scheme_value(reason: &str) -> bool {
+    ["bearer", "basic"].iter().any(|scheme| {
+        reason.match_indices(scheme).any(|(index, _)| {
+            if !is_label_boundary(reason[..index].chars().next_back()) {
+                return false;
+            }
+            let suffix = &reason[index + scheme.len()..];
+            if !suffix.chars().next().is_some_and(char::is_whitespace) {
+                return false;
+            }
+            let trimmed_suffix = suffix.trim_start();
+            let candidate_end = trimmed_suffix
+                .find(|character: char| !is_authentication_token_character(character))
+                .unwrap_or(trimmed_suffix.len());
+            let candidate = &trimmed_suffix[..candidate_end];
+            let trailing = trimmed_suffix[candidate_end..].trim_start();
+            match *scheme {
+                "bearer" => is_plausible_bearer_token(candidate, trailing),
+                "basic" => is_plausible_basic_token(candidate, trailing),
+                _ => false,
+            }
+        })
+    })
+}
+
+fn is_authentication_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '-' | '_' | '.' | '~' | '+' | '/' | '=')
+}
+
+fn is_plausible_bearer_token(candidate: &str, trailing: &str) -> bool {
+    candidate.len() >= 8
+        && (candidate
+            .chars()
+            .any(|character| !character.is_ascii_alphabetic())
+            || (candidate.len() >= 16 && !trailing.chars().any(char::is_alphanumeric)))
+}
+
+fn is_plausible_basic_token(candidate: &str, trailing: &str) -> bool {
+    candidate.len() >= 8
+        && candidate.len().is_multiple_of(4)
+        && (candidate.chars().any(|character| {
+            character.is_ascii_uppercase()
+                || character.is_ascii_digit()
+                || matches!(character, '+' | '/' | '=')
+        }) || !trailing.chars().any(char::is_alphanumeric))
+}
+
+fn contains_long_sk_token(reason: &str) -> bool {
+    reason.match_indices("sk-").any(|(index, _)| {
+        is_label_boundary(reason[..index].chars().next_back())
+            && reason[index + 3..]
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                .count()
+                >= 20
+    })
+}
+
+fn contains_private_key_block(reason: &str) -> bool {
+    reason.contains("-----begin ") && reason.contains("private key-----")
+}
+
+fn manual_unlock_event_id(task_id: &str) -> String {
+    format!("novel-application-{task_id}-manual_unlock")
 }
 
 #[cfg(test)]
