@@ -1122,6 +1122,14 @@ mod tests {
             panic!("unexpected resume_task")
         }
 
+        async fn unlock_failed_task(
+            &self,
+            _task_id: &str,
+            _reason: &str,
+        ) -> novel_application::Result<novel_application::NovelTaskUnlockReceipt> {
+            panic!("unexpected unlock_failed_task")
+        }
+
         async fn review_draft(
             &self,
             _review: MainReviewRecord,

@@ -317,7 +317,7 @@ impl NovelDomainStore {
         let payload = serde_json::to_string(checkpoint)?;
         let content_hash = knowledge_core::sha256_hex(payload.as_bytes());
         let connection = self.lock()?;
-        connection.execute(
+        let changed = connection.execute(
             "INSERT INTO novel_checkpoints(
                  task_id, project_id, phase, terminal, archived, draft_version,
                  content_hash, payload, updated_at
@@ -330,7 +330,8 @@ impl NovelDomainStore {
                  draft_version = excluded.draft_version,
                  content_hash = excluded.content_hash,
                  payload = excluded.payload,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at
+             WHERE novel_checkpoints.terminal = 0 OR excluded.terminal = 1",
             params![
                 checkpoint.task_id,
                 checkpoint.project_id,
@@ -342,6 +343,12 @@ impl NovelDomainStore {
                 checkpoint.updated_at
             ],
         )?;
+        if changed == 0 {
+            return Err(NovelApplicationError::Conflict(format!(
+                "终态 Novel checkpoint {} 拒绝重开为非终态",
+                checkpoint.task_id
+            )));
+        }
         Ok(())
     }
 
@@ -362,7 +369,7 @@ impl NovelDomainStore {
         let event_hash = knowledge_core::sha256_hex(event_payload.as_bytes());
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
+        let changed = transaction.execute(
             "INSERT INTO novel_checkpoints(
                  task_id, project_id, phase, terminal, archived, draft_version,
                  content_hash, payload, updated_at
@@ -375,7 +382,8 @@ impl NovelDomainStore {
                  draft_version = excluded.draft_version,
                  content_hash = excluded.content_hash,
                  payload = excluded.payload,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at
+             WHERE novel_checkpoints.terminal = 0 OR excluded.terminal = 1",
             params![
                 checkpoint.task_id,
                 checkpoint.project_id,
@@ -387,38 +395,75 @@ impl NovelDomainStore {
                 checkpoint.updated_at
             ],
         )?;
-        if let Some(existing_hash) = transaction
-            .query_row(
-                "SELECT content_hash FROM novel_task_events WHERE event_id = ?1",
-                [&event.event_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            if existing_hash != event_hash {
-                return Err(NovelApplicationError::Conflict(format!(
-                    "task event {} already exists with different content",
-                    event.event_id
-                )));
-            }
-        } else {
-            transaction.execute(
-                "INSERT INTO novel_task_events(
-                     event_id, task_id, project_id, phase, content_hash, payload, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    event.event_id,
-                    event.task_id,
-                    event.project_id,
-                    serde_json::to_string(&event.phase)?,
-                    event_hash,
-                    event_payload,
-                    event.created_at
-                ],
-            )?;
+        if changed == 0 {
+            return Err(NovelApplicationError::Conflict(format!(
+                "终态 Novel checkpoint {} 拒绝重开为非终态",
+                checkpoint.task_id
+            )));
         }
+        persist_task_event(&transaction, event, &event_payload, &event_hash)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn persist_state_event_if_checkpoint_unchanged(
+        &self,
+        expected_checkpoint: &NovelTaskCheckpoint,
+        state: &NovelTaskState,
+        event: &NovelTaskEvent,
+    ) -> Result<bool> {
+        let checkpoint = state.checkpoint()?;
+        if expected_checkpoint.task_id != checkpoint.task_id
+            || expected_checkpoint.project_id != checkpoint.project_id
+            || event.task_id != checkpoint.task_id
+            || event.project_id != checkpoint.project_id
+            || event.phase != checkpoint.phase
+        {
+            return Err(NovelApplicationError::Conflict(
+                "失败解锁 checkpoint 与审计事件身份不一致".into(),
+            ));
+        }
+        let expected_payload = serde_json::to_string(expected_checkpoint)?;
+        let expected_hash = knowledge_core::sha256_hex(expected_payload.as_bytes());
+        let checkpoint_payload = serde_json::to_string(&checkpoint)?;
+        let checkpoint_hash = knowledge_core::sha256_hex(checkpoint_payload.as_bytes());
+        let event_payload = serde_json::to_string(event)?;
+        let event_hash = knowledge_core::sha256_hex(event_payload.as_bytes());
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE novel_checkpoints
+             SET project_id = ?1,
+                 phase = ?2,
+                 terminal = ?3,
+                 archived = 0,
+                 draft_version = ?4,
+                 content_hash = ?5,
+                 payload = ?6,
+                 updated_at = ?7
+             WHERE task_id = ?8
+               AND content_hash = ?9
+               AND terminal = 0
+               AND archived = 0",
+            params![
+                checkpoint.project_id,
+                serde_json::to_string(&checkpoint.phase)?,
+                checkpoint.phase.is_terminal(),
+                checkpoint.draft_version,
+                checkpoint_hash,
+                checkpoint_payload,
+                checkpoint.updated_at,
+                checkpoint.task_id,
+                expected_hash,
+            ],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        persist_task_event(&transaction, event, &event_payload, &event_hash)?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn archive_task(&self, task_id: &str) -> Result<bool> {
@@ -842,6 +887,45 @@ fn load_json_optional<T: serde::de::DeserializeOwned>(
     payload
         .map(|payload| Ok(serde_json::from_str(&payload)?))
         .transpose()
+}
+
+fn persist_task_event(
+    transaction: &Transaction<'_>,
+    event: &NovelTaskEvent,
+    event_payload: &str,
+    event_hash: &str,
+) -> Result<()> {
+    if let Some(existing_hash) = transaction
+        .query_row(
+            "SELECT content_hash FROM novel_task_events WHERE event_id = ?1",
+            [&event.event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if existing_hash != event_hash {
+            return Err(NovelApplicationError::Conflict(format!(
+                "task event {} already exists with different content",
+                event.event_id
+            )));
+        }
+    } else {
+        transaction.execute(
+            "INSERT INTO novel_task_events(
+                 event_id, task_id, project_id, phase, content_hash, payload, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                event.event_id,
+                event.task_id,
+                event.project_id,
+                serde_json::to_string(&event.phase)?,
+                event_hash,
+                event_payload,
+                event.created_at
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn load_json_required<T: serde::de::DeserializeOwned>(

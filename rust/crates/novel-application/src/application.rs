@@ -134,6 +134,14 @@ pub struct NovelTaskUnlockReceipt {
     pub reason: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualUnlockDetails {
+    reason: String,
+    previous_phase: NovelTaskPhase,
+    execution_state: NovelTaskExecutionState,
+}
+
 #[async_trait]
 pub trait TaskApplicationPort: Send + Sync {
     async fn create_project(&self, project: NovelProject) -> Result<NovelProject>;
@@ -297,7 +305,11 @@ impl NovelApplicationService {
         let reason = validate_unlock_reason(reason)?;
         let task_lock = self.task_lock(task_id);
         let _guard = task_lock.lock().await;
-        let mut state = self.load_state(task_id)?;
+        let expected_checkpoint = self
+            .store
+            .load_checkpoint(task_id)?
+            .ok_or_else(|| NovelApplicationError::NotFound(format!("task {task_id}")))?;
+        let mut state = NovelTaskState::from_checkpoint(&expected_checkpoint)?;
         let workflow = self.workflow()?;
         let execution_state = workflow
             .task_execution_state(task_id)
@@ -316,39 +328,59 @@ impl NovelApplicationService {
             )));
         }
         if state.phase == NovelTaskPhase::Cancelled {
-            return Ok(NovelTaskUnlockReceipt {
-                task_id: state.request.task_id,
-                project_id: state.request.project_id,
-                previous_phase: NovelTaskPhase::Cancelled,
-                phase: NovelTaskPhase::Cancelled,
-                execution_state,
-                already_unlocked: true,
-                reason: reason.to_owned(),
+            return self.trusted_manual_unlock_receipt(&state)?.ok_or_else(|| {
+                NovelApplicationError::Conflict(
+                    "Cancelled checkpoint 缺少可信 manual_unlock 审计来源，拒绝失败解锁".into(),
+                )
             });
         }
 
         let previous_phase = state.phase;
         state.unlock_failed_execution()?;
-        self.persist(
-            &state,
-            NovelLifecycleActor::System,
-            "manual_unlock",
-            "manual_unlock",
-            serde_json::json!({
+        let event = NovelTaskEvent {
+            event_id: manual_unlock_event_id(task_id),
+            task_id: state.request.task_id.clone(),
+            project_id: state.request.project_id.clone(),
+            actor: NovelLifecycleActor::System,
+            phase: state.phase,
+            summary: "manual_unlock".into(),
+            details: serde_json::json!({
                 "reason": reason,
                 "previous_phase": previous_phase,
                 "execution_state": execution_state,
             }),
-        )?;
-        Ok(NovelTaskUnlockReceipt {
-            task_id: state.request.task_id,
-            project_id: state.request.project_id,
-            previous_phase,
-            phase: state.phase,
-            execution_state,
-            already_unlocked: false,
-            reason: reason.to_owned(),
-        })
+            created_at: state.updated_at,
+        };
+        if self.store.persist_state_event_if_checkpoint_unchanged(
+            &expected_checkpoint,
+            &state,
+            &event,
+        )? {
+            return Ok(NovelTaskUnlockReceipt {
+                task_id: state.request.task_id,
+                project_id: state.request.project_id,
+                previous_phase,
+                phase: state.phase,
+                execution_state,
+                already_unlocked: false,
+                reason: reason.to_owned(),
+            });
+        }
+
+        let current_checkpoint = self.store.load_checkpoint(task_id)?.ok_or_else(|| {
+            NovelApplicationError::Conflict("失败解锁期间 checkpoint 已发生并发变化".into())
+        })?;
+        let current = NovelTaskState::from_checkpoint(&current_checkpoint).map_err(|_| {
+            NovelApplicationError::Conflict("失败解锁期间 checkpoint 已发生并发变化".into())
+        })?;
+        if current.phase == NovelTaskPhase::Cancelled {
+            if let Some(receipt) = self.trusted_manual_unlock_receipt(&current)? {
+                return Ok(receipt);
+            }
+        }
+        Err(NovelApplicationError::Conflict(
+            "失败解锁期间 checkpoint 已发生并发变化".into(),
+        ))
     }
 
     pub async fn review_draft(&self, review: MainReviewRecord) -> Result<NovelTransition> {
@@ -721,6 +753,57 @@ impl NovelApplicationService {
         NovelTaskState::from_checkpoint(&checkpoint).map_err(Into::into)
     }
 
+    fn trusted_manual_unlock_receipt(
+        &self,
+        state: &NovelTaskState,
+    ) -> Result<Option<NovelTaskUnlockReceipt>> {
+        if state.phase != NovelTaskPhase::Cancelled {
+            return Ok(None);
+        }
+        let event_id = manual_unlock_event_id(&state.request.task_id);
+        let Some(event) = self
+            .store
+            .load_task_events(&state.request.task_id)?
+            .into_iter()
+            .find(|event| event.event_id == event_id)
+        else {
+            return Ok(None);
+        };
+        if event.task_id != state.request.task_id
+            || event.project_id != state.request.project_id
+            || event.actor != NovelLifecycleActor::System
+            || event.phase != NovelTaskPhase::Cancelled
+            || event.summary != "manual_unlock"
+            || event.created_at != state.updated_at
+        {
+            return Ok(None);
+        }
+        let Ok(details) = serde_json::from_value::<ManualUnlockDetails>(event.details) else {
+            return Ok(None);
+        };
+        let Ok(validated_reason) = validate_unlock_reason(&details.reason) else {
+            return Ok(None);
+        };
+        if validated_reason != details.reason
+            || details.previous_phase.is_terminal()
+            || !matches!(
+                details.execution_state,
+                NovelTaskExecutionState::Failed | NovelTaskExecutionState::Cancelled
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(NovelTaskUnlockReceipt {
+            task_id: state.request.task_id.clone(),
+            project_id: state.request.project_id.clone(),
+            previous_phase: details.previous_phase,
+            phase: NovelTaskPhase::Cancelled,
+            execution_state: details.execution_state,
+            already_unlocked: true,
+            reason: details.reason,
+        }))
+    }
+
     fn task_lock(&self, task_id: &str) -> Arc<AsyncMutex<()>> {
         let mut locks = self
             .task_locks
@@ -874,6 +957,10 @@ fn validate_unlock_reason(reason: &str) -> Result<&str> {
         ));
     }
     Ok(reason)
+}
+
+fn manual_unlock_event_id(task_id: &str) -> String {
+    format!("novel-application-{task_id}-manual_unlock")
 }
 
 #[cfg(test)]

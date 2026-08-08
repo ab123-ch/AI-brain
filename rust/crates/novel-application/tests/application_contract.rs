@@ -11,7 +11,7 @@ use novel_domain::{
     CanonStatus, ConflictRecord, MainReviewChecks, MainReviewRecord, MainReviewVerdict,
     NovelArtifactReceipt, NovelDraftEnvelope, NovelFactKind, NovelLifecycleActor, NovelMemoryDelta,
     NovelOutcome, NovelProject, NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict,
-    NovelTaskPhase, NovelTaskRequest, NovelTaskState, NovelTaskType, ProposedFact,
+    NovelTaskEvent, NovelTaskPhase, NovelTaskRequest, NovelTaskState, NovelTaskType, ProposedFact,
     PublicationPolicy, ReviewCheckStatus, UserDecision, UserDecisionRecord,
 };
 use novel_workflow::{
@@ -254,7 +254,7 @@ fn create_task_run_in_state(repository: &TaskRepository, task_id: &str, state: T
 }
 
 struct UnlockFixture {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     store: Arc<NovelDomainStore>,
     repository: Arc<TaskRepository>,
     writer_calls: Arc<AtomicUsize>,
@@ -297,7 +297,7 @@ fn unlock_fixture(state: &NovelTaskState, execution_state: Option<TaskRunState>)
     let service = NovelApplicationService::new(Arc::clone(&store), Some(workflow), resources);
 
     UnlockFixture {
-        _directory: directory,
+        directory,
         store,
         repository,
         writer_calls,
@@ -336,7 +336,7 @@ async fn failed_task_unlock_is_atomic_and_audited_without_writer_call() {
     );
     let events = fixture.store.load_task_events("task-1").unwrap();
     let event = events.last().unwrap();
-    assert!(event.event_id.contains("-manual_unlock-"));
+    assert_eq!(event.event_id, "novel-application-task-1-manual_unlock");
     assert_eq!(event.actor, NovelLifecycleActor::System);
     assert_eq!(event.phase, NovelTaskPhase::Cancelled);
     assert_eq!(event.summary, "manual_unlock");
@@ -495,13 +495,236 @@ async fn repeated_unlock_is_idempotent_and_keeps_one_audit_event() {
 
     assert!(!first.already_unlocked);
     assert!(second.already_unlocked);
-    assert_eq!(second.previous_phase, NovelTaskPhase::Cancelled);
+    assert_eq!(second.previous_phase, NovelTaskPhase::Drafting);
     assert_eq!(second.phase, NovelTaskPhase::Cancelled);
+    assert_eq!(second.execution_state, NovelTaskExecutionState::Failed);
+    assert_eq!(second.reason, "首次人工确认");
     let events = fixture.store.load_task_events("task-1").unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].summary, "manual_unlock");
     assert_eq!(events[0].details["reason"], "首次人工确认");
     assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_without_trusted_manual_unlock_provenance_is_rejected() {
+    let mut direct_cancelled = empty_drafting_state();
+    direct_cancelled.phase = NovelTaskPhase::Cancelled;
+    let mut conversation_cancelled = empty_drafting_state();
+    conversation_cancelled
+        .cancel_for_conversation_fork()
+        .unwrap();
+    let mut content_cancelled = approved_state();
+    content_cancelled.phase = NovelTaskPhase::Cancelled;
+
+    for state in [direct_cancelled, conversation_cancelled, content_cancelled] {
+        let fixture = unlock_fixture(&state, Some(TaskRunState::Cancelled));
+        let checkpoint = fixture.store.load_checkpoint("task-1").unwrap().unwrap();
+
+        let error = fixture
+            .service
+            .unlock_failed_task("task-1", "不能覆盖原始来源")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NovelApplicationError::Conflict(message)
+                if message.contains("可信") && message.contains("manual_unlock")
+        ));
+        assert_eq!(
+            fixture.store.load_checkpoint("task-1").unwrap().unwrap(),
+            checkpoint
+        );
+        assert!(fixture.store.load_task_events("task-1").unwrap().is_empty());
+        assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn forged_or_incomplete_manual_unlock_events_are_not_trusted() {
+    let mut cancelled = empty_drafting_state();
+    cancelled.phase = NovelTaskPhase::Cancelled;
+    let trusted_details = serde_json::json!({
+        "reason": "首次原因",
+        "previous_phase": "drafting",
+        "execution_state": "cancelled",
+    });
+    let cancelled_at = cancelled.updated_at;
+    let forged_events = [
+        NovelTaskEvent {
+            event_id: "novel-application-task-1-manual_unlock".into(),
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            actor: NovelLifecycleActor::User,
+            phase: NovelTaskPhase::Cancelled,
+            summary: "manual_unlock".into(),
+            details: trusted_details.clone(),
+            created_at: cancelled_at,
+        },
+        NovelTaskEvent {
+            event_id: "novel-application-task-1-manual_unlock".into(),
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            actor: NovelLifecycleActor::System,
+            phase: NovelTaskPhase::Cancelled,
+            summary: "manual_unlock".into(),
+            details: serde_json::json!({
+                "reason": "首次原因",
+                "previous_phase": "drafting",
+            }),
+            created_at: cancelled_at,
+        },
+        NovelTaskEvent {
+            event_id: "novel-application-task-1-manual_unlock".into(),
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            actor: NovelLifecycleActor::System,
+            phase: NovelTaskPhase::Cancelled,
+            summary: "forged_unlock".into(),
+            details: trusted_details,
+            created_at: cancelled_at,
+        },
+    ];
+
+    for event in forged_events {
+        let fixture = unlock_fixture(&cancelled, Some(TaskRunState::Cancelled));
+        fixture.store.append_task_event(&event).unwrap();
+
+        let error = fixture
+            .service
+            .unlock_failed_task("task-1", "新的原因")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, NovelApplicationError::Conflict(_)));
+        assert_eq!(fixture.store.load_task_events("task-1").unwrap().len(), 1);
+        assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+fn reopen_unlock_service(fixture: &UnlockFixture) -> (NovelApplicationService, Arc<AtomicUsize>) {
+    let root = fixture.directory.path();
+    let store = Arc::new(NovelDomainStore::open(root.join("novel.db")).unwrap());
+    let repository = Arc::new(TaskRepository::open(root.join("runtime.db")).unwrap());
+    let resources = Arc::new(TestResources {
+        root: root.join("workspace-second"),
+    });
+    let environment: Arc<dyn NovelWorkflowEnvironmentPort> = Arc::new(
+        StoreWorkflowEnvironment::new(Arc::clone(&store), resources.clone()),
+    );
+    let writer_calls = Arc::new(AtomicUsize::new(0));
+    let writer: Arc<dyn NovelWriterPort> = Arc::new(PanicWriter {
+        calls: Arc::clone(&writer_calls),
+    });
+    let workflow = Arc::new(NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        task_coordinator(repository),
+        environment,
+        writer,
+        workflow_models(),
+        NovelWorkflowBudget {
+            input_tokens: 100,
+            output_tokens: 100,
+        },
+    ));
+    (
+        NovelApplicationService::new(store, Some(workflow), resources),
+        writer_calls,
+    )
+}
+
+#[tokio::test]
+async fn concurrent_services_unlock_once_and_converge_on_original_receipt() {
+    let fixture = unlock_fixture(&empty_drafting_state(), Some(TaskRunState::Failed));
+    let (second_service, second_writer_calls) = reopen_unlock_service(&fixture);
+
+    let (left, right) = tokio::join!(
+        fixture.service.unlock_failed_task("task-1", "并发原始原因"),
+        second_service.unlock_failed_task("task-1", "并发替代原因"),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+
+    assert_ne!(left.already_unlocked, right.already_unlocked);
+    assert_eq!(left.reason, right.reason);
+    assert!(matches!(
+        left.reason.as_str(),
+        "并发原始原因" | "并发替代原因"
+    ));
+    for receipt in [&left, &right] {
+        assert_eq!(receipt.previous_phase, NovelTaskPhase::Drafting);
+        assert_eq!(receipt.phase, NovelTaskPhase::Cancelled);
+        assert_eq!(receipt.execution_state, NovelTaskExecutionState::Failed);
+    }
+    let events = fixture.store.load_task_events("task-1").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_id, "novel-application-task-1-manual_unlock");
+    assert!(fixture
+        .store
+        .active_checkpoint_for_project("project-1")
+        .unwrap()
+        .is_none());
+    assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second_writer_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn terminal_checkpoint_cannot_be_reopened_by_stale_save_or_event_persist() {
+    let stale_state = empty_drafting_state();
+    let stale_checkpoint = stale_state.checkpoint().unwrap();
+    let fixture = unlock_fixture(&stale_state, Some(TaskRunState::Failed));
+    fixture
+        .service
+        .unlock_failed_task("task-1", "终态保护")
+        .await
+        .unwrap();
+    let event_count = fixture.store.load_task_events("task-1").unwrap().len();
+
+    let save_error = fixture
+        .store
+        .save_checkpoint(&stale_checkpoint)
+        .unwrap_err();
+    assert!(matches!(save_error, NovelApplicationError::Conflict(_)));
+    let stale_event = NovelTaskEvent {
+        event_id: "stale-drafting-event".into(),
+        task_id: "task-1".into(),
+        project_id: "project-1".into(),
+        actor: NovelLifecycleActor::System,
+        phase: NovelTaskPhase::Drafting,
+        summary: "stale write".into(),
+        details: serde_json::Value::Null,
+        created_at: stale_state.updated_at,
+    };
+    let persist_error = fixture
+        .store
+        .persist_state_event(&stale_state, &stale_event)
+        .unwrap_err();
+    assert!(matches!(persist_error, NovelApplicationError::Conflict(_)));
+
+    let checkpoint = fixture.store.load_checkpoint("task-1").unwrap().unwrap();
+    assert_eq!(checkpoint.phase, NovelTaskPhase::Cancelled);
+    assert!(fixture
+        .store
+        .active_checkpoint_for_project("project-1")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        fixture.store.load_task_events("task-1").unwrap().len(),
+        event_count
+    );
+
+    fixture.store.save_checkpoint(&checkpoint).unwrap();
+    let cancelled_state = NovelTaskState::from_checkpoint(&checkpoint).unwrap();
+    let manual_event = fixture.store.load_task_events("task-1").unwrap()[0].clone();
+    fixture
+        .store
+        .persist_state_event(&cancelled_state, &manual_event)
+        .unwrap();
+    assert_eq!(
+        fixture.store.load_task_events("task-1").unwrap().len(),
+        event_count
+    );
 }
 
 #[tokio::test]
