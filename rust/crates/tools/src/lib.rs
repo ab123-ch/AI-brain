@@ -6309,6 +6309,14 @@ mod tests {
             "不得包含密钥",
             "status",
             "reason",
+            "status 只能 project_id，不能 task_id",
+            "running/unknown 拒绝解锁",
+            "无 draft/candidate/review/decision/publication",
+            "不调用 Writer/LLM、不删除、不归档",
+            "不自动启动，不复用旧失败 task_id 冒充 resume",
+            "reason 必须非空，最多 256 字符",
+            "禁止控制字符、token、API key、Authorization、cookie、其他凭据、个人敏感信息",
+            "不猜 decide，不循环解锁",
         ] {
             assert!(
                 skill.contains(required_text),

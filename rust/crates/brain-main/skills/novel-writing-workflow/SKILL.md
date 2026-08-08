@@ -33,17 +33,17 @@ description: 统筹中文长篇小说的大纲、卷纲、章纲、正文、续�
 
 ### 失败锁恢复
 
-当 `start` 返回精确症状 `project already has active work`，先调用合法的 `novel_task(action=status, project_id=...)`。`status` 只用于找旧 task 和当前 phase，不能传 `task_id`，也不包含 Task Engine 状态或错误；再从当前工具错误或最新运行日志确认旧 Task Engine 状态和最新工作流错误。
+当 `start` 返回精确症状 `project already has active work`，先调用合法的 `novel_task(action=status, project_id=...)`。status 只能 project_id，不能 task_id；它只用于找旧 task 和当前 phase，也不包含 Task Engine 状态或错误；再从当前工具错误或最新运行日志确认旧 Task Engine 状态和最新工作流错误。
 
-该锁防止同项目并发写作造成 Canon 冲突、重复产物、审核错配和重复发布，不能无条件清除。仅当旧 Task Engine 为 `failed` 或 `cancelled`、Novel checkpoint 仍非终态，且没有 draft/candidate/review/decision/publication 时，才调用：
+该锁防止同项目并发写作造成 Canon 冲突、重复产物、审核错配和重复发布，不能无条件清除。仅当旧 Task Engine 为 `failed` 或 `cancelled`、Novel checkpoint 仍非终态，且无 draft/candidate/review/decision/publication 时，才调用：
 
 ```json
 {"action":"unlock_failed","task_id":"旧 task_id","reason":"简短、可审计的失败原因"}
 ```
 
-`reason` 最多 256 字符，不得包含密钥、控制字符、Authorization、凭据或个人敏感信息；它会长期审计。若状态为 `queued`、`running`、`paused_budget`、`needs_input`、`completed` 或 `unknown`，或已有任何内容、审核或发布物，禁止解锁；按当前合法 phase 继续 `review`、`decide` 或 `publish`，或直接向用户报告拒绝原因。不能猜 `decide`，也不能循环解锁。
+reason 必须非空，最多 256 字符；不得包含密钥；禁止控制字符、token、API key、Authorization、cookie、其他凭据、个人敏感信息；它会长期审计。若状态为 `queued`、`running`、`paused_budget`、`needs_input`、`completed` 或 `unknown`，或已有任何内容、审核或发布物，禁止解锁；running/unknown 拒绝解锁。按当前合法 phase 继续 `review`、`decide` 或 `publish`，或直接向用户报告拒绝原因。不猜 decide，不循环解锁。
 
-`unlock_failed` 不调用 Writer/LLM、不删除历史、不归档；任何拒绝直接告知，**不得自动重试 LLM**。成功后，仅在用户仍要求继续创作时，对原本待启动的新任务显式调用 start 一次；不得自动启动，不复用旧失败 `task_id` 冒充 `resume`。
+`unlock_failed` 不调用 Writer/LLM、不删除、不归档；任何拒绝直接告知，**不得自动重试 LLM**。成功后，仅在用户仍要求继续创作时，对原本待启动的新任务显式调用 start 一次；不自动启动，不复用旧失败 task_id 冒充 resume。
 
 ### 独立复审
 
