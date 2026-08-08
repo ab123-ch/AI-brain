@@ -945,10 +945,11 @@ fn current_time_millis() -> i64 {
         .map_or(0, |duration| duration.as_millis() as i64)
 }
 
-fn validate_unlock_reason(reason: &str) -> Result<&str> {
-    if reason.chars().any(char::is_control) {
+pub fn validate_unlock_reason(reason: &str) -> Result<&str> {
+    let trimmed_reason = reason.trim();
+    if trimmed_reason.is_empty() {
         return Err(NovelApplicationError::Conflict(
-            "失败解锁原因不能包含 Unicode 控制字符".into(),
+            "失败解锁原因不能为空".into(),
         ));
     }
     if reason.chars().count() > 256 {
@@ -956,13 +957,185 @@ fn validate_unlock_reason(reason: &str) -> Result<&str> {
             "失败解锁原因不能超过 256 个 Unicode 字符".into(),
         ));
     }
-    let reason = reason.trim();
-    if reason.is_empty() {
+    if reason.chars().any(char::is_control) {
         return Err(NovelApplicationError::Conflict(
-            "失败解锁原因不能为空".into(),
+            "失败解锁原因不能包含 Unicode 控制字符".into(),
         ));
     }
-    Ok(reason)
+    if contains_sensitive_unlock_material(trimmed_reason) {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因疑似包含凭据、秘密或个人敏感信息，拒绝记录".into(),
+        ));
+    }
+    Ok(trimmed_reason)
+}
+
+fn contains_sensitive_unlock_material(reason: &str) -> bool {
+    let normalized = reason.to_lowercase();
+    contains_labeled_sensitive_value(&normalized)
+        || contains_authentication_scheme_value(&normalized)
+        || contains_long_sk_token(&normalized)
+        || contains_private_key_block(&normalized)
+}
+
+fn contains_labeled_sensitive_value(reason: &str) -> bool {
+    const SENSITIVE_LABELS: &[&str] = &[
+        "authorization",
+        "api_key",
+        "api-key",
+        "api key",
+        "apikey",
+        "token",
+        "secret",
+        "cookie",
+        "set-cookie",
+        "set_cookie",
+        "set cookie",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
+        "private_key",
+        "private-key",
+        "private key",
+        "access_key",
+        "access-key",
+        "access key",
+        "client_secret",
+        "client-secret",
+        "client secret",
+        "身份证号码",
+        "身份证号",
+        "身份证",
+        "手机号码",
+        "手机号",
+        "电话号码",
+        "银行卡号码",
+        "银行卡号",
+        "银行卡",
+        "邮箱地址",
+        "电子邮箱",
+        "邮箱",
+        "social security number",
+        "ssn",
+        "identity_card",
+        "identity-card",
+        "identity card",
+        "id_card",
+        "id-card",
+        "id card",
+        "phone_number",
+        "phone-number",
+        "phone number",
+        "phone",
+        "mobile",
+        "bank_card",
+        "bank-card",
+        "bank card",
+        "credit_card",
+        "credit-card",
+        "credit card",
+        "debit_card",
+        "debit-card",
+        "debit card",
+        "email",
+        "e-mail",
+    ];
+
+    SENSITIVE_LABELS.iter().any(|label| {
+        reason.match_indices(label).any(|(index, _)| {
+            is_label_boundary(reason[..index].chars().next_back())
+                && has_value_after_label(&reason[index + label.len()..])
+        })
+    })
+}
+
+fn is_label_boundary(previous: Option<char>) -> bool {
+    previous.is_none_or(|character| !character.is_alphanumeric())
+}
+
+fn has_value_after_label(suffix: &str) -> bool {
+    let suffix = trim_optional_quote(suffix.trim_start());
+    let Some(delimiter) = suffix.chars().next() else {
+        return false;
+    };
+    if !matches!(delimiter, ':' | '=' | '：' | '＝') {
+        return false;
+    }
+    let value = trim_optional_quote(suffix[delimiter.len_utf8()..].trim_start());
+    value.chars().any(|character| {
+        !character.is_whitespace() && !matches!(character, '\'' | '"' | ',' | '}' | ']')
+    })
+}
+
+fn trim_optional_quote(value: &str) -> &str {
+    match value.chars().next() {
+        Some(character @ ('\'' | '"')) => value[character.len_utf8()..].trim_start(),
+        _ => value,
+    }
+}
+
+fn contains_authentication_scheme_value(reason: &str) -> bool {
+    ["bearer", "basic"].iter().any(|scheme| {
+        reason.match_indices(scheme).any(|(index, _)| {
+            if !is_label_boundary(reason[..index].chars().next_back()) {
+                return false;
+            }
+            let suffix = &reason[index + scheme.len()..];
+            if !suffix.chars().next().is_some_and(char::is_whitespace) {
+                return false;
+            }
+            let candidate = suffix
+                .trim_start()
+                .split(|character: char| !is_authentication_token_character(character))
+                .next()
+                .unwrap_or_default();
+            match *scheme {
+                "bearer" => is_plausible_bearer_token(candidate),
+                "basic" => is_plausible_basic_token(candidate),
+                _ => false,
+            }
+        })
+    })
+}
+
+fn is_authentication_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '-' | '_' | '.' | '~' | '+' | '/' | '=')
+}
+
+fn is_plausible_bearer_token(candidate: &str) -> bool {
+    candidate.len() >= 8
+        && candidate
+            .chars()
+            .any(|character| !character.is_ascii_alphabetic())
+}
+
+fn is_plausible_basic_token(candidate: &str) -> bool {
+    candidate.len() >= 8
+        && candidate.len().is_multiple_of(4)
+        && candidate.chars().any(|character| {
+            character.is_ascii_uppercase()
+                || character.is_ascii_digit()
+                || matches!(character, '+' | '/' | '=')
+        })
+}
+
+fn contains_long_sk_token(reason: &str) -> bool {
+    reason.match_indices("sk-").any(|(index, _)| {
+        is_label_boundary(reason[..index].chars().next_back())
+            && reason[index + 3..]
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                .count()
+                >= 20
+    })
+}
+
+fn contains_private_key_block(reason: &str) -> bool {
+    reason.contains("-----begin ") && reason.contains("private key-----")
 }
 
 fn manual_unlock_event_id(task_id: &str) -> String {

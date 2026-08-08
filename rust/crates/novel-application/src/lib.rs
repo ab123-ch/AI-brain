@@ -7,8 +7,9 @@ mod projection;
 mod store;
 
 pub use application::{
-    NovelApplicationService, NovelApplicationStatus, NovelProjectStatusView, NovelResourcePort,
-    NovelTaskUnlockReceipt, StoreWorkflowEnvironment, TaskApplicationPort,
+    validate_unlock_reason, NovelApplicationService, NovelApplicationStatus,
+    NovelProjectStatusView, NovelResourcePort, NovelTaskUnlockReceipt, StoreWorkflowEnvironment,
+    TaskApplicationPort,
 };
 pub use error::{NovelApplicationError, Result};
 pub use migration::{LegacyNovelImporter, MigrationReport};

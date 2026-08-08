@@ -654,6 +654,55 @@ async fn forged_or_incomplete_manual_unlock_events_are_not_trusted() {
     }
 }
 
+#[tokio::test]
+async fn manual_unlock_event_with_sensitive_reason_is_not_trusted_during_replay() {
+    let mut cancelled = empty_drafting_state();
+    cancelled.phase = NovelTaskPhase::Cancelled;
+    let fixture = unlock_fixture(&cancelled, Some(TaskRunState::Cancelled));
+    let checkpoint = fixture.store.load_checkpoint("task-1").unwrap().unwrap();
+    let task_run = fixture.repository.task("novel-task-task-1").unwrap();
+    let event = NovelTaskEvent {
+        event_id: "novel-application-task-1-manual_unlock".into(),
+        task_id: "task-1".into(),
+        project_id: "project-1".into(),
+        actor: NovelLifecycleActor::System,
+        phase: NovelTaskPhase::Cancelled,
+        summary: "manual_unlock".into(),
+        details: serde_json::json!({
+            "reason": "Authorization: Bearer archived-secret",
+            "previous_phase": "drafting",
+            "execution_state": "cancelled",
+        }),
+        created_at: cancelled.updated_at,
+    };
+    fixture.store.append_task_event(&event).unwrap();
+
+    let error = fixture
+        .service
+        .unlock_failed_task("task-1", "确认历史记录")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        NovelApplicationError::Conflict(message)
+            if message == "Cancelled checkpoint 缺少可信 manual_unlock 审计来源，拒绝失败解锁"
+    ));
+    assert_eq!(
+        fixture.store.load_checkpoint("task-1").unwrap().unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        fixture.store.load_task_events("task-1").unwrap(),
+        vec![event]
+    );
+    assert_eq!(
+        fixture.repository.task("novel-task-task-1").unwrap(),
+        task_run
+    );
+    assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+}
+
 fn reopen_unlock_service(fixture: &UnlockFixture) -> (NovelApplicationService, Arc<AtomicUsize>) {
     let root = fixture.directory.path();
     let store = Arc::new(NovelDomainStore::open(root.join("novel.db")).unwrap());
@@ -1072,6 +1121,95 @@ async fn invalid_unlock_reasons_are_rejected_before_state_changes() {
             checkpoint
         );
         assert!(fixture.store.load_task_events("task-1").unwrap().is_empty());
+        assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn sensitive_unlock_reasons_are_rejected_before_any_state_change() {
+    let fixture = unlock_fixture(&empty_drafting_state(), Some(TaskRunState::Failed));
+    let checkpoint = fixture.store.load_checkpoint("task-1").unwrap().unwrap();
+    let events = fixture.store.load_task_events("task-1").unwrap();
+    let task_run = fixture.repository.task("novel-task-task-1").unwrap();
+    let artifact_path = fixture
+        .directory
+        .path()
+        .join("workspace/audit-sentinel.txt");
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(&artifact_path, "artifact-before-unlock").unwrap();
+    let artifact = std::fs::read(&artifact_path).unwrap();
+    let sensitive_reasons = [
+        "Authorization: Bearer audit-secret",
+        r#"{"api_key":"dummy-api-key-value"}"#,
+        "Cookie: session_id=dummy-session-value",
+        "sk-1234567890abcdefghijklmnopqrstuvwxyz",
+        "手机号：13800138000",
+        "Bearer dummy-bearer-value",
+        "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+        "api-key=dummy-api-key-value",
+        "apikey: dummy-api-key-value",
+        "token=dummy-token-value",
+        "secret: dummy-secret-value",
+        "Set-Cookie: session_id=dummy-session-value",
+        "password = dummy-password-value",
+        "passwd=dummy-password-value",
+        "credential: dummy-credential-value",
+        "access key: dummy-access-key-value",
+        "client_secret: dummy-client-secret-value",
+        r#"{"private_key":"dummy-private-key-value"}"#,
+        "-----BEGIN PRIVATE KEY-----",
+        "身份证号：110101199001011234",
+        "银行卡号=6222020000000000000",
+        "邮箱: user@example.test",
+    ];
+
+    for reason in sensitive_reasons {
+        let error = fixture
+            .service
+            .unlock_failed_task("task-1", reason)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NovelApplicationError::Conflict(message)
+                if message == "失败解锁原因疑似包含凭据、秘密或个人敏感信息，拒绝记录"
+        ));
+        assert_eq!(
+            fixture.store.load_checkpoint("task-1").unwrap().unwrap(),
+            checkpoint
+        );
+        assert_eq!(fixture.store.load_task_events("task-1").unwrap(), events);
+        assert_eq!(
+            fixture.repository.task("novel-task-task-1").unwrap(),
+            task_run
+        );
+        assert_eq!(std::fs::read(&artifact_path).unwrap(), artifact);
+        assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn normal_security_words_without_labeled_values_remain_valid_unlock_reasons() {
+    for reason in [
+        "token limit exceeded，确认任务已失败",
+        "Cookie 策略导致页面刷新，已人工核实失败",
+        "排查 Authorization 配置后确认执行失败",
+        "用户未提供手机号，确认不影响本次失败判定",
+        "password reset path 执行失败，未附带任何用户值",
+        "secret handling 逻辑触发异常，未记录秘密材料",
+        "Basic validation failed，确认任务已终止",
+        "Bearer task failed，确认没有认证材料",
+    ] {
+        let fixture = unlock_fixture(&empty_drafting_state(), Some(TaskRunState::Failed));
+
+        let receipt = fixture
+            .service
+            .unlock_failed_task("task-1", reason)
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.reason, reason);
+        assert_eq!(fixture.store.load_task_events("task-1").unwrap().len(), 1);
         assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
     }
 }

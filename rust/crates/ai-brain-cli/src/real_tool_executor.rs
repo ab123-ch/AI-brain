@@ -12,7 +12,7 @@ use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
 use brain_plugin::SkillCatalog;
-use novel_application::{NovelApplicationError, TaskApplicationPort};
+use novel_application::{validate_unlock_reason, NovelApplicationError, TaskApplicationPort};
 use novel_domain::{
     MainReviewRecord, NovelConversationSource, NovelProject, NovelResumeInput, NovelTaskRequest,
     NovelTaskType, UserDecisionRecord,
@@ -1002,13 +1002,11 @@ fn validate_novel_action_input(
             {
                 return Err(invalid_novel_unlock_task_id_error());
             }
-            let reason = required_string(input, "reason")?;
-            if reason.chars().count() > 256 {
-                return Err("novel_task unlock_failed 的 reason 超过 256 个字符".into());
-            }
-            if reason.chars().any(char::is_control) {
-                return Err("novel_task unlock_failed 的 reason 包含不允许的控制字符".into());
-            }
+            let reason = input
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid_novel_unlock_reason_error)?;
+            validate_unlock_reason(reason).map_err(|_| invalid_novel_unlock_reason_error())?;
             serde_json::from_value::<NovelUnlockFailedToolInput>(input.clone())
                 .map(|_| ())
                 .map_err(|_| invalid_novel_unlock_format_error())
@@ -1030,6 +1028,10 @@ fn invalid_novel_unlock_task_id_error() -> String {
 
 fn invalid_novel_unlock_format_error() -> String {
     "novel_task unlock_failed 格式错误；仅允许 task_id 和 reason 字段".into()
+}
+
+fn invalid_novel_unlock_reason_error() -> String {
+    "novel_task unlock_failed 的 reason 不符合安全审计要求".into()
 }
 
 fn novel_error_mapper(action: &str) -> impl FnOnce(NovelApplicationError) -> String + '_ {
@@ -1599,6 +1601,11 @@ mod tests {
 
         for reason in [
             "Authorization: Bearer secret\n请放行".to_string(),
+            "Authorization: Bearer single-line-secret".to_string(),
+            r#"{"api_key":"dummy-api-key-value"}"#.to_string(),
+            "Cookie: session_id=dummy-session-value".to_string(),
+            "sk-1234567890abcdefghijklmnopqrstuvwxyz".to_string(),
+            "身份证号：110101199001011234".to_string(),
             "x".repeat(257),
         ] {
             let result = executor
@@ -1614,7 +1621,15 @@ mod tests {
                 })
                 .await;
             assert!(result.is_error);
+            assert_eq!(
+                result.output,
+                "novel_task unlock_failed 的 reason 不符合安全审计要求"
+            );
             assert!(!result.output.contains(&reason));
+            assert!(matches!(
+                trace_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
         }
 
         assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
