@@ -12,7 +12,8 @@ use novel_domain::{
     NovelTransition, PublicationReceipt, UserDecision, UserDecisionRecord,
 };
 use novel_workflow::{
-    NovelContextDocument, NovelStartWorkflow, NovelWorkflowEnvironmentPort, NovelWorkflowPortError,
+    NovelContextDocument, NovelStartWorkflow, NovelTaskExecutionState,
+    NovelWorkflowEnvironmentPort, NovelWorkflowPortError,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
@@ -122,6 +123,17 @@ pub struct NovelApplicationStatus {
     pub pending_publications: Vec<NovelPublicationRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NovelTaskUnlockReceipt {
+    pub task_id: String,
+    pub project_id: String,
+    pub previous_phase: NovelTaskPhase,
+    pub phase: NovelTaskPhase,
+    pub execution_state: NovelTaskExecutionState,
+    pub already_unlocked: bool,
+    pub reason: String,
+}
+
 #[async_trait]
 pub trait TaskApplicationPort: Send + Sync {
     async fn create_project(&self, project: NovelProject) -> Result<NovelProject>;
@@ -140,6 +152,11 @@ pub trait TaskApplicationPort: Send + Sync {
     ) -> Result<NovelProject>;
     async fn start_task(&self, request: NovelTaskRequest) -> Result<NovelOutcome>;
     async fn resume_task(&self, task_id: &str, input: NovelResumeInput) -> Result<NovelOutcome>;
+    async fn unlock_failed_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<NovelTaskUnlockReceipt>;
     async fn review_draft(&self, review: MainReviewRecord) -> Result<NovelTransition>;
     async fn user_decision(&self, decision: UserDecisionRecord) -> Result<NovelTransition>;
     async fn publish(&self, task_id: &str, draft_version: u32) -> Result<PublicationReceipt>;
@@ -270,6 +287,68 @@ impl NovelApplicationService {
         Ok(Box::pin(workflow.continue_task(task_id, &input.input))
             .await?
             .outcome)
+    }
+
+    pub async fn unlock_failed_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<NovelTaskUnlockReceipt> {
+        let reason = validate_unlock_reason(reason)?;
+        let task_lock = self.task_lock(task_id);
+        let _guard = task_lock.lock().await;
+        let mut state = self.load_state(task_id)?;
+        let workflow = self.workflow()?;
+        let execution_state = workflow
+            .task_execution_state(task_id)
+            .await?
+            .ok_or_else(|| {
+                NovelApplicationError::NotFound(format!(
+                    "Task Engine 运行记录 novel-task-{task_id}"
+                ))
+            })?;
+        if !matches!(
+            execution_state,
+            NovelTaskExecutionState::Failed | NovelTaskExecutionState::Cancelled
+        ) {
+            return Err(NovelApplicationError::Conflict(format!(
+                "Task Engine 状态 {execution_state:?} 不允许执行失败解锁，拒绝失败解锁"
+            )));
+        }
+        if state.phase == NovelTaskPhase::Cancelled {
+            return Ok(NovelTaskUnlockReceipt {
+                task_id: state.request.task_id,
+                project_id: state.request.project_id,
+                previous_phase: NovelTaskPhase::Cancelled,
+                phase: NovelTaskPhase::Cancelled,
+                execution_state,
+                already_unlocked: true,
+                reason: reason.to_owned(),
+            });
+        }
+
+        let previous_phase = state.phase;
+        state.unlock_failed_execution()?;
+        self.persist(
+            &state,
+            NovelLifecycleActor::System,
+            "manual_unlock",
+            "manual_unlock",
+            serde_json::json!({
+                "reason": reason,
+                "previous_phase": previous_phase,
+                "execution_state": execution_state,
+            }),
+        )?;
+        Ok(NovelTaskUnlockReceipt {
+            task_id: state.request.task_id,
+            project_id: state.request.project_id,
+            previous_phase,
+            phase: state.phase,
+            execution_state,
+            already_unlocked: false,
+            reason: reason.to_owned(),
+        })
     }
 
     pub async fn review_draft(&self, review: MainReviewRecord) -> Result<NovelTransition> {
@@ -705,6 +784,14 @@ impl TaskApplicationPort for NovelApplicationService {
         Box::pin(NovelApplicationService::resume_task(self, task_id, input)).await
     }
 
+    async fn unlock_failed_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<NovelTaskUnlockReceipt> {
+        NovelApplicationService::unlock_failed_task(self, task_id, reason).await
+    }
+
     async fn review_draft(&self, review: MainReviewRecord) -> Result<NovelTransition> {
         Box::pin(NovelApplicationService::review_draft(self, review)).await
     }
@@ -767,6 +854,26 @@ fn current_time_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
+}
+
+fn validate_unlock_reason(reason: &str) -> Result<&str> {
+    if reason.chars().any(char::is_control) {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因不能包含 Unicode 控制字符".into(),
+        ));
+    }
+    if reason.chars().count() > 256 {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因不能超过 256 个 Unicode 字符".into(),
+        ));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(NovelApplicationError::Conflict(
+            "失败解锁原因不能为空".into(),
+        ));
+    }
+    Ok(reason)
 }
 
 #[cfg(test)]
