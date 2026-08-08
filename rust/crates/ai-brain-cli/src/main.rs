@@ -77,18 +77,11 @@ async fn main() {
     let cli = Cli::parse();
     let is_tui = cli.command.is_none() && std::io::stdin().is_terminal();
 
-    // 日志初始化：TUI 模式只写文件，避免污染 alternate screen
+    // 日志初始化：TUI 模式只写文件，其他模式同时写终端和文件。
     let (base_dir, is_first_run) = init::init_environment();
-    if is_tui {
-        init::init_tui_logging(&base_dir);
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
-        init::init_file_logging(&base_dir);
+    if let Err(error) = init::init_logging(&base_dir, is_tui) {
+        eprintln!("初始化日志失败: {error}");
+        std::process::exit(1);
     }
     // 首次运行：总是在终端显示引导（TUI 模式也不例外，此时尚未进入 alternate screen）
     if is_first_run {
