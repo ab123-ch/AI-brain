@@ -12,7 +12,7 @@ use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
 use brain_plugin::SkillCatalog;
-use novel_application::TaskApplicationPort;
+use novel_application::{NovelApplicationError, TaskApplicationPort};
 use novel_domain::{
     MainReviewRecord, NovelConversationSource, NovelProject, NovelResumeInput, NovelTaskRequest,
     NovelTaskType, UserDecisionRecord,
@@ -691,6 +691,8 @@ fn inject_novel_conversation_scope(input: &mut serde_json::Value) {
 struct NovelResumeToolInput {
     task_id: String,
     input: String,
+    #[serde(default)]
+    context_refs: Option<Vec<novel_domain::ContextRef>>,
 }
 
 #[derive(Deserialize)]
@@ -709,6 +711,7 @@ async fn execute_application_novel_tool(
         .as_object_mut()
         .ok_or_else(|| "Novel facade input must be an object".to_string())?
         .remove("action");
+    validate_novel_action_input(name, &action, &input)?;
     if name == "novel_task" && action != "start" {
         if let (Some(scope), Some(task_id)) = (
             crate::query_context::current_conversation_memory_scope(),
@@ -723,7 +726,7 @@ async fn execute_application_novel_tool(
                     },
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(novel_error_mapper(&action))?;
         }
     }
     let output = match (name, action.as_str()) {
@@ -732,9 +735,15 @@ async fn execute_application_novel_tool(
                 .map_err(|error| format!("novel_task resume 格式错误: {error}"))?;
             serde_json::to_value(
                 application
-                    .resume_task(&input.task_id, NovelResumeInput { input: input.input })
+                    .resume_task(
+                        &input.task_id,
+                        NovelResumeInput {
+                            input: input.input,
+                            context_refs: input.context_refs,
+                        },
+                    )
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "review") => {
@@ -744,7 +753,7 @@ async fn execute_application_novel_tool(
                 application
                     .review_draft(review)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "decide") => {
@@ -754,7 +763,7 @@ async fn execute_application_novel_tool(
                 application
                     .user_decision(decision)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "publish") => {
@@ -764,7 +773,7 @@ async fn execute_application_novel_tool(
                 application
                     .publish(&input.task_id, input.draft_version)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "status") => {
@@ -776,7 +785,7 @@ async fn execute_application_novel_tool(
                 application
                     .status(project_id.as_deref())
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "start") => {
@@ -786,7 +795,7 @@ async fn execute_application_novel_tool(
                 application
                     .start_task(request)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_project", "create") => {
@@ -812,14 +821,14 @@ async fn execute_application_novel_tool(
                 application
                     .create_project(project)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_project", "list") => serde_json::to_value(
             application
                 .list_projects()
                 .await
-                .map_err(|error| error.to_string())?,
+                .map_err(novel_error_mapper(&action))?,
         ),
         ("novel_project", "recall") => {
             let project_id = required_string(&input, "project_id")?;
@@ -834,14 +843,14 @@ async fn execute_application_novel_tool(
                 application
                     .recall_project(project_id, task_type)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_project", "consistency") => serde_json::to_value(
             application
                 .check_consistency(required_string(&input, "project_id")?)
                 .await
-                .map_err(|error| error.to_string())?,
+                .map_err(novel_error_mapper(&action))?,
         ),
         ("novel_project", "resolve_conflict") => serde_json::to_value(
             application
@@ -851,7 +860,7 @@ async fn execute_application_novel_tool(
                     required_string(&input, "resolution")?,
                 )
                 .await
-                .map_err(|error| error.to_string())?,
+                .map_err(novel_error_mapper(&action))?,
         ),
         _ => {
             return Err(format!(
@@ -861,6 +870,82 @@ async fn execute_application_novel_tool(
     }
     .map_err(|error| error.to_string())?;
     serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+fn validate_novel_action_input(
+    name: &str,
+    action: &str,
+    input: &serde_json::Value,
+) -> Result<(), String> {
+    if name != "novel_task" {
+        return Ok(());
+    }
+    if matches!(action, "resume" | "review" | "decide" | "publish") {
+        required_string(input, "task_id")?;
+    }
+    match action {
+        "resume" => {
+            if required_string(input, "input").is_err() {
+                return Err(
+                    "novel_task resume 缺少或无效字段 input；仅当上一次结果为 needs_clarification 时，使用同一 task_id 并提供非空 input 后重试一次"
+                        .into(),
+                );
+            }
+            serde_json::from_value::<NovelResumeToolInput>(input.clone())
+                .map(|_| ())
+                .map_err(|error| format!("novel_task resume 格式错误: {error}"))
+        }
+        "review" => serde_json::from_value::<MainReviewRecord>(input.clone())
+            .map(|_| ())
+            .map_err(|error| format!("MainReviewRecord 格式错误: {error}")),
+        "decide" => serde_json::from_value::<UserDecisionRecord>(input.clone())
+            .map(|_| ())
+            .map_err(|error| format!("UserDecisionRecord 格式错误: {error}")),
+        "publish" => serde_json::from_value::<NovelPublishToolInput>(input.clone())
+            .map(|_| ())
+            .map_err(|error| format!("novel_task publish 格式错误: {error}")),
+        "start" => serde_json::from_value::<NovelTaskRequest>(input.clone())
+            .map(|_| ())
+            .map_err(|error| format!("NovelTaskRequest 格式错误: {error}")),
+        "status" => Ok(()),
+        other => Err(format!(
+            "unsupported Novel application command: {name} action={other}"
+        )),
+    }
+}
+
+fn novel_error_mapper(action: &str) -> impl FnOnce(NovelApplicationError) -> String + '_ {
+    move |error| map_novel_application_error(error, action)
+}
+
+fn map_novel_application_error(error: NovelApplicationError, action: &str) -> String {
+    match error {
+        NovelApplicationError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        } if action == "start" => format!(
+            "Novel resource content hash changed: path={path}, expected={expected}, actual={actual}；请重新读取该资源，在原 start 请求的同 role/path ContextRef 中使用 actual hash，保持同一 task_id，并仅重试 start 一次"
+        ),
+        NovelApplicationError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        } if action == "resume" => format!(
+            "Novel resource content hash changed: path={path}, expected={expected}, actual={actual}；仅当任务仍为 needs_clarification 时，保持同一 task_id 再调用 resume 一次，同时提供完整 context_refs，保持原 role/path/顺序且只把对应 sha256 更新为 actual"
+        ),
+        NovelApplicationError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        } => format!(
+            "Novel resource content hash changed: path={path}, expected={expected}, actual={actual}；当前 action={action} 不支持自动刷新上下文，已停止且未重试"
+        ),
+        NovelApplicationError::ContextChanged(message) => format!(
+            "Novel resource content changed: {message}；当前 action={action} 已停止，不自动重试"
+        ),
+        other => other.to_string(),
+    }
 }
 
 fn required_string<'a>(input: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
@@ -947,12 +1032,13 @@ mod tests {
         store::GraphStore,
     };
     use novel_application::{
-        NovelApplicationService, NovelDomainStore, NovelResourcePort as ApplicationResourcePort,
-        StoreWorkflowEnvironment,
+        NovelApplicationError, NovelApplicationService, NovelApplicationStatus, NovelDomainStore,
+        NovelResourcePort as ApplicationResourcePort, StoreWorkflowEnvironment,
     };
     use novel_domain::{
-        NovelDraftEnvelope, NovelMemoryDelta, NovelOutcome, NovelSelfReview, NovelSelfReviewChecks,
-        NovelSelfReviewVerdict, NovelTaskPhase, ReviewCheckStatus,
+        ConsistencyReport, NovelDraftEnvelope, NovelMemoryDelta, NovelOutcome, NovelRecallPack,
+        NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict, NovelTaskPhase,
+        NovelTransition, PublicationReceipt, ReviewCheckStatus,
     };
     use novel_workflow::{
         NovelStartWorkflow, NovelWorkflowBudget, NovelWorkflowModels, NovelWorkflowPortError,
@@ -969,6 +1055,119 @@ mod tests {
 
     struct ExecutorTestWriter {
         calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct RecordingTaskApplication {
+        association_calls: AtomicUsize,
+        start_context_error: Option<String>,
+    }
+
+    #[async_trait]
+    impl TaskApplicationPort for RecordingTaskApplication {
+        async fn create_project(
+            &self,
+            _project: NovelProject,
+        ) -> novel_application::Result<NovelProject> {
+            panic!("unexpected create_project")
+        }
+
+        async fn list_projects(&self) -> novel_application::Result<Vec<NovelProject>> {
+            panic!("unexpected list_projects")
+        }
+
+        async fn recall_project(
+            &self,
+            _project_id: &str,
+            _task_type: NovelTaskType,
+        ) -> novel_application::Result<NovelRecallPack> {
+            panic!("unexpected recall_project")
+        }
+
+        async fn check_consistency(
+            &self,
+            _project_id: &str,
+        ) -> novel_application::Result<ConsistencyReport> {
+            panic!("unexpected check_consistency")
+        }
+
+        async fn resolve_conflict(
+            &self,
+            _project_id: &str,
+            _conflict_id: &str,
+            _resolution: &str,
+        ) -> novel_application::Result<NovelProject> {
+            panic!("unexpected resolve_conflict")
+        }
+
+        async fn start_task(
+            &self,
+            _request: NovelTaskRequest,
+        ) -> novel_application::Result<NovelOutcome> {
+            Err(NovelApplicationError::ContextHashChanged {
+                path: self
+                    .start_context_error
+                    .clone()
+                    .expect("start_context_error must be configured"),
+                expected: "deadbeef".into(),
+                actual: "cafebabe".into(),
+            })
+        }
+
+        async fn resume_task(
+            &self,
+            _task_id: &str,
+            _input: NovelResumeInput,
+        ) -> novel_application::Result<NovelOutcome> {
+            panic!("unexpected resume_task")
+        }
+
+        async fn review_draft(
+            &self,
+            _review: MainReviewRecord,
+        ) -> novel_application::Result<NovelTransition> {
+            panic!("unexpected review_draft")
+        }
+
+        async fn user_decision(
+            &self,
+            _decision: UserDecisionRecord,
+        ) -> novel_application::Result<NovelTransition> {
+            panic!("unexpected user_decision")
+        }
+
+        async fn publish(
+            &self,
+            _task_id: &str,
+            _draft_version: u32,
+        ) -> novel_application::Result<PublicationReceipt> {
+            panic!("unexpected publish")
+        }
+
+        async fn status(
+            &self,
+            _project_id: Option<&str>,
+        ) -> novel_application::Result<NovelApplicationStatus> {
+            panic!("unexpected status")
+        }
+
+        async fn invalidate_conversation_generations(
+            &self,
+            _conversation_id: &str,
+            _generation_ids: &[String],
+            _include_unscoped: bool,
+        ) -> novel_application::Result<Vec<String>> {
+            panic!("unexpected invalidate_conversation_generations")
+        }
+
+        async fn associate_conversation_source(
+            &self,
+            _task_id: &str,
+            _source: NovelConversationSource,
+        ) -> novel_application::Result<()> {
+            self.association_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1041,6 +1240,113 @@ mod tests {
             last_accessed: now,
             superseded: false,
         }
+    }
+
+    #[tokio::test]
+    async fn novel_resume_preflight_rejects_missing_input_before_association() {
+        let application = RecordingTaskApplication::default();
+        let scope = brain_memory::conversation_memory::ConversationMemoryScope::new(
+            "chat-1",
+            "generation-1",
+        )
+        .unwrap();
+
+        for input in [
+            json!({"action": "resume", "task_id": "task-1"}),
+            json!({"action": "resume", "task_id": "task-1", "input": "  "}),
+        ] {
+            let error = crate::query_context::with_conversation_memory_scope(&scope, async {
+                execute_application_novel_tool(&application, "novel_task", input)
+                    .await
+                    .unwrap_err()
+            })
+            .await;
+
+            assert_eq!(
+                error,
+                "novel_task resume 缺少或无效字段 input；仅当上一次结果为 needs_clarification 时，使用同一 task_id 并提供非空 input 后重试一次"
+            );
+        }
+        assert_eq!(application.association_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn novel_context_change_error_contains_finite_recovery_instruction() {
+        let application = RecordingTaskApplication {
+            association_calls: AtomicUsize::new(0),
+            start_context_error: Some("outline.md".into()),
+        };
+
+        let error = execute_application_novel_tool(
+            &application,
+            "novel_task",
+            json!({
+                "action": "start",
+                "task_id": "task-1",
+                "project_id": "project-1",
+                "task_type": "body",
+                "task_brief": "Write chapter one",
+                "target_chapter": 1,
+                "expected_revision": 0,
+                "output_path": "chapters/0001.md",
+                "context_refs": [],
+                "must_happen": [],
+                "must_not_change": [],
+                "acceptance_criteria": ["Complete chapter one"],
+                "allow_web_research": false,
+                "publication_policy": "require_user_acceptance"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        for required in [
+            "expected=deadbeef",
+            "actual=cafebabe",
+            "重新读取该资源",
+            "使用 actual hash",
+            "保持同一 task_id",
+            "仅重试 start 一次",
+        ] {
+            assert!(
+                error.contains(required),
+                "error missing {required}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_change_guidance_is_action_specific_and_never_guesses() {
+        let resume = map_novel_application_error(
+            NovelApplicationError::ContextHashChanged {
+                path: "outline.md".into(),
+                expected: "old".into(),
+                actual: "new".into(),
+            },
+            "resume",
+        );
+        for required in [
+            "needs_clarification",
+            "完整 context_refs",
+            "原 role/path/顺序",
+            "sha256 更新为 actual",
+        ] {
+            assert!(
+                resume.contains(required),
+                "resume error missing {required}: {resume}"
+            );
+        }
+
+        let publish = map_novel_application_error(
+            NovelApplicationError::ContextHashChanged {
+                path: "chapter.md".into(),
+                expected: "old".into(),
+                actual: "new".into(),
+            },
+            "publish",
+        );
+        assert!(publish.contains("不支持自动刷新上下文"), "{publish}");
+        assert!(publish.contains("未重试"), "{publish}");
     }
 
     #[test]

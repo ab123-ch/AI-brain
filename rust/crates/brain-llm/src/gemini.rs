@@ -339,6 +339,39 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+fn log_stream_failure(operation: &str, url: &str, error: &LlmError) {
+    match error {
+        LlmError::ApiError { status, message } => tracing::error!(
+            operation,
+            url,
+            http_status = *status,
+            body_bytes = message.len(),
+            "Gemini 流式请求失败；响应体不写入日志"
+        ),
+        other => tracing::error!(
+            operation,
+            url,
+            error_kind = llm_error_kind(other),
+            "Gemini 流式请求失败；错误详情不写入日志"
+        ),
+    }
+}
+
+const fn llm_error_kind(error: &LlmError) -> &'static str {
+    match error {
+        LlmError::Config(_) => "config",
+        LlmError::RequestFailed(_) => "request_failed",
+        LlmError::ApiError { .. } => "api_error",
+        LlmError::StreamError(_) => "stream_error",
+        LlmError::ApiKeyNotFound(_) => "api_key_not_found",
+        LlmError::ProviderNotFound(_) => "provider_not_found",
+        LlmError::BrainNotConfigured(_) => "brain_not_configured",
+        LlmError::RetriesExhausted { .. } => "retries_exhausted",
+        LlmError::JsonError(_) => "json_error",
+        LlmError::IoError(_) => "io_error",
+    }
+}
+
 impl LlmProvider for GeminiClient {
     fn model(&self) -> &str {
         &self.model
@@ -371,9 +404,11 @@ impl LlmProvider for GeminiClient {
                         let status = response.status();
                         tracing::info!("Gemini 请求收到响应: url={url}, status={status}");
                         if !status.is_success() {
+                            let body = response.text().await.unwrap_or_default();
+                            let body_bytes = body.len();
                             let error = LlmError::ApiError {
                                 status: status.as_u16(),
-                                message: response.text().await.unwrap_or_default(),
+                                message: body,
                             };
                             if error.is_retryable() && attempts < max_attempts {
                                 let backoff = retry.backoff_for_attempt(attempts);
@@ -385,7 +420,7 @@ impl LlmProvider for GeminiClient {
                                 continue;
                             }
                             tracing::error!(
-                                "Gemini API 非成功响应: url={url}, status={status}, error={error}"
+                                "Gemini API 非成功响应: url={url}, status={status}, body_bytes={body_bytes}; 响应体不写入日志"
                             );
                             return Err(error);
                         }
@@ -430,9 +465,7 @@ impl LlmProvider for GeminiClient {
                     "Gemini 批量流式请求完成: url={url}, events={}",
                     events.len()
                 ),
-                Err(error) => {
-                    tracing::error!("Gemini 批量流式请求失败: url={url}, error={error}");
-                }
+                Err(error) => log_stream_failure("batch", &url, error),
             }
             result
         })
@@ -452,9 +485,7 @@ impl LlmProvider for GeminiClient {
                 stream::stream_gemini_incremental(self.http.client(), &url, &headers, &body).await;
             match &result {
                 Ok(_) => tracing::info!("Gemini 增量流式连接建立成功: url={url}"),
-                Err(error) => {
-                    tracing::error!("Gemini 增量流式连接失败: url={url}, error={error}");
-                }
+                Err(error) => log_stream_failure("incremental", &url, error),
             }
             result
         })
@@ -463,9 +494,57 @@ impl LlmProvider for GeminiClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::provider::{ChatMessage, ChatRequest};
     use crate::types::ToolDefinition;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn local_error_proxy(body: &str, response_count: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            for _ in 0..response_count {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 16_384];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn minimal_request() -> ChatRequest {
+        ChatRequest {
+            model: None,
+            messages: vec![ChatMessage::user("ping")],
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            tools: None,
+            tool_choice: None,
+        }
+    }
 
     fn make_client() -> GeminiClient {
         GeminiClient::new(
@@ -476,6 +555,45 @@ mod tests {
             0.7,
             None,
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gemini_stream_tracing_never_logs_error_body() {
+        let secret = "GEMINI_STREAM_ERROR_BODY_SECRET";
+        let error_body = format!(r#"{{"error":"Authorization: Bearer {secret}"}}"#);
+        let proxy = local_error_proxy(&error_body, 2).await;
+        let client = GeminiClient::new(
+            "http://gemini.invalid/v1beta".into(),
+            "test-key".into(),
+            "test-model".into(),
+            64,
+            0.0,
+            Some(proxy),
+        );
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer_buffer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || CapturedWriter(Arc::clone(&writer_buffer)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        let batch_error = client.stream_complete(minimal_request()).await.unwrap_err();
+        let incremental_error = client
+            .stream_incremental(minimal_request())
+            .await
+            .unwrap_err();
+        assert!(batch_error.to_string().contains(secret));
+        assert!(incremental_error.to_string().contains(secret));
+
+        drop(guard);
+        let bytes = buffer.lock().unwrap().clone();
+        let logs = String::from_utf8(bytes).unwrap();
+        assert!(logs.contains("Gemini 批量流式请求发送开始"), "{logs}");
+        assert!(!logs.contains(secret), "流式错误正文泄漏到 tracing: {logs}");
     }
 
     #[test]

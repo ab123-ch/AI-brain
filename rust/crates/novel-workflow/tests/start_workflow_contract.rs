@@ -107,6 +107,24 @@ struct FakeWriter {
     branch_id: &'static str,
 }
 
+struct UsageFailingWriter;
+
+#[async_trait]
+impl NovelWriterPort for UsageFailingWriter {
+    async fn execute(
+        &self,
+        _invocation: NovelWriterInvocation,
+    ) -> Result<NovelWriterExecution, NovelWorkflowPortError> {
+        Err(NovelWorkflowPortError::WriterExecutionFailed {
+            message: "两次输出均不符合合同".into(),
+            usage: ActualUsage {
+                input_tokens: 52,
+                output_tokens: 11,
+            },
+        })
+    }
+}
+
 #[async_trait]
 impl NovelWriterPort for FakeWriter {
     async fn execute(
@@ -299,6 +317,36 @@ async fn start_is_task_backed_and_replays_without_a_second_model_call() {
     assert!(replay.replayed);
     assert_eq!(replay.artifact_id, first.artifact_id);
     assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_writer_persists_known_actual_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+    let environment = Arc::new(FakeEnvironment::default());
+    *environment.project.lock().unwrap() = Some(NovelProject::new("project-1", "Project"));
+    let service = NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        coordinator(Arc::clone(&repository)),
+        environment,
+        Arc::new(UsageFailingWriter),
+        models(),
+        NovelWorkflowBudget {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+        },
+    );
+
+    service.start_task(request()).await.unwrap_err();
+
+    let instance = repository.instance("novel-writer-run-task-1").unwrap();
+    assert_eq!(
+        instance.usage,
+        Some(ActualUsage {
+            input_tokens: 52,
+            output_tokens: 11,
+        })
+    );
 }
 
 #[tokio::test]

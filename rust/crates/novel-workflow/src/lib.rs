@@ -2,6 +2,7 @@
 
 mod response;
 mod start;
+mod writer_contract;
 
 use std::collections::BTreeMap;
 
@@ -10,8 +11,9 @@ use knowledge_core::ContextSnapshot;
 use serde::{Deserialize, Serialize};
 use task_engine::{BudgetLimits, BudgetRequest, NewTaskNode, NewTaskRun, NodeKind};
 
-pub use response::parse_novel_response;
+pub use response::{parse_novel_response, NovelWriterOutputBinding};
 pub use start::*;
+pub use writer_contract::render_writer_output_contract;
 
 pub const WRITER_PROFILE_ID: &str = "novel.writer.v1";
 pub const REVIEWER_PROFILE_ID: &str = "novel.reviewer.v1";

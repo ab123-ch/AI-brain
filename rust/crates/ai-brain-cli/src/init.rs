@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 /// 默认配置文件模板（带注释）
@@ -167,63 +166,51 @@ pub fn print_first_run_guide() {
     eprintln!();
 }
 
-/// 初始化文件日志（普通模式：stdout + 文件）
-pub fn init_file_logging(base_dir: &Path) {
+/// 构造一次可安装的日志分发器，便于启动与局部测试共享同一配置。
+pub fn build_logging_dispatch(
+    base_dir: &Path,
+    is_tui: bool,
+) -> Result<(tracing::Dispatch, PathBuf), String> {
     let log_dir = base_dir.join("logs");
+    fs::create_dir_all(&log_dir)
+        .map_err(|error| format!("创建日志目录失败 {}: {error}", log_dir.display()))?;
     let date = chrono::Local::now().format("%Y-%m-%d");
     let log_path = log_dir.join(format!("brain-{date}.log"));
-
-    let file = match fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("无法打开日志文件 {:?}: {e}", log_path);
-            return;
-        }
-    };
+        .map_err(|error| format!("打开日志文件失败 {}: {error}", log_path.display()))?;
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
-        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
-
-    // 在现有 subscriber 上叠加文件日志
-    let _ = tracing_subscriber::registry().with(file_layer).try_init();
+        .with_filter(
+            tracing_subscriber::filter::Targets::new()
+                .with_default(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with_target("brain_llm", tracing_subscriber::filter::LevelFilter::INFO),
+        );
+    let dispatch = if is_tui {
+        tracing::Dispatch::new(tracing_subscriber::registry().with(file_layer))
+    } else {
+        let terminal_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let terminal_layer = tracing_subscriber::fmt::layer().with_filter(terminal_filter);
+        tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(file_layer)
+                .with(terminal_layer),
+        )
+    };
+    Ok((dispatch, log_path))
 }
 
-/// 初始化 TUI 模式日志（只写文件，不写终端）
-pub fn init_tui_logging(base_dir: &Path) {
-    let log_dir = base_dir.join("logs");
-    let _ = fs::create_dir_all(&log_dir);
-    let date = chrono::Local::now().format("%Y-%m-%d");
-    let log_path = log_dir.join(format!("brain-{date}.log"));
-
-    match fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(file) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                )
-                .with_writer(std::sync::Mutex::new(file))
-                .with_ansi(false)
-                .init();
-        }
-        Err(_) => {
-            // 连日志文件都打不开，全部丢弃
-            tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
-                .with_writer(std::io::sink)
-                .init();
-        }
-    }
+/// 全局安装日志分发器。每个进程只能调用一次。
+pub fn init_logging(base_dir: &Path, is_tui: bool) -> Result<PathBuf, String> {
+    let (dispatch, log_path) = build_logging_dispatch(base_dir, is_tui)?;
+    tracing::dispatcher::set_global_default(dispatch)
+        .map_err(|error| format!("注册全局日志分发器失败: {error}"))?;
+    Ok(log_path)
 }
 
 /// AI Brain 根目录
@@ -236,7 +223,7 @@ pub fn base_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::CONFIG_TEMPLATE;
+    use super::{build_logging_dispatch, CONFIG_TEMPLATE};
 
     #[test]
     fn config_template_documents_instance_model_catalog_and_compatible_gemini_proxy() {
@@ -244,5 +231,63 @@ mod tests {
         assert!(CONFIG_TEMPLATE.contains("id = \"gemini-2-5-flash\""));
         assert!(CONFIG_TEMPLATE.contains("api_base = \"https://ai.xfws88.com/v1\""));
         assert!(CONFIG_TEMPLATE.contains("kind = \"openai\""));
+    }
+
+    fn assert_logging_dispatch_writes_file(is_tui: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = format!("logging-test-{}", uuid::Uuid::new_v4());
+        let (dispatch, path) = build_logging_dispatch(directory.path(), is_tui).unwrap();
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!("{marker}");
+        });
+        drop(dispatch);
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(!content.is_empty());
+        assert!(content.contains(&marker));
+    }
+
+    #[test]
+    fn logging_non_tui_dispatch_writes_file() {
+        assert_logging_dispatch_writes_file(false);
+    }
+
+    #[test]
+    fn logging_tui_dispatch_writes_file() {
+        assert_logging_dispatch_writes_file(true);
+    }
+
+    #[test]
+    fn logging_file_suppresses_brain_llm_debug_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = "PROVIDER_RAW_DEBUG_SECRET";
+        let (dispatch, path) = build_logging_dispatch(directory.path(), true).unwrap();
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::debug!(target: "brain_llm::openai_compat", "{secret}");
+            tracing::info!(target: "brain_llm::openai_compat", "Provider status only");
+        });
+        drop(dispatch);
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains(secret),
+            "文件日志泄漏 Provider DEBUG 正文"
+        );
+        assert!(content.contains("Provider status only"));
+    }
+
+    #[test]
+    fn logging_initialization_failure_is_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_base = directory.path().join("blocked-base");
+        std::fs::write(&blocked_base, "not a directory").unwrap();
+
+        let Err(error) = build_logging_dispatch(&blocked_base, false) else {
+            panic!("日志目录不可创建时必须返回错误");
+        };
+
+        assert!(error.contains("创建日志目录失败"), "{error}");
     }
 }

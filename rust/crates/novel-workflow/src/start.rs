@@ -39,12 +39,32 @@ pub enum NovelWorkflowPortError {
     StaleRevision { expected: u64, actual: u64 },
     #[error("invalid Novel writer output: {0}")]
     InvalidWriterOutput(String),
+    #[error("Novel Writer execution failed: {message}")]
+    WriterExecutionFailed { message: String, usage: ActualUsage },
     #[error("Novel workflow context changed: {0}")]
     ContextChanged(String),
+    #[error(
+        "Novel workflow context hash changed: path={path}, expected={expected}, actual={actual}"
+    )]
+    ContextHashChanged {
+        path: String,
+        expected: String,
+        actual: String,
+    },
     #[error("Novel TaskEngine operation failed: {0}")]
     TaskEngine(String),
     #[error("Novel workflow serialization failed: {0}")]
     Serialization(String),
+}
+
+impl NovelWorkflowPortError {
+    #[must_use]
+    pub const fn actual_usage(&self) -> Option<ActualUsage> {
+        match self {
+            Self::WriterExecutionFailed { usage, .. } => Some(*usage),
+            _ => None,
+        }
+    }
 }
 
 impl From<NovelWorkflowError> for NovelWorkflowPortError {
@@ -569,11 +589,12 @@ impl NovelStartWorkflow {
         let execution = match self.writer.execute(invocation).await {
             Ok(execution) => execution,
             Err(error) => {
+                let usage = error.actual_usage();
                 self.fail_after_execution(
                     &started.instance.instance_run_id,
                     started.instance.version,
                     &error.to_string(),
-                    None,
+                    usage,
                 )
                 .await?;
                 return Err(error);

@@ -14,6 +14,14 @@ pub enum NovelApplicationError {
     ResourceDenied(String),
     #[error("Novel resource content changed: {0}")]
     ContextChanged(String),
+    #[error(
+        "Novel resource content hash changed: path={path}, expected={expected}, actual={actual}"
+    )]
+    ContextHashChanged {
+        path: String,
+        expected: String,
+        actual: String,
+    },
     #[error("Novel serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("Novel knowledge projection failed: {0}")]
@@ -28,7 +36,21 @@ pub enum NovelApplicationError {
 
 impl From<novel_workflow::NovelWorkflowPortError> for NovelApplicationError {
     fn from(error: novel_workflow::NovelWorkflowPortError) -> Self {
-        Self::Workflow(error.to_string())
+        match error {
+            novel_workflow::NovelWorkflowPortError::ContextChanged(message) => {
+                Self::ContextChanged(message)
+            }
+            novel_workflow::NovelWorkflowPortError::ContextHashChanged {
+                path,
+                expected,
+                actual,
+            } => Self::ContextHashChanged {
+                path,
+                expected,
+                actual,
+            },
+            other => Self::Workflow(other.to_string()),
+        }
     }
 }
 
@@ -45,3 +67,38 @@ impl From<std::io::Error> for NovelApplicationError {
 }
 
 pub type Result<T> = std::result::Result<T, NovelApplicationError>;
+
+#[cfg(test)]
+mod tests {
+    use novel_workflow::NovelWorkflowPortError;
+
+    use super::NovelApplicationError;
+
+    #[test]
+    fn workflow_context_changed_conversion_preserves_application_variant() {
+        let error: NovelApplicationError =
+            NovelWorkflowPortError::ContextChanged("expected=old, actual=new".into()).into();
+
+        assert!(matches!(
+            error,
+            NovelApplicationError::ContextChanged(message)
+                if message == "expected=old, actual=new"
+        ));
+    }
+
+    #[test]
+    fn workflow_context_hash_conversion_preserves_typed_fields() {
+        let error: NovelApplicationError = NovelWorkflowPortError::ContextHashChanged {
+            path: "outline.md".into(),
+            expected: "old".into(),
+            actual: "new".into(),
+        }
+        .into();
+
+        assert!(matches!(
+            error,
+            NovelApplicationError::ContextHashChanged { path, expected, actual }
+                if path == "outline.md" && expected == "old" && actual == "new"
+        ));
+    }
+}

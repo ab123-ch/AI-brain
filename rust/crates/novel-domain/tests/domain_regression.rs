@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use novel_domain::{
     build_recall_pack, check_consistency, CanonStatus, ClarificationRequest, CommitReport,
-    ConflictRecord, MainReviewChecks, MainReviewRecord, MainReviewVerdict, NovelArtifactReceipt,
-    NovelDraftEnvelope, NovelFact, NovelFactKind, NovelMemoryDelta, NovelOutcome, NovelProject,
-    NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict, NovelTaskPhase,
-    NovelTaskRequest, NovelTaskState, NovelTaskType, NovelTransition, PublicationPolicy,
-    ReviewCheckStatus, ReviewIssue, UserDecision, UserDecisionRecord,
+    ConflictRecord, ContextRef, ContextRole, MainReviewChecks, MainReviewRecord, MainReviewVerdict,
+    NovelArtifactReceipt, NovelDraftEnvelope, NovelFact, NovelFactKind, NovelMemoryDelta,
+    NovelOutcome, NovelProject, NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict,
+    NovelTaskPhase, NovelTaskRequest, NovelTaskState, NovelTaskType, NovelTransition,
+    PublicationPolicy, ReviewCheckStatus, ReviewIssue, UserDecision, UserDecisionRecord,
 };
 
 fn fact(id: &str, kind: NovelFactKind, subject_key: &str) -> NovelFact {
@@ -284,6 +284,46 @@ fn clarification_pauses_drafting_and_can_be_resumed() {
         }))
         .is_err());
     assert_eq!(state.phase, NovelTaskPhase::Drafting);
+}
+
+#[test]
+fn clarification_refreshes_only_hashes_for_the_same_context_paths() {
+    let mut task_request = request(PublicationPolicy::RequireUserAcceptance);
+    task_request.context_refs = vec![ContextRef {
+        role: ContextRole::ChapterOutline,
+        canonical_path: PathBuf::from("outline.md"),
+        sha256: "old-hash".into(),
+        description: Some("第一章章纲".into()),
+    }];
+    let mut state = NovelTaskState::new(task_request).unwrap();
+    state.begin_drafting().unwrap();
+    state
+        .apply_outcome(NovelOutcome::NeedsClarification(ClarificationRequest {
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            questions: vec!["是否接受更新后的章纲？".into()],
+            reason: "章纲已变化".into(),
+        }))
+        .unwrap();
+    let refreshed = ContextRef {
+        role: ContextRole::ChapterOutline,
+        canonical_path: PathBuf::from("outline.md"),
+        sha256: "new-hash".into(),
+        description: Some("第一章章纲".into()),
+    };
+
+    state.refresh_context_refs(vec![refreshed.clone()]).unwrap();
+
+    assert_eq!(state.phase, NovelTaskPhase::NeedsClarification);
+    assert_eq!(state.request.context_refs, vec![refreshed]);
+
+    let mut wrong_path = state.request.context_refs.clone();
+    wrong_path[0].canonical_path = PathBuf::from("other.md");
+    assert!(state.refresh_context_refs(wrong_path).is_err());
+    state.begin_drafting().unwrap();
+    assert!(state
+        .refresh_context_refs(state.request.context_refs.clone())
+        .is_err());
 }
 
 #[test]

@@ -49,8 +49,9 @@ impl LlmError {
                     || lower.contains("socket")
             }
             // API 返回可重试的 HTTP 状态码（408/429/500/502/503/504）
-            Self::ApiError { status, .. } => {
-                matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+            Self::ApiError { status, message } => {
+                !is_deterministic_model_route_error(message)
+                    && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
             }
             // 以下不可重试
             Self::Config(_)
@@ -65,4 +66,42 @@ impl LlmError {
     }
 }
 
+fn is_deterministic_model_route_error(message: &str) -> bool {
+    let normalized = message.to_lowercase();
+    normalized.contains("model_not_found")
+        || normalized.contains("model not found")
+        || normalized.contains("no available channel")
+        || normalized.contains("没有可用渠道")
+}
+
 pub type Result<T> = std::result::Result<T, LlmError>;
+
+#[cfg(test)]
+mod tests {
+    use super::LlmError;
+
+    #[test]
+    fn model_route_503_is_not_retryable() {
+        for message in [
+            "model_not_found: No available channel for gemini-3.5-flash",
+            "Model not found in the default group",
+            "模型没有可用渠道",
+        ] {
+            let error = LlmError::ApiError {
+                status: 503,
+                message: message.into(),
+            };
+            assert!(!error.is_retryable(), "unexpected retry for {message}");
+        }
+    }
+
+    #[test]
+    fn ordinary_503_remains_retryable() {
+        let error = LlmError::ApiError {
+            status: 503,
+            message: "temporary upstream overload".into(),
+        };
+
+        assert!(error.is_retryable());
+    }
+}

@@ -643,13 +643,9 @@ impl Orchestrator {
                 .map_err(|error| format!("初始化小说资源端口失败: {error}"))?,
         );
         let application_resources: Arc<dyn ApplicationNovelResourcePort> = novel_resources;
-        let novel_start_workflow = if let Ok(client) = llm_config.create_brain_client("main") {
-            let novel_llm: Arc<dyn brain_llm::LlmProvider> = Arc::from(client);
-            let (max_output_tokens, temperature) = llm_config.params_for_brain("main");
-            let model = novel_workflow::ProfileModel::new(
-                llm_config.provider_for_brain("main"),
-                llm_config.model_for_brain("main"),
-            );
+        let novel_writer = create_novel_writer_client(&llm_config)?;
+        let novel_start_workflow = {
+            let model = novel_writer.model;
             let models = novel_workflow::NovelWorkflowModels {
                 writer: model.clone(),
                 reviewer: model.clone(),
@@ -659,15 +655,15 @@ impl Orchestrator {
                 input_tokens: collaboration_config.task_input_token_limit,
                 output_tokens: collaboration_config
                     .task_output_token_limit
-                    .min(u64::from(max_output_tokens)),
+                    .min(u64::from(novel_writer.max_output_tokens)),
             };
             let environment = Arc::new(StoreWorkflowEnvironment::new(
                 Arc::clone(&novel_store),
                 Arc::clone(&application_resources),
             ));
             let writer = Arc::new(crate::novel_adapters::LlmNovelWriterAdapter::new(
-                Arc::clone(&novel_llm),
-                temperature,
+                novel_writer.provider,
+                novel_writer.temperature,
             ));
             Some(Arc::new(novel_workflow::NovelStartWorkflow::new(
                 Arc::clone(&task_repository),
@@ -677,8 +673,6 @@ impl Orchestrator {
                 models,
                 budget,
             )))
-        } else {
-            None
         };
         let novel_application = Arc::new(NovelApplicationService::new(
             Arc::clone(&novel_store),
@@ -2763,6 +2757,61 @@ struct LlmResult {
     model_name: String,
 }
 
+struct NovelWriterClient {
+    provider: Arc<dyn brain_llm::LlmProvider>,
+    model: novel_workflow::ProfileModel,
+    max_output_tokens: u32,
+    temperature: f64,
+}
+
+const NOVEL_WRITER_ROUTE_ERROR_CHARS: usize = 128;
+const NOVEL_WRITER_DETAIL_ERROR_CHARS: usize = 2_048;
+
+/// 创建 Novel Writer 的显式路由；配置错误直接阻止启动，不进入不可用占位状态。
+fn create_novel_writer_client(config: &LlmConfig) -> Result<NovelWriterClient, String> {
+    let provider_name = config.provider_for_brain("main");
+    let model_name = config.model_for_brain("main");
+    let route_provider = crate::novel_adapters::bounded_sensitive_text(
+        provider_name,
+        NOVEL_WRITER_ROUTE_ERROR_CHARS,
+    );
+    let route_model =
+        crate::novel_adapters::bounded_sensitive_text(model_name, NOVEL_WRITER_ROUTE_ERROR_CHARS);
+    let route = format!("provider={route_provider}, model={route_model}");
+    let provider = config
+        .create_brain_client("main")
+        .map_err(|error| match error {
+            brain_llm::LlmError::ProviderNotFound(name) => {
+                let name = crate::novel_adapters::bounded_sensitive_text(
+                    &name,
+                    NOVEL_WRITER_ROUTE_ERROR_CHARS,
+                );
+                format!("初始化 Novel Writer LLM 失败 ({route}): Provider 不存在: {name}")
+            }
+            brain_llm::LlmError::ApiKeyNotFound(name) => {
+                let name = crate::novel_adapters::bounded_sensitive_text(
+                    &name,
+                    NOVEL_WRITER_ROUTE_ERROR_CHARS,
+                );
+                format!("初始化 Novel Writer LLM 失败 ({route}): API Key 未配置: {name}")
+            }
+            other => {
+                let detail = crate::novel_adapters::bounded_sensitive_text(
+                    &other.to_string(),
+                    NOVEL_WRITER_DETAIL_ERROR_CHARS,
+                );
+                format!("初始化 Novel Writer LLM 失败 ({route}): {detail}")
+            }
+        })?;
+    let (max_output_tokens, temperature) = config.params_for_brain("main");
+    Ok(NovelWriterClient {
+        provider: Arc::from(provider),
+        model: novel_workflow::ProfileModel::new(provider_name, model_name),
+        max_output_tokens,
+        temperature,
+    })
+}
+
 /// 创建感知脑 LLM（不降级，失败直接报错）
 fn create_sensory_llm(config: &LlmConfig) -> Result<LlmResult, String> {
     let client = config
@@ -3030,7 +3079,7 @@ fn create_sub_brains() -> Result<
 mod tests {
     use super::*;
     use brain_core::types::TurnUsage;
-    use brain_llm::config::{InstanceModelConfig, ProviderConfig};
+    use brain_llm::config::{InstanceModelConfig, ProviderConfig, ProviderKind};
     use knowledge_core::{ContextBlock, ContextBlockInput};
 
     #[test]
@@ -3181,6 +3230,108 @@ mod tests {
         assert!(error
             .to_string()
             .contains("成员模型策略未配置: not-configured"));
+    }
+
+    #[test]
+    fn novel_writer_initialization_reports_explicit_route_errors() {
+        let mut unknown = LlmConfig::default_config();
+        unknown
+            .llm
+            .brain_providers
+            .insert("main".into(), "missing-provider".into());
+        unknown
+            .llm
+            .brain_models
+            .insert("main".into(), "missing-model".into());
+        let error = match create_novel_writer_client(&unknown) {
+            Ok(_) => panic!("未知 provider 不应创建 Novel Writer"),
+            Err(error) => error,
+        };
+        for required in ["provider=missing-provider", "model=missing-model", "不存在"] {
+            assert!(
+                error.contains(required),
+                "error missing {required}: {error}"
+            );
+        }
+
+        let mut missing_key = LlmConfig::default_config();
+        missing_key.llm.providers.insert(
+            "writer-without-key".into(),
+            ProviderConfig {
+                api_base: "https://writer.invalid/v1".into(),
+                api_key_env: "AI_BRAIN_TEST_KEY_THAT_MUST_NOT_EXIST_7F8435".into(),
+                api_key: None,
+                ..ProviderConfig::default()
+            },
+        );
+        missing_key
+            .llm
+            .brain_providers
+            .insert("main".into(), "writer-without-key".into());
+        missing_key
+            .llm
+            .brain_models
+            .insert("main".into(), "writer-model".into());
+        let error = match create_novel_writer_client(&missing_key) {
+            Ok(_) => panic!("缺 API key 不应创建 Novel Writer"),
+            Err(error) => error,
+        };
+        for required in [
+            "provider=writer-without-key",
+            "model=writer-model",
+            "API Key",
+        ] {
+            assert!(
+                error.contains(required),
+                "error missing {required}: {error}"
+            );
+        }
+
+        let route_secret = "NOVEL_WRITER_ROUTE_SECRET";
+        let mut malicious_route = LlmConfig::default_config();
+        malicious_route.llm.brain_providers.insert(
+            "main".into(),
+            format!("missing\nAuthorization: Bearer {route_secret}"),
+        );
+        malicious_route.llm.brain_models.insert(
+            "main".into(),
+            format!("model\r\napi_key=\"{route_secret}\""),
+        );
+        let error = match create_novel_writer_client(&malicious_route) {
+            Ok(_) => panic!("恶意 route 不应创建 Novel Writer"),
+            Err(error) => error,
+        };
+        assert!(!error.contains(route_secret), "启动错误泄漏 route: {error}");
+        assert!(!error.contains('\n'), "启动错误允许换行注入: {error}");
+        assert!(!error.contains('\r'), "启动错误允许回车注入: {error}");
+
+        let proxy_secret = "NOVEL_WRITER_PROXY_SECRET";
+        let mut invalid_proxy = LlmConfig::default_config();
+        invalid_proxy.llm.providers.insert(
+            "writer-invalid-proxy".into(),
+            ProviderConfig {
+                api_base: "https://writer.invalid/v1".into(),
+                api_key: Some("test-key".into()),
+                kind: ProviderKind::Gemini,
+                proxy: Some(format!("not-a-url\nAuthorization: Bearer {proxy_secret}")),
+                ..ProviderConfig::default()
+            },
+        );
+        invalid_proxy
+            .llm
+            .brain_providers
+            .insert("main".into(), "writer-invalid-proxy".into());
+        invalid_proxy
+            .llm
+            .brain_models
+            .insert("main".into(), "writer-model".into());
+        let error = match create_novel_writer_client(&invalid_proxy) {
+            Ok(_) => panic!("无效 proxy 不应创建 Novel Writer"),
+            Err(error) => error,
+        };
+        assert!(!error.contains(proxy_secret), "启动错误泄漏 proxy: {error}");
+        assert!(!error.contains('\n'), "启动错误允许换行注入: {error}");
+        assert!(error.chars().count() < 2_500, "启动错误未限长");
     }
 
     #[test]
