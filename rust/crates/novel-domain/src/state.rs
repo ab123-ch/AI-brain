@@ -43,6 +43,7 @@ enum UnlockBlocker {
     Terminal,
     Publication,
     Content,
+    Phase,
 }
 
 impl NovelTaskState {
@@ -446,10 +447,9 @@ impl NovelTaskState {
     pub fn unlock_failed_execution(&mut self) -> Result<()> {
         match self.unlock_blocker() {
             Some(UnlockBlocker::Terminal) => {
-                return Err(NovelDomainError::InvalidTransition(format!(
-                    "任务 {} 已是终态，不能执行失败解锁",
-                    self.request.task_id
-                )));
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务已是终态，不能执行失败解锁".into(),
+                ));
             }
             Some(UnlockBlocker::Publication) => {
                 return Err(NovelDomainError::InvalidTransition(
@@ -460,6 +460,11 @@ impl NovelTaskState {
                 return Err(NovelDomainError::InvalidTransition(
                     "任务已有草稿、候选、评审或用户决定，拒绝解锁；请继续 review/decide/publish 流程"
                         .into(),
+                ));
+            }
+            Some(UnlockBlocker::Phase) => {
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务当前阶段不允许失败解锁".into(),
                 ));
             }
             None => {}
@@ -505,8 +510,16 @@ impl NovelTaskState {
             || user_decision.is_some()
         {
             Some(UnlockBlocker::Content)
-        } else {
+        } else if matches!(
+            phase,
+            NovelTaskPhase::Preparing
+                | NovelTaskPhase::Drafting
+                | NovelTaskPhase::NeedsClarification
+                | NovelTaskPhase::StaleRevision
+        ) {
             None
+        } else {
+            Some(UnlockBlocker::Phase)
         }
     }
 

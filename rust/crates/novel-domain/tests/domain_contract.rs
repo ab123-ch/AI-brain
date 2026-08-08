@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use novel_domain::{
     apply_canon_delta, sha256_hex, CandidateReview, CandidateReviewVerdict, CanonStatus,
     CommitReport, MainReviewChecks, MainReviewRecord, MainReviewVerdict, NovelArtifactReceipt,
-    NovelDraftEnvelope, NovelFactKind, NovelMemoryDelta, NovelOutcome, NovelProject,
-    NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict, NovelTaskPhase,
+    NovelDomainError, NovelDraftEnvelope, NovelFactKind, NovelMemoryDelta, NovelOutcome,
+    NovelProject, NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict, NovelTaskPhase,
     NovelTaskRequest, NovelTaskState, NovelTaskType, NovelTransition, ProposedFact,
     PublicationPolicy, ReviewCheckStatus, UserDecision, UserDecisionRecord,
 };
@@ -221,21 +221,78 @@ fn failed_execution_unlock_cancels_blank_drafting_task() {
 }
 
 #[test]
-fn failed_execution_unlock_rejects_terminal_tasks_without_mutation() {
-    for phase in [
-        NovelTaskPhase::Completed,
-        NovelTaskPhase::Rejected,
-        NovelTaskPhase::Cancelled,
-        NovelTaskPhase::Failed,
-    ] {
+fn failed_execution_unlock_applies_fail_closed_phase_allowlist() {
+    enum Expected {
+        Allowed,
+        Rejected(&'static str),
+    }
+
+    let cases = [
+        (NovelTaskPhase::Preparing, Expected::Allowed),
+        (NovelTaskPhase::Drafting, Expected::Allowed),
+        (
+            NovelTaskPhase::SelfReview,
+            Expected::Rejected("任务当前阶段不允许失败解锁"),
+        ),
+        (NovelTaskPhase::NeedsClarification, Expected::Allowed),
+        (
+            NovelTaskPhase::AwaitingMainReview,
+            Expected::Rejected("任务当前阶段不允许失败解锁"),
+        ),
+        (
+            NovelTaskPhase::AwaitingUserDecision,
+            Expected::Rejected("任务当前阶段不允许失败解锁"),
+        ),
+        (
+            NovelTaskPhase::ApprovedForPublication,
+            Expected::Rejected("任务当前阶段不允许失败解锁"),
+        ),
+        (
+            NovelTaskPhase::PublicationPending,
+            Expected::Rejected("任务处于发布流程或已有发布产物，拒绝解锁"),
+        ),
+        (
+            NovelTaskPhase::ArtifactSavedMemoryPending,
+            Expected::Rejected("任务处于发布流程或已有发布产物，拒绝解锁"),
+        ),
+        (
+            NovelTaskPhase::Completed,
+            Expected::Rejected("任务已是终态，不能执行失败解锁"),
+        ),
+        (
+            NovelTaskPhase::Rejected,
+            Expected::Rejected("任务已是终态，不能执行失败解锁"),
+        ),
+        (
+            NovelTaskPhase::Cancelled,
+            Expected::Rejected("任务已是终态，不能执行失败解锁"),
+        ),
+        (
+            NovelTaskPhase::Failed,
+            Expected::Rejected("任务已是终态，不能执行失败解锁"),
+        ),
+        (NovelTaskPhase::StaleRevision, Expected::Allowed),
+    ];
+
+    for (phase, expected) in cases {
         let mut state = NovelTaskState::new(request()).unwrap();
         state.phase = phase;
         let checkpoint = state.checkpoint().unwrap();
 
-        let error = state.unlock_failed_execution().unwrap_err();
-
-        assert!(error.to_string().contains("已是终态"));
-        assert_eq!(state.checkpoint().unwrap(), checkpoint);
+        match expected {
+            Expected::Allowed => {
+                state.unlock_failed_execution().unwrap();
+                assert_eq!(state.phase, NovelTaskPhase::Cancelled, "phase={phase:?}");
+            }
+            Expected::Rejected(expected_message) => {
+                let error = state.unlock_failed_execution().unwrap_err();
+                let NovelDomainError::InvalidTransition(actual_message) = error else {
+                    panic!("phase={phase:?} returned an unexpected error: {error}");
+                };
+                assert_eq!(actual_message, expected_message, "phase={phase:?}");
+                assert_eq!(state.checkpoint().unwrap(), checkpoint, "phase={phase:?}");
+            }
+        }
     }
 }
 
