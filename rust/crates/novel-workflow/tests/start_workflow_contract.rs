@@ -379,6 +379,38 @@ async fn task_execution_state_reports_failed_and_missing_task_runs() {
     );
 }
 
+#[tokio::test]
+async fn task_execution_state_rejects_blank_task_ids_without_creating_task_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+    let service = NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        coordinator(Arc::clone(&repository)),
+        Arc::new(FakeEnvironment::default()),
+        Arc::new(UsageFailingWriter),
+        models(),
+        NovelWorkflowBudget {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+        },
+    );
+
+    for task_id in ["", "  \t"] {
+        let error = service.task_execution_state(task_id).await.unwrap_err();
+        match error {
+            NovelWorkflowPortError::InvalidRequest(message) => {
+                assert!(message.contains("execution state lookup"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        service.task_execution_state("missing-task").await.unwrap(),
+        None
+    );
+}
+
 #[test]
 fn task_execution_state_maps_every_task_engine_state() {
     assert_eq!(
