@@ -679,6 +679,7 @@ impl Orchestrator {
             novel_start_workflow,
             application_resources,
         ));
+        // Novel 应用仍由 Orchestrator 保存，主脑工具执行器的注入入口在下方保持停用。
         let novel_application_port: Arc<dyn TaskApplicationPort> = novel_application.clone();
 
         // 启动 dispatch loop
@@ -701,7 +702,7 @@ impl Orchestrator {
             Some(Arc::clone(&memory)),
             dispatch.clone(),
             runtime_trace_tx.clone(),
-            Arc::clone(&novel_application_port),
+            // Arc::clone(&novel_application_port),
         );
 
         // 12.0 评估脑接入统一 SkillCatalog
@@ -2839,7 +2840,7 @@ fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<PyramidMemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
     runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
-    novel_application: Arc<dyn TaskApplicationPort>,
+    // novel_application: Arc<dyn TaskApplicationPort>,
 ) -> (
     Arc<Mutex<Option<MainBrain>>>,
     Option<PluginManager>,
@@ -2898,7 +2899,10 @@ fn create_v2_main_brain(
             .join("skills"),
     );
     match install_builtin_skills(&ai_brain_dir) {
-        Ok(root) => skill_roots.push(root),
+        Ok(_root) => {
+            // Novel 工作流已停用：技能文件继续保留，但不再加入主脑 SkillCatalog。
+            // skill_roots.push(_root);
+        }
         Err(error) => tracing::warn!("准备内置技能失败: {error}"),
     }
 
@@ -2930,8 +2934,9 @@ fn create_v2_main_brain(
         crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch)
             .with_skill_catalog(skill_catalog.clone())
             .with_mcp_pool(mcp_pool.clone())
-            .with_runtime_trace_sender(runtime_trace_tx)
-            .with_novel_application(Some(novel_application)),
+            .with_runtime_trace_sender(runtime_trace_tx),
+        // Novel 工作流已停用：保留执行器实现，但不再注入应用端口。
+        // .with_novel_application(Some(novel_application)),
     );
 
     let brain_config = BrainConfig::default();

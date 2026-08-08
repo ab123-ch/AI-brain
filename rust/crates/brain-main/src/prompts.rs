@@ -1,5 +1,15 @@
 use chrono::Datelike;
 
+/*
+Novel 工作流已停用，以下原系统提示词仅保留在源码中，不再发送给主脑：
+
+- 小说创作任务必须先调用 Skill(skill='novel-writing-workflow')，再只通过 novel_project
+  和 novel_task 高层应用入口工作。
+- Novel 应用服务拥有 TaskRun、候选稿、自检、review、用户决策、发布恢复和 Canon
+  commit 的状态转换；默认须经用户接受后发布，且不得用通用文件工具绕过。
+- revision 过期、ContextRef hash 变化或 Canon 冲突时按应用错误重新召回和复审。
+*/
+
 /// 主脑系统提示词（有工具时）
 pub fn build_system_prompt_with_tools() -> String {
     SYSTEM_PROMPT_WITH_TOOLS.into()
@@ -44,17 +54,6 @@ const SYSTEM_PROMPT_WITH_TOOLS: &str = r"你是 AI Brain（智脑），一个基
 - **精确单次搜索**（找某个函数定义、某个变量名）→ 直接用 grep_search，一次调用即可
 - **文件名查找**（找某个文件在哪里）→ 直接用 glob_search，按模式匹配
 - **多步骤开发任务**（需要同时修改多个文件、运行测试）→ 使用 Agent(subagent_type='general-purpose') 委托给通用子代理
-- **小说创作任务**（大纲、卷纲、章纲、正文、续写、审稿、润色、人物小传、剧情桥段、复盘）→ 识别任务后必须先调用 `Skill(skill='novel-writing-workflow')`，完整读取技能正文，再只通过 `novel_project` 和 `novel_task` 高层应用入口工作。不得用 `Agent(subagent_type='Novel')`，也不得绕过应用服务直接写正式正文或提交 Canon。
-
-## Novel 应用边界
-
-`novel-writing-workflow` 可以细化主脑准备和复审，但不能覆盖以下边界：
-
-1. `novel_task` 应用服务拥有 TaskRun、候选稿、自检、review、用户决策、发布恢复和 Canon commit 的状态转换；主脑不得猜测或伪造内部阶段。
-2. 主脑必须独立对照用户要求、前文、章纲和 Canon 复审，且不得把 Writer 自检或通用评估脑当作主脑复审。
-3. 默认必须把候选正文展示给用户并获得明确接受后才能请求发布；正式发布不得再次传正文，也不得用通用 `write_file` 或其他工具绕过应用服务。
-4. revision 过期、ContextRef hash 变化或 Canon 冲突时不得静默覆盖，必须按应用返回的 typed error 重新召回和复审。
-
 **关键原则**：当你需要 3 次以上搜索才能理解一段代码时，应该转用 Agent(Explore) 而不是继续手动搜索。手动搜索适合精确、确定性的查询。
 
 ## 回答准则

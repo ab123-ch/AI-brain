@@ -426,14 +426,13 @@ Use this when the task benefits from focused, independent work (e.g., codebase e
 code review, verification, research). Do NOT use for simple lookups — use read_file/grep/glob directly. \
 Available subagent_type values: 'Explore' (read-only research), 'Plan', 'Verification', \
 'general-purpose' (full tool access). \
-小说任务必须使用 novel_task 领域应用工具，不得使用 Agent。 \
 The sub-agent inherits your model and API credentials automatically — do NOT research how to launch it, just call this tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "description": "Short description of what the agent will do" },
                     "prompt": { "type": "string", "description": "Detailed instructions for the agent" },
-                    "subagent_type": { "type": "string", "enum": ["Explore", "Plan", "Verification", "general-purpose"], "description": "Temporary agent type. Novel work is handled by its domain workflow and is not launched through Agent." },
+                    "subagent_type": { "type": "string", "enum": ["Explore", "Plan", "Verification", "general-purpose"], "description": "Temporary agent type." },
                     "name": { "type": "string", "description": "Optional short name for the agent" },
                     "model": { "type": "string", "description": "Optional model override (leave empty to use default)" },
                     "run_in_background": { "type": "boolean", "description": "Set to true to run this temporary agent in the background.", "default": false }
@@ -715,6 +714,9 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             }),
             required_permission: PermissionMode::ReadOnly,
         },
+        /*
+         * Novel 工作流已停用：保留工具定义源码，但不再向主脑提供
+         * `novel_task` 和 `novel_project`。恢复工作流时取消本注释即可。
         ToolSpec {
             name: "novel_task",
             description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。仅在 needs_clarification 后调用 resume，且 input 必须非空。start 遇到 ContextRef hash 变化时更新原调用；resume 遇到变化时必须在 context_refs 中保持原 role/path，仅替换为 actual hash，并只重试一次。当 start 报告 project already has active work 时，先调用 status 找到旧 task；status 只用于查找旧 task，最新工作流错误需从当前工具结果或运行日志确认。该锁用于防止同项目并发写作造成 Canon 冲突、重复产物、重复审核或重复发布。只有 Task Engine 为 failed 或 cancelled，且旧 checkpoint 非终态、没有草稿/候选/审核决定/发布物时才能调用 unlock_failed。queued、运行中、paused_budget、needs_input、completed、未知或已有产物时工具会拒绝，模型必须直接告知，不能循环解锁。unlock_failed 不调用 Writer/LLM、不重试、不删除历史；成功后仅在用户仍要求继续创作时另行显式调用 start。reason 会长期写入审计，不得包含密钥、Authorization、个人敏感信息。",
@@ -884,6 +886,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
             }),
             required_permission: PermissionMode::WorkspaceWrite,
         },
+        */
         ToolSpec {
             name: "list_recent_memories",
             description: "按时间列出最近的会话记忆（L2 会话总结）。适合用户说「刚刚」「昨天」「最近」「上次」等时间相关表述时使用。返回每条记忆的文件路径、时间范围、标签和摘要预览。如需查看完整内容，再用 read_file 工具读取对应路径。",
