@@ -976,6 +976,79 @@ fn contains_sensitive_unlock_material(reason: &str) -> bool {
         || contains_authentication_scheme_value(&normalized)
         || contains_long_sk_token(&normalized)
         || contains_private_key_block(&normalized)
+        || contains_bare_personal_identifier(&normalized)
+}
+
+fn contains_bare_personal_identifier(reason: &str) -> bool {
+    reason
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '@' && character != '.'
+        })
+        .any(|token| {
+            contains_email_shape(token)
+                || contains_mobile_shape(token)
+                || contains_identity_card_shape(token)
+                || contains_luhn_card_shape(token)
+        })
+}
+
+fn contains_email_shape(token: &str) -> bool {
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.split_once('.').is_some_and(|(host, suffix)| {
+            !host.is_empty()
+                && suffix.len() >= 2
+                && host.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '.')
+                })
+                && suffix
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+        })
+}
+
+fn contains_mobile_shape(token: &str) -> bool {
+    token.len() == 11
+        && token.as_bytes()[0] == b'1'
+        && matches!(token.as_bytes()[1], b'3'..=b'9')
+        && token.bytes().all(|character| character.is_ascii_digit())
+}
+
+fn contains_identity_card_shape(token: &str) -> bool {
+    if token.len() != 18
+        || !token.as_bytes()[..17].iter().all(u8::is_ascii_digit)
+        || !token.as_bytes()[17].is_ascii_digit() && !matches!(token.as_bytes()[17], b'x' | b'X')
+    {
+        return false;
+    }
+    let year = token[6..10].parse::<u16>().unwrap_or_default();
+    let month = token[10..12].parse::<u8>().unwrap_or_default();
+    let day = token[12..14].parse::<u8>().unwrap_or_default();
+    (1900..=2100).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+fn contains_luhn_card_shape(token: &str) -> bool {
+    if !(13..=19).contains(&token.len())
+        || !token.bytes().all(|character| character.is_ascii_digit())
+    {
+        return false;
+    }
+    let mut sum = 0u32;
+    let mut double = false;
+    for character in token.bytes().rev() {
+        let mut digit = u32::from(character - b'0');
+        if double {
+            digit *= 2;
+            if digit > 9 {
+                digit -= 9;
+            }
+        }
+        sum += digit;
+        double = !double;
+    }
+    sum.is_multiple_of(10)
 }
 
 fn contains_labeled_sensitive_value(reason: &str) -> bool {

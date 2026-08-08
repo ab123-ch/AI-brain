@@ -1209,6 +1209,20 @@ fn unlock_reason_validator_rejects_plain_alphabetic_authentication_tokens() {
     }
 }
 
+#[test]
+fn unlock_reason_validator_rejects_bare_personal_identifiers() {
+    for reason in [
+        "联系 contact@example.com 确认失败",
+        "任务关联 13800138000 后失败",
+        "身份证 110101199001011234 已出现在错误里",
+    ] {
+        assert!(
+            validate_unlock_reason(reason).is_err(),
+            "裸个人标识不应进入长期审计: {reason}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn normal_security_words_without_labeled_values_remain_valid_unlock_reasons() {
     for reason in [
