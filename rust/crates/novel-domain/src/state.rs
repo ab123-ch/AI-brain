@@ -115,6 +115,42 @@ impl NovelTaskState {
         Ok(())
     }
 
+    /// 在用户澄清后显式接受同一批上下文文件的新内容哈希。
+    ///
+    /// 这里只允许更新 hash；角色、路径和顺序仍由原任务合同冻结。
+    pub fn refresh_context_refs(&mut self, refreshed: Vec<crate::ContextRef>) -> Result<()> {
+        if self.phase != NovelTaskPhase::NeedsClarification {
+            return Err(NovelDomainError::InvalidTransition(format!(
+                "task {} can refresh context only from NeedsClarification",
+                self.request.task_id
+            )));
+        }
+        if refreshed.len() != self.request.context_refs.len() {
+            return Err(NovelDomainError::InvalidRequest(
+                "refreshed context must preserve the frozen reference count".into(),
+            ));
+        }
+        for (existing, replacement) in self.request.context_refs.iter().zip(&refreshed) {
+            if existing.role != replacement.role
+                || existing.canonical_path != replacement.canonical_path
+            {
+                return Err(NovelDomainError::InvalidRequest(
+                    "refreshed context may change only hashes, not roles or paths".into(),
+                ));
+            }
+            if replacement.sha256.trim().is_empty() {
+                return Err(NovelDomainError::InvalidRequest(
+                    "every refreshed context reference requires a content hash".into(),
+                ));
+            }
+        }
+        for (existing, replacement) in self.request.context_refs.iter_mut().zip(refreshed) {
+            existing.sha256 = replacement.sha256.trim().to_ascii_lowercase();
+        }
+        self.updated_at = now_millis();
+        Ok(())
+    }
+
     pub fn apply_outcome(&mut self, outcome: NovelOutcome) -> Result<NovelOutcome> {
         if self.phase != NovelTaskPhase::Drafting {
             return Err(NovelDomainError::InvalidTransition(format!(

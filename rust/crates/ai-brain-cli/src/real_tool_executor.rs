@@ -691,6 +691,8 @@ fn inject_novel_conversation_scope(input: &mut serde_json::Value) {
 struct NovelResumeToolInput {
     task_id: String,
     input: String,
+    #[serde(default)]
+    context_refs: Option<Vec<novel_domain::ContextRef>>,
 }
 
 #[derive(Deserialize)]
@@ -724,7 +726,7 @@ async fn execute_application_novel_tool(
                     },
                 )
                 .await
-                .map_err(map_novel_application_error)?;
+                .map_err(novel_error_mapper(&action))?;
         }
     }
     let output = match (name, action.as_str()) {
@@ -733,9 +735,15 @@ async fn execute_application_novel_tool(
                 .map_err(|error| format!("novel_task resume 格式错误: {error}"))?;
             serde_json::to_value(
                 application
-                    .resume_task(&input.task_id, NovelResumeInput { input: input.input })
+                    .resume_task(
+                        &input.task_id,
+                        NovelResumeInput {
+                            input: input.input,
+                            context_refs: input.context_refs,
+                        },
+                    )
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "review") => {
@@ -745,7 +753,7 @@ async fn execute_application_novel_tool(
                 application
                     .review_draft(review)
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "decide") => {
@@ -755,7 +763,7 @@ async fn execute_application_novel_tool(
                 application
                     .user_decision(decision)
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "publish") => {
@@ -765,7 +773,7 @@ async fn execute_application_novel_tool(
                 application
                     .publish(&input.task_id, input.draft_version)
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "status") => {
@@ -777,7 +785,7 @@ async fn execute_application_novel_tool(
                 application
                     .status(project_id.as_deref())
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_task", "start") => {
@@ -787,7 +795,7 @@ async fn execute_application_novel_tool(
                 application
                     .start_task(request)
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_project", "create") => {
@@ -813,14 +821,14 @@ async fn execute_application_novel_tool(
                 application
                     .create_project(project)
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_project", "list") => serde_json::to_value(
             application
                 .list_projects()
                 .await
-                .map_err(map_novel_application_error)?,
+                .map_err(novel_error_mapper(&action))?,
         ),
         ("novel_project", "recall") => {
             let project_id = required_string(&input, "project_id")?;
@@ -835,14 +843,14 @@ async fn execute_application_novel_tool(
                 application
                     .recall_project(project_id, task_type)
                     .await
-                    .map_err(map_novel_application_error)?,
+                    .map_err(novel_error_mapper(&action))?,
             )
         }
         ("novel_project", "consistency") => serde_json::to_value(
             application
                 .check_consistency(required_string(&input, "project_id")?)
                 .await
-                .map_err(map_novel_application_error)?,
+                .map_err(novel_error_mapper(&action))?,
         ),
         ("novel_project", "resolve_conflict") => serde_json::to_value(
             application
@@ -852,7 +860,7 @@ async fn execute_application_novel_tool(
                     required_string(&input, "resolution")?,
                 )
                 .await
-                .map_err(map_novel_application_error)?,
+                .map_err(novel_error_mapper(&action))?,
         ),
         _ => {
             return Err(format!(
@@ -906,10 +914,35 @@ fn validate_novel_action_input(
     }
 }
 
-fn map_novel_application_error(error: NovelApplicationError) -> String {
+fn novel_error_mapper(action: &str) -> impl FnOnce(NovelApplicationError) -> String + '_ {
+    move |error| map_novel_application_error(error, action)
+}
+
+fn map_novel_application_error(error: NovelApplicationError, action: &str) -> String {
     match error {
+        NovelApplicationError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        } if action == "start" => format!(
+            "Novel resource content hash changed: path={path}, expected={expected}, actual={actual}；请重新读取该资源，在原 start 请求的同 role/path ContextRef 中使用 actual hash，保持同一 task_id，并仅重试 start 一次"
+        ),
+        NovelApplicationError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        } if action == "resume" => format!(
+            "Novel resource content hash changed: path={path}, expected={expected}, actual={actual}；仅当任务仍为 needs_clarification 时，保持同一 task_id 再调用 resume 一次，同时提供完整 context_refs，保持原 role/path/顺序且只把对应 sha256 更新为 actual"
+        ),
+        NovelApplicationError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        } => format!(
+            "Novel resource content hash changed: path={path}, expected={expected}, actual={actual}；当前 action={action} 不支持自动刷新上下文，已停止且未重试"
+        ),
         NovelApplicationError::ContextChanged(message) => format!(
-            "Novel resource content changed: {message}；请重新读取资源，使用错误中的 actual hash，保持同一 task_id，并仅重试一次"
+            "Novel resource content changed: {message}；当前 action={action} 已停止，不自动重试"
         ),
         other => other.to_string(),
     }
@@ -1071,11 +1104,14 @@ mod tests {
             &self,
             _request: NovelTaskRequest,
         ) -> novel_application::Result<NovelOutcome> {
-            Err(NovelApplicationError::ContextChanged(
-                self.start_context_error
+            Err(NovelApplicationError::ContextHashChanged {
+                path: self
+                    .start_context_error
                     .clone()
                     .expect("start_context_error must be configured"),
-            ))
+                expected: "deadbeef".into(),
+                actual: "cafebabe".into(),
+            })
         }
 
         async fn resume_task(
@@ -1238,9 +1274,7 @@ mod tests {
     async fn novel_context_change_error_contains_finite_recovery_instruction() {
         let application = RecordingTaskApplication {
             association_calls: AtomicUsize::new(0),
-            start_context_error: Some(
-                "outline.md 的内容 hash 已变化: expected=deadbeef, actual=cafebabe".into(),
-            ),
+            start_context_error: Some("outline.md".into()),
         };
 
         let error = execute_application_novel_tool(
@@ -1269,16 +1303,50 @@ mod tests {
         for required in [
             "expected=deadbeef",
             "actual=cafebabe",
-            "重新读取资源",
-            "使用错误中的 actual hash",
+            "重新读取该资源",
+            "使用 actual hash",
             "保持同一 task_id",
-            "仅重试一次",
+            "仅重试 start 一次",
         ] {
             assert!(
                 error.contains(required),
                 "error missing {required}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn context_change_guidance_is_action_specific_and_never_guesses() {
+        let resume = map_novel_application_error(
+            NovelApplicationError::ContextHashChanged {
+                path: "outline.md".into(),
+                expected: "old".into(),
+                actual: "new".into(),
+            },
+            "resume",
+        );
+        for required in [
+            "needs_clarification",
+            "完整 context_refs",
+            "原 role/path/顺序",
+            "sha256 更新为 actual",
+        ] {
+            assert!(
+                resume.contains(required),
+                "resume error missing {required}: {resume}"
+            );
+        }
+
+        let publish = map_novel_application_error(
+            NovelApplicationError::ContextHashChanged {
+                path: "chapter.md".into(),
+                expected: "old".into(),
+                actual: "new".into(),
+            },
+            "publish",
+        );
+        assert!(publish.contains("不支持自动刷新上下文"), "{publish}");
+        assert!(publish.contains("未重试"), "{publish}");
     }
 
     #[test]

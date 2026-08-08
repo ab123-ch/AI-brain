@@ -69,7 +69,7 @@
 }
 ```
 
-Adapter 生成 prompt 时把示例中的 `project_id`、`expected_revision`、`task_type`、`source_ref` 和 evidence refs 替换为冻结任务的真实值，避免模型猜测领域标识。
+Adapter 生成 prompt 时把示例中的 `project_id`、`branch_id`、`expected_revision`、`task_type`、`source_ref` 和 evidence refs 替换为冻结任务的真实值，并附上 progress、fact、state/plot/foreshadowing/experience 等非空列表元素的完整 shape，避免模型猜测领域标识或嵌套结构。
 
 `needs_clarification` 示例：
 
@@ -81,7 +81,7 @@ Adapter 生成 prompt 时把示例中的 `project_id`、`expected_revision`、`t
 }
 ```
 
-解析器要求显式 `outcome`。不再把任意合法 JSON 默认解释为 `draft_ready`；未知 outcome、缺字段、空正文、自检未通过、project/revision 不一致均保持失败。
+解析器使用独立、无领域默认值的 v1 wire DTO，所有层级拒绝未知字段并要求 nullable/list 字段显式出现。它要求显式 `outcome`，不接受 Markdown fence，也不再把任意合法 JSON 默认解释为 `draft_ready`；未知 outcome、缺/多字段、空正文、自检未通过以及 project/branch/revision/task type/source ref/evidence 不一致均在 Adapter 内保持失败，从而进入唯一一次格式纠正。
 
 ## 同模型格式纠正
 
@@ -90,7 +90,7 @@ Adapter 生成 prompt 时把示例中的 `project_id`、`expected_revision`、`t
 1. 使用原 Provider 和原 model，不改变 temperature 策略，不启用工具。
 2. 把第一次响应作为 assistant 内容，并要求只重排为完整合同，不新增、删改正文事实。
 3. 纠正调用的 `max_tokens` 不超过 Writer 剩余输出预算；没有剩余预算时直接失败。
-4. 纠正成功后合并两次 Provider 的真实 input/output token usage，再交给 TaskEngine 结算。
+4. 合并两次 Provider 的真实 input/output token usage（input 包含 cache create/read）；纠正成功或失败都把当前已知 usage 交给 TaskEngine 结算，不再在失败时按预留上限代替真实用量。
 5. Provider 网络/API 错误不进入格式纠正，也不触发跨 Provider 回退。
 6. 第二次仍不合规时结束任务，不做第三次尝试。
 
@@ -103,17 +103,17 @@ Adapter 为每次不合规响应生成受限诊断：
 - 最多 2,048 个 Unicode 字符的预览。
 - 对 `Authorization`/`Bearer` 值、`api_key`/`token`/`secret` 键值以及 `sk-` 开头的长 token 做脱敏，并把控制字符转义为可打印文本。
 
-诊断随 `InvalidWriterOutput` 进入现有 `instance_runs.error`、`node_failed` 和 `task_failed` 持久事件，并以 `warn` 写入 tracing。正文原文不完整复制到错误字段，避免数据库和日志无限增长。成功 Artifact 的内容与权限边界不变。
+诊断随带 usage 的 Writer execution error 进入现有 `instance_runs.error`、`node_failed` 和 `task_failed` 持久事件，并以 `warn` 写入 tracing。正文原文不完整复制到错误字段，避免数据库和日志无限增长。Provider 网络层也不得记录成功正文或非成功 error body，只记录状态、长度和安全元数据；成功 Artifact 的内容与权限边界不变。
 
 ## Provider 错误语义
 
-Writer Provider 调用错误必须包含 provider/model 路由和原始错误分类。额度不足、模型无渠道、参数错误等不可由 Novel Adapter 改写为格式错误，也不得自动切换模型。网络层既有的同 Provider 有界重试保持不变；耗尽后直接向调用者报告。
+Writer Provider 调用错误必须包含经脱敏、转义和限长的 provider/model 路由及原始错误分类。额度不足、模型无渠道、参数错误等不可由 Novel Adapter 改写为格式错误，也不得自动切换模型。网络层既有的同 Provider 有界重试保持不变；耗尽后直接向调用者报告。Novel Writer 客户端装配本身失败时阻止 Orchestrator 启动并直接报告路由原因，不创建静默的 `WriterUnavailable` 占位状态。
 
 ## Novel 工具入口
 
 - 在任何 `associate_conversation_source` 或领域调用前，先完成 action-specific 反序列化和非空字段校验。
-- `resume` 只接受非空 `task_id` 与 `input`；缺参返回稳定错误码、所需字段和“仅用于 needs_clarification”的恢复说明。
-- ContextRef hash 校验继续比较 expected/actual。ContextChanged 错误附带恢复说明：重新读取当前文件、使用 actual SHA-256、沿用同一 task ID 最多重试一次。
+- `resume` 要求非空 `task_id` 与 `input`，且应用层只允许从 `NeedsClarification` 状态进入；缺参在会话关联前返回稳定错误。它另接受可选 `context_refs`，仅用于显式接纳已变化文件的新 hash。
+- ContextRef hash 校验继续比较 expected/actual，并以 typed path/expected/actual 穿过 Resource、Workflow、Application。首次 `start` 可在无持久化副作用后更新原请求；`resume` 只能提交等长、同 role/path/顺序的完整 refs 并替换 hash，再创建新的冻结 iteration。其他 action 或非 hash ContextChanged 直接停止，不猜测恢复。
 - Novel 写作工作流 prompt 明确禁止对同一 stale hash 连续重试，禁止在非 `needs_clarification` 状态调用 `resume`。
 - 不引入绕过资源 scope、用户接受、主脑复审或 Canon publication authority 的路径。
 
@@ -122,8 +122,8 @@ Writer Provider 调用错误必须包含 provider/model 路由和原始错误分
 用一个统一入口替代“先终端 init、再文件 try_init”：
 
 - TUI：一个 registry，只挂文件 layer。
-- Web/CLI：一个 registry，同时挂 EnvFilter 终端 layer 和 DEBUG 文件 layer。
-- 文件打开或 subscriber 初始化失败时返回明确错误；非 TUI 可回退到终端并打印错误，TUI 回退到 sink 但在进入 alternate screen 前打印错误。
+- Web/CLI：一个 registry，同时挂 EnvFilter 终端 layer 和文件 layer；文件默认 DEBUG，但 `brain_llm` 最低为 INFO，且 Provider INFO/ERROR 不包含响应正文。
+- 文件打开或 subscriber 初始化失败时返回明确错误并非零退出；不回退到 sink 或无文件日志的降级运行状态。
 - 把 subscriber 组装与全局安装分离，使测试能用局部 default subscriber 验证文件确实收到事件，避免测试进程重复初始化全局 subscriber。
 
 ## 测试策略
@@ -135,7 +135,9 @@ Writer Provider 调用错误必须包含 provider/model 路由和原始错误分
 - 首次错误、第二次合规时只纠正一次并累计 usage。
 - Provider 失败不纠正、不回退；两次格式失败记录 hash、finish reason 和限长脱敏预览。
 - `resume` 缺少或提供空 input 时，在会话关联和领域服务调用前失败。
-- ContextChanged 错误保留 expected/actual 并提供单次恢复动作。
+- Context hash 错误保留 typed path/expected/actual；真实文件 + SQLite + Workflow/Application 测试证明 clarification 后同路径新 hash 可重新冻结一次，旧 hash 不调用 Writer。
+- Provider loopback trace 捕获证明成功正文/错误体不进入日志；quoted Authorization/Basic/空格值/恶意 route 均被有界脱敏。
+- 两次失败的 cache-aware usage 在真实 TaskRepository instance 中按实际值结算。
 - 非 TUI subscriber 同时写终端/文件，TUI 文件 layer 可写，初始化失败可见。
 - 现有 Novel Domain/Workflow/Application、tools、CLI 回归保持通过。
 

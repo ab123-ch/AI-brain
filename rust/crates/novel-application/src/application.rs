@@ -245,6 +245,27 @@ impl NovelApplicationService {
                 "resume input must not be empty".into(),
             ));
         }
+        let task_lock = self.task_lock(task_id);
+        let _guard = task_lock.lock().await;
+        let mut state = self.load_state(task_id)?;
+        if state.phase != novel_domain::NovelTaskPhase::NeedsClarification {
+            return Err(NovelApplicationError::Conflict(format!(
+                "resume is allowed only from needs_clarification, current phase={:?}",
+                state.phase
+            )));
+        }
+        if let Some(context_refs) = input.context_refs {
+            state.refresh_context_refs(context_refs)?;
+            self.persist(
+                &state,
+                NovelLifecycleActor::User,
+                "context_refs_refreshed",
+                "User accepted refreshed hashes for the same frozen context paths",
+                serde_json::json!({
+                    "context_refs": state.request.context_refs,
+                }),
+            )?;
+        }
         let workflow = self.workflow()?;
         Ok(Box::pin(workflow.continue_task(task_id, &input.input))
             .await?
@@ -729,6 +750,15 @@ fn workflow_error(error: NovelApplicationError) -> NovelWorkflowPortError {
         NovelApplicationError::ContextChanged(message) => {
             NovelWorkflowPortError::ContextChanged(message)
         }
+        NovelApplicationError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        } => NovelWorkflowPortError::ContextHashChanged {
+            path,
+            expected,
+            actual,
+        },
         other => NovelWorkflowPortError::Storage(other.to_string()),
     }
 }
@@ -753,6 +783,21 @@ mod tests {
             error,
             NovelWorkflowPortError::ContextChanged(message)
                 if message == "expected=old, actual=new"
+        ));
+    }
+
+    #[test]
+    fn workflow_error_preserves_typed_context_hash_variant() {
+        let error = workflow_error(NovelApplicationError::ContextHashChanged {
+            path: "outline.md".into(),
+            expected: "old".into(),
+            actual: "new".into(),
+        });
+
+        assert!(matches!(
+            error,
+            NovelWorkflowPortError::ContextHashChanged { path, expected, actual }
+                if path == "outline.md" && expected == "old" && actual == "new"
         ));
     }
 }

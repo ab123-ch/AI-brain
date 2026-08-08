@@ -371,9 +371,11 @@ impl LlmProvider for GeminiClient {
                         let status = response.status();
                         tracing::info!("Gemini 请求收到响应: url={url}, status={status}");
                         if !status.is_success() {
+                            let body = response.text().await.unwrap_or_default();
+                            let body_bytes = body.len();
                             let error = LlmError::ApiError {
                                 status: status.as_u16(),
-                                message: response.text().await.unwrap_or_default(),
+                                message: body,
                             };
                             if error.is_retryable() && attempts < max_attempts {
                                 let backoff = retry.backoff_for_attempt(attempts);
@@ -385,7 +387,7 @@ impl LlmProvider for GeminiClient {
                                 continue;
                             }
                             tracing::error!(
-                                "Gemini API 非成功响应: url={url}, status={status}, error={error}"
+                                "Gemini API 非成功响应: url={url}, status={status}, body_bytes={body_bytes}; 响应体不写入日志"
                             );
                             return Err(error);
                         }

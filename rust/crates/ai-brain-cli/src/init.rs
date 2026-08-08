@@ -185,7 +185,11 @@ pub fn build_logging_dispatch(
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
-        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
+        .with_filter(
+            tracing_subscriber::filter::Targets::new()
+                .with_default(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with_target("brain_llm", tracing_subscriber::filter::LevelFilter::INFO),
+        );
     let dispatch = if is_tui {
         tracing::Dispatch::new(tracing_subscriber::registry().with(file_layer))
     } else {
@@ -252,6 +256,26 @@ mod tests {
     #[test]
     fn logging_tui_dispatch_writes_file() {
         assert_logging_dispatch_writes_file(true);
+    }
+
+    #[test]
+    fn logging_file_suppresses_brain_llm_debug_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = "PROVIDER_RAW_DEBUG_SECRET";
+        let (dispatch, path) = build_logging_dispatch(directory.path(), true).unwrap();
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::debug!(target: "brain_llm::openai_compat", "{secret}");
+            tracing::info!(target: "brain_llm::openai_compat", "Provider status only");
+        });
+        drop(dispatch);
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains(secret),
+            "文件日志泄漏 Provider DEBUG 正文"
+        );
+        assert!(content.contains("Provider status only"));
     }
 
     #[test]

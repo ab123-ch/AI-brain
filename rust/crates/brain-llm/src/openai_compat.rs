@@ -7,15 +7,6 @@ use crate::error::{LlmError, Result};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, MessageRole};
 use crate::types::{ContentBlock, FinishReason, TokenUsage, ToolChoice};
 
-/// 按 UTF-8 字符数安全截断
-fn truncate_chars(s: &str, max: usize) -> &str {
-    if s.chars().count() <= max {
-        return s;
-    }
-    let boundary = s.char_indices().nth(max).map_or(s.len(), |(i, _)| i);
-    &s[..boundary]
-}
-
 // ---------------------------------------------------------------------------
 // OpenAI-compatible API Client
 // ---------------------------------------------------------------------------
@@ -602,6 +593,7 @@ impl LlmProvider for OpenAiCompatClient {
 
                         if !status.is_success() {
                             let body = response.text().await.unwrap_or_default();
+                            let body_bytes = body.len();
                             let error = LlmError::ApiError {
                                 status: status.as_u16(),
                                 message: body,
@@ -617,27 +609,24 @@ impl LlmProvider for OpenAiCompatClient {
                                 continue;
                             }
                             tracing::error!(
-                                "LLM API 非成功响应: status={status}, body={}",
-                                truncate_chars(&error.to_string(), 500)
+                                "LLM API 非成功响应: status={status}, body_bytes={body_bytes}; 响应体不写入日志"
                             );
                             return Err(error);
                         }
 
-                        // 记录原始响应体
                         let raw_body = response.text().await.map_err(|e| {
                             LlmError::RequestFailed(format!("Failed to read response body: {e}"))
                         })?;
                         tracing::debug!(
-                            "LLM API 原始响应 ({}字节): {}",
-                            raw_body.len(),
-                            truncate_chars(&raw_body, 2000)
+                            body_bytes = raw_body.len(),
+                            "LLM API 响应体已接收；正文不写入日志"
                         );
 
                         let api_resp: ApiChatResponse =
                             serde_json::from_str(&raw_body).map_err(|e| {
                                 tracing::error!(
-                                    "LLM API 响应 JSON 解析失败: {e}, 原始内容: {}",
-                                    truncate_chars(&raw_body, 500)
+                                    body_bytes = raw_body.len(),
+                                    "LLM API 响应 JSON 解析失败: {e}; 原始内容不写入日志"
                                 );
                                 LlmError::RequestFailed(format!("Failed to parse response: {e}"))
                             })?;
@@ -730,7 +719,73 @@ impl LlmProvider for OpenAiCompatClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn local_response(status: &str, body: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 16_384];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}/v1")
+    }
+
+    async fn captured_provider_logs(status: &str, body: &str) -> String {
+        let api_base = local_response(status, body).await;
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer_buffer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || CapturedWriter(Arc::clone(&writer_buffer)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        let mut client =
+            OpenAiCompatClient::new(api_base, "test-key".into(), "test-model".into(), 64, 0.0);
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let _ = client
+            .complete(ChatRequest {
+                model: Some("test-model".into()),
+                messages: vec![ChatMessage::user("ping")],
+                max_tokens: Some(8),
+                temperature: Some(0.0),
+                tools: None,
+                tool_choice: None,
+            })
+            .await;
+        drop(guard);
+        let bytes = buffer.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
 
     fn make_client() -> OpenAiCompatClient {
         OpenAiCompatClient::new(
@@ -788,6 +843,31 @@ mod tests {
             client.chat_url(),
             "https://api.example.com/v1/chat/completions"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_tracing_never_logs_success_body_or_error_body() {
+        let success_secret = "SUCCESS_RAW_BODY_SECRET";
+        let success_body = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": success_secret},
+                "finish_reason": "stop"
+            }],
+            "model": "test-model",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string();
+        let success_logs = captured_provider_logs("200 OK", &success_body).await;
+        assert!(
+            success_logs.contains("LLM 请求发送开始"),
+            "测试必须捕获真实 Provider tracing: {success_logs}"
+        );
+        assert!(!success_logs.contains(success_secret), "{success_logs}");
+
+        let error_secret = "ERROR_BODY_SECRET";
+        let error_body = format!(r#"{{"error":"Authorization: Bearer {error_secret}"}}"#);
+        let error_logs = captured_provider_logs("400 Bad Request", &error_body).await;
+        assert!(!error_logs.contains(error_secret), "{error_logs}");
     }
 
     #[test]

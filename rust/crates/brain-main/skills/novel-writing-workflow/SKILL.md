@@ -29,7 +29,7 @@ description: 统筹中文长篇小说的大纲、卷纲、章纲、正文、续�
 2. 计算每项材料的 SHA-256，构造包含 `role`、受工作区约束路径、`sha256` 和可选描述的 `ContextRef`。
 3. 调用 `novel_task(action=start)`，提交稳定 ID、任务合同、当前 revision、输出路径、ContextRef、约束和验收标准。默认使用 `publication_policy=require_user_acceptance`。
 4. 仅当应用明确返回 `needs_clarification` 时，才向用户询问并调用 `novel_task(action=resume)`；沿用同一 `task_id`，且 `input` 必须是用户给出的非空澄清内容。其他错误不得用 `resume` 猜测恢复。
-5. 若应用报告 ContextRef hash 已变化，重新读取该资源，使用错误中的 `actual` hash 更新调用，保持同一 `task_id` 并只重试一次；不得重复提交旧 hash。
+5. 若 `start` 报告 ContextRef hash 已变化，重新读取该资源，在原 `start` 请求中使用错误的 `actual` hash，保持同一 `task_id` 并只重试一次。若仅在 `needs_clarification` 后的 `resume` 报告变化，则再次 `resume` 时同时提供完整 `context_refs`：保持原 role、canonical_path 和顺序，只把对应 `sha256` 换成 `actual`；不得借机更换资料或重复提交旧 hash。其他 action 的 ContextChanged 直接告知用户，不猜测恢复。
 
 ### 独立复审
 

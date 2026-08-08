@@ -9,7 +9,8 @@ use novel_application::{NovelApplicationError, NovelResourcePort};
 use novel_domain::{ContextRef, NovelArtifactReceipt};
 use novel_workflow::{
     parse_novel_response, render_writer_output_contract, NovelContextDocument,
-    NovelWorkflowPortError, NovelWriterExecution, NovelWriterInvocation, NovelWriterPort,
+    NovelWorkflowPortError, NovelWriterExecution, NovelWriterInvocation, NovelWriterOutputBinding,
+    NovelWriterPort,
 };
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -19,6 +20,7 @@ const NOVEL_WRITING_WORKFLOW: &str =
     include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
 const WRITER_DIAGNOSTIC_PREVIEW_CHARS: usize = 2_048;
 const PROVIDER_ERROR_CHARS: usize = 2_048;
+const ROUTE_DIAGNOSTIC_CHARS: usize = 128;
 
 pub struct LlmNovelWriterAdapter {
     llm: Arc<dyn LlmProvider>,
@@ -72,11 +74,7 @@ impl LlmNovelWriterAdapter {
         let first_usage = response_usage(&first_response);
         match parse_novel_response(
             &first_raw,
-            &invocation.request.task_id,
-            &invocation.request.project_id,
-            invocation.next_draft_version,
-            invocation.request.expected_revision,
-            &prepared.evidence_refs,
+            &writer_output_binding(invocation, &prepared.evidence_refs),
         ) {
             Ok(outcome) => Ok(NovelWriterExecution {
                 outcome,
@@ -120,9 +118,10 @@ impl LlmNovelWriterAdapter {
         );
         if remaining_tokens == 0 {
             tracing::warn!("Novel Writer 输出格式错误且无剩余纠正预算: {first_diagnostic}");
-            return Err(NovelWorkflowPortError::InvalidWriterOutput(
-                first_diagnostic,
-            ));
+            return Err(NovelWorkflowPortError::WriterExecutionFailed {
+                message: first_diagnostic,
+                usage: invalid.usage,
+            });
         }
 
         let mut repair_messages = prepared.base_messages;
@@ -142,8 +141,8 @@ impl LlmNovelWriterAdapter {
                 tool_choice: None,
             })
             .await
-            .map_err(|error| {
-                NovelWorkflowPortError::Storage(format!(
+            .map_err(|error| NovelWorkflowPortError::WriterExecutionFailed {
+                message: format!(
                     "{}; first_invalid_response={first_diagnostic}",
                     provider_failure_message(
                         &invocation.model.provider,
@@ -151,17 +150,14 @@ impl LlmNovelWriterAdapter {
                         2,
                         &error,
                     )
-                ))
+                ),
+                usage: invalid.usage,
             })?;
         let second_raw = second_response.text();
         let total_usage = add_usage(invalid.usage, response_usage(&second_response));
         let outcome = parse_novel_response(
             &second_raw,
-            &invocation.request.task_id,
-            &invocation.request.project_id,
-            invocation.next_draft_version,
-            invocation.request.expected_revision,
-            &prepared.evidence_refs,
+            &writer_output_binding(invocation, &prepared.evidence_refs),
         )
         .map_err(|error| {
             let diagnostic = writer_output_diagnostic(
@@ -174,7 +170,10 @@ impl LlmNovelWriterAdapter {
                 total_usage,
             );
             tracing::warn!("Novel Writer 二次输出仍不符合合同: {diagnostic}");
-            NovelWorkflowPortError::InvalidWriterOutput(diagnostic)
+            NovelWorkflowPortError::WriterExecutionFailed {
+                message: diagnostic,
+                usage: total_usage,
+            }
         })?;
         Ok(NovelWriterExecution {
             outcome,
@@ -255,6 +254,26 @@ fn prepare_writer_request(
     })
 }
 
+fn writer_output_binding(
+    invocation: &NovelWriterInvocation,
+    evidence_refs: &[String],
+) -> NovelWriterOutputBinding {
+    NovelWriterOutputBinding {
+        task_id: invocation.request.task_id.clone(),
+        project_id: invocation.request.project_id.clone(),
+        branch_id: invocation.project.active_branch.clone(),
+        task_type: invocation.request.task_type.clone(),
+        source_ref: invocation
+            .request
+            .output_path
+            .to_string_lossy()
+            .into_owned(),
+        draft_version: invocation.next_draft_version,
+        canon_revision: invocation.request.expected_revision,
+        evidence_refs: evidence_refs.to_vec(),
+    }
+}
+
 fn provider_failure(
     provider: &str,
     model: &str,
@@ -270,15 +289,17 @@ fn provider_failure_message(
     attempt: u8,
     error: &brain_llm::LlmError,
 ) -> String {
+    let provider = bounded_sensitive_text(provider, ROUTE_DIAGNOSTIC_CHARS);
+    let model = bounded_sensitive_text(model, ROUTE_DIAGNOSTIC_CHARS);
     let error = bounded_sensitive_text(&error.to_string(), PROVIDER_ERROR_CHARS);
     format!(
         "Novel Writer Provider failed (provider={provider}, model={model}, attempt={attempt}/2): {error}"
     )
 }
 
-const fn response_usage(response: &ChatResponse) -> ActualUsage {
+fn response_usage(response: &ChatResponse) -> ActualUsage {
     ActualUsage {
-        input_tokens: response.usage.prompt_tokens,
+        input_tokens: response.usage.total_input_tokens(),
         output_tokens: response.usage.completion_tokens,
     }
 }
@@ -303,6 +324,8 @@ fn writer_output_diagnostic(
     parse_error: &str,
     usage: ActualUsage,
 ) -> String {
+    let provider = bounded_sensitive_text(provider, ROUTE_DIAGNOSTIC_CHARS);
+    let model = bounded_sensitive_text(model, ROUTE_DIAGNOSTIC_CHARS);
     let preview = escape_control_chars(&redact_writer_output(raw))
         .chars()
         .take(WRITER_DIAGNOSTIC_PREVIEW_CHARS)
@@ -329,19 +352,39 @@ fn finish_reason_label(reason: Option<&FinishReason>) -> &'static str {
 }
 
 fn redact_writer_output(raw: &str) -> String {
-    static SENSITIVE_VALUE: OnceLock<Regex> = OnceLock::new();
+    static QUOTED_SENSITIVE_VALUE: OnceLock<Regex> = OnceLock::new();
+    static UNQUOTED_SENSITIVE_VALUE: OnceLock<Regex> = OnceLock::new();
+    static AUTH_SCHEME: OnceLock<Regex> = OnceLock::new();
     static SK_TOKEN: OnceLock<Regex> = OnceLock::new();
-    let sensitive_value = SENSITIVE_VALUE.get_or_init(|| {
+    let quoted_sensitive_value = QUOTED_SENSITIVE_VALUE.get_or_init(|| {
         Regex::new(
-            r#"(?i)(["']?(?:authorization|api[_-]?key|token|secret)["']?\s*[:=]\s*(?:bearer\s+)?["']?)[^"',;\s}\]]+"#,
+            r#"(?i)(["']?(?:authorization|api[_-]?key|token|secret)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"#,
         )
         .expect("敏感字段脱敏正则必须有效")
+    });
+    let unquoted_sensitive_value = UNQUOTED_SENSITIVE_VALUE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(["']?(?:authorization|api[_-]?key|token|secret)["']?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^,;&\r\n}\]]+"#,
+        )
+        .expect("未引用敏感字段脱敏正则必须有效")
+    });
+    let auth_scheme = AUTH_SCHEME.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:bearer|basic)\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z0-9._~+/=-]+)"#,
+        )
+        .expect("Authorization scheme 脱敏正则必须有效")
     });
     let sk_token = SK_TOKEN.get_or_init(|| {
         Regex::new(r"\bsk-[A-Za-z0-9_-]{12,}\b").expect("sk token 脱敏正则必须有效")
     });
-    let redacted = sensitive_value
-        .replace_all(raw, "${1}[REDACTED]")
+    let redacted = quoted_sensitive_value
+        .replace_all(raw, "${1}\"[REDACTED]\"")
+        .into_owned();
+    let redacted = unquoted_sensitive_value
+        .replace_all(&redacted, "${1}[REDACTED]")
+        .into_owned();
+    let redacted = auth_scheme
+        .replace_all(&redacted, "[REDACTED]")
         .into_owned();
     sk_token.replace_all(&redacted, "[REDACTED]").into_owned()
 }
@@ -438,11 +481,11 @@ impl NovelResourcePort for ScopedNovelResourceAdapter {
         let content = std::fs::read_to_string(&path).map_err(resource_error)?;
         let actual_hash = sha256(content.as_bytes());
         if !actual_hash.eq_ignore_ascii_case(reference.sha256.trim()) {
-            return Err(NovelApplicationError::ContextChanged(format!(
-                "{} 的内容 hash 已变化: expected={}, actual={actual_hash}",
-                path.display(),
-                reference.sha256
-            )));
+            return Err(NovelApplicationError::ContextHashChanged {
+                path: path.display().to_string(),
+                expected: reference.sha256.clone(),
+                actual: actual_hash,
+            });
         }
         let mut normalized = reference.clone();
         normalized.canonical_path = path;
@@ -590,10 +633,18 @@ mod tests {
 
     use brain_llm::{ChatResponse, ContentBlock, FinishReason, LlmError, MessageRole, TokenUsage};
     use knowledge_core::ContextSnapshot;
-    use novel_domain::{
-        ContextRole, NovelOutcome, NovelProject, NovelTaskRequest, NovelTaskType, PublicationPolicy,
+    use novel_application::{
+        NovelApplicationService, NovelDomainStore, NovelResourcePort, StoreWorkflowEnvironment,
     };
-    use novel_workflow::{writer_profile, NovelWorkflowBudget, NovelWriterPort, ProfileModel};
+    use novel_domain::{
+        ContextRef, ContextRole, NovelOutcome, NovelProject, NovelResumeInput, NovelTaskRequest,
+        NovelTaskState, NovelTaskType, PublicationPolicy,
+    };
+    use novel_workflow::{
+        writer_profile, NovelStartWorkflow, NovelWorkflowBudget, NovelWorkflowModels,
+        NovelWriterPort, ProfileModel,
+    };
+    use task_engine::{Scheduler, SchedulerLimits, TaskCoordinator, TaskRepository};
 
     use super::*;
 
@@ -845,6 +896,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_failure_carries_both_responses_total_input_usage() {
+        let mut first = response(
+            r#"{"summary":"first invalid"}"#,
+            10,
+            5,
+            FinishReason::EndTurn,
+        );
+        first.usage.cache_creation_input_tokens = 3;
+        first.usage.cache_read_input_tokens = 4;
+        let mut second = response(
+            r#"{"summary":"second invalid"}"#,
+            20,
+            6,
+            FinishReason::EndTurn,
+        );
+        second.usage.cache_creation_input_tokens = 7;
+        second.usage.cache_read_input_tokens = 8;
+        let llm = Arc::new(RecordingLlm::new(vec![Ok(first), Ok(second)]));
+        let adapter = LlmNovelWriterAdapter::new(llm, 0.25);
+
+        let error = adapter.execute(writer_invocation(321)).await.unwrap_err();
+
+        assert_eq!(
+            error.actual_usage(),
+            Some(ActualUsage {
+                input_tokens: 52,
+                output_tokens: 11,
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostics_redact_quoted_headers_spaced_values_and_route_fields() {
+        let secrets = [
+            "quoted-bearer-secret",
+            "basic-secret-value",
+            "secret value with spaces",
+            "query-secret",
+            "route-provider-secret",
+            "route-model-secret",
+        ];
+        let raw = format!(
+            "{{\"Authorization\":\"Bearer {}\",\"secret\": \"{}\"}}\nAuthorization: Basic {}\nhttps://example.invalid/?api_key={}",
+            secrets[0], secrets[2], secrets[1], secrets[3]
+        );
+        let response = response(&raw, 1, 1, FinishReason::EndTurn);
+        let diagnostic = writer_output_diagnostic(
+            &format!("deepseek\nAuthorization: Bearer {}", secrets[4]),
+            &format!("model\r\napi_key=\"{}\"", secrets[5]),
+            1,
+            &response,
+            &raw,
+            &format!("Authorization: Basic {}", secrets[1]),
+            ActualUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        );
+
+        for secret in secrets {
+            assert!(!diagnostic.contains(secret), "诊断泄漏敏感值: {secret}");
+        }
+        assert!(!diagnostic.contains('\n'), "诊断允许换行注入: {diagnostic}");
+        assert!(!diagnostic.contains('\r'), "诊断允许回车注入: {diagnostic}");
+        assert!(diagnostic.chars().count() < 3_000, "诊断未整体限长");
+    }
+
+    #[tokio::test]
     async fn scoped_resources_validate_hash_scope_and_atomic_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let context_path = dir.path().join("outline.md");
@@ -913,7 +1032,7 @@ mod tests {
         };
         assert!(matches!(
             adapter.read_context(&reference).await.unwrap_err(),
-            NovelApplicationError::ContextChanged(_)
+            NovelApplicationError::ContextHashChanged { .. }
         ));
         assert!(matches!(
             adapter
@@ -922,5 +1041,110 @@ mod tests {
                 .unwrap_err(),
             NovelApplicationError::ResourceDenied(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn clarification_resume_can_refreeze_same_paths_with_actual_hash_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let outline_path = dir.path().join("outline.md");
+        std::fs::write(&outline_path, "旧章纲").unwrap();
+        let old_hash = sha256("旧章纲".as_bytes());
+        let new_hash = sha256("新章纲".as_bytes());
+        let store = Arc::new(NovelDomainStore::open(dir.path().join("novel.db")).unwrap());
+        let resources: Arc<dyn NovelResourcePort> =
+            Arc::new(ScopedNovelResourceAdapter::new(dir.path()).unwrap());
+        let environment = Arc::new(StoreWorkflowEnvironment::new(
+            Arc::clone(&store),
+            Arc::clone(&resources),
+        ));
+        let repository = Arc::new(TaskRepository::open(dir.path().join("runtime.db")).unwrap());
+        let scheduler = Scheduler::new(SchedulerLimits {
+            max_workers: 1,
+            max_global: 1,
+            max_per_room: 1,
+            max_per_member: 1,
+            max_per_provider: 1,
+            max_per_profile: 1,
+            max_per_task: 1,
+        })
+        .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![
+            Ok(clarification_response(10, 5)),
+            Ok(clarification_response(11, 6)),
+        ]));
+        let model = ProfileModel::new("test-provider", "test-model");
+        let workflow = Arc::new(NovelStartWorkflow::new(
+            Arc::clone(&repository),
+            TaskCoordinator::new(Arc::clone(&repository), scheduler),
+            environment,
+            Arc::new(LlmNovelWriterAdapter::new(llm.clone(), 0.0)),
+            NovelWorkflowModels {
+                writer: model.clone(),
+                reviewer: model.clone(),
+                canon_extractor: model,
+            },
+            NovelWorkflowBudget {
+                input_tokens: 1_000,
+                output_tokens: 128,
+            },
+        ));
+        let application =
+            NovelApplicationService::new(Arc::clone(&store), Some(workflow), resources);
+        application
+            .create_project(NovelProject::new("project-1", "Project"))
+            .unwrap();
+        let mut task_request = workflow_request();
+        task_request.context_refs = vec![ContextRef {
+            role: ContextRole::ChapterOutline,
+            canonical_path: PathBuf::from("outline.md"),
+            sha256: old_hash.clone(),
+            description: None,
+        }];
+
+        assert!(matches!(
+            application.start_task(task_request).await.unwrap(),
+            NovelOutcome::NeedsClarification(_)
+        ));
+        std::fs::write(&outline_path, "新章纲").unwrap();
+        let error = application
+            .resume_task(
+                "task-1",
+                NovelResumeInput {
+                    input: "接受新章纲".into(),
+                    context_refs: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NovelApplicationError::ContextHashChanged {
+                expected,
+                actual,
+                ..
+            } if expected == old_hash && actual == new_hash
+        ));
+
+        let outcome = application
+            .resume_task(
+                "task-1",
+                NovelResumeInput {
+                    input: "接受新章纲".into(),
+                    context_refs: Some(vec![ContextRef {
+                        role: ContextRole::ChapterOutline,
+                        canonical_path: PathBuf::from("outline.md"),
+                        sha256: new_hash.clone(),
+                        description: None,
+                    }]),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, NovelOutcome::NeedsClarification(_)));
+        assert_eq!(llm.requests.lock().unwrap().len(), 2);
+        let checkpoint = store.load_checkpoint("task-1").unwrap().unwrap();
+        let state = NovelTaskState::from_checkpoint(&checkpoint).unwrap();
+        assert_eq!(state.request.context_refs[0].sha256, new_hash);
     }
 }

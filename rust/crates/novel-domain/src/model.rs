@@ -458,6 +458,8 @@ pub struct NovelTaskRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NovelResumeInput {
     pub input: String,
+    #[serde(default)]
+    pub context_refs: Option<Vec<ContextRef>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

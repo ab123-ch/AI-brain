@@ -524,3 +524,6 @@ Success criteria:
 
 Report merged commit(s), full gate outputs, release binary timestamp/hash, old/new PID, HTTP/WS/file-log results, isolated smoke task ID/outcome/call count, and any residual external provider error exactly as returned. Do not claim success without fresh command evidence.
 
+## Independent-review hardening addendum
+
+Before merge, the independent review added six blocking cases. Resolve them with RED/GREEN coverage: strict deny-unknown wire DTOs and frozen-value validation; quoted/header/route redaction plus Provider body-free tracing; cache-aware usage persisted on failed executions; typed Context hash recovery with controlled `resume.context_refs`; and fail-fast Novel Writer provider initialization. Re-run the focused crate suites and request a second independent review before integration.
