@@ -724,12 +724,35 @@ impl TaskApplicationPort for NovelApplicationService {
     }
 }
 
-fn workflow_error(error: impl std::fmt::Display) -> NovelWorkflowPortError {
-    NovelWorkflowPortError::Storage(error.to_string())
+fn workflow_error(error: NovelApplicationError) -> NovelWorkflowPortError {
+    match error {
+        NovelApplicationError::ContextChanged(message) => {
+            NovelWorkflowPortError::ContextChanged(message)
+        }
+        other => NovelWorkflowPortError::Storage(other.to_string()),
+    }
 }
 
 fn current_time_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_error_preserves_context_changed_variant() {
+        let error = workflow_error(NovelApplicationError::ContextChanged(
+            "expected=old, actual=new".into(),
+        ));
+
+        assert!(matches!(
+            error,
+            NovelWorkflowPortError::ContextChanged(message)
+                if message == "expected=old, actual=new"
+        ));
+    }
 }

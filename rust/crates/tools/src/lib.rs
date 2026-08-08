@@ -717,7 +717,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
         },
         ToolSpec {
             name: "novel_task",
-            description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。",
+            description: "执行可恢复的小说任务应用命令。start 冻结上下文并运行 Writer；resume、review、decide、publish 和 status 继续或查询同一 durable task。仅在 needs_clarification 后调用 resume，且 input 必须非空。ContextRef hash 变化时重新读取资源，使用 actual hash、保持同一 task_id 并只重试一次。",
             input_schema: json!({
                 "type": "object",
                 "oneOf": [
@@ -758,7 +758,7 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
                     },
                     {
                         "type": "object",
-                        "properties": { "action": { "const": "resume" }, "task_id": { "type": "string" }, "input": { "type": "string" } },
+                        "properties": { "action": { "const": "resume" }, "task_id": { "type": "string", "minLength": 1 }, "input": { "type": "string", "minLength": 1 } },
                         "required": ["action", "task_id", "input"],
                         "additionalProperties": false
                     },
@@ -6273,6 +6273,27 @@ mod tests {
         novel_names.sort_unstable();
         assert_eq!(novel_names, vec!["novel_project", "novel_task"]);
         let task = specs.iter().find(|spec| spec.name == "novel_task").unwrap();
+        for guidance in [
+            "仅在 needs_clarification 后调用 resume",
+            "input 必须非空",
+            "hash 变化时重新读取资源",
+            "actual hash",
+            "同一 task_id",
+            "只重试一次",
+        ] {
+            assert!(
+                task.description.contains(guidance),
+                "novel_task description missing {guidance}"
+            );
+        }
+        let resume = task.input_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["action"]["const"] == "resume")
+            .unwrap();
+        assert_eq!(resume["properties"]["task_id"]["minLength"], 1);
+        assert_eq!(resume["properties"]["input"]["minLength"], 1);
         let publish = task.input_schema["oneOf"]
             .as_array()
             .unwrap()

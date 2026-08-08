@@ -28,7 +28,12 @@ pub enum NovelApplicationError {
 
 impl From<novel_workflow::NovelWorkflowPortError> for NovelApplicationError {
     fn from(error: novel_workflow::NovelWorkflowPortError) -> Self {
-        Self::Workflow(error.to_string())
+        match error {
+            novel_workflow::NovelWorkflowPortError::ContextChanged(message) => {
+                Self::ContextChanged(message)
+            }
+            other => Self::Workflow(other.to_string()),
+        }
     }
 }
 
@@ -45,3 +50,22 @@ impl From<std::io::Error> for NovelApplicationError {
 }
 
 pub type Result<T> = std::result::Result<T, NovelApplicationError>;
+
+#[cfg(test)]
+mod tests {
+    use novel_workflow::NovelWorkflowPortError;
+
+    use super::NovelApplicationError;
+
+    #[test]
+    fn workflow_context_changed_conversion_preserves_application_variant() {
+        let error: NovelApplicationError =
+            NovelWorkflowPortError::ContextChanged("expected=old, actual=new".into()).into();
+
+        assert!(matches!(
+            error,
+            NovelApplicationError::ContextChanged(message)
+                if message == "expected=old, actual=new"
+        ));
+    }
+}
