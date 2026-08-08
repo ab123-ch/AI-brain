@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use brain_core::config::BrainConfig;
-use brain_core::tool_executor::ToolExecutor;
+use brain_core::tool_executor::{ToolExecutionContext, ToolExecutor};
 use brain_core::types::{MainBrainOutput, ProgressEvent, TurnRecord, TurnRole, TurnUsage};
 use brain_llm::{ChatMessage, LlmProvider, ToolDefinition};
 
@@ -22,6 +22,7 @@ use brain_memory::threshold_compression::{ThresholdCompactionConfig, ThresholdCo
 pub struct MainBrain {
     llm: Arc<dyn LlmProvider>,
     tool_executor: Arc<dyn ToolExecutor>,
+    tool_execution_context: ToolExecutionContext,
     history: ConversationHistory,
     tools: Vec<ToolDefinition>,
     config: BrainConfig,
@@ -63,6 +64,7 @@ impl MainBrain {
         Self {
             llm,
             tool_executor,
+            tool_execution_context: ToolExecutionContext::default(),
             history: ConversationHistory::new(max_context_tokens),
             tools: Vec::new(),
             config,
@@ -91,9 +93,10 @@ impl MainBrain {
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
-        self.fork_isolated_with_llm_and_executor(
+        self.fork_isolated_with_llm_and_executor_in_context(
             llm,
             Arc::clone(&self.tool_executor),
+            self.tool_execution_context.clone(),
             Vec::new(),
             llm_max_tokens,
             llm_temperature,
@@ -113,6 +116,27 @@ impl MainBrain {
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
+        self.fork_isolated_with_llm_and_executor_in_context(
+            llm,
+            tool_executor,
+            self.tool_execution_context.clone(),
+            additional_tools,
+            llm_max_tokens,
+            llm_temperature,
+        )
+    }
+
+    /// 使用显式工具执行上下文创建隔离运行时。
+    #[must_use]
+    pub fn fork_isolated_with_llm_and_executor_in_context(
+        &self,
+        llm: Arc<dyn LlmProvider>,
+        tool_executor: Arc<dyn ToolExecutor>,
+        tool_execution_context: ToolExecutionContext,
+        additional_tools: Vec<ToolDefinition>,
+        llm_max_tokens: u32,
+        llm_temperature: f64,
+    ) -> Self {
         let mut fork = Self::new(
             llm,
             tool_executor,
@@ -120,6 +144,7 @@ impl MainBrain {
             llm_max_tokens,
             llm_temperature,
         );
+        fork.tool_execution_context = tool_execution_context;
         fork.tools.clone_from(&self.tools);
         fork.tools.extend(additional_tools);
         fork.memory_context.clone_from(&self.memory_context);
@@ -240,9 +265,10 @@ impl MainBrain {
         let mut prior_llm_calls = 0u32;
 
         loop {
-            let result = tool_loop::run_tool_loop_with_config(
+            let result = tool_loop::run_tool_loop_with_config_and_context(
                 self.llm.as_ref(),
                 self.tool_executor.as_ref(),
+                &self.tool_execution_context,
                 &mut messages,
                 &self.tools,
                 progress_tx,
@@ -507,6 +533,7 @@ impl MainBrain {
 
         let llm = self.llm.clone();
         let executor = self.tool_executor.clone();
+        let tool_execution_context = self.tool_execution_context.clone();
         let tools = self.tools.clone();
         let max_tokens = self.llm_max_tokens;
         let temperature = self.llm_temperature;
@@ -531,9 +558,10 @@ impl MainBrain {
                 })
                 .await;
 
-            let result = tool_loop::run_tool_loop_with_config(
+            let result = tool_loop::run_tool_loop_with_config_and_context(
                 llm.as_ref(),
                 executor.as_ref(),
+                &tool_execution_context,
                 &mut messages,
                 &tools,
                 Some(&tx),

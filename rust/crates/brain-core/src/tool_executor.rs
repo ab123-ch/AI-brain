@@ -4,8 +4,31 @@
 //! The concrete implementation lives in `brain-motor` where it bridges to the
 //! actual `runtime` and `tools` crates.
 
+use std::path::PathBuf;
+
 use crate::types::ToolCall;
 use crate::types::ToolExecutionResult;
+
+/// 不可变的工具执行上下文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionContext {
+    pub working_directory: PathBuf,
+}
+
+impl ToolExecutionContext {
+    #[must_use]
+    pub fn new(working_directory: impl Into<PathBuf>) -> Self {
+        Self {
+            working_directory: working_directory.into(),
+        }
+    }
+}
+
+impl Default for ToolExecutionContext {
+    fn default() -> Self {
+        Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tool Executor Trait
@@ -26,6 +49,18 @@ pub trait ToolExecutor: Send + Sync {
         &self,
         tool_call: &ToolCall,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + '_>>;
+
+    /// 使用调用方提供的不可变上下文执行工具。
+    ///
+    /// 默认委托旧接口，保持已有 executor 的对象安全性与向后兼容性。
+    fn execute_with_context<'a>(
+        &'a self,
+        tool_call: &'a ToolCall,
+        context: &'a ToolExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + 'a>> {
+        let _ = context;
+        self.execute(tool_call)
+    }
 
     /// List all available tools as descriptors (for LLM tool definitions).
     fn list_tools(&self) -> Vec<ToolDescriptor>;
@@ -138,6 +173,22 @@ mod tests {
         };
         let result = exec.execute(&call).await;
         assert_eq!(result.output, "");
+    }
+
+    #[tokio::test]
+    async fn stub_executor_default_delegation_accepts_explicit_tool_context() {
+        let exec = StubToolExecutor::new().with_response("read_file", "delegated".into());
+        let call = ToolCall {
+            tool_name: "read_file".into(),
+            input: json!({ "path": "/tmp/test.rs" }),
+            validated: false,
+            validation_id: None,
+        };
+        let context = ToolExecutionContext::new("/tmp/explicit-tool-context");
+
+        let result = exec.execute_with_context(&call, &context).await;
+
+        assert_eq!(result.output, "delegated");
     }
 
     #[test]
