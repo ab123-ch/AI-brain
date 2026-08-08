@@ -38,6 +38,13 @@ pub struct NovelTaskState {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlockBlocker {
+    Terminal,
+    Publication,
+    Content,
+}
+
 impl NovelTaskState {
     pub fn new(request: NovelTaskRequest) -> Result<Self> {
         validate_request(&request)?;
@@ -437,37 +444,70 @@ impl NovelTaskState {
     }
 
     pub fn unlock_failed_execution(&mut self) -> Result<()> {
-        if self.phase.is_terminal() {
-            return Err(NovelDomainError::InvalidTransition(format!(
-                "任务 {} 已是终态，不能执行失败解锁",
-                self.request.task_id
-            )));
-        }
-        if matches!(
-            self.phase,
-            NovelTaskPhase::PublicationPending | NovelTaskPhase::ArtifactSavedMemoryPending
-        ) || self.publication_id.is_some()
-            || self.artifact.is_some()
-            || self.commit_report.is_some()
-        {
-            return Err(NovelDomainError::InvalidTransition(
-                "任务处于发布流程或已有发布产物，拒绝解锁".into(),
-            ));
-        }
-        if self.draft_version != 0
-            || self.draft.is_some()
-            || self.candidate.is_some()
-            || !self.candidate_reviews.is_empty()
-            || self.main_review.is_some()
-            || self.user_decision.is_some()
-        {
-            return Err(NovelDomainError::InvalidTransition(
-                "任务已有草稿或候选版本，拒绝解锁；请继续 review/decide/publish 流程".into(),
-            ));
+        match self.unlock_blocker() {
+            Some(UnlockBlocker::Terminal) => {
+                return Err(NovelDomainError::InvalidTransition(format!(
+                    "任务 {} 已是终态，不能执行失败解锁",
+                    self.request.task_id
+                )));
+            }
+            Some(UnlockBlocker::Publication) => {
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务处于发布流程或已有发布产物，拒绝解锁".into(),
+                ));
+            }
+            Some(UnlockBlocker::Content) => {
+                return Err(NovelDomainError::InvalidTransition(
+                    "任务已有草稿、候选、评审或用户决定，拒绝解锁；请继续 review/decide/publish 流程"
+                        .into(),
+                ));
+            }
+            None => {}
         }
         self.phase = NovelTaskPhase::Cancelled;
         self.updated_at = now_millis();
         Ok(())
+    }
+
+    fn unlock_blocker(&self) -> Option<UnlockBlocker> {
+        let Self {
+            request: _,
+            phase,
+            draft_version,
+            draft,
+            candidate,
+            candidate_reviews,
+            main_review,
+            user_decision,
+            publication_id,
+            artifact,
+            commit_report,
+            conversation_sources: _,
+            created_at: _,
+            updated_at: _,
+        } = self;
+
+        if phase.is_terminal() {
+            Some(UnlockBlocker::Terminal)
+        } else if matches!(
+            phase,
+            NovelTaskPhase::PublicationPending | NovelTaskPhase::ArtifactSavedMemoryPending
+        ) || publication_id.is_some()
+            || artifact.is_some()
+            || commit_report.is_some()
+        {
+            Some(UnlockBlocker::Publication)
+        } else if *draft_version != 0
+            || draft.is_some()
+            || candidate.is_some()
+            || !candidate_reviews.is_empty()
+            || main_review.is_some()
+            || user_decision.is_some()
+        {
+            Some(UnlockBlocker::Content)
+        } else {
+            None
+        }
     }
 
     pub fn cancel_for_conversation_fork(&mut self) -> Result<()> {
@@ -600,7 +640,7 @@ mod tests {
 
         let error = state.unlock_failed_execution().unwrap_err();
 
-        assert!(error.to_string().contains("已有草稿或候选版本"));
+        assert!(error.to_string().contains("已有草稿、候选、评审或用户决定"));
         assert_eq!(state.checkpoint().unwrap(), checkpoint);
     }
 

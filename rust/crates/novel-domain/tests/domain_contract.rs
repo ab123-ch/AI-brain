@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use novel_domain::{
     apply_canon_delta, sha256_hex, CandidateReview, CandidateReviewVerdict, CanonStatus,
-    MainReviewChecks, MainReviewRecord, MainReviewVerdict, NovelDraftEnvelope, NovelFactKind,
-    NovelMemoryDelta, NovelOutcome, NovelProject, NovelSelfReview, NovelSelfReviewChecks,
-    NovelSelfReviewVerdict, NovelTaskPhase, NovelTaskRequest, NovelTaskState, NovelTaskType,
-    NovelTransition, ProposedFact, PublicationPolicy, ReviewCheckStatus, UserDecision,
-    UserDecisionRecord,
+    CommitReport, MainReviewChecks, MainReviewRecord, MainReviewVerdict, NovelArtifactReceipt,
+    NovelDraftEnvelope, NovelFactKind, NovelMemoryDelta, NovelOutcome, NovelProject,
+    NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict, NovelTaskPhase,
+    NovelTaskRequest, NovelTaskState, NovelTaskType, NovelTransition, ProposedFact,
+    PublicationPolicy, ReviewCheckStatus, UserDecision, UserDecisionRecord,
 };
 
 fn request() -> NovelTaskRequest {
@@ -203,11 +203,21 @@ fn checkpoint_roundtrip_preserves_domain_state_shape() {
 fn failed_execution_unlock_cancels_blank_drafting_task() {
     let mut state = NovelTaskState::new(request()).unwrap();
     state.begin_drafting().unwrap();
+    let mut before = state.checkpoint().unwrap();
 
     state.unlock_failed_execution().unwrap();
 
     assert_eq!(state.phase, NovelTaskPhase::Cancelled);
     assert!(state.phase.is_terminal());
+    let mut after = state.checkpoint().unwrap();
+    for checkpoint in [&mut before, &mut after] {
+        let state = checkpoint.state.as_object_mut().unwrap();
+        state.remove("phase");
+        state.remove("updated_at");
+    }
+    before.phase = NovelTaskPhase::Cancelled;
+    before.updated_at = after.updated_at;
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -243,6 +253,72 @@ fn failed_execution_unlock_prioritizes_publication_guard_without_mutation() {
     assert_eq!(state.checkpoint().unwrap(), checkpoint);
 }
 
+fn assert_publication_guard(mut state: NovelTaskState) {
+    let checkpoint = state.checkpoint().unwrap();
+
+    let error = state.unlock_failed_execution().unwrap_err();
+
+    assert!(error.to_string().contains("发布流程或已有发布产物"));
+    assert_eq!(state.checkpoint().unwrap(), checkpoint);
+}
+
+#[test]
+fn failed_execution_unlock_rejects_publication_pending_without_mutation() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+    state.phase = NovelTaskPhase::PublicationPending;
+
+    assert_publication_guard(state);
+}
+
+#[test]
+fn failed_execution_unlock_rejects_artifact_saved_pending_without_mutation() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+    state.phase = NovelTaskPhase::ArtifactSavedMemoryPending;
+
+    assert_publication_guard(state);
+}
+
+#[test]
+fn failed_execution_unlock_rejects_publication_id_without_mutation() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+    state.publication_id = Some("publication-1".into());
+
+    assert_publication_guard(state);
+}
+
+#[test]
+fn failed_execution_unlock_rejects_artifact_without_mutation() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+    state.artifact = Some(NovelArtifactReceipt {
+        canonical_path: "chapters/0001.md".into(),
+        sha256: "hash-1".into(),
+        bytes: 1,
+        written_at: 1,
+    });
+
+    assert_publication_guard(state);
+}
+
+#[test]
+fn failed_execution_unlock_rejects_commit_report_without_mutation() {
+    let mut state = NovelTaskState::new(request()).unwrap();
+    state.begin_drafting().unwrap();
+    state.commit_report = Some(CommitReport {
+        project_id: "project-1".into(),
+        previous_revision: 0,
+        new_revision: 1,
+        accepted_fact_ids: Vec::new(),
+        conflicts: Vec::new(),
+        graph_mirrored: true,
+    });
+
+    assert_publication_guard(state);
+}
+
 #[test]
 fn failed_execution_unlock_rejects_draft_history_without_mutation() {
     let mut state = NovelTaskState::new(request()).unwrap();
@@ -254,6 +330,6 @@ fn failed_execution_unlock_rejects_draft_history_without_mutation() {
 
     let error = state.unlock_failed_execution().unwrap_err();
 
-    assert!(error.to_string().contains("已有草稿或候选版本"));
+    assert!(error.to_string().contains("已有草稿、候选、评审或用户决定"));
     assert_eq!(state.checkpoint().unwrap(), checkpoint);
 }
