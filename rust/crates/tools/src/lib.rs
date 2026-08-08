@@ -1028,11 +1028,80 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
 }
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
+    if !is_workspace_tool(name) {
+        return execute_non_workspace_tool(name, input);
+    }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     execute_tool_in_directory(name, input, &cwd)
 }
 
+/// 在显式目录下执行工具。
+///
+/// Workspace 工具要求目录为绝对路径、已存在且确实是目录；其他工具忽略该参数。
 pub fn execute_tool_in_directory(
+    name: &str,
+    input: &Value,
+    working_directory: &Path,
+) -> Result<String, String> {
+    if !is_workspace_tool(name) {
+        return execute_non_workspace_tool(name, input);
+    }
+    let working_directory = validate_working_directory(working_directory)?;
+    execute_workspace_tool_in_directory(name, input, &working_directory)
+}
+
+fn is_workspace_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "glob_search"
+            | "grep_search"
+            | "TodoWrite"
+            | "Agent"
+            | "NotebookEdit"
+            | "Config"
+            | "EnterPlanMode"
+            | "ExitPlanMode"
+            | "REPL"
+            | "PowerShell"
+            | "graph_search_catalog"
+            | "graph_get_node_detail"
+            | "graph_trace_memory"
+            | "graph_list_domains"
+            | "graph_add_memory"
+            | "graph_add_concept"
+            | "graph_add_code_node"
+            | "graph_index_code_workspace"
+            | "graph_link_nodes"
+    )
+}
+
+fn validate_working_directory(working_directory: &Path) -> Result<PathBuf, String> {
+    if !working_directory.is_absolute() {
+        return Err(format!(
+            "工作目录必须是绝对路径：{}",
+            working_directory.display()
+        ));
+    }
+    if !working_directory.exists() {
+        return Err(format!("工作目录不存在：{}", working_directory.display()));
+    }
+    let canonical = fs::canonicalize(working_directory).map_err(|error| {
+        format!(
+            "无法解析工作目录 `{}`：{error}",
+            working_directory.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!("工作目录不是目录：{}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+fn execute_workspace_tool_in_directory(
     name: &str,
     input: &Value,
     working_directory: &Path,
@@ -1087,7 +1156,7 @@ pub fn execute_tool_in_directory(
         }
         "graph_link_nodes" => from_value::<GraphLinkNodesInput>(input)
             .and_then(|value| run_graph_link_nodes_in_directory(value, working_directory)),
-        _ => execute_non_workspace_tool(name, input),
+        _ => Err(format!("unsupported workspace tool: {name}")),
     }
 }
 
@@ -5623,6 +5692,45 @@ mod tests {
         }
     }
 
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(working_directory: &std::path::Path) -> std::io::Result<Self> {
+            let original = std::env::current_dir()?;
+            std::env::set_current_dir(working_directory)?;
+            Ok(Self { original })
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    fn current_dir_guard_restores_directory_after_scope() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = test_working_directory();
+        let temporary = temp_path("current-dir-guard");
+        let _temporary_cleanup = DirectoryCleanup::new(temporary.clone());
+        fs::create_dir_all(&temporary).expect("create temporary cwd");
+
+        {
+            let _cwd_guard = CurrentDirGuard::change_to(&temporary).expect("change cwd");
+            assert_eq!(
+                fs::canonicalize(test_working_directory()).expect("canonical current cwd"),
+                fs::canonicalize(&temporary).expect("canonical temporary cwd")
+            );
+        }
+
+        assert_eq!(test_working_directory(), original);
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn explicit_working_directory_scopes_workspace_tools() {
@@ -5821,12 +5929,15 @@ mod tests {
                         .expect("REPL stdout")
                         .contains(marker));
                 }
-                #[cfg(windows)]
-                Err(error) if error.contains("python runtime not found") => {
-                    let output = super::build_repl_command("cmd.exe", &["/C"], "cd", workspace)
-                        .output()
-                        .expect("run Windows REPL fallback subprocess");
-                    assert!(String::from_utf8_lossy(&output.stdout).contains(marker));
+                Err(error) if error == "python runtime not found" => {
+                    let canonical_workspace =
+                        fs::canonicalize(workspace).expect("canonicalize REPL workspace");
+                    let command =
+                        super::build_repl_command("missing-runtime", &[], "", &canonical_workspace);
+                    assert_eq!(
+                        command.get_current_dir(),
+                        Some(canonical_workspace.as_path())
+                    );
                 }
                 Err(error) => panic!("run scoped REPL: {error}"),
             }
@@ -6151,7 +6262,111 @@ mod tests {
     }
 
     #[test]
+    fn explicit_working_directory_rejects_missing_workspace_directories_without_side_effects() {
+        let root = temp_path("missing-explicit-working-directories");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        fs::create_dir_all(&root).expect("create missing cwd parent");
+        let missing_todo = root.join("missing-todo");
+        let missing_config = root.join("missing-config");
+        let missing_graph = root.join("missing-graph");
+
+        let todo = super::execute_tool_in_directory(
+            "TodoWrite",
+            &json!({
+                "todos": [{
+                    "content": "must not be stored",
+                    "status": "pending",
+                    "activeForm": "must not be stored"
+                }]
+            }),
+            &missing_todo,
+        );
+        let config = super::execute_tool_in_directory(
+            "Config",
+            &json!({"setting": "language", "value": "zh-CN"}),
+            &missing_config,
+        );
+        let graph = super::execute_tool_in_directory(
+            "graph_list_domains",
+            &json!({"db_path": "graph/graph.db"}),
+            &missing_graph,
+        );
+
+        assert!(
+            todo.is_err() && config.is_err() && graph.is_err(),
+            "缺失 cwd 必须全部拒绝且不得创建：TodoWrite={todo:?} created={}，Config={config:?} created={}，graph={graph:?} created={}",
+            missing_todo.exists(),
+            missing_config.exists(),
+            missing_graph.exists()
+        );
+        for error in [
+            todo.expect_err("TodoWrite must reject missing cwd"),
+            config.expect_err("Config must reject missing cwd"),
+            graph.expect_err("graph must reject missing cwd"),
+        ] {
+            assert!(
+                error.contains("工作目录不存在"),
+                "unexpected error: {error}"
+            );
+        }
+        assert!(!missing_todo.exists());
+        assert!(!missing_config.exists());
+        assert!(!missing_graph.exists());
+    }
+
+    #[test]
+    fn explicit_working_directory_validates_workspace_paths_only_for_workspace_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("invalid-explicit-working-directories");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        fs::create_dir_all(&root).expect("create invalid cwd fixtures");
+        let cwd_file = root.join("not-a-directory.txt");
+        fs::write(&cwd_file, "not a directory").expect("write cwd file fixture");
+        let relative_cwd = PathBuf::from(
+            temp_path("relative-explicit-working-directory")
+                .file_name()
+                .expect("relative cwd name"),
+        );
+        let absolute_relative_cwd = test_working_directory().join(&relative_cwd);
+        let _relative_cleanup = DirectoryCleanup::new(absolute_relative_cwd.clone());
+        fs::create_dir_all(&absolute_relative_cwd).expect("create relative cwd fixture");
+
+        let relative = super::execute_tool_in_directory(
+            "TodoWrite",
+            &json!({
+                "todos": [{
+                    "content": "relative cwd must fail",
+                    "status": "pending",
+                    "activeForm": "relative cwd must fail"
+                }]
+            }),
+            &relative_cwd,
+        );
+        let file =
+            super::execute_tool_in_directory("Config", &json!({"setting": "language"}), &cwd_file);
+        let missing_non_workspace = root.join("missing-non-workspace-cwd");
+        let sleep = super::execute_tool_in_directory(
+            "Sleep",
+            &json!({"duration_ms": 0}),
+            &missing_non_workspace,
+        );
+
+        let relative_error = relative.expect_err("relative workspace cwd must be rejected");
+        assert!(relative_error.contains("工作目录必须是绝对路径"));
+        let file_error = file.expect_err("file workspace cwd must be rejected");
+        assert!(file_error.contains("工作目录不是目录"));
+        assert!(sleep.is_ok(), "非 workspace 工具不应校验 cwd: {sleep:?}");
+        assert!(!absolute_relative_cwd.join(".clawd-todos.json").exists());
+        assert!(!missing_non_workspace.exists());
+    }
+
+    #[test]
     fn legacy_execute_tool_keeps_current_directory_behavior() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cwd = std::env::current_dir().expect("current directory");
         let relative_dir = PathBuf::from(format!(
             ".clawd-tools-legacy-{}",
@@ -6161,6 +6376,7 @@ mod tests {
                 .as_nanos()
         ));
         let fixture_dir = cwd.join(&relative_dir);
+        let _fixture_cleanup = DirectoryCleanup::new(fixture_dir.clone());
         fs::create_dir_all(&fixture_dir).expect("create legacy fixture dir");
         fs::write(fixture_dir.join("same.txt"), "legacy-current-directory")
             .expect("write legacy fixture");
@@ -6168,8 +6384,6 @@ mod tests {
         let output = execute_tool("read_file", &json!({"path": relative_dir.join("same.txt")}))
             .expect("legacy execute_tool reads from process cwd");
         assert!(output.contains("legacy-current-directory"));
-
-        let _ = fs::remove_dir_all(fixture_dir);
     }
 
     fn graph_node(title: &str, keywords: &[&str], importance: f64) -> Node {
@@ -7506,8 +7720,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("fs-suite");
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&root).expect("set cwd");
 
         let write_create = execute_tool(
             "write_file",
@@ -7611,7 +7824,7 @@ mod tests {
         .expect_err("missing substring should fail");
         assert!(edit_missing.contains("old_string not found"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7622,8 +7835,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("search-suite");
         fs::create_dir_all(root.join("nested")).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&root).expect("set cwd");
 
         fs::write(
             root.join("nested/lib.rs"),
@@ -7683,7 +7895,7 @@ mod tests {
         .expect_err("invalid regex should fail");
         assert!(!grep_error.is_empty());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7769,10 +7981,9 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&cwd).expect("set cwd");
 
         let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
         let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
@@ -7799,7 +8010,7 @@ mod tests {
         let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
         assert_eq!(unknown_output["success"], false);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -7835,10 +8046,9 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&cwd).expect("set cwd");
 
         let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
@@ -7872,7 +8082,7 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -7903,10 +8113,9 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&cwd).expect("set cwd");
 
         let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
@@ -7933,7 +8142,7 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
