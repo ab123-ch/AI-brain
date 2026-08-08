@@ -903,12 +903,16 @@ mod tests {
     use brain_core::tool_executor::{
         StubToolExecutor, ToolDescriptor, ToolExecutionContext, ToolExecutor,
     };
+    use brain_hooks::config::HooksConfig;
+    use brain_hooks::types::HookHandlerConfig;
     use brain_llm::TokenUsage;
+    use std::ffi::OsString;
     use std::future::Future;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     struct ToolCallingLlm {
         calls: AtomicUsize,
@@ -997,6 +1001,87 @@ mod tests {
         }
     }
 
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn prepend_path(directory: &std::path::Path) -> Self {
+            let key = "PATH";
+            let original = std::env::var_os(key);
+            let current = original.clone().unwrap_or_default();
+            let paths =
+                std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&current));
+            let updated = std::env::join_paths(paths).expect("测试 PATH 应可重新组合");
+            std::env::set_var(key, updated);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn hook_shell_path_guard() -> Option<EnvVarGuard> {
+        if Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return None;
+        }
+
+        let output = Command::new("git")
+            .arg("--exec-path")
+            .output()
+            .expect("测试需要可用的 Git 以定位 sh");
+        assert!(output.status.success(), "git --exec-path 应执行成功");
+        let git_exec_path = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("Git exec path 应为 UTF-8")
+                .trim(),
+        );
+        let shell_name = if cfg!(windows) { "sh.exe" } else { "sh" };
+        let shell_directory = git_exec_path
+            .ancestors()
+            .map(|ancestor| ancestor.join("bin"))
+            .find(|candidate| candidate.join(shell_name).is_file())
+            .expect("Git 安装目录的祖先路径中应包含 bin/sh");
+        let guard = EnvVarGuard::prepend_path(&shell_directory);
+        assert!(
+            Command::new("sh")
+                .arg("-c")
+                .arg("exit 0")
+                .status()
+                .is_ok_and(|status| status.success()),
+            "将 Git bin 加入 PATH 后应能启动 sh"
+        );
+        Some(guard)
+    }
+
+    fn hook_cwd_command(capture_file: &std::path::Path) -> String {
+        let capture_file = capture_file.to_string_lossy().replace('\\', "/");
+        let capture_file = capture_file.replace('\'', "'\"'\"'");
+        format!(
+            "if command -v cygpath >/dev/null 2>&1; then cygpath -w \"$PWD\"; else pwd -P; fi > '{capture_file}'"
+        )
+    }
+
     /// 简单 LLM stub：直接返回文本
     struct TextLlm;
 
@@ -1036,13 +1121,31 @@ mod tests {
 
     #[tokio::test]
     async fn tool_loop_passes_explicit_tool_context_to_executor() {
+        let _env_lock = env_lock().await;
+        let _path_guard = hook_shell_path_guard();
         let llm = ToolCallingLlm::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let executor = RecordingContextExecutor {
             seen: Arc::clone(&seen),
         };
-        let working_directory = std::env::temp_dir().join("brain-main-explicit-tool-context");
+        let suffix = std::process::id();
+        let working_directory =
+            std::env::temp_dir().join(format!("brain-main-explicit-tool-context-{suffix}"));
+        let capture_file = std::env::temp_dir().join(format!("brain-main-hook-cwd-{suffix}.txt"));
+        let _ = std::fs::remove_file(&capture_file);
+        let _ = std::fs::remove_dir(&working_directory);
+        std::fs::create_dir(&working_directory).expect("应创建显式工具工作目录");
+        let working_directory =
+            std::fs::canonicalize(working_directory).expect("显式工具工作目录应可规范化");
         let context = ToolExecutionContext::new(working_directory.clone());
+        let hook_runner = HookRunner::new(HooksConfig {
+            pre_tool_use: vec![HookHandlerConfig::Command {
+                command: hook_cwd_command(&capture_file),
+                matcher: Some("context_probe".into()),
+                timeout: 1,
+            }],
+            ..HooksConfig::default()
+        });
         let mut messages = vec![ChatMessage::user("测试显式工具上下文")];
 
         let result = run_tool_loop_with_config_and_context(
@@ -1052,7 +1155,7 @@ mod tests {
             &mut messages,
             &[],
             None,
-            None,
+            Some(&hook_runner),
             4096,
             0.7,
             None,
@@ -1060,8 +1163,20 @@ mod tests {
         .await
         .unwrap();
 
+        let executor_working_directories = seen.lock().unwrap().clone();
+        let hook_working_directory = std::fs::read_to_string(&capture_file)
+            .map(|path| PathBuf::from(path.trim()))
+            .and_then(std::fs::canonicalize)
+            .expect("PreToolUse hook 应记录可规范化的 cwd");
+        std::fs::remove_file(&capture_file).expect("应清理 hook cwd 捕获文件");
+        std::fs::remove_dir(&working_directory).expect("应清理显式工具工作目录");
+
         assert_eq!(result.response.text(), "工具调用完成");
-        assert_eq!(*seen.lock().unwrap(), vec![working_directory]);
+        assert_eq!(
+            executor_working_directories,
+            vec![working_directory.clone()]
+        );
+        assert_eq!(hook_working_directory, executor_working_directories[0]);
     }
 
     #[tokio::test]
