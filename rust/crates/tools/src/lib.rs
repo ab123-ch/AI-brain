@@ -1062,6 +1062,8 @@ fn is_workspace_tool(name: &str) -> bool {
             | "TodoWrite"
             | "Agent"
             | "NotebookEdit"
+            | "SendUserMessage"
+            | "Brief"
             | "Config"
             | "EnterPlanMode"
             | "ExitPlanMode"
@@ -1125,6 +1127,8 @@ fn execute_workspace_tool_in_directory(
             .and_then(|value| run_agent_in_directory(value, working_directory)),
         "NotebookEdit" => from_value::<NotebookEditInput>(input)
             .and_then(|value| run_notebook_edit_in_directory(value, working_directory)),
+        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input)
+            .and_then(|value| run_brief_in_directory(value, working_directory)),
         "Config" => from_value::<ConfigInput>(input)
             .and_then(|value| run_config_in_directory(value, working_directory)),
         "EnterPlanMode" => from_value::<EnterPlanModeInput>(input)
@@ -1167,7 +1171,6 @@ fn execute_non_workspace_tool(name: &str, input: &Value) -> Result<String, Strin
         "Skill" => Err("Skill tool is handled by RealToolExecutor directly".to_string()),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
-        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
@@ -2136,8 +2139,8 @@ fn run_sleep(input: SleepInput) -> Result<String, String> {
     to_pretty_json(execute_sleep(input)?)
 }
 
-fn run_brief(input: BriefInput) -> Result<String, String> {
-    to_pretty_json(execute_brief(input)?)
+fn run_brief_in_directory(input: BriefInput, working_directory: &Path) -> Result<String, String> {
+    to_pretty_json(execute_brief(input, working_directory)?)
 }
 
 fn run_config_in_directory(input: ConfigInput, working_directory: &Path) -> Result<String, String> {
@@ -4694,7 +4697,7 @@ fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
     })
 }
 
-fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
+fn execute_brief(input: BriefInput, working_directory: &Path) -> Result<BriefOutput, String> {
     if input.message.trim().is_empty() {
         return Err(String::from("message must not be empty"));
     }
@@ -4705,7 +4708,7 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
         .map(|paths| {
             paths
                 .iter()
-                .map(|path| resolve_attachment(path))
+                .map(|path| resolve_attachment_in_directory(path, working_directory))
                 .collect::<Result<Vec<_>, String>>()
         })
         .transpose()?;
@@ -4721,9 +4724,28 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
     })
 }
 
-fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-    let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
+fn resolve_attachment_in_directory(
+    path: &str,
+    working_directory: &Path,
+) -> Result<ResolvedAttachment, String> {
+    let path = Path::new(path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
+    };
+    let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("附件不存在：{}", candidate.display())
+        } else {
+            format!("无法解析附件路径 `{}`：{error}", candidate.display())
+        }
+    })?;
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|error| format!("无法读取附件元数据 `{}`：{error}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("附件路径不是文件：{}", resolved.display()));
+    }
     Ok(ResolvedAttachment {
         path: resolved.display().to_string(),
         size: metadata.len(),
@@ -5732,6 +5754,94 @@ mod tests {
     }
 
     #[test]
+    fn explicit_working_directory_scopes_message_attachments() {
+        let root = temp_path("scoped-message-attachments");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create workspace A");
+        fs::create_dir_all(&workspace_b).expect("create workspace B");
+        fs::write(workspace_a.join("same.bin"), b"a").expect("write attachment A");
+        fs::write(workspace_b.join("same.bin"), b"workspace-b").expect("write attachment B");
+
+        let result_a = super::execute_tool_in_directory(
+            "SendUserMessage",
+            &json!({
+                "message": "workspace A",
+                "attachments": ["same.bin"],
+                "status": "normal"
+            }),
+            &workspace_a,
+        );
+        let result_b = super::execute_tool_in_directory(
+            "Brief",
+            &json!({
+                "message": "workspace B",
+                "attachments": ["same.bin"],
+                "status": "normal"
+            }),
+            &workspace_b,
+        );
+
+        assert!(
+            result_a.is_ok() && result_b.is_ok(),
+            "相同相对附件必须分别基于请求 cwd 解析：A={result_a:?}，B={result_b:?}"
+        );
+        for (result, workspace, expected_size) in [
+            (result_a, workspace_a, 1_u64),
+            (result_b, workspace_b, 11_u64),
+        ] {
+            let output: serde_json::Value =
+                serde_json::from_str(&result.expect("scoped message output"))
+                    .expect("message json");
+            let expected_path = fs::canonicalize(workspace.join("same.bin"))
+                .expect("canonical attachment path")
+                .display()
+                .to_string();
+            assert_eq!(output["attachments"][0]["path"], expected_path);
+            assert_eq!(output["attachments"][0]["size"], expected_size);
+        }
+    }
+
+    #[test]
+    fn message_attachments_reject_missing_and_non_file_paths() {
+        let workspace = temp_path("invalid-message-attachments");
+        let _workspace_cleanup = DirectoryCleanup::new(workspace.clone());
+        fs::create_dir_all(workspace.join("directory-attachment"))
+            .expect("create directory attachment");
+
+        let missing = super::execute_tool_in_directory(
+            "SendUserMessage",
+            &json!({
+                "message": "missing attachment",
+                "attachments": ["missing.bin"],
+                "status": "normal"
+            }),
+            &workspace,
+        )
+        .expect_err("missing attachment must fail");
+        let directory = super::execute_tool_in_directory(
+            "Brief",
+            &json!({
+                "message": "directory attachment",
+                "attachments": ["directory-attachment"],
+                "status": "normal"
+            }),
+            &workspace,
+        )
+        .expect_err("directory attachment must fail");
+
+        assert!(
+            missing.contains("附件不存在"),
+            "unexpected error: {missing}"
+        );
+        assert!(
+            directory.contains("附件路径不是文件"),
+            "unexpected error: {directory}"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn explicit_working_directory_scopes_workspace_tools() {
         let _guard = env_lock()
@@ -6384,6 +6494,34 @@ mod tests {
         let output = execute_tool("read_file", &json!({"path": relative_dir.join("same.txt")}))
             .expect("legacy execute_tool reads from process cwd");
         assert!(output.contains("legacy-current-directory"));
+
+        let attachment = execute_tool(
+            "Brief",
+            &json!({
+                "message": "legacy relative attachment",
+                "attachments": [relative_dir.join("same.txt")],
+                "status": "normal"
+            }),
+        )
+        .expect("legacy Brief resolves attachments from process cwd");
+        let attachment: serde_json::Value =
+            serde_json::from_str(&attachment).expect("legacy Brief json");
+        assert_eq!(
+            attachment["attachments"][0]["path"],
+            fs::canonicalize(fixture_dir.join("same.txt"))
+                .expect("canonical legacy attachment")
+                .display()
+                .to_string()
+        );
+
+        let without_attachment = execute_tool(
+            "Brief",
+            &json!({"message": "legacy without attachment", "status": "normal"}),
+        )
+        .expect("legacy Brief without attachment succeeds");
+        let without_attachment: serde_json::Value =
+            serde_json::from_str(&without_attachment).expect("legacy Brief json");
+        assert!(without_attachment["attachments"].is_null());
     }
 
     fn graph_node(title: &str, keywords: &[&str], importance: f64) -> Node {
@@ -7954,6 +8092,13 @@ mod tests {
         assert_eq!(output["message"], "hello user");
         assert!(output["sentAt"].as_str().is_some());
         assert_eq!(output["attachments"][0]["isImage"], true);
+        assert_eq!(
+            output["attachments"][0]["path"],
+            fs::canonicalize(&attachment)
+                .expect("canonical absolute attachment")
+                .display()
+                .to_string()
+        );
         let _ = std::fs::remove_file(attachment);
     }
 
