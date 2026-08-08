@@ -16,7 +16,8 @@ use novel_workflow::{
     NovelWriterExecution, NovelWriterInvocation, NovelWriterPort, ProfileModel,
 };
 use task_engine::{
-    ActualUsage, Scheduler, SchedulerLimits, TaskCoordinator, TaskRepository, TaskRunState,
+    ActualUsage, Scheduler, SchedulerLimits, TaskCoordinator, TaskEngineError, TaskRepository,
+    TaskRunState,
 };
 
 #[derive(Default)]
@@ -373,10 +374,15 @@ async fn task_execution_state_reports_failed_and_missing_task_runs() {
         service.task_execution_state("task-1").await.unwrap(),
         Some(NovelTaskExecutionState::Failed)
     );
-    assert_eq!(
-        service.task_execution_state("missing-task").await.unwrap(),
-        None
-    );
+    for task_run_id in ["novel-task-", "novel-task-  \t"] {
+        assert!(matches!(
+            repository.task(task_run_id),
+            Err(TaskEngineError::NotFound {
+                entity: "task run",
+                ..
+            })
+        ));
+    }
 }
 
 #[tokio::test]
