@@ -154,6 +154,58 @@ impl MemoryQueryPort for EmptyMemory {
 }
 
 #[test]
+fn conversation_reference_has_stable_wire_name() {
+    assert_eq!(
+        serde_json::to_value(ContextBlockKind::ConversationReference).unwrap(),
+        serde_json::json!("conversation_reference")
+    );
+}
+
+#[test]
+fn required_conversation_reference_is_not_silently_truncated() {
+    let tenant = TenantId::from("tenant-1");
+    let member_scope = ScopeRef::new(
+        tenant.clone(),
+        NamespaceId::from("platform.core"),
+        ScopeTypeId::from("member"),
+        "member-a",
+    )
+    .unwrap();
+    let builder = ContextBuilder::new(
+        Arc::new(EmptyMemory),
+        Arc::new(UnavailableGraph),
+        Arc::new(ContentResolverRegistry::new()),
+    );
+    let request = ContextRequest::new(
+        tenant,
+        vec![member_scope],
+        vec!["reply".into()],
+        ContextBudget {
+            max_total_tokens: 64,
+            max_optional_tokens: 0,
+            max_memory_tokens: 0,
+            max_graph_tokens: 0,
+            max_items: 1,
+        },
+    )
+    .with_required_block(ContextBlockInput::new(
+        "policy",
+        ContextBlockKind::SystemPolicy,
+        "policy",
+    ))
+    .with_required_block(ContextBlockInput::new(
+        "reply-reference:event-1",
+        ContextBlockKind::ConversationReference,
+        "quoted material",
+    ));
+
+    assert!(matches!(
+        builder.build(&request),
+        Err(KnowledgeError::BudgetExceeded(_))
+    ));
+}
+
+#[test]
 fn frozen_context_is_budgeted_traceable_and_degrades_when_graph_is_unavailable() {
     let tenant = TenantId::from("tenant-1");
     let member_scope = ScopeRef::new(

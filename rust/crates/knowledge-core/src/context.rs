@@ -14,6 +14,7 @@ pub enum ContextBlockKind {
     SystemPolicy,
     ConversationUser,
     ConversationAssistant,
+    ConversationReference,
     CurrentInput,
     Memory,
     GraphEvidence,

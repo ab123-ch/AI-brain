@@ -189,6 +189,9 @@ fn member_inputs_from_snapshot(
                 role: "assistant".into(),
                 content: block.content.clone(),
             }),
+            ContextBlockKind::ConversationReference => {
+                system_context.push(block.content.clone());
+            }
             ContextBlockKind::CurrentInput => {
                 if input.replace(block.content.clone()).is_some() {
                     return Err("成员上下文包含多个 current_input block".into());
@@ -3156,6 +3159,12 @@ mod tests {
                 ))
                 .unwrap(),
                 ContextBlock::from_input(ContextBlockInput::new(
+                    "reply-reference:event-1",
+                    ContextBlockKind::ConversationReference,
+                    "[被回复引用]\n较早的权威消息",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
                     "current",
                     ContextBlockKind::CurrentInput,
                     "current question",
@@ -3173,6 +3182,8 @@ mod tests {
         assert_eq!(history[1].role, "assistant");
         assert!(system.contains("member policy"));
         assert!(system.contains("authorized memory"));
+        assert!(system.contains("[被回复引用]"));
+        assert!(system.contains("较早的权威消息"));
 
         let mut tampered = snapshot;
         tampered.blocks[0].content = "changed after freeze".into();
