@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use brain_core::tool_executor::{ToolDescriptor, ToolExecutor};
+use brain_core::tool_executor::{ToolDescriptor, ToolExecutionContext, ToolExecutor};
 use brain_core::types::{ToolCall, ToolExecutionResult};
 use brain_llm::ToolDefinition;
 use serde::Serialize;
@@ -131,6 +131,17 @@ impl ToolExecutor for GroupMessageToolExecutor {
         })
     }
 
+    fn execute_with_context<'a>(
+        &'a self,
+        tool_call: &'a ToolCall,
+        context: &'a ToolExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + 'a>> {
+        if tool_call.tool_name == READ_GROUP_MESSAGES_TOOL {
+            return self.execute(tool_call);
+        }
+        self.inner.execute_with_context(tool_call, context)
+    }
+
     fn list_tools(&self) -> Vec<ToolDescriptor> {
         let mut tools = self.inner.list_tools();
         if !tools
@@ -178,13 +189,89 @@ impl From<&RoomEventView> for GroupMessageToolEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use brain_core::tool_executor::{StubToolExecutor, ToolExecutor};
-    use brain_core::types::ToolCall;
+    use brain_core::tool_executor::{ToolExecutionContext, ToolExecutor};
+    use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 
     use super::{GroupMessageToolExecutor, GroupMessageToolScope, READ_GROUP_MESSAGES_TOOL};
     use crate::web::collaboration::{CollaborationRepository, RoomInputMode};
+
+    #[derive(Default)]
+    struct RecordingToolExecutor {
+        contexts: Mutex<Vec<PathBuf>>,
+        execute_calls: AtomicUsize,
+    }
+
+    impl ToolExecutor for RecordingToolExecutor {
+        fn execute(
+            &self,
+            tool_call: &ToolCall,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + '_>>
+        {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            let tool_name = tool_call.tool_name.clone();
+            Box::pin(async move {
+                ToolExecutionResult {
+                    tool_name,
+                    output: "inner-ok".into(),
+                    is_error: false,
+                    duration_ms: 0,
+                }
+            })
+        }
+
+        fn execute_with_context<'a>(
+            &'a self,
+            tool_call: &'a ToolCall,
+            context: &'a ToolExecutionContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + 'a>>
+        {
+            self.contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context.working_directory.clone());
+            self.execute(tool_call)
+        }
+
+        fn list_tools(&self) -> Vec<ToolDescriptor> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_working_directory_is_forwarded_by_group_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_directory = directory.path().canonicalize().unwrap();
+        let repository =
+            Arc::new(CollaborationRepository::new(&working_directory, Default::default()).unwrap());
+        let inner = Arc::new(RecordingToolExecutor::default());
+        let executor = GroupMessageToolExecutor::new(
+            inner.clone(),
+            GroupMessageToolScope::new(repository, "room-1", 0),
+        );
+        let call = ToolCall {
+            tool_name: "read_file".into(),
+            input: serde_json::json!({ "path": "same.txt" }),
+            validated: true,
+            validation_id: None,
+        };
+
+        let result = executor
+            .execute_with_context(&call, &ToolExecutionContext::new(&working_directory))
+            .await;
+
+        assert!(!result.is_error);
+        assert_eq!(
+            *inner
+                .contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![working_directory]
+        );
+    }
 
     #[tokio::test]
     async fn scoped_tool_cannot_read_messages_after_claim_boundary() {
@@ -210,23 +297,33 @@ mod tests {
                 "scoped-tool-2",
             )
             .unwrap();
+        let inner = Arc::new(RecordingToolExecutor::default());
         let executor = GroupMessageToolExecutor::new(
-            Arc::new(StubToolExecutor::new()),
+            inner.clone(),
             GroupMessageToolScope::new(Arc::clone(&repository), "room-1", first.event.sequence),
         );
 
         let result = executor
-            .execute(&ToolCall {
-                tool_name: READ_GROUP_MESSAGES_TOOL.into(),
-                input: serde_json::json!({"limit": 10, "before_sequence": 999}),
-                validated: true,
-                validation_id: None,
-            })
+            .execute_with_context(
+                &ToolCall {
+                    tool_name: READ_GROUP_MESSAGES_TOOL.into(),
+                    input: serde_json::json!({"limit": 10, "before_sequence": 999}),
+                    validated: true,
+                    validation_id: None,
+                },
+                &ToolExecutionContext::new(directory.path().canonicalize().unwrap()),
+            )
             .await;
 
         assert!(!result.is_error);
         assert!(result.output.contains("边界内消息"));
         assert!(!result.output.contains("边界外消息"));
+        assert_eq!(inner.execute_calls.load(Ordering::SeqCst), 0);
+        assert!(inner
+            .contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
         assert!(executor
             .list_tools()
             .iter()

@@ -2080,7 +2080,7 @@ pub async fn execute_agent_tool_with_completion(input: &Value) -> Result<AgentTo
     execute_agent_tool_with_completion_in_directory(input, &cwd).await
 }
 
-async fn execute_agent_tool_with_completion_in_directory(
+pub async fn execute_agent_tool_with_completion_in_directory(
     input: &Value,
     working_directory: &Path,
 ) -> Result<AgentToolLaunch, String> {
@@ -6130,7 +6130,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_working_directory_scopes_agent_preparation_and_executor() {
+    fn agent_inherits_working_directory() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
