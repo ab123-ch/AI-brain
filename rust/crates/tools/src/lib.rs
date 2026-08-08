@@ -6292,6 +6292,32 @@ mod tests {
     }
 
     #[test]
+    fn novel_workflow_skill_documents_failed_unlock() {
+        let skill = include_str!("../../brain-main/skills/novel-writing-workflow/SKILL.md");
+
+        for required_text in [
+            "unlock_failed",
+            "project already has active work",
+            "failed",
+            "cancelled",
+            "queued",
+            "paused_budget",
+            "needs_input",
+            "completed",
+            "不得自动重试 LLM",
+            "显式调用 start",
+            "不得包含密钥",
+            "status",
+            "reason",
+        ] {
+            assert!(
+                skill.contains(required_text),
+                "novel workflow skill missing {required_text}"
+            );
+        }
+    }
+
+    #[test]
     fn novel_workflow_tools_replace_ephemeral_agent_schema() {
         let specs = mvp_tool_specs();
         let agent = specs
