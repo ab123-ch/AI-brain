@@ -374,15 +374,10 @@ async fn task_execution_state_reports_failed_and_missing_task_runs() {
         service.task_execution_state("task-1").await.unwrap(),
         Some(NovelTaskExecutionState::Failed)
     );
-    for task_run_id in ["novel-task-", "novel-task-  \t"] {
-        assert!(matches!(
-            repository.task(task_run_id),
-            Err(TaskEngineError::NotFound {
-                entity: "task run",
-                ..
-            })
-        ));
-    }
+    assert_eq!(
+        service.task_execution_state("missing-task").await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -411,10 +406,15 @@ async fn task_execution_state_rejects_blank_task_ids_without_creating_task_runs(
         }
     }
 
-    assert_eq!(
-        service.task_execution_state("missing-task").await.unwrap(),
-        None
-    );
+    for task_run_id in ["novel-task-", "novel-task-  \t"] {
+        assert!(matches!(
+            repository.task(task_run_id),
+            Err(TaskEngineError::NotFound {
+                entity: "task run",
+                ..
+            })
+        ));
+    }
 }
 
 #[test]
