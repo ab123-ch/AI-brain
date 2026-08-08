@@ -80,6 +80,7 @@ dependencies = [
  "novel-knowledge-adapter",
  "novel-workflow",
  "ratatui",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
