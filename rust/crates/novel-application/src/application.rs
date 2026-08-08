@@ -544,9 +544,15 @@ impl NovelApplicationService {
             .map(String::as_str)
             .collect::<HashSet<_>>();
         let mut cancelled = Vec::new();
-        for checkpoint in self.store.active_checkpoints()? {
-            let task_lock = self.task_lock(&checkpoint.task_id);
+        for snapshot in self.store.active_checkpoints()? {
+            let task_lock = self.task_lock(&snapshot.task_id);
             let _guard = task_lock.lock().await;
+            let Some(checkpoint) = self.store.load_checkpoint(&snapshot.task_id)? else {
+                continue;
+            };
+            if checkpoint.phase.is_terminal() {
+                continue;
+            }
             let mut state = NovelTaskState::from_checkpoint(&checkpoint)?;
             if !state.matches_conversation_generations(
                 conversation_id,

@@ -8,11 +8,12 @@ use novel_application::{
     NovelTaskUnlockReceipt, StoreWorkflowEnvironment,
 };
 use novel_domain::{
-    CanonStatus, ConflictRecord, MainReviewChecks, MainReviewRecord, MainReviewVerdict,
-    NovelArtifactReceipt, NovelDraftEnvelope, NovelFactKind, NovelLifecycleActor, NovelMemoryDelta,
-    NovelOutcome, NovelProject, NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict,
-    NovelTaskEvent, NovelTaskPhase, NovelTaskRequest, NovelTaskState, NovelTaskType, ProposedFact,
-    PublicationPolicy, ReviewCheckStatus, UserDecision, UserDecisionRecord,
+    CanonStatus, ClarificationRequest, ConflictRecord, MainReviewChecks, MainReviewRecord,
+    MainReviewVerdict, NovelArtifactReceipt, NovelDraftEnvelope, NovelFactKind,
+    NovelLifecycleActor, NovelMemoryDelta, NovelOutcome, NovelProject, NovelResumeInput,
+    NovelSelfReview, NovelSelfReviewChecks, NovelSelfReviewVerdict, NovelTaskEvent, NovelTaskPhase,
+    NovelTaskRequest, NovelTaskState, NovelTaskType, ProposedFact, PublicationPolicy,
+    ReviewCheckStatus, UserDecision, UserDecisionRecord,
 };
 use novel_workflow::{
     NovelStartWorkflow, NovelTaskExecutionState, NovelWorkflowBudget, NovelWorkflowEnvironmentPort,
@@ -23,6 +24,7 @@ use task_engine::{
     ActualUsage, BudgetLimits, BudgetRequest, NewTaskNode, NewTaskRun, NodeKind, Scheduler,
     SchedulerLimits, TaskCoordinator, TaskRepository, TaskRunState,
 };
+use tokio::sync::Barrier;
 
 struct TestResources {
     root: PathBuf,
@@ -30,6 +32,38 @@ struct TestResources {
 
 struct PanicWriter {
     calls: Arc<AtomicUsize>,
+}
+
+struct BlockingClarificationWriter {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+#[async_trait]
+impl NovelWriterPort for BlockingClarificationWriter {
+    async fn execute(
+        &self,
+        invocation: NovelWriterInvocation,
+    ) -> Result<NovelWriterExecution, NovelWorkflowPortError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.wait().await;
+        self.release.wait().await;
+        let outcome = NovelOutcome::NeedsClarification(ClarificationRequest {
+            task_id: invocation.request.task_id.clone(),
+            project_id: invocation.request.project_id.clone(),
+            questions: vec!["请确认后续方向".into()],
+            reason: "需要更多信息".into(),
+        });
+        Ok(NovelWriterExecution {
+            raw_output: serde_json::to_string(&outcome).unwrap(),
+            outcome,
+            usage: ActualUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        })
+    }
 }
 
 #[async_trait]
@@ -127,6 +161,23 @@ fn task_request() -> NovelTaskRequest {
 fn empty_drafting_state() -> NovelTaskState {
     let mut state = NovelTaskState::new(task_request()).unwrap();
     state.begin_drafting().unwrap();
+    state
+}
+
+fn clarification_state_with_conversation() -> NovelTaskState {
+    let mut request = task_request();
+    request.source_conversation_id = Some("conversation-1".into());
+    request.source_generation_id = Some("generation-1".into());
+    let mut state = NovelTaskState::new(request).unwrap();
+    state.begin_drafting().unwrap();
+    state
+        .apply_outcome(NovelOutcome::NeedsClarification(ClarificationRequest {
+            task_id: "task-1".into(),
+            project_id: "project-1".into(),
+            questions: vec!["请确认后续方向".into()],
+            reason: "需要更多信息".into(),
+        }))
+        .unwrap();
     state
 }
 
@@ -634,6 +685,104 @@ fn reopen_unlock_service(fixture: &UnlockFixture) -> (NovelApplicationService, A
     )
 }
 
+struct StaleInvalidationFixture {
+    _directory: tempfile::TempDir,
+    store: Arc<NovelDomainStore>,
+    repository: Arc<TaskRepository>,
+    invalidation_service: Arc<NovelApplicationService>,
+    unlock_service: NovelApplicationService,
+    writer_calls: Arc<AtomicUsize>,
+    unlock_writer_calls: Arc<AtomicUsize>,
+    writer_entered: Arc<Barrier>,
+    writer_release: Arc<Barrier>,
+}
+
+fn stale_invalidation_fixture() -> StaleInvalidationFixture {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(NovelDomainStore::open(directory.path().join("novel.db")).unwrap());
+    store
+        .import_project(&NovelProject::new("project-1", "Project"))
+        .unwrap();
+    store
+        .save_checkpoint(
+            &clarification_state_with_conversation()
+                .checkpoint()
+                .unwrap(),
+        )
+        .unwrap();
+    let repository = Arc::new(TaskRepository::open(directory.path().join("runtime.db")).unwrap());
+    create_task_run_in_state(&repository, "task-1", TaskRunState::Queued);
+    let resources = Arc::new(TestResources {
+        root: directory.path().join("workspace-invalidation"),
+    });
+    let environment: Arc<dyn NovelWorkflowEnvironmentPort> = Arc::new(
+        StoreWorkflowEnvironment::new(Arc::clone(&store), resources.clone()),
+    );
+    let writer_calls = Arc::new(AtomicUsize::new(0));
+    let writer_entered = Arc::new(Barrier::new(2));
+    let writer_release = Arc::new(Barrier::new(2));
+    let writer: Arc<dyn NovelWriterPort> = Arc::new(BlockingClarificationWriter {
+        calls: Arc::clone(&writer_calls),
+        entered: Arc::clone(&writer_entered),
+        release: Arc::clone(&writer_release),
+    });
+    let workflow = Arc::new(NovelStartWorkflow::new(
+        Arc::clone(&repository),
+        task_coordinator(Arc::clone(&repository)),
+        environment,
+        writer,
+        workflow_models(),
+        NovelWorkflowBudget {
+            input_tokens: 100,
+            output_tokens: 100,
+        },
+    ));
+    let invalidation_service = Arc::new(NovelApplicationService::new(
+        Arc::clone(&store),
+        Some(workflow),
+        resources,
+    ));
+
+    let unlock_store = Arc::new(NovelDomainStore::open(directory.path().join("novel.db")).unwrap());
+    let unlock_repository =
+        Arc::new(TaskRepository::open(directory.path().join("runtime.db")).unwrap());
+    let unlock_resources = Arc::new(TestResources {
+        root: directory.path().join("workspace-unlock"),
+    });
+    let unlock_environment: Arc<dyn NovelWorkflowEnvironmentPort> = Arc::new(
+        StoreWorkflowEnvironment::new(Arc::clone(&unlock_store), unlock_resources.clone()),
+    );
+    let unlock_writer_calls = Arc::new(AtomicUsize::new(0));
+    let unlock_writer: Arc<dyn NovelWriterPort> = Arc::new(PanicWriter {
+        calls: Arc::clone(&unlock_writer_calls),
+    });
+    let unlock_workflow = Arc::new(NovelStartWorkflow::new(
+        Arc::clone(&unlock_repository),
+        task_coordinator(unlock_repository),
+        unlock_environment,
+        unlock_writer,
+        workflow_models(),
+        NovelWorkflowBudget {
+            input_tokens: 100,
+            output_tokens: 100,
+        },
+    ));
+    let unlock_service =
+        NovelApplicationService::new(unlock_store, Some(unlock_workflow), unlock_resources);
+
+    StaleInvalidationFixture {
+        _directory: directory,
+        store,
+        repository,
+        invalidation_service,
+        unlock_service,
+        writer_calls,
+        unlock_writer_calls,
+        writer_entered,
+        writer_release,
+    }
+}
+
 #[tokio::test]
 async fn concurrent_services_unlock_once_and_converge_on_original_receipt() {
     let fixture = unlock_fixture(&empty_drafting_state(), Some(TaskRunState::Failed));
@@ -667,6 +816,66 @@ async fn concurrent_services_unlock_once_and_converge_on_original_receipt() {
         .is_none());
     assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
     assert_eq!(second_writer_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stale_conversation_snapshot_cannot_overwrite_manual_unlock() {
+    let fixture = stale_invalidation_fixture();
+    let resume_service = Arc::clone(&fixture.invalidation_service);
+    let resume = tokio::spawn(async move {
+        resume_service
+            .resume_task(
+                "task-1",
+                NovelResumeInput {
+                    input: "继续写作".into(),
+                    context_refs: None,
+                },
+            )
+            .await
+    });
+    fixture.writer_entered.wait().await;
+
+    let invalidation_service = Arc::clone(&fixture.invalidation_service);
+    let invalidation = tokio::spawn(async move {
+        invalidation_service
+            .invalidate_conversation_generations("conversation-1", &["generation-1".into()], false)
+            .await
+    });
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!invalidation.is_finished());
+
+    let task = fixture.repository.task("novel-task-task-1").unwrap();
+    fixture
+        .repository
+        .cancel_task("novel-task-task-1", task.version)
+        .unwrap();
+    let receipt = fixture
+        .unlock_service
+        .unlock_failed_task("task-1", "Writer 已失败，人工解锁")
+        .await
+        .unwrap();
+    assert!(!receipt.already_unlocked);
+    fixture.writer_release.wait().await;
+
+    assert!(resume.await.unwrap().is_err());
+    assert!(invalidation.await.unwrap().unwrap().is_empty());
+    let checkpoint = fixture.store.load_checkpoint("task-1").unwrap().unwrap();
+    assert_eq!(checkpoint.phase, NovelTaskPhase::Cancelled);
+    let events = fixture.store.load_task_events("task-1").unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.summary == "manual_unlock")
+            .count(),
+        1
+    );
+    assert!(!events
+        .iter()
+        .any(|event| event.event_id.contains("conversation_invalidated")));
+    assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.unlock_writer_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -725,6 +934,116 @@ async fn terminal_checkpoint_cannot_be_reopened_by_stale_save_or_event_persist()
         fixture.store.load_task_events("task-1").unwrap().len(),
         event_count
     );
+}
+
+#[tokio::test]
+async fn terminal_checkpoint_rejects_different_terminal_payloads_and_preserves_archive() {
+    let fixture = unlock_fixture(&empty_drafting_state(), Some(TaskRunState::Failed));
+    fixture
+        .service
+        .unlock_failed_task("task-1", "终态不可变")
+        .await
+        .unwrap();
+    let checkpoint = fixture.store.load_checkpoint("task-1").unwrap().unwrap();
+    let event_count = fixture.store.load_task_events("task-1").unwrap().len();
+    let mut different_terminal = NovelTaskState::from_checkpoint(&checkpoint).unwrap();
+    different_terminal.phase = NovelTaskPhase::Failed;
+    different_terminal.updated_at += 1;
+    let different_checkpoint = different_terminal.checkpoint().unwrap();
+
+    let save_error = fixture
+        .store
+        .save_checkpoint(&different_checkpoint)
+        .unwrap_err();
+    assert!(matches!(save_error, NovelApplicationError::Conflict(_)));
+    let different_event = NovelTaskEvent {
+        event_id: "different-terminal-event".into(),
+        task_id: "task-1".into(),
+        project_id: "project-1".into(),
+        actor: NovelLifecycleActor::System,
+        phase: NovelTaskPhase::Failed,
+        summary: "different terminal payload".into(),
+        details: serde_json::Value::Null,
+        created_at: different_terminal.updated_at,
+    };
+    let persist_error = fixture
+        .store
+        .persist_state_event(&different_terminal, &different_event)
+        .unwrap_err();
+    assert!(matches!(persist_error, NovelApplicationError::Conflict(_)));
+    assert_eq!(
+        fixture.store.load_checkpoint("task-1").unwrap().unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        fixture.store.load_task_events("task-1").unwrap().len(),
+        event_count
+    );
+
+    assert!(fixture.store.archive_task("task-1").unwrap());
+    let archived_save_error = fixture.store.save_checkpoint(&checkpoint).unwrap_err();
+    assert!(matches!(
+        archived_save_error,
+        NovelApplicationError::Conflict(_)
+    ));
+    let cancelled_state = NovelTaskState::from_checkpoint(&checkpoint).unwrap();
+    let manual_event = fixture.store.load_task_events("task-1").unwrap()[0].clone();
+    let archived_persist_error = fixture
+        .store
+        .persist_state_event(&cancelled_state, &manual_event)
+        .unwrap_err();
+    assert!(matches!(
+        archived_persist_error,
+        NovelApplicationError::Conflict(_)
+    ));
+    assert!(!fixture.store.archive_task("task-1").unwrap());
+    assert_eq!(
+        fixture.store.load_checkpoint("task-1").unwrap().unwrap(),
+        checkpoint
+    );
+    assert_eq!(
+        fixture.store.load_task_events("task-1").unwrap().len(),
+        event_count
+    );
+}
+
+#[tokio::test]
+async fn conflicting_deterministic_event_rolls_back_unlock_checkpoint_cas() {
+    let fixture = unlock_fixture(&empty_drafting_state(), Some(TaskRunState::Failed));
+    let checkpoint = fixture.store.load_checkpoint("task-1").unwrap().unwrap();
+    let conflicting_event = NovelTaskEvent {
+        event_id: "novel-application-task-1-manual_unlock".into(),
+        task_id: "task-1".into(),
+        project_id: "project-1".into(),
+        actor: NovelLifecycleActor::User,
+        phase: NovelTaskPhase::Cancelled,
+        summary: "conflicting manual unlock".into(),
+        details: serde_json::json!({"forged": true}),
+        created_at: 1,
+    };
+    fixture.store.append_task_event(&conflicting_event).unwrap();
+
+    let error = fixture
+        .service
+        .unlock_failed_task("task-1", "必须原子回滚")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, NovelApplicationError::Conflict(_)));
+    assert_eq!(
+        fixture.store.load_checkpoint("task-1").unwrap().unwrap(),
+        checkpoint
+    );
+    assert!(fixture
+        .store
+        .active_checkpoint_for_project("project-1")
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        fixture.store.load_task_events("task-1").unwrap(),
+        vec![conflicting_event]
+    );
+    assert_eq!(fixture.writer_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

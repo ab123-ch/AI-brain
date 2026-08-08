@@ -326,12 +326,18 @@ impl NovelDomainStore {
                  project_id = excluded.project_id,
                  phase = excluded.phase,
                  terminal = excluded.terminal,
-                 archived = 0,
                  draft_version = excluded.draft_version,
                  content_hash = excluded.content_hash,
                  payload = excluded.payload,
                  updated_at = excluded.updated_at
-             WHERE novel_checkpoints.terminal = 0 OR excluded.terminal = 1",
+             WHERE novel_checkpoints.archived = 0
+               AND (
+                   novel_checkpoints.terminal = 0
+                   OR (
+                       excluded.terminal = 1
+                       AND novel_checkpoints.content_hash = excluded.content_hash
+                   )
+               )",
             params![
                 checkpoint.task_id,
                 checkpoint.project_id,
@@ -345,7 +351,7 @@ impl NovelDomainStore {
         )?;
         if changed == 0 {
             return Err(NovelApplicationError::Conflict(format!(
-                "终态 Novel checkpoint {} 拒绝重开为非终态",
+                "Novel checkpoint {} 拒绝非幂等终态覆盖或 archived 更新",
                 checkpoint.task_id
             )));
         }
@@ -378,12 +384,18 @@ impl NovelDomainStore {
                  project_id = excluded.project_id,
                  phase = excluded.phase,
                  terminal = excluded.terminal,
-                 archived = 0,
                  draft_version = excluded.draft_version,
                  content_hash = excluded.content_hash,
                  payload = excluded.payload,
                  updated_at = excluded.updated_at
-             WHERE novel_checkpoints.terminal = 0 OR excluded.terminal = 1",
+             WHERE novel_checkpoints.archived = 0
+               AND (
+                   novel_checkpoints.terminal = 0
+                   OR (
+                       excluded.terminal = 1
+                       AND novel_checkpoints.content_hash = excluded.content_hash
+                   )
+               )",
             params![
                 checkpoint.task_id,
                 checkpoint.project_id,
@@ -397,7 +409,7 @@ impl NovelDomainStore {
         )?;
         if changed == 0 {
             return Err(NovelApplicationError::Conflict(format!(
-                "终态 Novel checkpoint {} 拒绝重开为非终态",
+                "Novel checkpoint {} 拒绝非幂等终态覆盖或 archived 更新",
                 checkpoint.task_id
             )));
         }
