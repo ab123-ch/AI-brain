@@ -432,9 +432,29 @@ impl LlmProvider for GeminiClient {
                             return Err(error);
                         }
 
-                        let value = response.json::<Value>().await.map_err(|e| {
-                            LlmError::RequestFailed(format!("Gemini 响应解析失败: {e}"))
-                        })?;
+                        let value = match response.json::<Value>().await {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let last_error = format!("Gemini 响应解析失败: {error}");
+                                let retryable = is_retryable_reqwest_error(&error);
+                                if retryable && attempts < max_attempts {
+                                    let backoff = retry.backoff_for_attempt(attempts);
+                                    tracing::warn!(
+                                        "Gemini 响应体读取失败（可重试）: url={url}, \
+                                         第{attempts}次尝试, error={error}, {backoff:?}后重试"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                    continue;
+                                }
+                                if retryable {
+                                    return Err(LlmError::RetriesExhausted {
+                                        attempts,
+                                        last_error,
+                                    });
+                                }
+                                return Err(LlmError::RequestFailed(last_error));
+                            }
+                        };
                         return Ok(Self::parse_gemini_response(&value, fallback_model));
                     }
                     Err(source) => {
@@ -740,6 +760,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn complete_retries_truncated_success_body_before_json_delivery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_request_body(&mut socket).await;
+                *server_attempts.lock().unwrap() += 1;
+                if attempt == 0 {
+                    let partial = "{\"candidates\":[";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+                        partial.len() + 100
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    drop(socket);
+                    continue;
+                }
+                let body = serde_json::json!({
+                    "candidates": [{
+                        "content": {"parts": [{"text": "body-ok"}]},
+                        "finishReason": "STOP"
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 1,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 2
+                    }
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let proxy = format!("http://{address}");
+        let mut client = GeminiClient::new(
+            "http://gemini.invalid/v1beta".into(),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+            Some(proxy.clone()),
+        );
+        client.http = SharedHttpClient::new(
+            Some(&proxy),
+            RetryConfig {
+                max_retries: 1,
+                initial_backoff: std::time::Duration::ZERO,
+                max_backoff: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
+
+        let response = client.complete(minimal_request()).await.unwrap();
+
+        assert_eq!(response.text(), "body-ok");
+        assert_eq!(*attempts.lock().unwrap(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn complete_http_status_retry_exhaustion_reports_six_attempts() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1012,13 +1098,19 @@ mod tests {
             .stream_incremental(minimal_request())
             .await
             .unwrap_err();
-        assert!(batch_error.to_string().contains(secret));
-        assert!(incremental_error.to_string().contains(secret));
+        for error in [&batch_error, &incremental_error] {
+            assert!(matches!(
+                error,
+                LlmError::ApiError { message, .. } if message.contains(secret)
+            ));
+            assert!(!error.to_string().contains(secret));
+        }
 
         drop(guard);
         let bytes = buffer.lock().unwrap().clone();
         let logs = String::from_utf8(bytes).unwrap();
-        assert!(logs.contains("Gemini 批量流式请求发送开始"), "{logs}");
+        assert!(logs.contains("operation=\"batch\""), "{logs}");
+        assert!(logs.contains("operation=\"incremental\""), "{logs}");
         assert!(!logs.contains(secret), "流式错误正文泄漏到 tracing: {logs}");
     }
 

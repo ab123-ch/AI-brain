@@ -142,7 +142,7 @@ Expected: 用户原有 `.no_proxy()` 仍存在且未被覆盖。
 - Modify: `crates/brain-llm/src/openai_compat.rs`
 - Test: `crates/brain-llm/src/openai_compat.rs`
 
-- [ ] **Step 1: 写连接中断和逻辑调用隔离 RED 测试**
+- [x] **Step 1: 写连接中断和逻辑调用隔离 RED 测试**
 
 本地 `TcpListener` 保存每个请求 JSON。测试执行三个逻辑调用：call-1 一次成功；call-2
 前五次断线、第六次成功；call-3 一次成功。断言 wire bodies 共 8 个，call-2 六份
@@ -159,7 +159,7 @@ RetryConfig {
 }
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```powershell
 cargo test -p brain-llm retries_current_request_five_times_without_replaying_previous_call -- --exact --nocapture
@@ -168,13 +168,13 @@ cargo test -p brain-llm stops_after_six_total_attempts -- --exact --nocapture
 
 Expected: FAIL，当前字符串分类漏判本地断线或耗尽错误没有 attempts=6。
 
-- [ ] **Step 3: 实现 typed 分类**
+- [x] **Step 3: 实现 typed 分类**
 
 在 `.send().await` 的 `Err(source)` 分支直接调用
 `is_retryable_reqwest_error(&source)`；HTTP 分支调用共享状态分类。所有尝试复用循环外生成
 的 `api_request`。可重试错误耗尽时返回 `RetriesExhausted`，确定性错误直接返回原错误。
 
-- [ ] **Step 4: 运行 GREEN**
+- [x] **Step 4: 运行 GREEN**
 
 ```powershell
 cargo test -p brain-llm openai_compat::tests -- --nocapture
@@ -188,12 +188,12 @@ Expected: 新增故障注入与既有解析/脱敏测试全部 PASS。
 - Modify: `crates/brain-llm/src/gemini.rs`
 - Test: `crates/brain-llm/src/gemini.rs`
 
-- [ ] **Step 1: 写 Gemini RED 测试**
+- [x] **Step 1: 写 Gemini RED 测试**
 
 本地服务器返回最小合法 Gemini JSON。证明前五次断线、第六次成功；401 只请求一次；
 普通 503 可恢复；含 `No available channel` 的 503 只请求一次。
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```powershell
 cargo test -p brain-llm gemini_retries_typed_transport_failure_five_times -- --exact --nocapture
@@ -201,12 +201,12 @@ cargo test -p brain-llm gemini_retries_typed_transport_failure_five_times -- --e
 
 Expected: FAIL，因为 Gemini 仍通过 `RequestFailed(String)` 分类。
 
-- [ ] **Step 3: 实现共享分类调用**
+- [x] **Step 3: 实现共享分类调用**
 
 在 Gemini `.send()` typed error 边界调用共享分类，HTTP 分支调用共享状态分类，耗尽语义
 与 OpenAI 相同。不更改 URL、认证 header 或响应解析。
 
-- [ ] **Step 4: 运行 GREEN**
+- [x] **Step 4: 运行 GREEN**
 
 ```powershell
 cargo test -p brain-llm gemini::tests -- --nocapture
@@ -223,7 +223,7 @@ Expected: 全部 PASS，日志脱敏测试继续不出现 secret。
 - Modify: `crates/brain-llm/src/gemini.rs`
 - Test: `crates/brain-llm/src/stream.rs`
 
-- [ ] **Step 1: 写流式 RED 合同**
+- [x] **Step 1: 写流式 RED 合同**
 
 ```rust
 #[tokio::test]
@@ -314,7 +314,7 @@ async fn dropping_incremental_receiver_stops_driver() {
 完整请求、按脚本写入合法 SSE 帧，并以原子计数器暴露 request count。OpenAI 与 Gemini
 分别使用各自合法 SSE JSON，测试不得访问外网或使用真实 API Key。
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```powershell
 cargo test -p brain-llm stream::tests -- --nocapture
@@ -322,13 +322,13 @@ cargo test -p brain-llm stream::tests -- --nocapture
 
 Expected: FAIL；批量流无 retry，增量错误静默关闭且无 Error variant。
 
-- [ ] **Step 3: 实现批量流尝试循环**
+- [x] **Step 3: 实现批量流尝试循环**
 
 让 `stream_openai`/`stream_gemini` 接收 `&RetryConfig`。每次尝试覆盖 send、status、完整
 body 读取和 SSE parse；send/body typed 暂态错误与白名单状态可重试，完整 body 解析
 错误直接返回。失败 attempt 的事件不得暴露。
 
-- [ ] **Step 4: 实现增量流首事件探测**
+- [x] **Step 4: 实现增量流首事件探测**
 
 返回 receiver 前建立请求、验证状态并读取到首个可解析事件。首事件前暂态错误进入下一
 attempt；得到首批事件后创建 channel 并 spawn 余下 driver。driver 中断时发送：
@@ -340,7 +340,7 @@ StreamEvent::Error { message: safe_message }
 随后结束，不重新发请求。receiver drop 立即结束 driver。Gemini 的 `call_sequence` 与
 `has_tool_use` 必须从探测阶段连续传给后台 driver。
 
-- [ ] **Step 5: 运行 GREEN**
+- [x] **Step 5: 运行 GREEN**
 
 ```powershell
 cargo test -p brain-llm stream::tests -- --nocapture
@@ -359,7 +359,7 @@ Expected: 全部 PASS，无真实网络请求。
 - Update: `findings.md`
 - Update: `progress.md`
 
-- [ ] **Step 1: 验证逻辑调用和用户重试未变化**
+- [x] **Step 1: 验证逻辑调用和用户重试未变化**
 
 ```powershell
 cargo test -p brain-main tool_loop -- --nocapture
@@ -369,7 +369,7 @@ cargo test -p ai-brain-cli --lib retry_last_user_message -- --nocapture
 Expected: Provider wire retries不增加逻辑 `llm_calls`；Web 用户重试全部 PASS 且生产文件
 无 diff。
 
-- [ ] **Step 2: 运行仓库要求门禁**
+- [x] **Step 2: 运行仓库要求门禁**
 
 ```powershell
 cargo fmt --all -- --check
@@ -380,7 +380,7 @@ cargo test --workspace
 Expected: 新代码无失败；范围外既有失败需记录退出码和首个阻断点，并补跑受影响包严格
 定向门禁。
 
-- [ ] **Step 3: 检查范围**
+- [x] **Step 3: 检查范围**
 
 ```powershell
 git diff --check

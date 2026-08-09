@@ -1230,3 +1230,8 @@
 - 批量流只有在完整读取响应体后才解析事件，因此失败尝试中的 `discard-me` 文本不会暴露；两种 Provider 的测试均证明仅成功尝试的事件可见。
 - 增量流在返回 receiver 前先读取到首个可解析事件：此前断线可安全丢弃 buffer 并重试；此后驱动器只发送 `StreamEvent::Error`，绝不重发请求。
 - 增量驱动器同时等待下一个网络 chunk 与 `Sender::closed()`；用户丢弃 receiver 会主动释放响应连接。
+- 独立代码审查发现普通调用的 2xx 响应体截断未重试；OpenAI/Gemini 新增本地截断响应 RED 后，成功 body 读取也纳入 typed 尝试循环。
+- 自动重试会放大原有“CancellationToken 只在下一轮检查”的等待时间；tool loop 现在以 `select!` 竞争当前 Provider future，取消会 drop future 并阻止下一次发送，同时保留已完成部分结果。
+- `ApiError.message` 仍结构化保存非成功响应体供分类和 body 长度诊断，但 `Display` 只暴露 HTTP status；因此上层 `format!("{e}")`、日志和 UI 错误不会携带响应正文。
+- `StreamEvent::Error` 是批准设计要求的显式部分流错误合同。`brain-llm` 继承 workspace `publish = false`、版本 0.1，所有消费者均为路径依赖；该内部 API 演进不涉及已发布外部 crate。
+- in-flight 取消发生在 `llm_calls` 预增之后；部分结果必须减去这次未完成调用，才能继续把 `llm_calls` 定义为已完成的逻辑 LLM 调用数。

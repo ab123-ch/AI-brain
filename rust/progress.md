@@ -776,3 +776,11 @@
 - 严格 `cargo clippy -p brain-llm --all-targets -- -D warnings` 通过；`cargo test -p brain-llm --lib` 通过 115/115。
 - `cargo check -p brain-main -p ai-brain-cli` 通过，仅有仓库既有 warning；新增流事件未破坏实际消费链。
 - 原有用户整轮重试测试 `retry_reuses_only_the_last_user_message_without_duplication` 通过 1/1，确认该需求未被修改。
+- 独立代码审查给出 3 项 Important：2xx body 截断、取消贯穿、端到端错误正文脱敏；均已分别建立 RED 证据并修复。
+- OpenAI/Gemini `complete_retries_truncated_success_body_before_json_delivery` 从 2/2 RED 转为 2/2 GREEN。
+- `cancellation_stops_the_in_flight_provider_call` 从 200ms 超时 RED 转为立即取消 GREEN；当前 Provider future 被 drop，不会继续退避或补发。
+- `api_error_display_omits_response_body_but_keeps_structured_message` 从泄漏 secret 的 RED 转为 GREEN；上层 tool loop 脱敏回归和 Gemini 流式脱敏测试均通过。
+- 仓库要求 `cargo fmt --all -- --check` 通过；workspace Clippy 和 workspace test 分别被既有 `plugins`/`brain-hooks` lint 与过期 `e2e_real_llm` 测试 API 阻断，首个错误已记录在 `task_plan.md`。
+- 复核发现第二轮 in-flight 取消会把未完成调用计入 `llm_calls`；新增 tool-use 后 pending 的部分结果测试先 RED（2 != 1），取消分支减去未完成调用后 GREEN。
+- 最新定向验证：`brain-llm` 119/119、`brain-main tool_loop` 6/6、用户手动重试核心 1/1、`cargo check --workspace --lib` 通过。
+- 独立复核在计数修复后给出 Ready: Yes，无剩余 Critical/Important。

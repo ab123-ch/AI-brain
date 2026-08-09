@@ -1289,7 +1289,7 @@ impl App {
         // process_input 会将已执行的工具调用写入历史，避免信息丢失。
         if let Some(cancel) = self.cancel_token.take() {
             cancel.cancel();
-            tracing::info!("已发送协作取消信号，tool_loop 将在下一轮 LLM 调用前退出");
+            tracing::info!("已发送协作取消信号，tool_loop 将停止当前 LLM 调用且不再重试");
         }
         // 不 abort task — 让它自然完成，process_input 内部会写回已执行结果
         // JoinHandle drop 时自动 detach

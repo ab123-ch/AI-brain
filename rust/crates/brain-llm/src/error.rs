@@ -10,7 +10,7 @@ pub enum LlmError {
     #[error("API request failed: {0}")]
     RequestFailed(String),
 
-    #[error("API returned error: status={status}, message={message}")]
+    #[error("API returned error: status={status}")]
     ApiError { status: u16, message: String },
 
     #[error("stream error: {0}")]
@@ -99,5 +99,28 @@ mod tests {
             let error = LlmError::RequestFailed(message.into());
             assert!(!error.is_retryable(), "展示字符串不应触发重试: {message}");
         }
+    }
+
+    #[test]
+    fn api_error_display_omits_response_body_but_keeps_structured_message() {
+        let secret = "Authorization: Bearer TOP_SECRET";
+        let error = LlmError::ApiError {
+            status: 401,
+            message: secret.into(),
+        };
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("401"));
+        assert!(!rendered.contains(secret));
+        assert!(matches!(
+            error,
+            LlmError::ApiError { message, .. } if message == secret
+        ));
+
+        let exhausted = LlmError::RetriesExhausted {
+            attempts: 6,
+            last_error: rendered,
+        };
+        assert!(!exhausted.to_string().contains(secret));
     }
 }

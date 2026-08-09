@@ -136,6 +136,28 @@ pub(crate) struct ToolLoopResult {
 
 const MAX_BLANK_RESPONSE_ATTEMPTS: u32 = 2;
 
+fn cancelled_tool_loop_result(
+    last_response: Option<ChatResponse>,
+    llm_calls: u32,
+    turns: Vec<TurnRecord>,
+    total_prompt_tokens: u64,
+    last_prompt_tokens: u64,
+    usage_records: Vec<TokenUsage>,
+) -> Result<ToolLoopResult> {
+    if let Some(response) = last_response {
+        return Ok(ToolLoopResult {
+            response,
+            llm_calls,
+            turns,
+            total_prompt_tokens,
+            last_prompt_tokens,
+            usage_records,
+            context_overflow: false,
+        });
+    }
+    Err(MainBrainError::LlmError("查询被用户取消".into()))
+}
+
 /// 运行 tool_loop — LLM ↔ 工具 循环直到 LLM 不再调用工具（默认参数的便捷入口）
 #[allow(dead_code)]
 pub async fn run_tool_loop(
@@ -162,7 +184,7 @@ pub async fn run_tool_loop(
 
 /// 带配置参数的 tool_loop
 ///
-/// `cancel` — 可选的取消令牌，调用 `cancel()` 后 tool_loop 会在下一轮 LLM 调用前退出，
+/// `cancel` — 可选的取消令牌，调用 `cancel()` 后会停止当前 LLM 调用且不再重试，
 /// 返回已执行的部分结果（已完成的工具调用和 LLM 回复不会丢失）。
 pub async fn run_tool_loop_with_config(
     llm: &dyn LlmProvider,
@@ -192,20 +214,14 @@ pub async fn run_tool_loop_with_config(
                     "tool_loop 收到取消信号，返回已执行结果（{} 轮 LLM 调用）",
                     llm_calls
                 );
-                // 如果已有部分 LLM 响应，构建结果返回
-                if let Some(response) = last_response.take() {
-                    return Ok(ToolLoopResult {
-                        response,
-                        llm_calls,
-                        turns,
-                        total_prompt_tokens,
-                        last_prompt_tokens,
-                        usage_records,
-                        context_overflow: false,
-                    });
-                }
-                // 还没有任何 LLM 响应，返回错误
-                return Err(MainBrainError::LlmError("查询被用户取消".into()));
+                return cancelled_tool_loop_result(
+                    last_response.take(),
+                    llm_calls,
+                    turns,
+                    total_prompt_tokens,
+                    last_prompt_tokens,
+                    usage_records,
+                );
             }
         }
         llm_calls += 1;
@@ -267,7 +283,29 @@ pub async fn run_tool_loop_with_config(
         // === 调用 LLM（带超时保护，防止 API 无响应永久挂起） ===
         // 重试已在 brain-llm 的 complete() 内部实现（指数退避），此处超时为兜底保护
         let llm_timeout = Duration::from_secs(360);
-        let response = match tokio::time::timeout(llm_timeout, llm.complete(request)).await {
+        let llm_call = tokio::time::timeout(llm_timeout, llm.complete(request));
+        tokio::pin!(llm_call);
+        let call_result = if let Some(ref cancel) = cancel {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!(
+                        "tool_loop 在当前 LLM 调用中收到取消信号，不再执行 Provider 重试"
+                    );
+                    return cancelled_tool_loop_result(
+                        last_response.take(),
+                        llm_calls.saturating_sub(1),
+                        turns,
+                        total_prompt_tokens,
+                        last_prompt_tokens,
+                        usage_records,
+                    );
+                }
+                result = &mut llm_call => result,
+            }
+        } else {
+            (&mut llm_call).await
+        };
+        let response = match call_result {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
                 let err_msg = format!("{e}");
@@ -871,6 +909,177 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct PendingLlm {
+        calls: AtomicUsize,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl LlmProvider for PendingLlm {
+        fn model(&self) -> &'static str {
+            "pending"
+        }
+
+        fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct ApiErrorLlm;
+
+    impl LlmProvider for ApiErrorLlm {
+        fn model(&self) -> &'static str {
+            "api-error"
+        }
+
+        fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            Box::pin(async {
+                Err(brain_llm::LlmError::ApiError {
+                    status: 401,
+                    message: "Authorization: Bearer TOP_SECRET".into(),
+                })
+            })
+        }
+    }
+
+    struct ToolThenPendingLlm {
+        calls: AtomicUsize,
+        second_started: Arc<tokio::sync::Notify>,
+    }
+
+    impl LlmProvider for ToolThenPendingLlm {
+        fn model(&self) -> &'static str {
+            "tool-then-pending"
+        }
+
+        fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Box::pin(async {
+                    Ok(ChatResponse {
+                        content: vec![ContentBlock::ToolUse {
+                            id: "call-1".into(),
+                            name: "stub_tool".into(),
+                            input: serde_json::json!({}),
+                        }],
+                        model: "tool-then-pending".into(),
+                        usage: TokenUsage {
+                            prompt_tokens: 3,
+                            completion_tokens: 2,
+                            total_tokens: 5,
+                            ..TokenUsage::default()
+                        },
+                        finish_reason: Some(brain_llm::FinishReason::ToolUse),
+                    })
+                });
+            }
+            self.second_started.notify_one();
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_partial_result_counts_only_completed_llm_calls() {
+        let second_started = Arc::new(tokio::sync::Notify::new());
+        let llm = ToolThenPendingLlm {
+            calls: AtomicUsize::new(0),
+            second_started: Arc::clone(&second_started),
+        };
+        let executor = StubToolExecutor::new().with_response("stub_tool", "工具结果".into());
+        let mut messages = vec![ChatMessage::user("先调用工具")];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_second_call = cancel.clone();
+        tokio::spawn(async move {
+            second_started.notified().await;
+            cancel_second_call.cancel();
+        });
+
+        let result = run_tool_loop_with_config(
+            &llm,
+            &executor,
+            &mut messages,
+            &[],
+            None,
+            None,
+            32,
+            0.0,
+            Some(cancel),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.response.has_tool_calls());
+        assert_eq!(result.llm_calls, 1);
+        assert_eq!(result.usage_records.len(), 1);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_is_not_exposed_by_the_tool_loop() {
+        let executor = StubToolExecutor::new();
+        let mut messages = vec![ChatMessage::user("测试脱敏")];
+
+        let result = run_tool_loop(&ApiErrorLlm, &executor, &mut messages, &[], None, None).await;
+        let Err(error) = result else {
+            panic!("API 错误不应返回成功结果");
+        };
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("401"));
+        assert!(!rendered.contains("TOP_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_the_in_flight_provider_call() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let llm = PendingLlm {
+            calls: AtomicUsize::new(0),
+            started: Arc::clone(&started),
+        };
+        let executor = StubToolExecutor::new();
+        let mut messages = vec![ChatMessage::user("测试取消")];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_after_start = cancel.clone();
+        tokio::spawn(async move {
+            started.notified().await;
+            cancel_after_start.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_tool_loop_with_config(
+                &llm,
+                &executor,
+                &mut messages,
+                &[],
+                None,
+                None,
+                32,
+                0.0,
+                Some(cancel),
+            ),
+        )
+        .await
+        .expect("取消后应立即结束当前 Provider 调用");
+
+        assert!(matches!(
+            result,
+            Err(MainBrainError::LlmError(message)) if message == "查询被用户取消"
+        ));
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+    }
 
     /// 简单 LLM stub：直接返回文本
     struct TextLlm;

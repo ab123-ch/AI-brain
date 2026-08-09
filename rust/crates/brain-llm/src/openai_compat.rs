@@ -590,9 +590,29 @@ impl LlmProvider for OpenAiCompatClient {
                             return Err(error);
                         }
 
-                        let raw_body = response.text().await.map_err(|e| {
-                            LlmError::RequestFailed(format!("Failed to read response body: {e}"))
-                        })?;
+                        let raw_body = match response.text().await {
+                            Ok(raw_body) => raw_body,
+                            Err(error) => {
+                                let last_error = format!("Failed to read response body: {error}");
+                                let retryable = is_retryable_reqwest_error(&error);
+                                if retryable && attempts < max_attempts {
+                                    let backoff = retry_config.backoff_for_attempt(attempts);
+                                    tracing::warn!(
+                                        "LLM 响应体读取失败（可重试）: 第{attempts}次尝试, \
+                                         error={error}, {backoff:?}后重试"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                    continue;
+                                }
+                                if retryable {
+                                    return Err(LlmError::RetriesExhausted {
+                                        attempts,
+                                        last_error,
+                                    });
+                                }
+                                return Err(LlmError::RequestFailed(last_error));
+                            }
+                        };
                         tracing::debug!(
                             body_bytes = raw_body.len(),
                             "LLM API 响应体已接收；正文不写入日志"
@@ -919,6 +939,67 @@ mod tests {
             LlmError::RetriesExhausted { attempts: 6, .. }
         ));
         assert_eq!(*attempts.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_retries_truncated_success_body_before_json_delivery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_request_body(&mut socket).await;
+                *server_attempts.lock().unwrap() += 1;
+                if attempt == 0 {
+                    let partial = "{\"choices\":[";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+                        partial.len() + 100
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    drop(socket);
+                    continue;
+                }
+                let body = serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "body-ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "model": "test-model",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 1,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let response = client
+            .complete(minimal_request("truncated-body"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.text(), "body-ok");
+        assert_eq!(*attempts.lock().unwrap(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

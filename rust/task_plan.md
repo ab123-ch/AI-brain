@@ -819,3 +819,5 @@ Build an operational cockpit and conversation trace that expose the real runtime
 | typed 断连 RED 测试使用 `Client::new()` 时被系统代理接管，本地断连变成 HTTP 502 | Task 1 RED | 证据是返回 remote proxy 的 502 而非 reqwest error；测试客户端显式 `.no_proxy()`，只修正故障注入边界后重跑 RED。 |
 | 截断响应体的 reqwest 错误同时标记为 decode，首版 typed 分类先排除 decode 导致增量流未重试 | Task 4 首事件前 RED | 先遍历错误源链识别 `UnexpectedEof`，再排除无 I/O 源的纯 decode 错误；保留“解析错误不重试”边界。 |
 | 全工作区 all-target check 在 Windows 编译 `runtime` 测试时引用 `std::os::unix`/`PermissionsExt::set_mode` 失败 | Task 4 兼容检查 | 保留无关历史测试不动；改跑 `brain-main` 与 `ai-brain-cli` 实际消费链，定向编译通过。 |
+| 扩大运行 CLI `retry` 测试时 7/8 通过，唯一失败为对 `ws_handler.rs` 固定空格数做源码字符串断言 | Task 5 手动重试回归 | 确认相关生产文件在功能 Git 范围中无 diff，核心会话重试和协作失效测试均通过；记录为既有脆弱测试，不修改不同需求。 |
+| workspace Clippy 被 `plugins` 未使用导入和 `brain-hooks` 既有严格 lint 阻断；workspace test 被 `brain-integration-tests/e2e_real_llm.rs` 过期 API 阻断 | Task 5 仓库门禁 | 保留范围外代码不动；受影响 `brain-llm` 严格 Clippy、完整 lib 测试和主消费链定向检查通过。 |
