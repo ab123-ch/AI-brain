@@ -18,7 +18,7 @@ use task_engine::SchedulerLimits;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 const DEFAULT_PROFILE_ID: &str = "general_member";
 pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
@@ -118,6 +118,7 @@ impl CollaborationActor {
 pub enum RoomCapability {
     RoomRead,
     RoomPost,
+    ConfigureRoom,
     MentionMember,
     SubmitTask,
     CreateMember,
@@ -136,6 +137,7 @@ impl RoomCapability {
         vec![
             Self::RoomRead,
             Self::RoomPost,
+            Self::ConfigureRoom,
             Self::MentionMember,
             Self::SubmitTask,
             Self::CreateMember,
@@ -603,6 +605,7 @@ impl RoomInputMode {
 pub struct CollaborationRoomView {
     pub room_id: String,
     pub title: String,
+    pub working_directory: String,
     pub default_member_id: String,
     pub latest_event_seq: u64,
     pub version: u64,
@@ -760,14 +763,32 @@ fn history_content_hash(content: &str) -> String {
 pub struct CollaborationRepository {
     database_path: PathBuf,
     config: CollaborationConfig,
+    startup_working_directory: PathBuf,
 }
 
 impl CollaborationRepository {
     pub fn new(runtime_dir: &Path, config: CollaborationConfig) -> Result<Self> {
+        let startup_working_directory = std::env::current_dir()?;
+        Self::new_with_startup_working_directory(runtime_dir, config, &startup_working_directory)
+    }
+
+    pub fn new_with_startup_working_directory(
+        runtime_dir: &Path,
+        config: CollaborationConfig,
+        startup_working_directory: &Path,
+    ) -> Result<Self> {
+        let startup_working_directory = startup_working_directory.canonicalize()?;
+        if !startup_working_directory.is_dir() {
+            return Err(CollaborationError::Config(format!(
+                "启动工作目录不是目录: {}",
+                startup_working_directory.display()
+            )));
+        }
         fs::create_dir_all(runtime_dir)?;
         let repository = Self {
             database_path: runtime_dir.join("runtime.db"),
             config,
+            startup_working_directory,
         };
         repository.initialize()?;
         Ok(repository)
@@ -790,7 +811,7 @@ impl CollaborationRepository {
 
     #[allow(clippy::too_many_lines)]
     fn initialize(&self) -> Result<()> {
-        let connection = self.connect()?;
+        let mut connection = self.connect()?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS collaboration_schema (
@@ -803,6 +824,7 @@ impl CollaborationRepository {
                  room_id TEXT PRIMARY KEY,
                  workspace_id TEXT NOT NULL DEFAULT 'local',
                  title TEXT NOT NULL,
+                 working_directory TEXT NOT NULL,
                  default_member_id TEXT NOT NULL,
                  latest_event_seq INTEGER NOT NULL DEFAULT 0,
                  room_summary_ref TEXT,
@@ -870,6 +892,7 @@ impl CollaborationRepository {
                  idempotency_key TEXT NOT NULL,
                  created_at TEXT NOT NULL,
                  invalidated_at TEXT,
+                 execution_working_directory TEXT,
                  UNIQUE(room_id, sequence),
                  UNIQUE(room_id, idempotency_key)
              );
@@ -1143,6 +1166,49 @@ impl CollaborationRepository {
             )?;
             version = 6;
         }
+        if version == 6 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !table_has_column(&transaction, "collaboration_rooms", "working_directory")? {
+                transaction.execute(
+                    "ALTER TABLE collaboration_rooms
+                     ADD COLUMN working_directory TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            if !table_has_column(&transaction, "room_events", "execution_working_directory")? {
+                transaction.execute(
+                    "ALTER TABLE room_events ADD COLUMN execution_working_directory TEXT",
+                    [],
+                )?;
+            }
+            let startup_working_directory = self.startup_working_directory.display().to_string();
+            transaction.execute(
+                "UPDATE collaboration_rooms SET working_directory = ?1",
+                [&startup_working_directory],
+            )?;
+            transaction.execute(
+                "UPDATE room_events SET execution_working_directory = ?1",
+                [&startup_working_directory],
+            )?;
+            transaction.execute(
+                "UPDATE room_principal_memberships
+                 SET capabilities_json = ?1, capability_version = 2,
+                     version = version + 1, updated_at = ?2
+                 WHERE principal_id = ?3 AND role = 'owner'",
+                params![
+                    serialize_capabilities(&RoomCapability::owner_capabilities())?,
+                    Utc::now().to_rfc3339(),
+                    LOCAL_PRINCIPAL_ID,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE collaboration_schema SET version = 7 WHERE singleton = 1",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 7;
+        }
         if version != SCHEMA_VERSION {
             return Err(CollaborationError::Config(format!(
                 "不支持的协作存储版本 {version}"
@@ -1192,7 +1258,7 @@ impl CollaborationRepository {
                  room_id, principal_id, role, capabilities_json, capability_version,
                  version, created_at, updated_at
              )
-             SELECT room_id, ?1, 'owner', ?2, 1, 1, ?3, ?3
+             SELECT room_id, ?1, 'owner', ?2, 2, 1, ?3, ?3
              FROM collaboration_rooms
              WHERE 1
              ON CONFLICT(room_id, principal_id) DO NOTHING",
@@ -1241,10 +1307,17 @@ impl CollaborationRepository {
         let now = Utc::now();
         transaction.execute(
             "INSERT INTO collaboration_rooms(
-                 room_id, title, default_member_id, latest_event_seq, version, created_at
-             ) VALUES (?1, ?2, ?3, 0, 1, ?4)
+                 room_id, title, working_directory, default_member_id,
+                 latest_event_seq, version, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)
              ON CONFLICT(room_id) DO UPDATE SET title = excluded.title",
-            params![room_id, title, default_member_id, now.to_rfc3339()],
+            params![
+                room_id,
+                title,
+                self.startup_working_directory.display().to_string(),
+                default_member_id,
+                now.to_rfc3339(),
+            ],
         )?;
         transaction.execute(
             "INSERT INTO brain_members(
@@ -1323,6 +1396,89 @@ impl CollaborationRepository {
         )?;
         transaction.commit()?;
         self.snapshot(room_id)
+    }
+
+    pub fn update_room_working_directory(
+        &self,
+        room_id: &str,
+        working_directory: &str,
+        expected_version: u64,
+    ) -> Result<CollaborationRoomView> {
+        self.update_room_working_directory_as(
+            &CollaborationActor::local(),
+            room_id,
+            working_directory,
+            expected_version,
+        )
+    }
+
+    pub fn update_room_working_directory_as(
+        &self,
+        actor: &CollaborationActor,
+        room_id: &str,
+        working_directory: &str,
+        expected_version: u64,
+    ) -> Result<CollaborationRoomView> {
+        {
+            let connection = self.connect()?;
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM collaboration_rooms WHERE room_id = ?1)",
+                [room_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(CollaborationError::RoomNotFound(room_id.into()));
+            }
+            require_capability(&connection, actor, room_id, RoomCapability::ConfigureRoom)?;
+        }
+
+        let working_directory = working_directory.trim();
+        if working_directory.is_empty() {
+            return Err(CollaborationError::Config("房间工作目录不能为空".into()));
+        }
+        let requested_path = Path::new(working_directory);
+        let candidate = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.startup_working_directory.join(requested_path)
+        };
+        let canonical = candidate.canonicalize()?;
+        if !canonical.is_dir() {
+            return Err(CollaborationError::Config(format!(
+                "房间工作目录不是目录: {}",
+                canonical.display()
+            )));
+        }
+        let canonical = canonical.display().to_string();
+
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_capability(&transaction, actor, room_id, RoomCapability::ConfigureRoom)?;
+        let actual_version = transaction
+            .query_row(
+                "SELECT version FROM collaboration_rooms WHERE room_id = ?1",
+                [room_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| CollaborationError::RoomNotFound(room_id.into()))?;
+        ensure_version("room", room_id, expected_version, actual_version)?;
+        transaction.execute(
+            "UPDATE collaboration_rooms
+             SET working_directory = ?1, version = version + 1
+             WHERE room_id = ?2",
+            params![canonical, room_id],
+        )?;
+        enqueue_room_changed(
+            &transaction,
+            room_id,
+            "room",
+            room_id,
+            &format!("room-working-directory:{room_id}:{}", Uuid::new_v4()),
+        )?;
+        let room = room_from_connection(&transaction, room_id)?;
+        transaction.commit()?;
+        Ok(room)
     }
 
     pub fn create_member(
@@ -3814,7 +3970,7 @@ fn ensure_local_owner_membership(
         "INSERT INTO room_principal_memberships(
              room_id, principal_id, role, capabilities_json, capability_version,
              version, created_at, updated_at
-         ) VALUES (?1, ?2, 'owner', ?3, 1, 1, ?4, ?4)
+         ) VALUES (?1, ?2, 'owner', ?3, 2, 1, ?4, ?4)
          ON CONFLICT(room_id, principal_id) DO NOTHING",
         params![
             room_id,
@@ -4318,17 +4474,19 @@ fn inbox_for_event(connection: &Connection, event_id: &str) -> Result<Vec<InboxI
 fn room_from_connection(connection: &Connection, room_id: &str) -> Result<CollaborationRoomView> {
     connection
         .query_row(
-            "SELECT room_id, title, default_member_id, latest_event_seq, version, created_at
+            "SELECT room_id, title, working_directory, default_member_id,
+                    latest_event_seq, version, created_at
              FROM collaboration_rooms WHERE room_id = ?1",
             [room_id],
             |row| {
                 Ok(CollaborationRoomView {
                     room_id: row.get(0)?,
                     title: row.get(1)?,
-                    default_member_id: row.get(2)?,
-                    latest_event_seq: row.get(3)?,
-                    version: row.get(4)?,
-                    created_at: parse_datetime(&row.get::<_, String>(5)?),
+                    working_directory: row.get(2)?,
+                    default_member_id: row.get(3)?,
+                    latest_event_seq: row.get(4)?,
+                    version: row.get(5)?,
+                    created_at: parse_datetime(&row.get::<_, String>(6)?),
                 })
             },
         )
@@ -4704,6 +4862,199 @@ mod tests {
 
     fn ensure(repository: &CollaborationRepository) -> RoomSnapshot {
         repository.ensure_room("room-1", "Test Room", &[]).unwrap()
+    }
+
+    #[test]
+    fn room_working_directory_defaults_to_startup_and_survives_reopen() {
+        let runtime = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let canonical_a = workspace_a.path().canonicalize().unwrap();
+
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        let created = repository.ensure_room("room-1", "Room", &[]).unwrap();
+        assert_eq!(Path::new(&created.room.working_directory), canonical_a);
+        drop(repository);
+
+        let reopened = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_b.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&reopened.snapshot("room-1").unwrap().room.working_directory),
+            canonical_a
+        );
+    }
+
+    #[test]
+    fn room_working_directory_update_is_versioned_persisted_and_not_reset_by_ensure() {
+        let runtime = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let canonical_b = workspace_b.path().canonicalize().unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        let created = repository.ensure_room("room-1", "Room", &[]).unwrap();
+
+        let updated = repository
+            .update_room_working_directory(
+                "room-1",
+                &workspace_b.path().to_string_lossy(),
+                created.room.version,
+            )
+            .unwrap();
+        assert_eq!(updated.version, created.room.version + 1);
+        assert_eq!(Path::new(&updated.working_directory), canonical_b);
+
+        let ensured = repository
+            .ensure_room("room-1", "Renamed Room", &[])
+            .unwrap();
+        assert_eq!(ensured.room.title, "Renamed Room");
+        assert_eq!(Path::new(&ensured.room.working_directory), canonical_b);
+        assert_eq!(ensured.room.version, updated.version);
+        drop(repository);
+
+        let reopened = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&reopened.snapshot("room-1").unwrap().room.working_directory),
+            canonical_b
+        );
+    }
+
+    #[test]
+    fn invalid_room_working_directory_errors_leave_path_and_version_unchanged() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let absolute_workspace = tempfile::tempdir().unwrap();
+        let relative_workspace = startup.path().join("relative-workspace");
+        fs::create_dir(&relative_workspace).unwrap();
+        let file_path = startup.path().join("not-a-directory.txt");
+        fs::write(&file_path, "file").unwrap();
+        let missing_path = startup.path().join("missing-workspace");
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        let created = repository.ensure_room("room-1", "Room", &[]).unwrap();
+        let original_path = created.room.working_directory.clone();
+        let original_version = created.room.version;
+
+        for invalid_path in [
+            "",
+            "   ",
+            missing_path.to_str().unwrap(),
+            file_path.to_str().unwrap(),
+        ] {
+            assert!(repository
+                .update_room_working_directory("room-1", invalid_path, original_version)
+                .is_err());
+            let unchanged = repository.snapshot("room-1").unwrap().room;
+            assert_eq!(unchanged.working_directory, original_path);
+            assert_eq!(unchanged.version, original_version);
+        }
+
+        let relative = repository
+            .update_room_working_directory("room-1", "  relative-workspace  ", original_version)
+            .unwrap();
+        assert_eq!(
+            Path::new(&relative.working_directory),
+            relative_workspace.canonicalize().unwrap()
+        );
+        assert_eq!(relative.version, original_version + 1);
+
+        let stale_error = repository
+            .update_room_working_directory(
+                "room-1",
+                &absolute_workspace.path().to_string_lossy(),
+                original_version,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale_error,
+            CollaborationError::VersionConflict {
+                entity: "room",
+                expected,
+                actual,
+                ..
+            } if expected == original_version && actual == relative.version
+        ));
+        let unchanged = repository.snapshot("room-1").unwrap().room;
+        assert_eq!(unchanged.working_directory, relative.working_directory);
+        assert_eq!(unchanged.version, relative.version);
+
+        let absolute = repository
+            .update_room_working_directory(
+                "room-1",
+                &absolute_workspace.path().to_string_lossy(),
+                relative.version,
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(&absolute.working_directory),
+            absolute_workspace.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_room_working_directory_is_hidden_from_actor_without_configure_room() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        repository.ensure_room("room-1", "Room", &[]).unwrap();
+        repository
+            .upsert_membership(
+                &CollaborationActor::local(),
+                "room-1",
+                "viewer-1",
+                RoomRole::Viewer,
+                &[RoomCapability::RoomRead],
+                None,
+            )
+            .unwrap();
+        let before = repository.snapshot("room-1").unwrap().room;
+        let missing_path = startup.path().join("secret-does-not-exist");
+
+        let error = repository
+            .update_room_working_directory_as(
+                &CollaborationActor::new("viewer-1"),
+                "room-1",
+                &missing_path.to_string_lossy(),
+                before.version,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::CapabilityDenied {
+                capability: RoomCapability::ConfigureRoom,
+                ..
+            }
+        ));
+        let after = repository.snapshot("room-1").unwrap().room;
+        assert_eq!(after.working_directory, before.working_directory);
+        assert_eq!(after.version, before.version);
     }
 
     #[test]
@@ -5957,6 +6308,253 @@ mod tests {
             .all(|delivery| delivery.kind == DeliveryKind::Direct));
     }
 
+    fn create_schema_six_working_directory_fixture(database_path: &Path) {
+        let connection = Connection::open(database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE collaboration_schema (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO collaboration_schema(singleton, version) VALUES (1, 6);
+                 CREATE TABLE collaboration_rooms (
+                     room_id TEXT PRIMARY KEY,
+                     workspace_id TEXT NOT NULL DEFAULT 'local',
+                     title TEXT NOT NULL,
+                     default_member_id TEXT NOT NULL,
+                     latest_event_seq INTEGER NOT NULL DEFAULT 0,
+                     room_summary_ref TEXT,
+                     room_summary_through_seq INTEGER NOT NULL DEFAULT 0,
+                     version INTEGER NOT NULL DEFAULT 1,
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE room_events (
+                     event_id TEXT PRIMARY KEY,
+                     room_id TEXT NOT NULL REFERENCES collaboration_rooms(room_id),
+                     sequence INTEGER NOT NULL,
+                     sender_kind TEXT NOT NULL,
+                     sender_id TEXT NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     visibility TEXT NOT NULL DEFAULT 'room',
+                     kind TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     run_id TEXT,
+                     parent_event_id TEXT,
+                     conversation_root_event_id TEXT,
+                     debate_depth INTEGER NOT NULL DEFAULT 0,
+                     group_enabled INTEGER NOT NULL DEFAULT 0,
+                     conversation_mode TEXT NOT NULL DEFAULT 'chat',
+                     idempotency_key TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     invalidated_at TEXT,
+                     UNIQUE(room_id, sequence),
+                     UNIQUE(room_id, idempotency_key)
+                 );
+                 CREATE TABLE room_principal_memberships (
+                     room_id TEXT NOT NULL REFERENCES collaboration_rooms(room_id) ON DELETE CASCADE,
+                     principal_id TEXT NOT NULL,
+                     role TEXT NOT NULL,
+                     capabilities_json TEXT NOT NULL,
+                     capability_version INTEGER NOT NULL DEFAULT 1,
+                     version INTEGER NOT NULL DEFAULT 1,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL,
+                     PRIMARY KEY(room_id, principal_id)
+                 );",
+            )
+            .unwrap();
+        let legacy_time = "2026-08-08T00:00:00Z";
+        connection
+            .execute(
+                "INSERT INTO collaboration_rooms(
+                     room_id, workspace_id, title, default_member_id, latest_event_seq,
+                     room_summary_ref, room_summary_through_seq, version, created_at
+                 ) VALUES ('legacy-room', 'local', '旧房间', 'legacy-member', 2, NULL, 0, 11, ?1)",
+                [legacy_time],
+            )
+            .unwrap();
+        for (event_id, sequence, sender_kind, sender_id, kind, content) in [
+            (
+                "legacy-user",
+                1_u64,
+                "user",
+                "user",
+                "user_message",
+                "旧用户消息",
+            ),
+            (
+                "legacy-member-event",
+                2_u64,
+                "member",
+                "legacy-member",
+                "member_message",
+                "旧成员消息",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO room_events(
+                         event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                         visibility, kind, content, run_id, parent_event_id,
+                         conversation_root_event_id, debate_depth, group_enabled,
+                         conversation_mode, idempotency_key, created_at, invalidated_at
+                     ) VALUES (
+                         ?1, 'legacy-room', ?2, ?3, ?4, ?4, 'room', ?5, ?6, NULL,
+                         NULL, ?1, 0, 0, 'chat', ?1, ?7, NULL
+                     )",
+                    params![
+                        event_id,
+                        sequence,
+                        sender_kind,
+                        sender_id,
+                        kind,
+                        content,
+                        legacy_time,
+                    ],
+                )
+                .unwrap();
+        }
+        let legacy_capabilities = serialize_capabilities(&[
+            RoomCapability::RoomRead,
+            RoomCapability::RoomPost,
+            RoomCapability::MentionMember,
+            RoomCapability::SubmitTask,
+            RoomCapability::CreateMember,
+            RoomCapability::ConfigureMember,
+            RoomCapability::WakeSleepMember,
+            RoomCapability::ArchiveRestoreMember,
+            RoomCapability::InterruptOwnRun,
+            RoomCapability::InterruptAnyRun,
+            RoomCapability::OverrideMemberModel,
+            RoomCapability::OverrideMemberReasoning,
+            RoomCapability::ManageMembership,
+        ])
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO room_principal_memberships(
+                     room_id, principal_id, role, capabilities_json, capability_version,
+                     version, created_at, updated_at
+                 ) VALUES ('legacy-room', ?1, 'owner', ?2, 1, 4, ?3, ?3)",
+                params![LOCAL_PRINCIPAL_ID, legacy_capabilities, legacy_time],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn migrates_working_directory_and_owner_capability_from_schema_six() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let canonical_startup = startup.path().canonicalize().unwrap().display().to_string();
+        create_schema_six_working_directory_fixture(&runtime.path().join("runtime.db"));
+
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        let room = repository.snapshot("legacy-room").unwrap().room;
+        assert_eq!(room.working_directory, canonical_startup);
+        assert_eq!(room.version, 11);
+
+        let connection = repository.connect().unwrap();
+        let schema_version: u32 = connection
+            .query_row(
+                "SELECT version FROM collaboration_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 7);
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id, execution_working_directory
+                 FROM room_events ORDER BY sequence",
+            )
+            .unwrap();
+        let event_directories = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            event_directories,
+            vec![
+                ("legacy-user".into(), canonical_startup.clone()),
+                ("legacy-member-event".into(), canonical_startup.clone()),
+            ]
+        );
+        let owner =
+            membership_from_connection(&connection, "legacy-room", LOCAL_PRINCIPAL_ID).unwrap();
+        assert!(owner.capabilities.contains(&RoomCapability::ConfigureRoom));
+        assert_eq!(owner.capability_version, 2);
+        assert_eq!(owner.version, 5);
+        let updated_at: String = connection
+            .query_row(
+                "SELECT updated_at FROM room_principal_memberships
+                 WHERE room_id = 'legacy-room' AND principal_id = ?1",
+                [LOCAL_PRINCIPAL_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(updated_at, "2026-08-08T00:00:00Z");
+    }
+
+    #[test]
+    fn migrates_working_directory_atomically_when_owner_update_fails() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let database_path = runtime.path().join("runtime.db");
+        create_schema_six_working_directory_fixture(&database_path);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_owner_capability_migration
+                 BEFORE UPDATE OF capabilities_json ON room_principal_memberships
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced owner migration failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .is_err());
+
+        let connection = Connection::open(&database_path).unwrap();
+        let schema_version: u32 = connection
+            .query_row(
+                "SELECT version FROM collaboration_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 6);
+        assert!(
+            !table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap()
+        );
+        assert!(
+            !table_has_column(&connection, "room_events", "execution_working_directory").unwrap()
+        );
+        let owner_versions: (u64, u64) = connection
+            .query_row(
+                "SELECT capability_version, version FROM room_principal_memberships
+                 WHERE room_id = 'legacy-room' AND principal_id = ?1",
+                [LOCAL_PRINCIPAL_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_versions, (1, 4));
+    }
+
     #[test]
     fn retry_invalidation_schema_extends_phase_five_without_replacing_it() {
         let (_directory, repository) = repository();
@@ -5969,8 +6567,15 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert!(table_has_column(&connection, "room_events", "invalidated_at").unwrap());
+        assert!(table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap());
+        assert!(
+            table_has_column(&connection, "room_events", "execution_working_directory").unwrap()
+        );
+        let owner = membership_from_connection(&connection, "room-1", LOCAL_PRINCIPAL_ID).unwrap();
+        assert!(owner.capabilities.contains(&RoomCapability::ConfigureRoom));
+        assert_eq!(owner.capability_version, 2);
         let member_name_index: bool = connection
             .query_row(
                 "SELECT EXISTS(
@@ -6009,6 +6614,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn version_two_database_migrates_in_place_without_losing_room_history() {
         let directory = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("runtime.db");
         let connection = Connection::open(&database_path).unwrap();
         connection
@@ -6119,10 +6725,16 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let repository =
-            CollaborationRepository::new(directory.path(), CollaborationConfig::default()).unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            directory.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
         let snapshot = repository.snapshot("legacy-room").unwrap();
         assert_eq!(snapshot.room.version, 7);
+        let canonical_startup = startup.path().canonicalize().unwrap().display().to_string();
+        assert_eq!(snapshot.room.working_directory, canonical_startup);
         assert_eq!(snapshot.members[0].display_name, "旧智脑");
         assert_eq!(
             snapshot.members[0].availability,
@@ -6135,9 +6747,33 @@ mod tests {
             snapshot.inbox[0].task_run_id.as_deref(),
             Some("legacy-task")
         );
-        let migrated_idempotency_key: String = repository
-            .connect()
-            .unwrap()
+        let connection = repository.connect().unwrap();
+        let schema_version: u32 = connection
+            .query_row(
+                "SELECT version FROM collaboration_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 7);
+        assert!(table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap());
+        assert!(
+            table_has_column(&connection, "room_events", "execution_working_directory").unwrap()
+        );
+        let execution_working_directory: String = connection
+            .query_row(
+                "SELECT execution_working_directory FROM room_events
+                 WHERE event_id = 'legacy-event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(execution_working_directory, canonical_startup);
+        let owner =
+            membership_from_connection(&connection, "legacy-room", LOCAL_PRINCIPAL_ID).unwrap();
+        assert!(owner.capabilities.contains(&RoomCapability::ConfigureRoom));
+        assert_eq!(owner.capability_version, 2);
+        let migrated_idempotency_key: String = connection
             .query_row(
                 "SELECT idempotency_key FROM member_inbox_items WHERE inbox_item_id = 'legacy-inbox'",
                 [],
