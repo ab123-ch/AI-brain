@@ -8,10 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use brain_core::types::{MainBrainOutput, ProgressEvent};
 use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
 use brain_memory::conversation_memory::ConversationMemoryScope;
 use knowledge_core::{
-    sha256_hex, ContextBlockInput, ContextBlockKind, ContextBudget, ContextRequest,
+    sha256_hex, ContextBlockInput, ContextBlockKind, ContextBudget, ContextBuilder, ContextRequest,
     ContextSnapshot, NamespaceId, ResourceTypeId, ScopeRef, ScopeTypeId, SourceRef, TenantId,
 };
 use task_engine::{
@@ -22,7 +23,7 @@ use task_engine::{
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{MemberQueryError, Orchestrator};
 use crate::web::collaboration::{
     BrainMemberView, ClaimedInboxItem, CollaborationActor, CollaborationConfig, CollaborationError,
     CollaborationRepository, InboxPurpose, LegacyMessageSeed, MemberAddress, MemberHistoryMessage,
@@ -98,11 +99,76 @@ impl std::fmt::Display for ClaimRunError {
     }
 }
 
+pub(crate) trait CollaborationRuntimeServices: Send + Sync {
+    fn task_repository(&self) -> Arc<TaskRepository>;
+
+    fn task_coordinator(&self) -> TaskCoordinator;
+
+    fn context_builder(&self) -> Arc<ContextBuilder>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_member_streaming_scoped(
+        self: Arc<Self>,
+        context_snapshot: ContextSnapshot,
+        memory_scope: ConversationMemoryScope,
+        llm_config: Arc<LlmConfig>,
+        model_policy: &str,
+        reasoning_depth: &str,
+        allow_tools: bool,
+        group_message_scope: Option<GroupMessageToolScope>,
+    ) -> (
+        tokio::sync::mpsc::Receiver<ProgressEvent>,
+        tokio::task::JoinHandle<Result<MainBrainOutput, MemberQueryError>>,
+        CancellationToken,
+    );
+}
+
+impl CollaborationRuntimeServices for Orchestrator {
+    fn task_repository(&self) -> Arc<TaskRepository> {
+        Orchestrator::task_repository(self)
+    }
+
+    fn task_coordinator(&self) -> TaskCoordinator {
+        Orchestrator::task_coordinator(self)
+    }
+
+    fn context_builder(&self) -> Arc<ContextBuilder> {
+        Orchestrator::context_builder(self)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_member_streaming_scoped(
+        self: Arc<Self>,
+        context_snapshot: ContextSnapshot,
+        memory_scope: ConversationMemoryScope,
+        llm_config: Arc<LlmConfig>,
+        model_policy: &str,
+        reasoning_depth: &str,
+        allow_tools: bool,
+        group_message_scope: Option<GroupMessageToolScope>,
+    ) -> (
+        tokio::sync::mpsc::Receiver<ProgressEvent>,
+        tokio::task::JoinHandle<Result<MainBrainOutput, MemberQueryError>>,
+        CancellationToken,
+    ) {
+        Orchestrator::query_member_streaming_scoped(
+            &self,
+            context_snapshot,
+            memory_scope,
+            llm_config,
+            model_policy,
+            reasoning_depth,
+            allow_tools,
+            group_message_scope,
+        )
+    }
+}
+
 pub struct CollaborationRuntime {
     repository: Arc<CollaborationRepository>,
     task_repository: Arc<TaskRepository>,
     coordinator: TaskCoordinator,
-    orchestrator: Arc<Orchestrator>,
+    orchestrator: Arc<dyn CollaborationRuntimeServices>,
     events: broadcast::Sender<WebProgressEvent>,
     dispatcher_notify: Arc<Notify>,
     active_runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
@@ -111,14 +177,41 @@ pub struct CollaborationRuntime {
 }
 
 impl CollaborationRuntime {
+    #[cfg(not(test))]
     pub async fn start(
         repository: Arc<CollaborationRepository>,
         orchestrator: Arc<Orchestrator>,
         llm_config: Arc<LlmConfig>,
         model_policy_details: Vec<ResolvedModelPolicy>,
     ) -> Result<Arc<Self>, String> {
+        Self::start_with_services(repository, orchestrator, llm_config, model_policy_details).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start<T>(
+        repository: Arc<CollaborationRepository>,
+        orchestrator: Arc<T>,
+        llm_config: Arc<LlmConfig>,
+        model_policy_details: Vec<ResolvedModelPolicy>,
+    ) -> Result<Arc<Self>, String>
+    where
+        T: CollaborationRuntimeServices + 'static,
+    {
+        Self::start_with_services(repository, orchestrator, llm_config, model_policy_details).await
+    }
+
+    async fn start_with_services<T>(
+        repository: Arc<CollaborationRepository>,
+        orchestrator: Arc<T>,
+        llm_config: Arc<LlmConfig>,
+        model_policy_details: Vec<ResolvedModelPolicy>,
+    ) -> Result<Arc<Self>, String>
+    where
+        T: CollaborationRuntimeServices + 'static,
+    {
         let task_repository = orchestrator.task_repository();
         let coordinator = orchestrator.task_coordinator();
+        let orchestrator: Arc<dyn CollaborationRuntimeServices> = orchestrator;
 
         let result_tasks = Arc::clone(&task_repository);
         let durable_results =
@@ -128,9 +221,11 @@ impl CollaborationRuntime {
                 .map_err(|error| format!("读取任务完成事件失败: {error}"))?;
         let mut reconciled = 0_usize;
         for result in durable_results {
+            let origin_id = result.origin_id.clone();
+            let task_run_id = result.task_run_id.clone();
             let result_repository = Arc::clone(&repository);
             let result_tasks = Arc::clone(&task_repository);
-            let projected = tokio::task::spawn_blocking(move || {
+            let recovery = tokio::task::spawn_blocking(move || {
                 reconcile_durable_result(
                     &result_repository,
                     &result_tasks,
@@ -141,9 +236,28 @@ impl CollaborationRuntime {
                 )
             })
             .await
-            .map_err(|error| format!("恢复成员完成事件线程失败: {error}"))?
-            .map_err(|error| format!("恢复成员完成事件失败: {error}"))?;
-            reconciled += usize::from(projected.is_some());
+            .map_err(|error| {
+                format!(
+                    "恢复成员完成事件线程失败 (task_run_id={task_run_id}, origin_id={origin_id}): {error}"
+                )
+            })?
+            .map_err(|error| {
+                format!(
+                    "恢复成员完成事件失败 (task_run_id={task_run_id}, origin_id={origin_id}): {error}"
+                )
+            })?;
+            match recovery {
+                DurableResultDisposition::Projected(_completion) => reconciled += 1,
+                DurableResultDisposition::AlreadySettled => {}
+                DurableResultDisposition::Rejected { reason } => {
+                    tracing::error!(
+                        task_run_id = %task_run_id,
+                        origin_id = %origin_id,
+                        reason = %reason,
+                        "跳过无法恢复的成员完成结果"
+                    );
+                }
+            }
         }
         if reconciled > 0 {
             tracing::warn!(reconciled, "已从持久 Task event 补齐成员回复");
@@ -890,15 +1004,16 @@ impl CollaborationRuntime {
                 claim.context_through_seq,
             )
         });
-        let (mut progress, handle, cancel) = self.orchestrator.query_member_streaming_scoped(
-            context_snapshot,
-            memory_scope,
-            Arc::clone(&self.llm_config),
-            &execution_policy.model_policy,
-            &execution_policy.reasoning_depth,
-            execution_policy.allow_tools,
-            group_message_scope,
-        );
+        let (mut progress, handle, cancel) = Arc::clone(&self.orchestrator)
+            .query_member_streaming_scoped(
+                context_snapshot,
+                memory_scope,
+                Arc::clone(&self.llm_config),
+                &execution_policy.model_policy,
+                &execution_policy.reasoning_depth,
+                execution_policy.allow_tools,
+                group_message_scope,
+            );
         self.active_runs.lock().await.insert(
             claim.run_id.clone(),
             ActiveRun {
@@ -1428,6 +1543,23 @@ fn parse_participation_answer(answer: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug)]
+enum DurableResultDisposition {
+    Projected(Box<ParticipationCompletion>),
+    AlreadySettled,
+    Rejected { reason: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DurableResultRecoveryError {
+    #[error("读取成员完成结果 Claim 失败: {0}")]
+    Claim(#[source] CollaborationError),
+    #[error("读取成员持久任务失败: {0}")]
+    TaskRead(#[source] TaskEngineError),
+    #[error("投影成员完成结果失败: {0}")]
+    Projection(#[source] CollaborationError),
+}
+
 fn reconcile_durable_result(
     repository: &CollaborationRepository,
     task_repository: &TaskRepository,
@@ -1435,16 +1567,28 @@ fn reconcile_durable_result(
     task_run_id: &str,
     durable_run_id: &str,
     artifact_content: &str,
-) -> std::result::Result<Option<ParticipationCompletion>, CollaborationError> {
-    let Some(claim) =
-        repository.claim_for_reconciliation(inbox_item_id, task_run_id, durable_run_id)?
-    else {
-        return Ok(None);
+) -> std::result::Result<DurableResultDisposition, DurableResultRecoveryError> {
+    let claim =
+        match repository.claim_for_reconciliation(inbox_item_id, task_run_id, durable_run_id) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return Ok(DurableResultDisposition::AlreadySettled),
+            Err(CollaborationError::Config(reason)) => {
+                return Ok(DurableResultDisposition::Rejected { reason });
+            }
+            Err(error) => return Err(DurableResultRecoveryError::Claim(error)),
+        };
+    let task = match task_repository.task(task_run_id) {
+        Ok(task) => task,
+        Err(error @ (TaskEngineError::Invalid(_) | TaskEngineError::NotFound { .. })) => {
+            return Ok(DurableResultDisposition::Rejected {
+                reason: format!("读取成员持久任务 {task_run_id} 失败: {error}"),
+            });
+        }
+        Err(error) => return Err(DurableResultRecoveryError::TaskRead(error)),
     };
-    let task = task_repository.task(task_run_id).map_err(|error| {
-        CollaborationError::Config(format!("读取成员持久任务 {task_run_id} 失败: {error}"))
-    })?;
-    validated_task_context(&task, &claim).map_err(CollaborationError::Config)?;
+    if let Err(reason) = validated_task_context(&task, &claim) {
+        return Ok(DurableResultDisposition::Rejected { reason });
+    }
     let answer = if claim.purpose == InboxPurpose::Participation {
         parse_participation_answer(artifact_content)
     } else {
@@ -1452,7 +1596,8 @@ fn reconcile_durable_result(
     };
     repository
         .reconcile_claim_result(&claim, durable_run_id, answer.as_deref())
-        .map(Some)
+        .map(|completion| DurableResultDisposition::Projected(Box::new(completion)))
+        .map_err(DurableResultRecoveryError::Projection)
 }
 
 const MAX_CONTEXT_TOKENS: usize = 12_000;
@@ -1890,19 +2035,29 @@ fn task_request_for_claim(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     use super::{
         context_request_for_claim, context_snapshot_from_task, parse_participation_answer,
         reconcile_durable_result, scheduler_limits, task_request_for_claim,
         validate_task_claim_identity, validated_task_context, with_model_policy_details,
+        CollaborationRuntime, CollaborationRuntimeServices, DurableResultDisposition,
+        DurableResultRecoveryError,
     };
+    use crate::orchestrator::MemberQueryError;
     use crate::web::collaboration::{
         CollaborationActor, CollaborationConfig, CollaborationRepository, InboxPurpose, InboxState,
         MemberAddress, MemberHistoryMessage, ParticipationDisposition, RoomInputMode,
         DEFAULT_THREAD_KEY,
     };
+    use crate::web::collaboration_tools::GroupMessageToolScope;
+    use brain_core::types::{MainBrainOutput, ProgressEvent};
     use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
+    use brain_memory::conversation_memory::ConversationMemoryScope;
     use knowledge_core::{
         ContentResolverRegistry, ContextBlock, ContextBlockInput, ContextBlockKind, ContextBuilder,
         ContextSnapshot, GraphQueryPort, GraphQueryRequest, GraphQueryResult, KnowledgeError,
@@ -2060,6 +2215,70 @@ mod tests {
     impl GraphQueryPort for UnavailableGraph {
         fn query(&self, _query: &GraphQueryRequest) -> Result<GraphQueryResult, KnowledgeError> {
             Err(KnowledgeError::Unavailable("test graph outage".into()))
+        }
+    }
+
+    struct TestRuntimeServices {
+        tasks: Arc<TaskRepository>,
+        coordinator: TaskCoordinator,
+        context_builder: Arc<ContextBuilder>,
+        query_count: Arc<AtomicUsize>,
+    }
+
+    impl TestRuntimeServices {
+        fn new(collaboration: &CollaborationRepository, config: &CollaborationConfig) -> Self {
+            let tasks = Arc::new(TaskRepository::open(collaboration.database_path()).unwrap());
+            let coordinator = TaskCoordinator::new(
+                Arc::clone(&tasks),
+                Scheduler::new(scheduler_limits(config)).unwrap(),
+            );
+            Self {
+                tasks,
+                coordinator,
+                context_builder: Arc::new(ContextBuilder::new(
+                    Arc::new(EmptyMemory),
+                    Arc::new(UnavailableGraph),
+                    Arc::new(ContentResolverRegistry::new()),
+                )),
+                query_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl CollaborationRuntimeServices for TestRuntimeServices {
+        fn task_repository(&self) -> Arc<TaskRepository> {
+            Arc::clone(&self.tasks)
+        }
+
+        fn task_coordinator(&self) -> TaskCoordinator {
+            self.coordinator.clone()
+        }
+
+        fn context_builder(&self) -> Arc<ContextBuilder> {
+            Arc::clone(&self.context_builder)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn query_member_streaming_scoped(
+            self: Arc<Self>,
+            _context_snapshot: ContextSnapshot,
+            _memory_scope: ConversationMemoryScope,
+            _llm_config: Arc<LlmConfig>,
+            _model_policy: &str,
+            _reasoning_depth: &str,
+            _allow_tools: bool,
+            _group_message_scope: Option<GroupMessageToolScope>,
+        ) -> (
+            tokio::sync::mpsc::Receiver<ProgressEvent>,
+            tokio::task::JoinHandle<Result<MainBrainOutput, MemberQueryError>>,
+            CancellationToken,
+        ) {
+            self.query_count.fetch_add(1, Ordering::Relaxed);
+            let (_progress, receiver) = tokio::sync::mpsc::channel(1);
+            let handle = tokio::spawn(async {
+                std::future::pending::<Result<MainBrainOutput, MemberQueryError>>().await
+            });
+            (receiver, handle, CancellationToken::new())
         }
     }
 
@@ -2719,7 +2938,7 @@ mod tests {
         let results = reopened_tasks.completed_results("member_inbox").unwrap();
         assert_eq!(results.len(), 1);
         let result = &results[0];
-        let completion = reconcile_durable_result(
+        let disposition = reconcile_durable_result(
             &reopened_collaboration,
             &reopened_tasks,
             &result.origin_id,
@@ -2727,8 +2946,10 @@ mod tests {
             &result.instance_run_id,
             &result.artifact.content,
         )
-        .unwrap()
         .unwrap();
+        let DurableResultDisposition::Projected(completion) = disposition else {
+            panic!("健康 v3 完成结果应被投影");
+        };
         let event = completion.event.unwrap();
         assert_eq!(event.content, "历史 v3 恢复回复");
         let persisted_directory: String =
@@ -2799,16 +3020,18 @@ mod tests {
         assert_ne!(claim.inbox_item_id, first.inbox_item_id);
         assert_eq!(request.task_run_id, expected_task_run_id);
         tasks.create_task(request).unwrap();
-        assert!(reconcile_durable_result(
-            &collaboration,
-            &tasks,
-            &claim.inbox_item_id,
-            &first.task_run_id,
-            "old-durable-run",
-            "旧回答",
-        )
-        .unwrap()
-        .is_none());
+        assert!(matches!(
+            reconcile_durable_result(
+                &collaboration,
+                &tasks,
+                &claim.inbox_item_id,
+                &first.task_run_id,
+                "old-durable-run",
+                "旧回答",
+            )
+            .unwrap(),
+            DurableResultDisposition::AlreadySettled
+        ));
     }
 
     #[test]
@@ -2837,7 +3060,7 @@ mod tests {
             .create_task(task_request_for_claim(&direct, &config, &model, &context))
             .unwrap();
 
-        let completion = reconcile_durable_result(
+        let disposition = reconcile_durable_result(
             &collaboration,
             &tasks,
             &direct.inbox_item_id,
@@ -2845,8 +3068,10 @@ mod tests {
             "durable-direct-run",
             "明确的回复",
         )
-        .unwrap()
         .unwrap();
+        let DurableResultDisposition::Projected(completion) = disposition else {
+            panic!("健康完成结果应被投影");
+        };
 
         assert_eq!(completion.disposition, ParticipationDisposition::Replied);
         assert_eq!(completion.event.as_ref().unwrap().content, "明确的回复");
@@ -2856,6 +3081,265 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == "member_message" && event.content == "明确的回复"));
+    }
+
+    #[test]
+    fn completed_result_missing_task_run_is_rejected_as_history_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config).unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Missing Task Room", &[])
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&room.room.default_member_id),
+                "缺少 TaskRun 的历史结果",
+                RoomInputMode::Task,
+                "missing-task-run-result",
+            )
+            .unwrap();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+        let tasks = TaskRepository::open(collaboration.database_path()).unwrap();
+
+        let disposition = reconcile_durable_result(
+            &collaboration,
+            &tasks,
+            &claim.inbox_item_id,
+            &claim.task_run_id,
+            "missing-task-durable-run",
+            "不应投影",
+        )
+        .unwrap();
+
+        let DurableResultDisposition::Rejected { reason } = disposition else {
+            panic!("缺失 TaskRun 应被分类为单任务历史损坏");
+        };
+        assert!(reason.contains(&claim.task_run_id));
+        assert!(reason.contains("读取成员持久任务"));
+        assert!(collaboration
+            .snapshot("room-1")
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event.content != "不应投影"));
+    }
+
+    #[test]
+    fn completed_result_corrupt_claim_is_rejected_before_task_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config).unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Corrupt Claim Room", &[])
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&room.room.default_member_id),
+                "冻结目录后来损坏",
+                RoomInputMode::Task,
+                "corrupt-claim-result",
+            )
+            .unwrap();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+        rusqlite::Connection::open(collaboration.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE room_events SET execution_working_directory = '' WHERE event_id = ?1",
+                [&claim.source_event_id],
+            )
+            .unwrap();
+        let tasks = TaskRepository::open(collaboration.database_path()).unwrap();
+
+        let disposition = reconcile_durable_result(
+            &collaboration,
+            &tasks,
+            &claim.inbox_item_id,
+            &claim.task_run_id,
+            "corrupt-claim-durable-run",
+            "不应投影",
+        )
+        .unwrap();
+
+        let DurableResultDisposition::Rejected { reason } = disposition else {
+            panic!("损坏 Claim 应被分类为单任务历史损坏");
+        };
+        assert!(reason.contains("缺少冻结的执行工作目录"));
+    }
+
+    #[test]
+    fn completed_result_task_database_error_remains_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config).unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Task Database Failure Room", &[])
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&room.room.default_member_id),
+                "读取 TaskRun 时数据库损坏",
+                RoomInputMode::Task,
+                "task-database-failure-result",
+            )
+            .unwrap();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+        let tasks = TaskRepository::open(collaboration.database_path()).unwrap();
+        rusqlite::Connection::open(collaboration.database_path())
+            .unwrap()
+            .execute_batch("ALTER TABLE task_runs RENAME TO unavailable_task_runs;")
+            .unwrap();
+
+        let error = reconcile_durable_result(
+            &collaboration,
+            &tasks,
+            &claim.inbox_item_id,
+            &claim.task_run_id,
+            "database-failure-durable-run",
+            "不应投影",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DurableResultRecoveryError::TaskRead(TaskEngineError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_isolates_invalid_completed_result_and_recovers_later_valid_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Start Recovery Room", &[])
+            .unwrap();
+        let invalid_member_id = room.room.default_member_id;
+        let valid_member_id = collaboration
+            .create_member("room-1", "健康恢复成员", None, None)
+            .unwrap()
+            .member_id;
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&invalid_member_id),
+                "先完成但损坏的任务",
+                RoomInputMode::Task,
+                "start-invalid-completed-result",
+            )
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&valid_member_id),
+                "后完成且健康的任务",
+                RoomInputMode::Task,
+                "start-valid-completed-result",
+            )
+            .unwrap();
+
+        let invalid_claim = collaboration.lease_next().unwrap().unwrap();
+        let invalid_context = task_context_snapshot("context-start-invalid", &invalid_claim.input);
+        let invalid_task = complete_durable_claim_without_projection(
+            &collaboration,
+            &config,
+            &invalid_claim,
+            &invalid_context,
+            "不应投影的损坏回复",
+        )
+        .await;
+        rewrite_task_config_for_test(
+            &collaboration,
+            &invalid_task,
+            "collaboration-task-v5",
+            &invalid_task.resolved_config,
+        );
+
+        let valid_claim = collaboration.lease_next().unwrap().unwrap();
+        let valid_context = task_context_snapshot("context-start-valid", &valid_claim.input);
+        let valid_task = complete_durable_claim_without_projection(
+            &collaboration,
+            &config,
+            &valid_claim,
+            &valid_context,
+            "应投影的健康回复",
+        )
+        .await;
+        let connection = rusqlite::Connection::open(collaboration.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE task_runs SET created_at = '2000-01-01T00:00:00Z'\
+                 WHERE task_run_id = ?1",
+                [&invalid_task.task_run_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_runs SET created_at = '2000-01-02T00:00:00Z'\
+                 WHERE task_run_id = ?1",
+                [&valid_task.task_run_id],
+            )
+            .unwrap();
+        drop(connection);
+        let durable_order = TaskRepository::open(collaboration.database_path())
+            .unwrap()
+            .completed_results("member_inbox")
+            .unwrap()
+            .into_iter()
+            .map(|result| result.origin_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            durable_order,
+            vec![
+                invalid_claim.inbox_item_id.clone(),
+                valid_claim.inbox_item_id.clone()
+            ]
+        );
+        drop(collaboration);
+
+        let reopened =
+            Arc::new(CollaborationRepository::new(directory.path(), config.clone()).unwrap());
+        let services = Arc::new(TestRuntimeServices::new(&reopened, &config));
+        let query_count = Arc::clone(&services.query_count);
+        let runtime = CollaborationRuntime::start(
+            Arc::clone(&reopened),
+            services,
+            Arc::new(LlmConfig::default_config()),
+            Vec::new(),
+        )
+        .await
+        .expect("单个损坏的完成结果不应阻止协作运行时启动");
+
+        let snapshot = runtime.snapshot("room-1".into()).await.unwrap();
+        assert!(snapshot
+            .events
+            .iter()
+            .all(|event| event.content != "不应投影的损坏回复"));
+        assert!(snapshot
+            .events
+            .iter()
+            .any(|event| event.content == "应投影的健康回复"));
+
+        let mut invalid_failed = false;
+        for _ in 0..100 {
+            let snapshot = runtime.snapshot("room-1".into()).await.unwrap();
+            invalid_failed = snapshot.inbox.iter().any(|item| {
+                item.inbox_item_id == invalid_claim.inbox_item_id
+                    && item.state == InboxState::Failed
+            });
+            if invalid_failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            invalid_failed,
+            "recover_inflight 和 dispatcher 应继续启动并隔离损坏任务"
+        );
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -2901,7 +3385,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         let result = &results[0];
 
-        let error = reconcile_durable_result(
+        let disposition = reconcile_durable_result(
             &reopened_collaboration,
             &reopened_tasks,
             &result.origin_id,
@@ -2909,8 +3393,11 @@ mod tests {
             &result.instance_run_id,
             &result.artifact.content,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("不支持的配置"));
+        .unwrap();
+        let DurableResultDisposition::Rejected { reason } = disposition else {
+            panic!("不支持的任务版本应被分类为单任务历史损坏");
+        };
+        assert!(reason.contains("不支持的配置"));
         let snapshot = reopened_collaboration.snapshot("room-1").unwrap();
         assert!(snapshot
             .events
@@ -2979,7 +3466,7 @@ mod tests {
         let results = reopened_tasks.completed_results("member_inbox").unwrap();
         assert_eq!(results.len(), 1);
         let result = &results[0];
-        let error = reconcile_durable_result(
+        let disposition = reconcile_durable_result(
             &reopened_collaboration,
             &reopened_tasks,
             &result.origin_id,
@@ -2987,8 +3474,11 @@ mod tests {
             &result.instance_run_id,
             &result.artifact.content,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("必须且只能包含一个回复引用"));
+        .unwrap();
+        let DurableResultDisposition::Rejected { reason } = disposition else {
+            panic!("损坏的 v4 引用快照应被分类为单任务历史损坏");
+        };
+        assert!(reason.contains("必须且只能包含一个回复引用"));
         let snapshot = reopened_collaboration.snapshot("room-1").unwrap();
         assert!(snapshot
             .events
