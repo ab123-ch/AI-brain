@@ -753,3 +753,11 @@
 - 读取 `writing-plans` 与 `planning-with-files`，恢复旧规划记录并开始当前任务实施计划。
 - 审计发现当前 `StreamEvent` 无错误事件，增量流 chunk 失败会静默关闭 receiver；计划以兼容的新 Error 事件建立明确失败合同。
 - 实施计划已写入 `docs/superpowers/plans/2026-08-09-llm-provider-call-retry.md`；占位符、类型名称、规格覆盖和 diff check 自审通过。
+- 创建隔离 worktree `.worktrees/llm-provider-call-retry`，分支 `feat/llm-provider-call-retry`；当前主检出的用户未提交文件未进入该 worktree。
+- 隔离基线 `cargo test -p brain-llm --lib` 通过：96 passed、0 failed。
+- Task 1 默认重试 RED 正确得到 left=2/right=5；最小修改为额外 5 次、退避上限 16 秒后 GREEN。
+- Task 1 字符串分类 RED 正确证明 `timeout` 会触发旧逻辑；`RequestFailed(String)` 改为永不自行判定可重试后 error tests 3/3 GREEN。
+- 共享 `retry.rs` 重构完成，状态分类、默认配置和既有公开导出测试 GREEN。
+- typed 断连测试首跑被系统代理转成 HTTP 502，已按系统化排障将测试客户端改为明确直连，尚未修改分类实现。
+- typed 断连测试修正环境后按预期 RED；实现 `reqwest::Error` typed/源链分类后 retry tests 3/3、error tests 3/3 GREEN。
+- Task 1 完成：共享 `retry.rs`、默认额外 5 次、1/2/4/8/16 秒退避、HTTP 白名单和确定性路由排除均已有测试。

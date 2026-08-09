@@ -5,44 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{LlmError, Result};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, MessageRole};
+pub use crate::retry::RetryConfig;
 use crate::types::{ContentBlock, FinishReason, TokenUsage, ToolChoice};
 
 // ---------------------------------------------------------------------------
 // OpenAI-compatible API Client
 // ---------------------------------------------------------------------------
-
-/// 重试配置
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    /// 最大重试次数（不含首次请求）
-    pub max_retries: u32,
-    /// 初始退避时间
-    pub initial_backoff: std::time::Duration,
-    /// 最大退避时间
-    pub max_backoff: std::time::Duration,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 2,
-            initial_backoff: std::time::Duration::from_secs(1),
-            max_backoff: std::time::Duration::from_secs(30),
-        }
-    }
-}
-
-impl RetryConfig {
-    /// 计算第 N 次重试的退避时间（指数退避，带上限）
-    pub fn backoff_for_attempt(&self, attempt: u32) -> std::time::Duration {
-        let multiplier = 1u32
-            .checked_shl(attempt.saturating_sub(1))
-            .unwrap_or(u32::MAX);
-        self.initial_backoff
-            .checked_mul(multiplier)
-            .map_or(self.max_backoff, |delay| delay.min(self.max_backoff))
-    }
-}
 
 pub struct OpenAiCompatClient {
     api_base: String,
@@ -724,6 +692,17 @@ mod tests {
 
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn default_retry_policy_uses_five_retries_and_expected_backoff() {
+        let retry = RetryConfig::default();
+
+        assert_eq!(retry.max_retries, 5);
+        let delays = (1..=5)
+            .map(|attempt| retry.backoff_for_attempt(attempt))
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [1, 2, 4, 8, 16].map(std::time::Duration::from_secs));
+    }
 
     #[derive(Clone)]
     struct CapturedWriter(Arc<Mutex<Vec<u8>>>);

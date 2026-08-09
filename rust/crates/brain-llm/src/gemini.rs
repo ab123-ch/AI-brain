@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 
 use crate::error::{LlmError, Result};
 use crate::http_client::SharedHttpClient;
-use crate::openai_compat::RetryConfig;
 use crate::provider::{ChatRequest, ChatResponse, LlmProvider, MessageRole};
+use crate::retry::RetryConfig;
 use crate::stream;
 use crate::types::{ContentBlock, FinishReason, StreamEvent, TokenUsage, ToolChoice};
 

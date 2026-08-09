@@ -795,7 +795,7 @@ Build an operational cockpit and conversation trace that expose the real runtime
 - [x] 诊断生产连接重置未重试的根因并确认需求边界。
 - [x] 完成并提交设计 `dc16714b`。
 - [x] 编写详细 TDD 实施计划。
-- [ ] 以 RED 测试建立共享错误分类与默认策略合同。
+- [x] 以 RED 测试建立共享错误分类与默认策略合同。
 - [ ] 实现普通完成的 OpenAI/Gemini 统一重试。
 - [ ] 实现批量流和首事件前增量流重试。
 - [ ] 运行定向、回归和仓库门禁。
@@ -815,3 +815,4 @@ Build an operational cockpit and conversation trace that expose the real runtime
 |---|---|---|
 | 现有增量流在后台 chunk 失败时只写日志并静默关闭 receiver，没有错误事件 | 实施规划审计 | 在 `brain-llm::StreamEvent` 增加内部统一的 `Error` 事件，保持现有 wildcard 消费者兼容，并用测试证明部分输出后不重发。 |
 | 首次创建实施计划的补丁在命令代码块处缺少 `+` 前缀，被 `apply_patch` 原子拒绝 | 实施计划写入 | 记录失败并改用完整带前缀的 Add File 补丁；没有计划文件被部分创建。 |
+| typed 断连 RED 测试使用 `Client::new()` 时被系统代理接管，本地断连变成 HTTP 502 | Task 1 RED | 证据是返回 remote proxy 的 502 而非 reqwest error；测试客户端显式 `.no_proxy()`，只修正故障注入边界后重跑 RED。 |

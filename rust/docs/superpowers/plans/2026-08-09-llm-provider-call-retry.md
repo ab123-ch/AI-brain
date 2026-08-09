@@ -32,7 +32,7 @@
 - Modify: `crates/brain-llm/src/openai_compat.rs`
 - Modify: `crates/brain-llm/src/gemini.rs`
 
-- [ ] **Step 1: 写默认次数、退避和 HTTP 状态 RED 测试**
+- [x] **Step 1: 写默认次数、退避和 HTTP 状态 RED 测试**
 
 ```rust
 #[test]
@@ -68,7 +68,7 @@ fn deterministic_model_route_503_is_not_retryable() {
 }
 ```
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```powershell
 cargo test -p brain-llm retry::tests -- --nocapture
@@ -76,7 +76,7 @@ cargo test -p brain-llm retry::tests -- --nocapture
 
 Expected: FAIL，因为默认仍为额外 2 次，且共享模块不存在。
 
-- [ ] **Step 3: 实现最小共享策略**
+- [x] **Step 3: 实现最小共享策略**
 
 ```rust
 #[derive(Debug, Clone)]
@@ -118,7 +118,7 @@ pub fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
 从 OpenAI 模块移走 `RetryConfig`，`lib.rs` 改为 `pub use retry::RetryConfig`。
 `LlmError::RequestFailed` 不再解析展示字符串；`ApiError` 委托状态分类。
 
-- [ ] **Step 4: 运行 GREEN**
+- [x] **Step 4: 运行 GREEN**
 
 ```powershell
 cargo fmt -p brain-llm -- --check
@@ -128,7 +128,7 @@ cargo test -p brain-llm error::tests -- --nocapture
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: 检查 `.no_proxy()`**
+- [x] **Step 5: 检查 `.no_proxy()`**
 
 ```powershell
 git diff -- crates/brain-llm/src/openai_compat.rs

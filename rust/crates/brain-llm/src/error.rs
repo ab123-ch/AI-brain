@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::retry::is_retryable_http_status;
+
 #[derive(Error, Debug)]
 pub enum LlmError {
     #[error("configuration error: {0}")]
@@ -37,22 +39,11 @@ impl LlmError {
     /// 判断错误是否可重试（网络超时、连接失败、服务端 5xx 等）
     pub fn is_retryable(&self) -> bool {
         match self {
-            // 网络层失败（超时、连接断开等）— 可重试
-            Self::RequestFailed(msg) => {
-                let lower = msg.to_lowercase();
-                lower.contains("timeout")
-                    || lower.contains("connection")
-                    || lower.contains("timed out")
-                    || lower.contains("connect")
-                    || lower.contains("hyper")
-                    || lower.contains("tcp")
-                    || lower.contains("socket")
-            }
+            // RequestFailed 已失去底层错误类型，不能根据展示字符串猜测。
+            // 网络错误必须在仍持有 reqwest::Error 的 Provider 边界分类。
+            Self::RequestFailed(_) => false,
             // API 返回可重试的 HTTP 状态码（408/429/500/502/503/504）
-            Self::ApiError { status, message } => {
-                !is_deterministic_model_route_error(message)
-                    && matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
-            }
+            Self::ApiError { status, message } => is_retryable_http_status(*status, message),
             // 以下不可重试
             Self::Config(_)
             | Self::StreamError(_)
@@ -64,14 +55,6 @@ impl LlmError {
             | Self::IoError(_) => false,
         }
     }
-}
-
-fn is_deterministic_model_route_error(message: &str) -> bool {
-    let normalized = message.to_lowercase();
-    normalized.contains("model_not_found")
-        || normalized.contains("model not found")
-        || normalized.contains("no available channel")
-        || normalized.contains("没有可用渠道")
 }
 
 pub type Result<T> = std::result::Result<T, LlmError>;
@@ -103,5 +86,18 @@ mod tests {
         };
 
         assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn request_failed_display_text_never_drives_retry_classification() {
+        for message in [
+            "timeout",
+            "connection reset",
+            "error sending request for url",
+            "hyper tcp socket failure",
+        ] {
+            let error = LlmError::RequestFailed(message.into());
+            assert!(!error.is_retryable(), "展示字符串不应触发重试: {message}");
+        }
     }
 }

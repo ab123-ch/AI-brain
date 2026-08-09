@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::error::{LlmError, Result};
-use crate::openai_compat::RetryConfig;
+use crate::retry::RetryConfig;
 
 /// 共享 HTTP 客户端
 pub struct SharedHttpClient {
