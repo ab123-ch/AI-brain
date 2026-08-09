@@ -244,8 +244,28 @@ impl RoomProtocolRuntime for CollaborationRuntime {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoomOperationErrorIdentity {
+    Post {
+        room_id: String,
+        command_id: String,
+    },
+    Directory {
+        room_id: String,
+        expected_room_version: u64,
+        working_directory: String,
+    },
+    Pagination {
+        room_id: String,
+        before_sequence: u64,
+    },
+}
+
 enum RoomProtocolDispatch {
-    Handled(Vec<WebProgressEvent>),
+    Handled {
+        events: Vec<WebProgressEvent>,
+        error_identity: Option<RoomOperationErrorIdentity>,
+    },
     Unhandled(ClientMessage),
 }
 
@@ -254,50 +274,71 @@ async fn dispatch_room_protocol_message(
     active_room_id: String,
     message: ClientMessage,
 ) -> RoomProtocolDispatch {
-    let events = match message {
+    let (events, error_identity) = match message {
         ClientMessage::UpdateRoomWorkingDirectory {
             working_directory,
             expected_room_version,
-        } => match runtime
-            .update_room_working_directory(
-                active_room_id.clone(),
-                working_directory,
+        } => {
+            let identity = RoomOperationErrorIdentity::Directory {
+                room_id: active_room_id.clone(),
                 expected_room_version,
-            )
-            .await
-        {
-            Ok(_) => Vec::new(),
-            Err(error) => {
-                let version_conflict = error.is_version_conflict();
-                let mut events = vec![WebProgressEvent::Error {
-                    message: error.into_message(),
-                }];
-                if version_conflict {
-                    match runtime.snapshot(active_room_id).await {
-                        Ok(snapshot) => events.push(WebProgressEvent::RoomSnapshot { snapshot }),
-                        Err(error) => events.push(WebProgressEvent::Error {
-                            message: format!("刷新协作房间快照失败: {error}"),
-                        }),
+                working_directory: working_directory.clone(),
+            };
+            match runtime
+                .update_room_working_directory(
+                    active_room_id.clone(),
+                    working_directory,
+                    expected_room_version,
+                )
+                .await
+            {
+                Ok(_) => (Vec::new(), None),
+                Err(error) => {
+                    let version_conflict = error.is_version_conflict();
+                    let mut events = vec![WebProgressEvent::Error {
+                        message: error.into_message(),
+                    }];
+                    if version_conflict {
+                        match runtime.snapshot(active_room_id).await {
+                            Ok(snapshot) => {
+                                events.push(WebProgressEvent::RoomSnapshot { snapshot })
+                            }
+                            Err(error) => events.push(WebProgressEvent::Error {
+                                message: format!("刷新协作房间快照失败: {error}"),
+                            }),
+                        }
                     }
+                    (events, Some(identity))
                 }
-                events
             }
-        },
+        }
         ClientMessage::LoadRoomEventsBefore {
             before_sequence,
             limit,
-        } => match runtime
-            .events_before(active_room_id.clone(), before_sequence, limit)
-            .await
-        {
-            Ok(page) => vec![WebProgressEvent::RoomEventsLoadedBefore {
-                room_id: active_room_id,
+        } => {
+            let identity = RoomOperationErrorIdentity::Pagination {
+                room_id: active_room_id.clone(),
                 before_sequence,
-                has_more: page.has_more,
-                events: page.events,
-            }],
-            Err(error) => vec![WebProgressEvent::Error { message: error }],
-        },
+            };
+            match runtime
+                .events_before(active_room_id.clone(), before_sequence, limit)
+                .await
+            {
+                Ok(page) => (
+                    vec![WebProgressEvent::RoomEventsLoadedBefore {
+                        room_id: active_room_id,
+                        before_sequence,
+                        has_more: page.has_more,
+                        events: page.events,
+                    }],
+                    None,
+                ),
+                Err(error) => (
+                    vec![WebProgressEvent::Error { message: error }],
+                    Some(identity),
+                ),
+            }
+        }
         ClientMessage::PostRoomMessage {
             recipients,
             content,
@@ -325,18 +366,30 @@ async fn dispatch_room_protocol_message(
                 )
                 .await
             {
-                Ok(result) => vec![WebProgressEvent::RoomMessageAccepted {
-                    room_id: active_room_id,
-                    command_id,
-                    event_id: result.event.event_id,
-                    duplicate: result.duplicate,
-                }],
-                Err(error) => vec![WebProgressEvent::Error { message: error }],
+                Ok(result) => (
+                    vec![WebProgressEvent::RoomMessageAccepted {
+                        room_id: active_room_id,
+                        command_id,
+                        event_id: result.event.event_id,
+                        duplicate: result.duplicate,
+                    }],
+                    None,
+                ),
+                Err(error) => (
+                    vec![WebProgressEvent::Error { message: error }],
+                    Some(RoomOperationErrorIdentity::Post {
+                        room_id: active_room_id,
+                        command_id,
+                    }),
+                ),
             }
         }
         message => return RoomProtocolDispatch::Unhandled(message),
     };
-    RoomProtocolDispatch::Handled(events)
+    RoomProtocolDispatch::Handled {
+        events,
+        error_identity,
+    }
 }
 
 // ─── WebSocket 升级入口 ──────────────────────────────────────────────
@@ -1248,9 +1301,20 @@ async fn handle_client_message(
     )
     .await
     {
-        RoomProtocolDispatch::Handled(events) => {
+        RoomProtocolDispatch::Handled {
+            events,
+            mut error_identity,
+        } => {
             for event in events {
-                if send_event(sender, event).await.is_err() {
+                let correlated_identity =
+                    take_room_operation_error_identity(&event, &mut error_identity);
+                let sent = match (event, correlated_identity.as_ref()) {
+                    (WebProgressEvent::Error { message }, Some(identity)) => {
+                        send_room_operation_error(sender, &message, identity).await
+                    }
+                    (event, _) => send_event(sender, event).await,
+                };
+                if sent.is_err() {
                     return;
                 }
             }
@@ -1678,6 +1742,71 @@ async fn send_event(
     }
 }
 
+fn room_operation_error_json(
+    message: &str,
+    identity: &RoomOperationErrorIdentity,
+) -> serde_json::Value {
+    match identity {
+        RoomOperationErrorIdentity::Post {
+            room_id,
+            command_id,
+        } => serde_json::json!({
+            "type": "error",
+            "message": message,
+            "room_operation": "post",
+            "room_id": room_id,
+            "command_id": command_id,
+        }),
+        RoomOperationErrorIdentity::Directory {
+            room_id,
+            expected_room_version,
+            working_directory,
+        } => serde_json::json!({
+            "type": "error",
+            "message": message,
+            "room_operation": "directory",
+            "room_id": room_id,
+            "expected_room_version": expected_room_version,
+            "working_directory": working_directory,
+        }),
+        RoomOperationErrorIdentity::Pagination {
+            room_id,
+            before_sequence,
+        } => serde_json::json!({
+            "type": "error",
+            "message": message,
+            "room_operation": "pagination",
+            "room_id": room_id,
+            "before_sequence": before_sequence,
+        }),
+    }
+}
+
+fn take_room_operation_error_identity(
+    event: &WebProgressEvent,
+    identity: &mut Option<RoomOperationErrorIdentity>,
+) -> Option<RoomOperationErrorIdentity> {
+    if matches!(event, WebProgressEvent::Error { .. }) {
+        identity.take()
+    } else {
+        None
+    }
+}
+
+async fn send_room_operation_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: &str,
+    identity: &RoomOperationErrorIdentity,
+) -> Result<(), axum::Error> {
+    sender
+        .send(Message::Text(
+            room_operation_error_json(message, identity)
+                .to_string()
+                .into(),
+        ))
+        .await
+}
+
 /// 发送会话列表
 async fn send_session_list(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
@@ -1789,13 +1918,98 @@ mod tests {
         }
     }
 
-    fn handled_room_events(dispatch: RoomProtocolDispatch) -> Vec<WebProgressEvent> {
+    fn handled_room_dispatch(
+        dispatch: RoomProtocolDispatch,
+    ) -> (Vec<WebProgressEvent>, Option<RoomOperationErrorIdentity>) {
         match dispatch {
-            RoomProtocolDispatch::Handled(events) => events,
+            RoomProtocolDispatch::Handled {
+                events,
+                error_identity,
+            } => (events, error_identity),
             RoomProtocolDispatch::Unhandled(message) => {
                 panic!("expected handled room protocol message, got {message:?}")
             }
         }
+    }
+
+    fn handled_room_events(dispatch: RoomProtocolDispatch) -> Vec<WebProgressEvent> {
+        handled_room_dispatch(dispatch).0
+    }
+
+    #[test]
+    fn room_operation_error_payloads_include_complete_correlation_identity() {
+        let cases = [
+            (
+                RoomOperationErrorIdentity::Post {
+                    room_id: "room-a".into(),
+                    command_id: "command-1".into(),
+                },
+                serde_json::json!({
+                    "type": "error",
+                    "message": "failed",
+                    "room_operation": "post",
+                    "room_id": "room-a",
+                    "command_id": "command-1",
+                }),
+            ),
+            (
+                RoomOperationErrorIdentity::Directory {
+                    room_id: "room-a".into(),
+                    expected_room_version: 3,
+                    working_directory: "D:\\workspace\\next".into(),
+                },
+                serde_json::json!({
+                    "type": "error",
+                    "message": "failed",
+                    "room_operation": "directory",
+                    "room_id": "room-a",
+                    "expected_room_version": 3,
+                    "working_directory": "D:\\workspace\\next",
+                }),
+            ),
+            (
+                RoomOperationErrorIdentity::Pagination {
+                    room_id: "room-a".into(),
+                    before_sequence: 10,
+                },
+                serde_json::json!({
+                    "type": "error",
+                    "message": "failed",
+                    "room_operation": "pagination",
+                    "room_id": "room-a",
+                    "before_sequence": 10,
+                }),
+            ),
+        ];
+
+        for (identity, expected) in cases {
+            assert_eq!(room_operation_error_json("failed", &identity), expected);
+        }
+    }
+
+    #[test]
+    fn room_operation_error_identity_is_consumed_by_only_the_primary_error() {
+        let expected = RoomOperationErrorIdentity::Directory {
+            room_id: "room-a".into(),
+            expected_room_version: 3,
+            working_directory: "D:\\workspace\\next".into(),
+        };
+        let mut identity = Some(expected.clone());
+        let primary = WebProgressEvent::Error {
+            message: "目录版本冲突".into(),
+        };
+        let refresh = WebProgressEvent::Error {
+            message: "刷新协作房间快照失败".into(),
+        };
+
+        assert_eq!(
+            take_room_operation_error_identity(&primary, &mut identity),
+            Some(expected)
+        );
+        assert_eq!(
+            take_room_operation_error_identity(&refresh, &mut identity),
+            None
+        );
     }
 
     #[test]
@@ -1833,6 +2047,80 @@ mod tests {
         assert!(script.contains("lastVisibleUserEventId"));
         assert!(script.contains("candidate.sequence <= event.sequence"));
         assert!(script.contains("send('retry_last_user_message', { message_id: event.event_id })"));
+    }
+
+    #[test]
+    fn collaboration_web_assets_expose_directory_reply_and_pagination_controls() {
+        let html = include_str!("static/index.html");
+        let script = include_str!("static/app.js");
+        let reply_module = include_str!("static/room_reply.js");
+        let style = include_str!("static/style.css");
+        let collaboration_scripts = format!("{script}\n{reply_module}");
+
+        for required_id in [
+            "room-working-directory",
+            "room-directory-modal",
+            "load-earlier-events",
+            "reply-preview",
+            "reply-cancel",
+        ] {
+            assert!(
+                html.contains(&format!("id=\"{required_id}\"")),
+                "页面缺少 #{required_id}"
+            );
+        }
+        let room_reply_position = html.find("src=\"/room_reply.js\"").unwrap();
+        let app_position = html.find("src=\"/app.js\"").unwrap();
+        assert!(room_reply_position < app_position);
+        assert!(script.contains("operationResult.directoryConfirmed"));
+        assert!(script.contains("RoomReply.captureTimelineViewport"));
+        assert!(script.contains("RoomReply.timelineScrollTarget"));
+        assert!(!script.contains("authoritativeRoomEventSequence = Math.max"));
+
+        let progress_handler = script
+            .split_once("function handleMemberRunProgress")
+            .and_then(|(_, rest)| rest.split_once("function handleMemberRunFinished"))
+            .map(|(handler, _)| handler)
+            .expect("脚本缺少成员进度处理函数");
+        assert!(progress_handler.contains("$messages.scrollTop = $messages.scrollHeight"));
+        assert!(!progress_handler.contains("scrollToBottom()"));
+        assert!(script.contains("'follow-if-near-bottom'"));
+
+        let input_state_handler = script
+            .split_once("function setInputEnabled")
+            .and_then(|(_, rest)| rest.split_once("function updateSendButton"))
+            .map(|(handler, _)| handler)
+            .expect("脚本缺少输入状态处理函数");
+        assert!(input_state_handler.contains("RoomReply.shouldFocusComposer"));
+        assert!(input_state_handler.contains(".modal[aria-modal=\"true\"]:not(.hidden)"));
+
+        let css_rule = |selector: &str| {
+            let after_selector = style
+                .split_once(selector)
+                .unwrap_or_else(|| panic!("CSS 缺少 {selector}"))
+                .1;
+            after_selector
+                .split_once('{')
+                .and_then(|(_, body)| body.split_once('}').map(|(rule, _)| rule))
+                .unwrap_or_else(|| panic!("CSS {selector} 规则不完整"))
+        };
+        assert!(css_rule(".reply-preview strong").contains("overflow-wrap: anywhere"));
+        assert!(css_rule(".room-reply-reference strong").contains("overflow-wrap: anywhere"));
+
+        for contract in [
+            "RoomReply.beginReply",
+            "RoomReply.buildRoomPostPayload",
+            "reply_to_event_id",
+            "room_message_accepted",
+            "room_events_loaded_before",
+            "update_room_working_directory",
+            "load_room_events_before",
+        ] {
+            assert!(
+                collaboration_scripts.contains(contract),
+                "脚本缺少 {contract} 接线"
+            );
+        }
     }
 
     #[test]
@@ -2072,7 +2360,7 @@ mod tests {
         let authoritative_path = authoritative_directory.path().canonicalize().unwrap();
         let protocol = TestRoomProtocol::new(Arc::clone(&repository));
 
-        let events = handled_room_events(
+        let (events, error_identity) = handled_room_dispatch(
             dispatch_room_protocol_message(
                 &protocol,
                 "active-room".into(),
@@ -2084,6 +2372,14 @@ mod tests {
             .await,
         );
 
+        assert_eq!(
+            error_identity,
+            Some(RoomOperationErrorIdentity::Directory {
+                room_id: "active-room".into(),
+                expected_room_version: initial.room.version,
+                working_directory: rejected_directory.path().display().to_string(),
+            })
+        );
         assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
@@ -2123,7 +2419,7 @@ mod tests {
         std::fs::write(&non_directory, b"not a directory").unwrap();
         let protocol = TestRoomProtocol::new(repository);
 
-        let events = handled_room_events(
+        let (events, error_identity) = handled_room_dispatch(
             dispatch_room_protocol_message(
                 &protocol,
                 "active-room".into(),
@@ -2135,6 +2431,14 @@ mod tests {
             .await,
         );
 
+        assert_eq!(
+            error_identity,
+            Some(RoomOperationErrorIdentity::Directory {
+                room_id: "active-room".into(),
+                expected_room_version: initial.room.version,
+                working_directory: non_directory.display().to_string(),
+            })
+        );
         assert!(matches!(
             events.as_slice(),
             [WebProgressEvent::Error { message }]
@@ -2202,6 +2506,29 @@ mod tests {
         assert_eq!(
             protocol.calls.lock().await.as_slice(),
             &[("events_before".into(), "active-room".into())]
+        );
+
+        let (failed_events, error_identity) = handled_room_dispatch(
+            dispatch_room_protocol_message(
+                &protocol,
+                "missing-room".into(),
+                ClientMessage::LoadRoomEventsBefore {
+                    before_sequence: 42,
+                    limit: 100,
+                },
+            )
+            .await,
+        );
+        assert!(matches!(
+            failed_events.as_slice(),
+            [WebProgressEvent::Error { .. }]
+        ));
+        assert_eq!(
+            error_identity,
+            Some(RoomOperationErrorIdentity::Pagination {
+                room_id: "missing-room".into(),
+                before_sequence: 42,
+            })
         );
     }
 
@@ -2283,7 +2610,7 @@ mod tests {
         ));
 
         let current = repository.snapshot("active-room").unwrap();
-        let rejected = handled_room_events(
+        let (rejected, error_identity) = handled_room_dispatch(
             dispatch_room_protocol_message(
                 &protocol,
                 "active-room".into(),
@@ -2301,6 +2628,13 @@ mod tests {
                 },
             )
             .await,
+        );
+        assert_eq!(
+            error_identity,
+            Some(RoomOperationErrorIdentity::Post {
+                room_id: "active-room".into(),
+                command_id: "command-invalid".into(),
+            })
         );
         assert!(matches!(
             rejected.as_slice(),

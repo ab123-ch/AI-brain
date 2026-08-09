@@ -50,9 +50,14 @@
                         <div>
                             <h2 id="room-title">当前会话</h2>
                             <span id="room-sequence">0 条事件</span>
+                            <div id="room-directory-row">
+                                <span id="room-working-directory"></span>
+                                <button id="room-directory-btn" class="icon-btn" type="button" title="设置工作目录" aria-label="设置工作目录"><i data-lucide="folder-cog"></i></button>
+                            </div>
                         </div>
                         <button id="room-refresh-btn" class="icon-btn" type="button" title="刷新房间" aria-label="刷新房间"><i data-lucide="refresh-cw"></i></button>
                     </div>
+                    <button id="load-earlier-events" class="hidden" type="button" title="加载较早消息" aria-label="加载较早消息">加载较早消息</button>
                     <div id="messages"></div>
                     <div id="input-area">
                         <div class="composer-toolbar">
@@ -61,6 +66,13 @@
                                 <button type="button" data-mode="task">任务</button>
                             </div>
                             <div id="recipient-selector" aria-label="收件人"></div>
+                        </div>
+                        <div id="reply-preview" class="reply-preview hidden" aria-live="polite">
+                            <div>
+                                <strong id="reply-preview-sender"></strong>
+                                <span id="reply-preview-content"></span>
+                            </div>
+                            <button id="reply-cancel" class="icon-btn" type="button" title="取消回复" aria-label="取消回复"><i data-lucide="x"></i></button>
                         </div>
                         <div class="composer-row">
                             <textarea id="input" placeholder="发送消息..." rows="1"></textarea>
@@ -233,12 +245,28 @@
             </footer>
         </form>
     </div>
+    <div id="room-directory-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="room-directory-modal-title">
+        <form id="room-directory-form" class="member-modal-content room-directory-modal-content">
+            <header>
+                <h2 id="room-directory-modal-title">设置工作目录</h2>
+                <button id="room-directory-modal-close" class="icon-btn" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <label for="room-directory-input">目录路径</label>
+            <input id="room-directory-input" type="text" required autocomplete="off" spellcheck="false">
+            <small>成员后续任务会在这个目录中执行。</small>
+            <footer>
+                <button id="room-directory-modal-cancel" type="button" class="secondary-btn">取消</button>
+                <button id="room-directory-submit" type="submit" class="primary-btn">保存</button>
+            </footer>
+        </form>
+    </div>
     <div id="toast-region" aria-live="polite" aria-atomic="true"></div>
     <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
     <script src="/mentions.js"></script>
     <script src="/model_catalog.js"></script>
+    <script src="/room_reply.js"></script>
     <script src="/app.js"></script>
 </body>
 </html>

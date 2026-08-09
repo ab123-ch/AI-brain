@@ -25,6 +25,7 @@ static STYLE_CSS: &str = include_str!("web/static/style.css");
 static APP_JS: &str = include_str!("web/static/app.js");
 static MENTIONS_JS: &str = include_str!("web/static/mentions.js");
 static MODEL_CATALOG_JS: &str = include_str!("web/static/model_catalog.js");
+static ROOM_REPLY_JS: &str = include_str!("web/static/room_reply.js");
 
 // ─── 请求/响应类型 ───────────────────────────────────────────────
 
@@ -441,6 +442,7 @@ async fn serve_web_with_policy(
         .route("/app.js", get(serve_js))
         .route("/mentions.js", get(serve_mentions_js))
         .route("/model_catalog.js", get(serve_model_catalog_js))
+        .route("/room_reply.js", get(serve_room_reply_js))
         .route(
             "/api/local-file",
             get(serve_local_file).post(save_local_file),
@@ -562,6 +564,16 @@ async fn serve_model_catalog_js() -> impl IntoResponse {
     )
 }
 
+async fn serve_room_reply_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        ROOM_REPLY_JS,
+    )
+}
+
 #[derive(Deserialize)]
 struct LocalFileQuery {
     path: String,
@@ -680,7 +692,23 @@ mod static_asset_tests {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
 
-    use super::serve_model_catalog_js;
+    use super::{serve_model_catalog_js, serve_room_reply_js};
+
+    #[tokio::test]
+    async fn collaboration_web_assets_serves_room_reply_script() {
+        let response = serve_room_reply_js().await.into_response();
+
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("RoomReply"));
+    }
 
     #[tokio::test]
     async fn model_catalog_script_returns_javascript_content_type_and_catalog_api() {
