@@ -911,7 +911,7 @@ async fn execute_tool_calls(
                 let hook_input = HookInput {
                     event: HookEvent::PostToolUse,
                     session_id: String::new(),
-                    cwd: std::env::current_dir().unwrap_or_default(),
+                    cwd: tool_execution_context.working_directory.clone(),
                     tool_name: Some(name.clone()),
                     tool_input: Some(serde_json::to_string(input).unwrap_or_default()),
                     tool_output: Some(turns.last().map_or(String::new(), |t| {

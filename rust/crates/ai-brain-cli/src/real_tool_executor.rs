@@ -46,6 +46,10 @@ pub struct RealToolExecutor {
 impl RealToolExecutor {
     /// Create a new executor, registering all MVP tool specs from the tools crate.
     pub fn new() -> Self {
+        Self::new_with_graph_db_path(default_graph_db_path())
+    }
+
+    fn new_with_graph_db_path(graph_db_path: Option<PathBuf>) -> Self {
         let specs = tools::mvp_tool_specs();
         let tool_descriptors = specs
             .iter()
@@ -66,7 +70,7 @@ impl RealToolExecutor {
             dispatch: None,
             skill_catalog: None,
             mcp_pool: None,
-            graph_db_path: default_graph_db_path(),
+            graph_db_path,
             runtime_trace_tx: None,
             novel_application: None,
         }
@@ -75,6 +79,16 @@ impl RealToolExecutor {
     /// Create with an optional PyramidMemoryBrain for search_memory support.
     pub fn with_memory(memory_brain: Option<Arc<tokio::sync::Mutex<PyramidMemoryBrain>>>) -> Self {
         let mut exec = Self::new();
+        exec.memory_brain = memory_brain;
+        exec
+    }
+
+    /// 使用调用方解析好的图数据库路径创建执行器，不读取用户 HOME 默认值。
+    pub fn with_memory_and_graph_db_path(
+        memory_brain: Option<Arc<tokio::sync::Mutex<PyramidMemoryBrain>>>,
+        graph_db_path: Option<PathBuf>,
+    ) -> Self {
+        let mut exec = Self::new_with_graph_db_path(graph_db_path);
         exec.memory_brain = memory_brain;
         exec
     }
@@ -1653,6 +1667,17 @@ mod tests {
         );
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output.as_array().unwrap()[0]["node_count"], 1);
+    }
+
+    #[test]
+    fn explicit_runtime_graph_path_never_falls_back_to_user_home() {
+        let explicit = PathBuf::from("isolated-runtime/graph.db");
+        let executor =
+            RealToolExecutor::with_memory_and_graph_db_path(None, Some(explicit.clone()));
+        assert_eq!(executor.graph_db_path.as_ref(), Some(&explicit));
+
+        let disabled = RealToolExecutor::with_memory_and_graph_db_path(None, None);
+        assert!(disabled.graph_db_path.is_none());
     }
 
     #[test]

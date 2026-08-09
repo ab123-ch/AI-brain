@@ -217,6 +217,91 @@ fn member_inputs_from_snapshot(
     Ok((input, history, system_context.join("\n\n")))
 }
 
+/// 执行一次已准入的协作成员运行。
+///
+/// 生产 Orchestrator 与隔离测试服务共享这一执行边界；测试只省略可选的持久记忆写入，
+/// MainBrain 隔离 fork、工具包装、工具定义和 tool loop 均走相同实现。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_member_run<F>(
+    template: Arc<Mutex<Option<MainBrain>>>,
+    memory: Option<Arc<Mutex<PyramidMemoryBrain>>>,
+    context_snapshot: KnowledgeContextSnapshot,
+    memory_scope: ConversationMemoryScope,
+    resolve_model: F,
+    allow_tools: bool,
+    tool_execution_context: ToolExecutionContext,
+    group_message_scope: Option<GroupMessageToolScope>,
+    progress_tx: tokio::sync::mpsc::Sender<ProgressEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<MainBrainOutput, MemberQueryError>
+where
+    F: FnOnce() -> Result<(Arc<dyn brain_llm::LlmProvider>, u32, f64), MemberQueryError>
+        + Send
+        + 'static,
+{
+    let (input, restore_history, member_context) = member_inputs_from_snapshot(&context_snapshot)
+        .map_err(MemberQueryError::before_execution)?;
+    let (client, max_tokens, temperature) = resolve_model()?;
+
+    let mut brain = {
+        let template = template.lock().await;
+        let template = template.as_ref().ok_or_else(|| {
+            MemberQueryError::before_execution("MainBrain 当前不可用，无法创建成员运行")
+        })?;
+        if allow_tools {
+            if let Some(scope) = group_message_scope {
+                template.fork_isolated_with_llm_and_executor_in_context(
+                    client,
+                    Arc::new(GroupMessageToolExecutor::new(
+                        template.tool_executor(),
+                        scope,
+                    )),
+                    tool_execution_context,
+                    vec![group_message_tool_definition()],
+                    max_tokens,
+                    temperature,
+                )
+            } else {
+                template.fork_isolated_with_llm_and_executor_in_context(
+                    client,
+                    template.tool_executor(),
+                    tool_execution_context,
+                    Vec::new(),
+                    max_tokens,
+                    temperature,
+                )
+            }
+        } else {
+            template.fork_isolated_with_llm_and_executor_in_context(
+                client,
+                template.tool_executor(),
+                tool_execution_context,
+                Vec::new(),
+                max_tokens,
+                temperature,
+            )
+        }
+    };
+    if !allow_tools {
+        brain.register_tools(Vec::new());
+    }
+    brain.restore_history(restore_history);
+    brain.push_memory_context(&member_context);
+
+    let process = brain.process_input(&input, Some(&progress_tx), Some(cancel));
+    let result = crate::query_context::with_conversation_memory_scope(&memory_scope, process)
+        .await
+        .map_err(|error| MemberQueryError::after_execution(error.to_string()));
+
+    if let (Ok(output), Some(memory)) = (&result, memory) {
+        let memory = memory.lock().await;
+        if let Err(error) = memory.store_turns_scoped(&output.turns, &memory_scope) {
+            tracing::warn!("成员对话存入独立记忆代次失败: {error}");
+        }
+    }
+    result
+}
+
 // ─── LLM 适配器 ──────────────────────────────────────────────────
 
 /// 将 brain-llm 的 LlmProvider 适配为 brain-sensory 的 LlmProvider
@@ -422,8 +507,6 @@ pub struct Orchestrator {
     /// MCP 客户端池
     #[allow(dead_code)] // Task 8 会使用
     mcp_pool: Arc<McpClientPool>,
-    #[cfg(test)]
-    member_llm_override: Option<Arc<dyn brain_llm::LlmProvider>>,
 }
 
 /// 系统状态结构体（TUI 状态栏用）
@@ -956,8 +1039,6 @@ impl Orchestrator {
             plugin_mgr,
             skill_catalog,
             mcp_pool,
-            #[cfg(test)]
-            member_llm_override: None,
         })
     }
 
@@ -967,40 +1048,6 @@ impl Orchestrator {
 
     pub(crate) fn task_coordinator(&self) -> TaskCoordinator {
         self.task_coordinator.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn new_for_collaboration_test(
-        runtime_dir: &Path,
-        task_repository: Arc<TaskRepository>,
-        task_coordinator: TaskCoordinator,
-        member_llm: Arc<dyn brain_llm::LlmProvider>,
-    ) -> Result<Self, String> {
-        let mut llm_config = LlmConfig::default_config();
-        for provider in llm_config.llm.providers.values_mut() {
-            provider.api_key_env.clear();
-            provider.api_key = Some("collaboration-test-key".into());
-        }
-        let mut orchestrator =
-            Self::new_with_runtime(llm_config, runtime_dir.to_path_buf()).await?;
-        orchestrator.configure_collaboration_runtime_for_test(
-            task_repository,
-            task_coordinator,
-            member_llm,
-        );
-        Ok(orchestrator)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configure_collaboration_runtime_for_test(
-        &mut self,
-        task_repository: Arc<TaskRepository>,
-        task_coordinator: TaskCoordinator,
-        member_llm: Arc<dyn brain_llm::LlmProvider>,
-    ) {
-        self.task_repository = task_repository;
-        self.task_coordinator = task_coordinator;
-        self.member_llm_override = Some(member_llm);
     }
 
     /// 提交查询
@@ -1263,108 +1310,40 @@ impl Orchestrator {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let (tx, rx) = tokio::sync::mpsc::channel(256);
-        let this = Arc::clone(self);
+        let template = Arc::clone(&self.v2_brain);
+        let memory = Some(Arc::clone(&self.memory_brain));
         let model_policy = model_policy.to_string();
         let reasoning_depth = reasoning_depth.to_string();
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_for_run = cancel.clone();
 
-        let handle = tokio::spawn(async move {
-            let (input, restore_history, member_context) =
-                member_inputs_from_snapshot(&context_snapshot)
-                    .map_err(MemberQueryError::before_execution)?;
-            let (client, resolved_model_policy) =
-                this.member_execution_client(&llm_config, &model_policy)?;
-            let max_tokens = resolve_member_reasoning_tokens(
-                resolved_model_policy.max_output_tokens,
-                &reasoning_depth,
-            )
-            .map_err(MemberQueryError::before_execution)?;
-            let temperature = resolved_model_policy.temperature;
-
-            let mut brain = {
-                let template = this.v2_brain.lock().await;
-                let template = template.as_ref().ok_or_else(|| {
-                    MemberQueryError::before_execution("MainBrain 当前不可用，无法创建成员运行")
-                })?;
-                if allow_tools {
-                    if let Some(scope) = group_message_scope {
-                        template.fork_isolated_with_llm_and_executor_in_context(
-                            client,
-                            Arc::new(GroupMessageToolExecutor::new(
-                                template.tool_executor(),
-                                scope,
-                            )),
-                            tool_execution_context,
-                            vec![group_message_tool_definition()],
-                            max_tokens,
-                            temperature,
-                        )
-                    } else {
-                        template.fork_isolated_with_llm_and_executor_in_context(
-                            client,
-                            template.tool_executor(),
-                            tool_execution_context,
-                            Vec::new(),
-                            max_tokens,
-                            temperature,
-                        )
-                    }
-                } else {
-                    template.fork_isolated_with_llm_and_executor_in_context(
-                        client,
-                        template.tool_executor(),
-                        tool_execution_context,
-                        Vec::new(),
-                        max_tokens,
-                        temperature,
-                    )
-                }
-            };
-            if !allow_tools {
-                brain.register_tools(Vec::new());
-            }
-            brain.restore_history(restore_history);
-            brain.push_memory_context(&member_context);
-
-            let process = brain.process_input(&input, Some(&tx), Some(cancel_for_run));
-            let result =
-                crate::query_context::with_conversation_memory_scope(&memory_scope, process)
-                    .await
-                    .map_err(|error| MemberQueryError::after_execution(error.to_string()));
-
-            if let Ok(ref output) = result {
-                let memory = this.memory_brain.lock().await;
-                if let Err(error) = memory.store_turns_scoped(&output.turns, &memory_scope) {
-                    tracing::warn!("成员对话存入独立记忆代次失败: {error}");
-                }
-            }
-            result
-        });
+        let handle = tokio::spawn(execute_member_run(
+            template,
+            memory,
+            context_snapshot,
+            memory_scope,
+            move || {
+                let (client, resolved_model_policy) =
+                    create_member_execution_client(&llm_config, &model_policy)?;
+                let max_tokens = resolve_member_reasoning_tokens(
+                    resolved_model_policy.max_output_tokens,
+                    &reasoning_depth,
+                )
+                .map_err(MemberQueryError::before_execution)?;
+                Ok((
+                    Arc::from(client),
+                    max_tokens,
+                    resolved_model_policy.temperature,
+                ))
+            },
+            allow_tools,
+            tool_execution_context,
+            group_message_scope,
+            tx,
+            cancel_for_run,
+        ));
 
         (rx, handle, cancel)
-    }
-
-    fn member_execution_client(
-        &self,
-        llm_config: &LlmConfig,
-        policy_id: &str,
-    ) -> Result<
-        (
-            Arc<dyn brain_llm::LlmProvider>,
-            brain_llm::config::ResolvedModelPolicy,
-        ),
-        MemberQueryError,
-    > {
-        #[cfg(test)]
-        if let Some(client) = self.member_llm_override.as_ref() {
-            return Ok((
-                Arc::clone(client),
-                resolve_member_model_policy(llm_config, policy_id)?,
-            ));
-        }
-        let (client, policy) = create_member_execution_client(llm_config, policy_id)?;
-        Ok((Arc::from(client), policy))
     }
 
     fn query_streaming_with_memory_scope(

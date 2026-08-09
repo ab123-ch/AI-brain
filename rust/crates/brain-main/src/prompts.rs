@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use chrono::Datelike;
 
 /// 主脑系统提示词（有工具时）
@@ -142,14 +144,18 @@ pub fn build_full_system_prompt(memory_context: Option<&str>) -> String {
 /// 让 LLM 感知当前操作系统、工作目录和日期，
 /// 避免在回答中猜测或编造这些信息。
 pub fn build_environment_info() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "unknown".into());
+    build_environment_info_for(&cwd)
+}
+
+/// 使用调用方提供的工作目录构建运行环境信息。
+pub fn build_environment_info_for(cwd: &Path) -> String {
     let os = match std::env::consts::OS {
         "macos" => "macOS",
         "linux" => "Linux",
         "windows" => "Windows",
         other => other,
     };
-    let cwd =
-        std::env::current_dir().map_or_else(|_| "unknown".into(), |p| p.display().to_string());
     let now = chrono::Utc::now();
     let date_str = now.format("%Y年%m月%d日").to_string();
     let weekday = match now.weekday().num_days_from_monday() {
@@ -162,7 +168,10 @@ pub fn build_environment_info() -> String {
         6 => "周日",
         _ => "未知",
     };
-    format!("\n## 运行环境\n- 操作系统: {os}\n- 工作目录: {cwd}\n- 当前日期: {date_str} {weekday}")
+    format!(
+        "\n## 运行环境\n- 操作系统: {os}\n- 工作目录: {}\n- 当前日期: {date_str} {weekday}",
+        cwd.display()
+    )
 }
 
 /// 构建记忆脑启动注入提示词

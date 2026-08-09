@@ -54,6 +54,25 @@ impl MainBrain {
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
+        Self::new_in_context(
+            llm,
+            tool_executor,
+            config,
+            llm_max_tokens,
+            llm_temperature,
+            ToolExecutionContext::default(),
+        )
+    }
+
+    /// 使用调用方冻结的工具工作目录创建主脑模板。
+    pub fn new_in_context(
+        llm: Arc<dyn LlmProvider>,
+        tool_executor: Arc<dyn ToolExecutor>,
+        config: BrainConfig,
+        llm_max_tokens: u32,
+        llm_temperature: f64,
+        tool_execution_context: ToolExecutionContext,
+    ) -> Self {
         // 从 ThresholdConfig 取 max_context_tokens，默认 1M
         let max_context_tokens = config.brain.thresholds.max_context_tokens as usize;
 
@@ -64,7 +83,7 @@ impl MainBrain {
         Self {
             llm,
             tool_executor,
-            tool_execution_context: ToolExecutionContext::default(),
+            tool_execution_context,
             history: ConversationHistory::new(max_context_tokens),
             tools: Vec::new(),
             config,
@@ -137,14 +156,14 @@ impl MainBrain {
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
-        let mut fork = Self::new(
+        let mut fork = Self::new_in_context(
             llm,
             tool_executor,
             self.config.clone(),
             llm_max_tokens,
             llm_temperature,
+            tool_execution_context,
         );
-        fork.tool_execution_context = tool_execution_context;
         fork.tools.clone_from(&self.tools);
         fork.tools.extend(additional_tools);
         fork.memory_context.clone_from(&self.memory_context);
@@ -710,7 +729,8 @@ impl MainBrain {
             prompts::build_system_prompt_with_tools()
         };
         // 注入运行环境信息（OS、工作目录、日期）
-        let env_info = prompts::build_environment_info();
+        let env_info =
+            prompts::build_environment_info_for(&self.tool_execution_context.working_directory);
         // 将记忆上下文追加到 system prompt
         // Prompt cache 排序：越稳定的越靠前
         // 1. Bootstrap 技能（插件注入，会话级稳定）
@@ -766,6 +786,24 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[test]
+    fn explicit_constructor_keeps_the_injected_tool_execution_context() {
+        let context = ToolExecutionContext::new("isolated-template-workspace");
+        let brain = MainBrain::new_in_context(
+            Arc::new(StubLlm),
+            Arc::new(StubToolExecutor::new()),
+            BrainConfig::default(),
+            32_768,
+            0.7,
+            context.clone(),
+        );
+
+        assert_eq!(brain.tool_execution_context, context);
+        assert!(brain.build_messages()[0]
+            .text_content()
+            .contains("isolated-template-workspace"));
     }
 
     #[tokio::test]
