@@ -796,14 +796,15 @@ Build an operational cockpit and conversation trace that expose the real runtime
 - [x] 完成并提交设计 `dc16714b`。
 - [x] 编写详细 TDD 实施计划。
 - [x] 以 RED 测试建立共享错误分类与默认策略合同。
-- [ ] 实现普通完成的 OpenAI/Gemini 统一重试。
+- [x] 实现 OpenAI 兼容普通完成的当前调用级重试。
+- [ ] 实现 Gemini 普通完成的当前调用级重试。
 - [ ] 实现批量流和首事件前增量流重试。
 - [ ] 运行定向、回归和仓库门禁。
 - [ ] 重建并重启智脑，验证 HTTP/日志和本地故障注入行为。
 
 ### Decisions
 
-- 当前工作树的 `openai_compat.rs` 含用户未提交 `.no_proxy()` 改动；在原工作树就地实现并保留该行，不另建 worktree。
+- 主检出中的 `openai_compat.rs` 含用户未提交 `.no_proxy()` 改动；功能在隔离 worktree 实现，最终合并时保留该行。
 - 网络错误在仍为 `reqwest::Error` 时通过 typed API/错误源链分类；禁止字符串包含判断。
 - HTTP 只重试 408/429/500/502/503/504，并保留确定性模型路由 503 排除。
 - 批量流可丢弃未公开事件并重试；增量流仅在首个事件交付前重试，交付后错误通过 `StreamEvent::Error` 显式报告且不重发。

@@ -1221,3 +1221,6 @@
 - 增量流在 response headers 后立即返回 receiver，后台 chunk 错误仅 warning + break；`StreamEvent` 没有错误 variant。要可靠区分“首事件前重试”和“部分输出后不重试”，需要由一个后台驱动器持有 attempts/delivered 状态，并用显式错误事件报告耗尽或部分流失败。
 - 现有真实 Gemini 增量测试使用 wildcard 分支，新增 `StreamEvent::Error` 不会破坏其 match；仓库未发现其他对 `brain_llm::StreamEvent` 的穷尽匹配。
 - OpenAI 兼容文件已有用户未提交 `.no_proxy()` 两行修改，本功能不得覆盖或提交为自己的既有变更。
+- OpenAI 普通完成可以在同一个 `complete` future 内重发序列化后的同一 `api_request`，因此重试不会回到工具循环或重放更早的逻辑调用。
+- `reqwest::Error` 必须在 `.send().await` 的 `Err(e)` 分支直接分类；转换为 `RequestFailed(String)` 后只用于最终展示，不能再参与策略判断。
+- 本地脚本化服务已证明三个连续逻辑调用的网络请求次数为 `1 + 6 + 1`：仅第二个失败调用被重发，前后调用各执行一次。

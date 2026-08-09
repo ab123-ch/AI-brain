@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{LlmError, Result};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, LlmProvider, MessageRole};
+use crate::retry::is_retryable_reqwest_error;
 pub use crate::retry::RetryConfig;
 use crate::types::{ContentBlock, FinishReason, TokenUsage, ToolChoice};
 
@@ -566,8 +567,9 @@ impl LlmProvider for OpenAiCompatClient {
                                 status: status.as_u16(),
                                 message: body,
                             };
+                            let retryable = error.is_retryable();
 
-                            if error.is_retryable() && attempts < max_attempts {
+                            if retryable && attempts < max_attempts {
                                 let backoff = retry_config.backoff_for_attempt(attempts);
                                 tracing::warn!(
                                     "LLM 返回可重试错误: status={status}, 第{attempts}次尝试, \
@@ -579,6 +581,12 @@ impl LlmProvider for OpenAiCompatClient {
                             tracing::error!(
                                 "LLM API 非成功响应: status={status}, body_bytes={body_bytes}; 响应体不写入日志"
                             );
+                            if retryable {
+                                return Err(LlmError::RetriesExhausted {
+                                    attempts,
+                                    last_error: error.to_string(),
+                                });
+                            }
                             return Err(error);
                         }
 
@@ -631,9 +639,10 @@ impl LlmProvider for OpenAiCompatClient {
                         return Ok(parsed);
                     }
                     Err(e) => {
-                        let error = LlmError::RequestFailed(format!("HTTP request failed: {e}"));
+                        let last_error = format!("HTTP request failed: {e}");
+                        let retryable = is_retryable_reqwest_error(&e);
 
-                        if error.is_retryable() && attempts < max_attempts {
+                        if retryable && attempts < max_attempts {
                             let backoff = retry_config.backoff_for_attempt(attempts);
                             tracing::warn!(
                                 "LLM 请求发送失败（可重试）: 第{attempts}次尝试, \
@@ -644,7 +653,13 @@ impl LlmProvider for OpenAiCompatClient {
                         }
 
                         tracing::error!("LLM 请求发送失败: url={url}, error={e}");
-                        return Err(error);
+                        if retryable {
+                            return Err(LlmError::RetriesExhausted {
+                                attempts,
+                                last_error,
+                            });
+                        }
+                        return Err(LlmError::RequestFailed(last_error));
                     }
                 }
             }
@@ -734,6 +749,219 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         format!("http://{address}/v1")
+    }
+
+    async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            if bytes.len() >= body_start + content_length {
+                return String::from_utf8(bytes[body_start..body_start + content_length].to_vec())
+                    .unwrap();
+            }
+        }
+        String::new()
+    }
+
+    fn minimal_request(text: &str) -> ChatRequest {
+        ChatRequest {
+            model: Some("test-model".into()),
+            messages: vec![ChatMessage::user(text)],
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retries_only_the_current_logical_call_after_transport_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let server_captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for attempt in 0..8 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = read_request_body(&mut socket).await;
+                server_captured.lock().unwrap().push(body);
+                if (1..=5).contains(&attempt) {
+                    drop(socket);
+                    continue;
+                }
+                let answer = match attempt {
+                    0 => "first-ok",
+                    6 => "second-ok",
+                    7 => "third-ok",
+                    _ => unreachable!(),
+                };
+                let body = serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": answer},
+                        "finish_reason": "stop"
+                    }],
+                    "model": "test-model",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        assert_eq!(
+            client
+                .complete(minimal_request("call-1"))
+                .await
+                .unwrap()
+                .text(),
+            "first-ok"
+        );
+        assert_eq!(
+            client
+                .complete(minimal_request("call-2"))
+                .await
+                .unwrap()
+                .text(),
+            "second-ok"
+        );
+        assert_eq!(
+            client
+                .complete(minimal_request("call-3"))
+                .await
+                .unwrap()
+                .text(),
+            "third-ok"
+        );
+
+        let bodies = captured.lock().unwrap();
+        assert_eq!(bodies.len(), 8);
+        assert!(bodies[0].contains("call-1"));
+        assert!(bodies[7].contains("call-3"));
+        assert!(bodies[1..=6].iter().all(|body| body == &bodies[1]));
+        assert!(bodies[1].contains("call-2"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_retry_exhaustion_reports_six_attempts_without_a_seventh() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_request_body(&mut socket).await;
+                *server_attempts.lock().unwrap() += 1;
+                drop(socket);
+            }
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let error = client
+            .complete(minimal_request("exhaust-me"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LlmError::RetriesExhausted { attempts: 6, .. }
+        ));
+        assert_eq!(*attempts.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_status_retry_exhaustion_reports_six_attempts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_request_body(&mut socket).await;
+                *server_attempts.lock().unwrap() += 1;
+                let body = r#"{"error":"temporary overload"}"#;
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let error = client
+            .complete(minimal_request("status-exhaustion"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LlmError::RetriesExhausted { attempts: 6, .. }
+        ));
+        assert_eq!(*attempts.lock().unwrap(), 6);
     }
 
     async fn captured_provider_logs(status: &str, body: &str) -> String {

@@ -761,3 +761,7 @@
 - typed 断连测试首跑被系统代理转成 HTTP 502，已按系统化排障将测试客户端改为明确直连，尚未修改分类实现。
 - typed 断连测试修正环境后按预期 RED；实现 `reqwest::Error` typed/源链分类后 retry tests 3/3、error tests 3/3 GREEN。
 - Task 1 完成：共享 `retry.rs`、默认额外 5 次、1/2/4/8/16 秒退避、HTTP 白名单和确定性路由排除均已有测试。
+- Task 2 OpenAI 传输错误 RED 正确在第二个逻辑调用首次断连时返回；改为在原始 `reqwest::Error` 边界分类后，`1 + 6 + 1` 请求隔离测试 GREEN。
+- OpenAI 传输错误耗尽 RED 正确返回旧 `RequestFailed`；实现后返回 `RetriesExhausted { attempts: 6 }` 且服务端确认没有第七次连接。
+- OpenAI HTTP 429 耗尽 RED 正确返回旧 `ApiError`；实现统一耗尽语义后 GREEN。
+- `cargo test -p brain-llm openai_compat::tests -- --nocapture` 通过：25 passed、0 failed。
