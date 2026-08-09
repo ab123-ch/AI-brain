@@ -26,10 +26,10 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 use crate::orchestrator::Orchestrator;
 use crate::runtime_trace::ExchangePhase;
 use crate::web::collaboration::{
-    InboxState, LegacyMessageSeed, MemberAddress, PostMessageResult, RoomInputMode, RoomSnapshot,
-    DEFAULT_THREAD_KEY,
+    InboxState, LegacyMessageSeed, MemberAddress, PostMessageResult, RoomEventPage, RoomInputMode,
+    RoomSnapshot, DEFAULT_THREAD_KEY,
 };
-use crate::web::collaboration_runtime::CollaborationRuntime;
+use crate::web::collaboration_runtime::{CollaborationRuntime, RoomWorkingDirectoryUpdateError};
 use crate::web::progress_adapter::{ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent};
 use crate::web::session_manager::{ConversationFork, SessionManager, UserQueryTurn};
 use brain_core::types::{MainBrainOutput, ProgressEvent};
@@ -98,6 +98,17 @@ enum ClientMessage {
         expected_room_version: u64,
         #[serde(default)]
         command_id: String,
+        #[serde(default)]
+        reply_to_event_id: Option<String>,
+    },
+    UpdateRoomWorkingDirectory {
+        working_directory: String,
+        expected_room_version: u64,
+    },
+    LoadRoomEventsBefore {
+        before_sequence: u64,
+        #[serde(default = "default_room_event_page_limit")]
+        limit: usize,
     },
     CreateMember {
         display_name: String,
@@ -138,6 +149,194 @@ enum ClientMessage {
 
 fn default_thread_key() -> String {
     DEFAULT_THREAD_KEY.into()
+}
+
+const fn default_room_event_page_limit() -> usize {
+    100
+}
+
+#[async_trait::async_trait]
+trait RoomProtocolRuntime: Send + Sync {
+    async fn update_room_working_directory(
+        &self,
+        room_id: String,
+        working_directory: String,
+        expected_room_version: u64,
+    ) -> Result<RoomSnapshot, RoomWorkingDirectoryUpdateError>;
+
+    async fn snapshot(&self, room_id: String) -> Result<RoomSnapshot, String>;
+
+    async fn events_before(
+        &self,
+        room_id: String,
+        before_sequence: u64,
+        limit: usize,
+    ) -> Result<RoomEventPage, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn post_message_checked(
+        &self,
+        room_id: String,
+        recipients: Vec<MemberAddress>,
+        content: String,
+        mode: RoomInputMode,
+        thread_key: String,
+        expected_room_version: u64,
+        command_id: String,
+        reply_to_event_id: Option<String>,
+    ) -> Result<PostMessageResult, String>;
+}
+
+#[async_trait::async_trait]
+impl RoomProtocolRuntime for CollaborationRuntime {
+    async fn update_room_working_directory(
+        &self,
+        room_id: String,
+        working_directory: String,
+        expected_room_version: u64,
+    ) -> Result<RoomSnapshot, RoomWorkingDirectoryUpdateError> {
+        CollaborationRuntime::update_room_working_directory_classified(
+            self,
+            room_id,
+            working_directory,
+            expected_room_version,
+        )
+        .await
+    }
+
+    async fn snapshot(&self, room_id: String) -> Result<RoomSnapshot, String> {
+        CollaborationRuntime::snapshot(self, room_id).await
+    }
+
+    async fn events_before(
+        &self,
+        room_id: String,
+        before_sequence: u64,
+        limit: usize,
+    ) -> Result<RoomEventPage, String> {
+        CollaborationRuntime::events_before(self, room_id, before_sequence, limit).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn post_message_checked(
+        &self,
+        room_id: String,
+        recipients: Vec<MemberAddress>,
+        content: String,
+        mode: RoomInputMode,
+        thread_key: String,
+        expected_room_version: u64,
+        command_id: String,
+        reply_to_event_id: Option<String>,
+    ) -> Result<PostMessageResult, String> {
+        CollaborationRuntime::post_message_checked(
+            self,
+            room_id,
+            recipients,
+            content,
+            mode,
+            thread_key,
+            expected_room_version,
+            command_id,
+            reply_to_event_id,
+        )
+        .await
+    }
+}
+
+enum RoomProtocolDispatch {
+    Handled(Vec<WebProgressEvent>),
+    Unhandled(ClientMessage),
+}
+
+async fn dispatch_room_protocol_message(
+    runtime: &dyn RoomProtocolRuntime,
+    active_room_id: String,
+    message: ClientMessage,
+) -> RoomProtocolDispatch {
+    let events = match message {
+        ClientMessage::UpdateRoomWorkingDirectory {
+            working_directory,
+            expected_room_version,
+        } => match runtime
+            .update_room_working_directory(
+                active_room_id.clone(),
+                working_directory,
+                expected_room_version,
+            )
+            .await
+        {
+            Ok(_) => Vec::new(),
+            Err(error) => {
+                let version_conflict = error.is_version_conflict();
+                let mut events = vec![WebProgressEvent::Error {
+                    message: error.into_message(),
+                }];
+                if version_conflict {
+                    match runtime.snapshot(active_room_id).await {
+                        Ok(snapshot) => events.push(WebProgressEvent::RoomSnapshot { snapshot }),
+                        Err(error) => events.push(WebProgressEvent::Error {
+                            message: format!("刷新协作房间快照失败: {error}"),
+                        }),
+                    }
+                }
+                events
+            }
+        },
+        ClientMessage::LoadRoomEventsBefore {
+            before_sequence,
+            limit,
+        } => match runtime
+            .events_before(active_room_id.clone(), before_sequence, limit)
+            .await
+        {
+            Ok(page) => vec![WebProgressEvent::RoomEventsLoadedBefore {
+                room_id: active_room_id,
+                before_sequence,
+                has_more: page.has_more,
+                events: page.events,
+            }],
+            Err(error) => vec![WebProgressEvent::Error { message: error }],
+        },
+        ClientMessage::PostRoomMessage {
+            recipients,
+            content,
+            mode,
+            thread_key,
+            expected_room_version,
+            command_id,
+            reply_to_event_id,
+        } => {
+            let command_id = if command_id.trim().is_empty() {
+                format!("web-{}", uuid::Uuid::new_v4())
+            } else {
+                command_id
+            };
+            match runtime
+                .post_message_checked(
+                    active_room_id.clone(),
+                    recipients,
+                    content,
+                    mode,
+                    thread_key,
+                    expected_room_version,
+                    command_id.clone(),
+                    reply_to_event_id,
+                )
+                .await
+            {
+                Ok(result) => vec![WebProgressEvent::RoomMessageAccepted {
+                    room_id: active_room_id,
+                    command_id,
+                    event_id: result.event.event_id,
+                    duplicate: result.duplicate,
+                }],
+                Err(error) => vec![WebProgressEvent::Error { message: error }],
+            }
+        }
+        message => return RoomProtocolDispatch::Unhandled(message),
+    };
+    RoomProtocolDispatch::Handled(events)
 }
 
 // ─── WebSocket 升级入口 ──────────────────────────────────────────────
@@ -267,6 +466,7 @@ async fn submit_legacy_query(
             DEFAULT_THREAD_KEY.into(),
             snapshot.room.version,
             format!("legacy-query-{}", uuid::Uuid::new_v4()),
+            None,
         )
         .await?;
     PendingLegacyQuery::from_post(&result)
@@ -379,6 +579,8 @@ fn collaboration_event_room_id(event: &WebProgressEvent) -> Option<&str> {
         WebProgressEvent::RoomEventAppended { event } => Some(&event.room_id),
         WebProgressEvent::MemberChanged { member } => Some(&member.room_id),
         WebProgressEvent::RoomEventsReplayed { room_id, .. }
+        | WebProgressEvent::RoomEventsLoadedBefore { room_id, .. }
+        | WebProgressEvent::RoomMessageAccepted { room_id, .. }
         | WebProgressEvent::InboxItemChanged { room_id, .. }
         | WebProgressEvent::MemberRunProgress { room_id, .. }
         | WebProgressEvent::MemberRunFinished { room_id, .. } => Some(room_id),
@@ -1039,6 +1241,24 @@ async fn handle_client_message(
     state: &Arc<AppState>,
     msg: ClientMessage,
 ) {
+    let msg = match dispatch_room_protocol_message(
+        state.collaboration.as_ref(),
+        active_room_id(state).await,
+        msg,
+    )
+    .await
+    {
+        RoomProtocolDispatch::Handled(events) => {
+            for event in events {
+                if send_event(sender, event).await.is_err() {
+                    return;
+                }
+            }
+            return;
+        }
+        RoomProtocolDispatch::Unhandled(message) => message,
+    };
+
     match msg {
         ClientMessage::Query { .. }
         | ClientMessage::EditUserMessage { .. }
@@ -1125,35 +1345,10 @@ async fn handle_client_message(
                 Err(error) => send_collaboration_error(sender, error).await,
             }
         }
-        ClientMessage::PostRoomMessage {
-            recipients,
-            content,
-            mode,
-            thread_key,
-            expected_room_version,
-            command_id,
-        } => {
-            let room_id = active_room_id(state).await;
-            let command_id = if command_id.trim().is_empty() {
-                format!("web-{}", uuid::Uuid::new_v4())
-            } else {
-                command_id
-            };
-            if let Err(error) = state
-                .collaboration
-                .post_message_checked(
-                    room_id,
-                    recipients,
-                    content,
-                    mode,
-                    thread_key,
-                    expected_room_version,
-                    command_id,
-                )
-                .await
-            {
-                send_collaboration_error(sender, error).await;
-            }
+        ClientMessage::PostRoomMessage { .. }
+        | ClientMessage::UpdateRoomWorkingDirectory { .. }
+        | ClientMessage::LoadRoomEventsBefore { .. } => {
+            unreachable!("房间协议消息必须由定向 dispatcher 处理")
         }
         ClientMessage::CreateMember {
             display_name,
@@ -1505,6 +1700,103 @@ async fn send_session_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::collaboration::{CollaborationActor, CollaborationConfig, RoomEventPage};
+    use tokio::sync::Mutex as TokioMutex;
+
+    struct TestRoomProtocol {
+        repository: Arc<crate::web::collaboration::CollaborationRepository>,
+        calls: TokioMutex<Vec<(String, String)>>,
+    }
+
+    impl TestRoomProtocol {
+        fn new(repository: Arc<crate::web::collaboration::CollaborationRepository>) -> Self {
+            Self {
+                repository,
+                calls: TokioMutex::new(Vec::new()),
+            }
+        }
+
+        async fn record(&self, operation: &str, room_id: &str) {
+            self.calls
+                .lock()
+                .await
+                .push((operation.into(), room_id.into()));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RoomProtocolRuntime for TestRoomProtocol {
+        async fn update_room_working_directory(
+            &self,
+            room_id: String,
+            working_directory: String,
+            expected_room_version: u64,
+        ) -> Result<RoomSnapshot, RoomWorkingDirectoryUpdateError> {
+            self.record("update_directory", &room_id).await;
+            self.repository
+                .update_room_working_directory(&room_id, &working_directory, expected_room_version)
+                .map_err(RoomWorkingDirectoryUpdateError::from)?;
+            self.repository
+                .snapshot(&room_id)
+                .map_err(RoomWorkingDirectoryUpdateError::from)
+        }
+
+        async fn snapshot(&self, room_id: String) -> Result<RoomSnapshot, String> {
+            self.record("snapshot", &room_id).await;
+            self.repository
+                .snapshot(&room_id)
+                .map_err(|error| error.to_string())
+        }
+
+        async fn events_before(
+            &self,
+            room_id: String,
+            before_sequence: u64,
+            limit: usize,
+        ) -> Result<RoomEventPage, String> {
+            self.record("events_before", &room_id).await;
+            self.repository
+                .events_before(&room_id, before_sequence, limit)
+                .map_err(|error| error.to_string())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn post_message_checked(
+            &self,
+            room_id: String,
+            recipients: Vec<MemberAddress>,
+            content: String,
+            mode: RoomInputMode,
+            thread_key: String,
+            expected_room_version: u64,
+            command_id: String,
+            reply_to_event_id: Option<String>,
+        ) -> Result<PostMessageResult, String> {
+            self.record("post_message", &room_id).await;
+            self.repository
+                .post_group_message_checked_with_reply(
+                    &CollaborationActor::local(),
+                    &room_id,
+                    &recipients,
+                    &content,
+                    mode,
+                    &thread_key,
+                    expected_room_version,
+                    &command_id,
+                    reply_to_event_id.as_deref(),
+                )
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn handled_room_events(dispatch: RoomProtocolDispatch) -> Vec<WebProgressEvent> {
+        match dispatch {
+            RoomProtocolDispatch::Handled(events) => events,
+            RoomProtocolDispatch::Unhandled(message) => {
+                panic!("expected handled room protocol message, got {message:?}")
+            }
+        }
+    }
 
     #[test]
     fn edit_and_retry_client_messages_deserialize_with_stable_ids() {
@@ -1559,6 +1851,30 @@ mod tests {
 
     #[test]
     fn collaboration_client_messages_deserialize_with_explicit_targets() {
+        let legacy: ClientMessage = serde_json::from_str(
+            r#"{"type":"post_room_message","recipients":[],"content":"x","mode":"chat","expected_room_version":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            ClientMessage::PostRoomMessage {
+                reply_to_event_id: None,
+                ..
+            }
+        ));
+
+        let reply: ClientMessage = serde_json::from_str(
+            r#"{"type":"post_room_message","recipients":[],"content":"x","mode":"chat","expected_room_version":1,"reply_to_event_id":"event-9"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            reply,
+            ClientMessage::PostRoomMessage {
+                reply_to_event_id: Some(id),
+                ..
+            } if id == "event-9"
+        ));
+
         let post: ClientMessage = serde_json::from_str(
             r#"{"type":"post_room_message","recipients":[{"member_id":"member-a","expected_version":3},{"member_id":"member-b","expected_version":5}],"content":"分别检查接口和界面","mode":"task","thread_key":"review","expected_room_version":8,"command_id":"command-1"}"#,
         )
@@ -1571,6 +1887,7 @@ mod tests {
                 thread_key,
                 expected_room_version,
                 command_id,
+                reply_to_event_id,
             } => {
                 assert_eq!(
                     recipients,
@@ -1590,6 +1907,7 @@ mod tests {
                 assert_eq!(thread_key, "review");
                 assert_eq!(expected_room_version, 8);
                 assert_eq!(command_id, "command-1");
+                assert_eq!(reply_to_event_id, None);
             }
             other => panic!("expected room message, got {other:?}"),
         }
@@ -1612,6 +1930,385 @@ mod tests {
             ClientMessage::JoinRoom { room_id, after_sequence }
                 if room_id == "room-1" && after_sequence == 42
         ));
+
+        let directory: ClientMessage = serde_json::from_str(
+            r#"{"type":"update_room_working_directory","working_directory":"workspace-a","expected_room_version":12,"room_id":"forged-room"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            directory,
+            ClientMessage::UpdateRoomWorkingDirectory {
+                working_directory,
+                expected_room_version,
+            } if working_directory == "workspace-a" && expected_room_version == 12
+        ));
+
+        let page: ClientMessage = serde_json::from_str(
+            r#"{"type":"load_room_events_before","before_sequence":91,"room_id":"forged-room"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            page,
+            ClientMessage::LoadRoomEventsBefore {
+                before_sequence,
+                limit,
+            } if before_sequence == 91 && limit == 100
+        ));
+    }
+
+    #[test]
+    fn collaboration_event_room_id_filters_new_protocol_events() {
+        let loaded = WebProgressEvent::RoomEventsLoadedBefore {
+            room_id: "room-loaded".into(),
+            before_sequence: 42,
+            has_more: false,
+            events: Vec::new(),
+        };
+        let accepted = WebProgressEvent::RoomMessageAccepted {
+            room_id: "room-accepted".into(),
+            command_id: "command-1".into(),
+            event_id: "event-1".into(),
+            duplicate: false,
+        };
+
+        assert_eq!(collaboration_event_room_id(&loaded), Some("room-loaded"));
+        assert_eq!(
+            collaboration_event_room_id(&accepted),
+            Some("room-accepted")
+        );
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap()["type"],
+            "room_events_loaded_before"
+        );
+        assert_eq!(
+            serde_json::to_value(&accepted).unwrap()["type"],
+            "room_message_accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn room_working_directory_websocket_uses_only_the_active_room() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let startup_directory = tempfile::tempdir().unwrap();
+        let requested_directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(
+            crate::web::collaboration::CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                CollaborationConfig::default(),
+                startup_directory.path(),
+            )
+            .unwrap(),
+        );
+        let active = repository
+            .ensure_room("active-room", "Active", &[])
+            .unwrap();
+        repository
+            .ensure_room("forged-room", "Forged", &[])
+            .unwrap();
+        let protocol = TestRoomProtocol::new(Arc::clone(&repository));
+        let message: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "update_room_working_directory",
+            "room_id": "forged-room",
+            "working_directory": requested_directory.path(),
+            "expected_room_version": active.room.version,
+        }))
+        .unwrap();
+
+        let events = handled_room_events(
+            dispatch_room_protocol_message(&protocol, "active-room".into(), message).await,
+        );
+
+        assert!(events.is_empty(), "成功目录更新由 runtime 广播快照");
+        assert_eq!(
+            protocol.calls.lock().await.as_slice(),
+            &[("update_directory".into(), "active-room".into())]
+        );
+        assert_eq!(
+            std::path::PathBuf::from(
+                repository
+                    .snapshot("active-room")
+                    .unwrap()
+                    .room
+                    .working_directory
+            ),
+            requested_directory.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            std::path::PathBuf::from(
+                repository
+                    .snapshot("forged-room")
+                    .unwrap()
+                    .room
+                    .working_directory
+            ),
+            startup_directory.path().canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn room_working_directory_websocket_stale_version_returns_error_then_fresh_snapshot() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let startup_directory = tempfile::tempdir().unwrap();
+        let authoritative_directory = tempfile::tempdir().unwrap();
+        let rejected_directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(
+            crate::web::collaboration::CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                CollaborationConfig::default(),
+                startup_directory.path(),
+            )
+            .unwrap(),
+        );
+        let initial = repository
+            .ensure_room("active-room", "Active", &[])
+            .unwrap();
+        repository
+            .update_room_working_directory(
+                "active-room",
+                &authoritative_directory.path().display().to_string(),
+                initial.room.version,
+            )
+            .unwrap();
+        let authoritative_path = authoritative_directory.path().canonicalize().unwrap();
+        let protocol = TestRoomProtocol::new(Arc::clone(&repository));
+
+        let events = handled_room_events(
+            dispatch_room_protocol_message(
+                &protocol,
+                "active-room".into(),
+                ClientMessage::UpdateRoomWorkingDirectory {
+                    working_directory: rejected_directory.path().display().to_string(),
+                    expected_room_version: initial.room.version,
+                },
+            )
+            .await,
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            WebProgressEvent::Error { message } if message.contains("版本冲突")
+        ));
+        assert!(matches!(
+            &events[1],
+            WebProgressEvent::RoomSnapshot { snapshot }
+                if std::path::Path::new(&snapshot.room.working_directory)
+                    == authoritative_path.as_path()
+        ));
+        assert_eq!(
+            protocol.calls.lock().await.as_slice(),
+            &[
+                ("update_directory".into(), "active-room".into()),
+                ("snapshot".into(), "active-room".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn room_working_directory_websocket_non_version_error_never_refreshes_snapshot() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let startup_directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(
+            crate::web::collaboration::CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                CollaborationConfig::default(),
+                startup_directory.path(),
+            )
+            .unwrap(),
+        );
+        let initial = repository
+            .ensure_room("active-room", "Active", &[])
+            .unwrap();
+        let non_directory = startup_directory.path().join("版本冲突.txt");
+        std::fs::write(&non_directory, b"not a directory").unwrap();
+        let protocol = TestRoomProtocol::new(repository);
+
+        let events = handled_room_events(
+            dispatch_room_protocol_message(
+                &protocol,
+                "active-room".into(),
+                ClientMessage::UpdateRoomWorkingDirectory {
+                    working_directory: non_directory.display().to_string(),
+                    expected_room_version: initial.room.version,
+                },
+            )
+            .await,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [WebProgressEvent::Error { message }]
+                if message.contains("房间工作目录不是目录") && message.contains("版本冲突.txt")
+        ));
+        assert_eq!(
+            protocol.calls.lock().await.as_slice(),
+            &[("update_directory".into(), "active-room".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn room_events_before_websocket_reads_only_active_room_and_clamps_limit() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let startup_directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(
+            crate::web::collaboration::CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                CollaborationConfig::default(),
+                startup_directory.path(),
+            )
+            .unwrap(),
+        );
+        let now = chrono::Utc::now();
+        let history = (1..=150)
+            .map(|index| LegacyMessageSeed {
+                id: format!("message-{index}"),
+                role: "assistant".into(),
+                content: format!("历史 {index}"),
+                timestamp: now + chrono::Duration::seconds(index),
+                hidden: false,
+            })
+            .collect::<Vec<_>>();
+        let active = repository
+            .ensure_room("active-room", "Active", &history)
+            .unwrap();
+        repository
+            .ensure_room("forged-room", "Forged", &[])
+            .unwrap();
+        let protocol = TestRoomProtocol::new(repository);
+        let message: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "load_room_events_before",
+            "room_id": "forged-room",
+            "before_sequence": active.room.latest_event_seq + 1,
+            "limit": usize::MAX,
+        }))
+        .unwrap();
+
+        let events = handled_room_events(
+            dispatch_room_protocol_message(&protocol, "active-room".into(), message).await,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [WebProgressEvent::RoomEventsLoadedBefore {
+                room_id,
+                before_sequence,
+                has_more: true,
+                events,
+            }] if room_id == "active-room"
+                && *before_sequence == active.room.latest_event_seq + 1
+                && events.len() == 100
+                && events.iter().all(|event| event.room_id == "active-room")
+        ));
+        assert_eq!(
+            protocol.calls.lock().await.as_slice(),
+            &[("events_before".into(), "active-room".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn room_message_ack_websocket_accepts_valid_reply_and_rejects_invalid_reply() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let startup_directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(
+            crate::web::collaboration::CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                CollaborationConfig::default(),
+                startup_directory.path(),
+            )
+            .unwrap(),
+        );
+        let target_id = "legacy-active-room-target";
+        let initial = repository
+            .ensure_room(
+                "active-room",
+                "Active",
+                &[LegacyMessageSeed {
+                    id: "target".into(),
+                    role: "user".into(),
+                    content: "被引用消息".into(),
+                    timestamp: chrono::Utc::now(),
+                    hidden: false,
+                }],
+            )
+            .unwrap();
+        let recipient = MemberAddress {
+            member_id: initial.room.default_member_id.clone(),
+            expected_version: initial.members[0].version,
+        };
+        let protocol = TestRoomProtocol::new(Arc::clone(&repository));
+        let valid_message = || ClientMessage::PostRoomMessage {
+            recipients: vec![recipient.clone()],
+            content: "带引用的新消息".into(),
+            mode: RoomInputMode::Chat,
+            thread_key: DEFAULT_THREAD_KEY.into(),
+            expected_room_version: initial.room.version,
+            command_id: "command-valid".into(),
+            reply_to_event_id: Some(target_id.into()),
+        };
+
+        let accepted = handled_room_events(
+            dispatch_room_protocol_message(&protocol, "active-room".into(), valid_message()).await,
+        );
+        let accepted_event_id = match accepted.as_slice() {
+            [WebProgressEvent::RoomMessageAccepted {
+                room_id,
+                command_id,
+                event_id,
+                duplicate: false,
+            }] if room_id == "active-room" && command_id == "command-valid" => event_id.clone(),
+            other => panic!("expected accepted reply, got {other:?}"),
+        };
+        let stored = repository
+            .snapshot("active-room")
+            .unwrap()
+            .events
+            .into_iter()
+            .find(|event| event.event_id == accepted_event_id)
+            .unwrap();
+        assert_eq!(stored.parent_event_id.as_deref(), Some(target_id));
+
+        let duplicate = handled_room_events(
+            dispatch_room_protocol_message(&protocol, "active-room".into(), valid_message()).await,
+        );
+        assert!(matches!(
+            duplicate.as_slice(),
+            [WebProgressEvent::RoomMessageAccepted {
+                room_id,
+                command_id,
+                event_id,
+                duplicate: true,
+            }] if room_id == "active-room"
+                && command_id == "command-valid"
+                && event_id == &accepted_event_id
+        ));
+
+        let current = repository.snapshot("active-room").unwrap();
+        let rejected = handled_room_events(
+            dispatch_room_protocol_message(
+                &protocol,
+                "active-room".into(),
+                ClientMessage::PostRoomMessage {
+                    recipients: vec![MemberAddress {
+                        member_id: current.room.default_member_id.clone(),
+                        expected_version: current.members[0].version,
+                    }],
+                    content: "非法引用".into(),
+                    mode: RoomInputMode::Chat,
+                    thread_key: DEFAULT_THREAD_KEY.into(),
+                    expected_room_version: current.room.version,
+                    command_id: "command-invalid".into(),
+                    reply_to_event_id: Some("missing-event".into()),
+                },
+            )
+            .await,
+        );
+        assert!(matches!(
+            rejected.as_slice(),
+            [WebProgressEvent::Error { message }] if message.contains("回复目标不存在")
+        ));
+        assert!(!rejected
+            .iter()
+            .any(|event| matches!(event, WebProgressEvent::RoomMessageAccepted { .. })));
     }
 
     #[test]

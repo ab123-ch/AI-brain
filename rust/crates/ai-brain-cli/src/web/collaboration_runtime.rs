@@ -30,8 +30,8 @@ use crate::web::collaboration::{
     BrainMemberView, ClaimReleaseDisposition, ClaimedInboxItem, CollaborationActor,
     CollaborationConfig, CollaborationError, CollaborationRepository, InboxFailureDisposition,
     InboxPurpose, LegacyMessageSeed, MemberAddress, MemberHistoryMessage, ParticipationCompletion,
-    ParticipationDisposition, PostMessageResult, RoomEventReferenceView, RoomEventView,
-    RoomInputMode, RoomSnapshot,
+    ParticipationDisposition, PostMessageResult, RoomEventPage, RoomEventReferenceView,
+    RoomEventView, RoomInputMode, RoomSnapshot,
 };
 use crate::web::collaboration_tools::GroupMessageToolScope;
 use crate::web::progress_adapter::WebProgressEvent;
@@ -237,6 +237,38 @@ pub struct CollaborationRuntime {
     model_policy_details: Vec<ResolvedModelPolicy>,
 }
 
+#[derive(Debug)]
+pub(crate) enum RoomWorkingDirectoryUpdateError {
+    Collaboration(CollaborationError),
+    Runtime(String),
+}
+
+impl RoomWorkingDirectoryUpdateError {
+    pub(crate) fn runtime(message: impl Into<String>) -> Self {
+        Self::Runtime(message.into())
+    }
+
+    pub(crate) const fn is_version_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Collaboration(CollaborationError::VersionConflict { .. })
+        )
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Collaboration(error) => error.to_string(),
+            Self::Runtime(message) => message,
+        }
+    }
+}
+
+impl From<CollaborationError> for RoomWorkingDirectoryUpdateError {
+    fn from(error: CollaborationError) -> Self {
+        Self::Collaboration(error)
+    }
+}
+
 impl CollaborationRuntime {
     #[cfg(not(test))]
     pub async fn start(
@@ -397,6 +429,66 @@ impl CollaborationRuntime {
         .map_err(|error| error.to_string())
     }
 
+    pub async fn events_before(
+        &self,
+        room_id: String,
+        before_sequence: u64,
+        limit: usize,
+    ) -> Result<RoomEventPage, String> {
+        let repository = Arc::clone(&self.repository);
+        tokio::task::spawn_blocking(move || {
+            repository.events_before(&room_id, before_sequence, limit)
+        })
+        .await
+        .map_err(|error| format!("读取较早协作房间事件线程失败: {error}"))?
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn update_room_working_directory(
+        &self,
+        room_id: String,
+        working_directory: String,
+        expected_room_version: u64,
+    ) -> Result<RoomSnapshot, String> {
+        self.update_room_working_directory_classified(
+            room_id,
+            working_directory,
+            expected_room_version,
+        )
+        .await
+        .map_err(RoomWorkingDirectoryUpdateError::into_message)
+    }
+
+    pub(crate) async fn update_room_working_directory_classified(
+        &self,
+        room_id: String,
+        working_directory: String,
+        expected_room_version: u64,
+    ) -> Result<RoomSnapshot, RoomWorkingDirectoryUpdateError> {
+        let repository = Arc::clone(&self.repository);
+        let room_for_update = room_id.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            repository.update_room_working_directory(
+                &room_for_update,
+                &working_directory,
+                expected_room_version,
+            )?;
+            repository.snapshot(&room_for_update)
+        })
+        .await
+        .map_err(|error| {
+            RoomWorkingDirectoryUpdateError::runtime(format!(
+                "更新协作房间工作目录线程失败: {error}"
+            ))
+        })?
+        .map_err(RoomWorkingDirectoryUpdateError::from)?;
+        let snapshot = self.with_model_policy_details(snapshot);
+        self.broadcast(WebProgressEvent::RoomSnapshot {
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+
     pub async fn retry_last_user_message(
         &self,
         room_id: String,
@@ -475,11 +567,12 @@ impl CollaborationRuntime {
         thread_key: String,
         expected_room_version: u64,
         command_id: String,
+        reply_to_event_id: Option<String>,
     ) -> Result<PostMessageResult, String> {
         let repository = Arc::clone(&self.repository);
         let room_for_commit = room_id.clone();
         let result = tokio::task::spawn_blocking(move || {
-            repository.post_group_message_checked(
+            repository.post_group_message_checked_with_reply(
                 &CollaborationActor::local(),
                 &room_for_commit,
                 &recipients,
@@ -488,6 +581,7 @@ impl CollaborationRuntime {
                 &thread_key,
                 expected_room_version,
                 &command_id,
+                reply_to_event_id.as_deref(),
             )
         })
         .await
@@ -2482,8 +2576,8 @@ mod tests {
     use crate::real_tool_executor::{mvp_tool_definitions, RealToolExecutor};
     use crate::web::collaboration::{
         CollaborationActor, CollaborationConfig, CollaborationRepository, InboxPurpose, InboxState,
-        MemberAddress, MemberHistoryMessage, ParticipationDisposition, RoomInputMode,
-        DEFAULT_THREAD_KEY,
+        LegacyMessageSeed, MemberAddress, MemberHistoryMessage, ParticipationDisposition,
+        RoomInputMode, DEFAULT_THREAD_KEY,
     };
     use crate::web::collaboration_tools::GroupMessageToolScope;
     use crate::web::progress_adapter::WebProgressEvent;
@@ -2989,6 +3083,130 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("等待房间 {room_id} 成员回复超时");
+    }
+
+    #[tokio::test]
+    async fn room_working_directory_websocket_broadcasts_authoritative_snapshot() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let startup_directory = tempfile::tempdir().unwrap();
+        let requested_directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                startup_directory.path(),
+            )
+            .unwrap(),
+        );
+        let initial = collaboration
+            .ensure_room("room-directory-websocket", "Directory", &[])
+            .unwrap();
+        let services = Arc::new(TestRuntimeServices::new(&collaboration, &config));
+        let runtime = CollaborationRuntime::start(
+            Arc::clone(&collaboration),
+            services,
+            Arc::new(LlmConfig::default_config()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime.subscribe();
+
+        let snapshot = runtime
+            .update_room_working_directory(
+                "room-directory-websocket".into(),
+                requested_directory.path().display().to_string(),
+                initial.room.version,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::path::PathBuf::from(&snapshot.room.working_directory),
+            requested_directory.path().canonicalize().unwrap()
+        );
+        assert_eq!(snapshot.room.version, initial.room.version + 1);
+        let broadcast = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if matches!(
+                    &event,
+                    WebProgressEvent::RoomSnapshot { snapshot: pushed }
+                        if pushed.room.room_id == "room-directory-websocket"
+                            && pushed.room.version == snapshot.room.version
+                            && pushed.room.working_directory == snapshot.room.working_directory
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            broadcast,
+            WebProgressEvent::RoomSnapshot { snapshot: pushed }
+                if pushed.room.room_id == "room-directory-websocket"
+                    && pushed.room.version == snapshot.room.version
+                    && pushed.room.working_directory == snapshot.room.working_directory
+        ));
+    }
+
+    #[tokio::test]
+    async fn room_events_before_websocket_uses_repository_limit_and_has_more() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let startup_directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                startup_directory.path(),
+            )
+            .unwrap(),
+        );
+        let now = chrono::Utc::now();
+        let legacy_messages = (1..=150)
+            .map(|index| LegacyMessageSeed {
+                id: format!("legacy-{index}"),
+                role: "assistant".into(),
+                content: format!("历史消息 {index}"),
+                timestamp: now + chrono::Duration::seconds(index),
+                hidden: false,
+            })
+            .collect::<Vec<_>>();
+        let initial = collaboration
+            .ensure_room("room-events-websocket", "Events", &legacy_messages)
+            .unwrap();
+        let services = Arc::new(TestRuntimeServices::new(&collaboration, &config));
+        let runtime = CollaborationRuntime::start(
+            collaboration,
+            services,
+            Arc::new(LlmConfig::default_config()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let page = runtime
+            .events_before(
+                "room-events-websocket".into(),
+                initial.room.latest_event_seq + 1,
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.events.len(), 100);
+        assert!(page.has_more);
+        assert!(page
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(page
+            .events
+            .iter()
+            .all(|event| event.room_id == "room-events-websocket"));
     }
 
     async fn assert_missing_frozen_directory_failure(existing_task: bool, recovered_task: bool) {
