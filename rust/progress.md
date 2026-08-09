@@ -784,3 +784,9 @@
 - 复核发现第二轮 in-flight 取消会把未完成调用计入 `llm_calls`；新增 tool-use 后 pending 的部分结果测试先 RED（2 != 1），取消分支减去未完成调用后 GREEN。
 - 最新定向验证：`brain-llm` 119/119、`brain-main tool_loop` 6/6、用户手动重试核心 1/1、`cargo check --workspace --lib` 通过。
 - 独立复核在计数修复后给出 Ready: Yes，无剩余 Critical/Important。
+- 将 `feat/llm-provider-call-retry` 快进合并到 `featrue/20260404-nao`；合并前单独暂存、合并后恢复用户的 `.no_proxy()` 修改，其他待办和小说材料均未进入提交。
+- 合并后重新验证通过：`brain-llm` 119/119、`brain-main tool_loop` 6/6、用户手动重试核心 1/1、严格 `brain-llm` Clippy、格式、workspace lib check 和 Git whitespace 均为绿色。
+- `codexall` 已配置到 Windows PowerShell profile 与 CMD AutoRun；两端运行 `codexall --version` 均返回 `codex-cli 0.147.0`，并会附加 `--dangerously-bypass-approvals-and-sandbox`。
+- release 产物已部署到 `target/release/ai-brain.exe`，SHA-256 为 `413AB76169D4150D9F80833408246D816C47A87467F57D0E1C9287EB1AB064CF`；旧 PID 13952 精确停止，新 PID 39600 隐藏启动并监听 `127.0.0.1:8080`，HTTP 返回 200。
+- 当日日志 `C:\Users\16038\.ai-brain\logs\brain-2026-08-09.log` 已追加新启动记录；旧二进制保留为 `target/release/ai-brain.pre-209a60a2.exe`，独立临时 release 构建目录已清理。
+- 已移除合并完成且干净的功能 worktree，并删除本地功能分支；当前实现保留在 `featrue/20260404-nao`。

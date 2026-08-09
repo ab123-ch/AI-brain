@@ -391,7 +391,7 @@ git diff -- crates/brain-llm/src/openai_compat.rs
 Expected: `retry_last_user_message` 生产文件无 diff；`.no_proxy()` 仍存在；用户小说材料、
 `.clawd-todos.json` 未进入本功能暂存区。
 
-- [ ] **Step 4: 重建并重启智脑**
+- [x] **Step 4: 重建并重启智脑**
 
 精确核实当前 `ai-brain.exe` PID/命令行/路径后停止该进程，再运行：
 
@@ -403,7 +403,7 @@ cargo build --release -p ai-brain-cli --bin ai-brain
 监听 `127.0.0.1:8080`、HTTP 200 和当天日志非空。不调用真实付费模型做失败 smoke；
 故障注入证据来自本地服务器测试。
 
-- [ ] **Step 5: 完成记录**
+- [x] **Step 5: 完成记录**
 
 更新三份规划文件。实施提交前单独审查暂存区；如果无法安全拆分 `openai_compat.rs` 中
 用户 `.no_proxy()` hunk，则保持实现未提交并说明，绝不误提交用户改动。

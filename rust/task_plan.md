@@ -799,8 +799,8 @@ Build an operational cockpit and conversation trace that expose the real runtime
 - [x] 实现 OpenAI 兼容普通完成的当前调用级重试。
 - [x] 实现 Gemini 普通完成的当前调用级重试。
 - [x] 实现批量流和首事件前增量流重试。
-- [ ] 运行定向、回归和仓库门禁。
-- [ ] 重建并重启智脑，验证 HTTP/日志和本地故障注入行为。
+- [x] 运行定向、回归和仓库门禁。
+- [x] 重建并重启智脑，验证 HTTP/日志和本地故障注入行为。
 
 ### Decisions
 
