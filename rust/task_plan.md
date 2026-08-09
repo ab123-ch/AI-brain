@@ -797,7 +797,7 @@ Build an operational cockpit and conversation trace that expose the real runtime
 - [x] 编写详细 TDD 实施计划。
 - [x] 以 RED 测试建立共享错误分类与默认策略合同。
 - [x] 实现 OpenAI 兼容普通完成的当前调用级重试。
-- [ ] 实现 Gemini 普通完成的当前调用级重试。
+- [x] 实现 Gemini 普通完成的当前调用级重试。
 - [ ] 实现批量流和首事件前增量流重试。
 - [ ] 运行定向、回归和仓库门禁。
 - [ ] 重建并重启智脑，验证 HTTP/日志和本地故障注入行为。

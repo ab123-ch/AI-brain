@@ -1224,3 +1224,5 @@
 - OpenAI 普通完成可以在同一个 `complete` future 内重发序列化后的同一 `api_request`，因此重试不会回到工具循环或重放更早的逻辑调用。
 - `reqwest::Error` 必须在 `.send().await` 的 `Err(e)` 分支直接分类；转换为 `RequestFailed(String)` 后只用于最终展示，不能再参与策略判断。
 - 本地脚本化服务已证明三个连续逻辑调用的网络请求次数为 `1 + 6 + 1`：仅第二个失败调用被重发，前后调用各执行一次。
+- Gemini 通过 `SharedHttpClient` 持有重试配置；在测试中使用本地 HTTP 代理可以稳定注入断连，同时不依赖机器的系统代理设置。
+- Gemini 普通完成与 OpenAI 兼容路径使用相同 typed 分类和耗尽合同；Provider 协议转换只发生在请求重试循环内部，不会重启上层任务。

@@ -765,3 +765,6 @@
 - OpenAI 传输错误耗尽 RED 正确返回旧 `RequestFailed`；实现后返回 `RetriesExhausted { attempts: 6 }` 且服务端确认没有第七次连接。
 - OpenAI HTTP 429 耗尽 RED 正确返回旧 `ApiError`；实现统一耗尽语义后 GREEN。
 - `cargo test -p brain-llm openai_compat::tests -- --nocapture` 通过：25 passed、0 failed。
+- Task 3 Gemini 当前调用隔离 RED 正确在首次断线返回旧 `RequestFailed`；接入共享 typed 分类后 `1 + 6 + 1` 测试 GREEN。
+- Gemini 传输错误和 HTTP 429 的耗尽测试分别先 RED，再实现 `RetriesExhausted { attempts: 6 }` 后 GREEN。
+- `cargo test -p brain-llm gemini::tests -- --nocapture` 通过：24 passed、0 failed。
