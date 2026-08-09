@@ -41,11 +41,11 @@ impl LlmError {
         match self {
             // RequestFailed 已失去底层错误类型，不能根据展示字符串猜测。
             // 网络错误必须在仍持有 reqwest::Error 的 Provider 边界分类。
-            Self::RequestFailed(_) => false,
             // API 返回可重试的 HTTP 状态码（408/429/500/502/503/504）
             Self::ApiError { status, message } => is_retryable_http_status(*status, message),
             // 以下不可重试
-            Self::Config(_)
+            Self::RequestFailed(_)
+            | Self::Config(_)
             | Self::StreamError(_)
             | Self::ApiKeyNotFound(_)
             | Self::ProviderNotFound(_)

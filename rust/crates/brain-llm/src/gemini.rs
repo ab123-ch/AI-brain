@@ -470,9 +470,11 @@ impl LlmProvider for GeminiClient {
         let url = self.stream_url();
         let body = self.to_gemini_request(request);
         let headers = self.build_headers();
+        let retry = self.http.retry_config().clone();
         Box::pin(async move {
             tracing::info!("Gemini 批量流式请求发送开始: url={url}");
-            let result = stream::stream_gemini(self.http.client(), &url, &headers, &body).await;
+            let result =
+                stream::stream_gemini(self.http.client(), &url, &headers, &body, &retry).await;
             match &result {
                 Ok(events) => tracing::info!(
                     "Gemini 批量流式请求完成: url={url}, events={}",
@@ -492,10 +494,17 @@ impl LlmProvider for GeminiClient {
         let url = self.stream_url();
         let body = self.to_gemini_request(request);
         let headers = self.build_headers();
+        let retry = self.http.retry_config().clone();
         Box::pin(async move {
             tracing::info!("Gemini 增量流式请求发送开始: url={url}");
-            let result =
-                stream::stream_gemini_incremental(self.http.client(), &url, &headers, &body).await;
+            let result = stream::stream_gemini_incremental(
+                self.http.client(),
+                &url,
+                &headers,
+                &body,
+                &retry,
+            )
+            .await;
             match &result {
                 Ok(_) => tracing::info!("Gemini 增量流式连接建立成功: url={url}"),
                 Err(error) => log_stream_failure("incremental", &url, error),
@@ -776,6 +785,191 @@ mod tests {
             LlmError::RetriesExhausted { attempts: 6, .. }
         ));
         assert_eq!(*attempts.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_stream_retries_transport_failure_before_exposing_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            for attempt in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_request_body(&mut socket).await;
+                *server_attempts.lock().unwrap() += 1;
+                if attempt < 5 {
+                    let discarded = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"discard-me\"}]}}]}\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{discarded}",
+                        discarded.len() + 100
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    drop(socket);
+                    continue;
+                }
+                let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"stream-ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let proxy = format!("http://{address}");
+        let mut client = GeminiClient::new(
+            "http://gemini.invalid/v1beta".into(),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+            Some(proxy.clone()),
+        );
+        client.http = SharedHttpClient::new(
+            Some(&proxy),
+            RetryConfig {
+                max_retries: 5,
+                initial_backoff: std::time::Duration::ZERO,
+                max_backoff: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
+
+        let events = client.stream_complete(minimal_request()).await.unwrap();
+
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::TextDelta { text }) if text == "stream-ok"
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta { text } if text == "discard-me")));
+        assert_eq!(*attempts.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_stream_retries_disconnect_before_first_event() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            for attempt in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_request_body(&mut socket).await;
+                *server_attempts.lock().unwrap() += 1;
+                if attempt < 5 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    drop(socket);
+                    continue;
+                }
+                let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"stream-ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let proxy = format!("http://{address}");
+        let mut client = GeminiClient::new(
+            "http://gemini.invalid/v1beta".into(),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+            Some(proxy.clone()),
+        );
+        client.http = SharedHttpClient::new(
+            Some(&proxy),
+            RetryConfig {
+                max_retries: 5,
+                initial_backoff: std::time::Duration::ZERO,
+                max_backoff: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
+
+        let mut receiver = client.stream_incremental(minimal_request()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::TextDelta { text }) if text == "stream-ok"
+        ));
+        assert_eq!(*attempts.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_stream_reports_error_without_retry_after_first_event() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            *server_attempts.lock().unwrap() += 1;
+            let body =
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() + 100
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            drop(socket);
+
+            if let Ok(Ok((mut retry_socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await
+            {
+                let _ = read_request_body(&mut retry_socket).await;
+                *server_attempts.lock().unwrap() += 1;
+            }
+        });
+
+        let proxy = format!("http://{address}");
+        let mut client = GeminiClient::new(
+            "http://gemini.invalid/v1beta".into(),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+            Some(proxy.clone()),
+        );
+        client.http = SharedHttpClient::new(
+            Some(&proxy),
+            RetryConfig {
+                max_retries: 5,
+                initial_backoff: std::time::Duration::ZERO,
+                max_backoff: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
+
+        let mut receiver = client.stream_incremental(minimal_request()).await.unwrap();
+        let first = receiver.recv().await.unwrap();
+        let second = receiver.recv().await.unwrap();
+
+        assert!(matches!(
+            first,
+            StreamEvent::TextDelta { text } if text == "partial"
+        ));
+        assert!(matches!(
+            second,
+            StreamEvent::Error { message } if message.contains("中断")
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(*attempts.lock().unwrap(), 1);
     }
 
     fn make_client() -> GeminiClient {

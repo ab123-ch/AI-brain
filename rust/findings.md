@@ -1226,3 +1226,7 @@
 - 本地脚本化服务已证明三个连续逻辑调用的网络请求次数为 `1 + 6 + 1`：仅第二个失败调用被重发，前后调用各执行一次。
 - Gemini 通过 `SharedHttpClient` 持有重试配置；在测试中使用本地 HTTP 代理可以稳定注入断连，同时不依赖机器的系统代理设置。
 - Gemini 普通完成与 OpenAI 兼容路径使用相同 typed 分类和耗尽合同；Provider 协议转换只发生在请求重试循环内部，不会重启上层任务。
+- reqwest 的截断响应体错误可能 `is_decode() == true` 且 `is_body() == false`，但错误源链携带 `io::ErrorKind::UnexpectedEof`；分类必须先检查 typed 源链，再排除纯 decode。
+- 批量流只有在完整读取响应体后才解析事件，因此失败尝试中的 `discard-me` 文本不会暴露；两种 Provider 的测试均证明仅成功尝试的事件可见。
+- 增量流在返回 receiver 前先读取到首个可解析事件：此前断线可安全丢弃 buffer 并重试；此后驱动器只发送 `StreamEvent::Error`，绝不重发请求。
+- 增量驱动器同时等待下一个网络 chunk 与 `Sender::closed()`；用户丢弃 receiver 会主动释放响应连接。

@@ -6,6 +6,7 @@
 
 use crate::error::{LlmError, Result};
 use crate::gemini::gemini_tool_call_id;
+use crate::retry::{is_retryable_reqwest_error, RetryConfig};
 use crate::types::{FinishReason, StreamEvent, TokenUsage};
 
 // ---------------------------------------------------------------------------
@@ -382,37 +383,141 @@ struct ToolCallAccumulator {
 // Batch streaming (collect all events)
 // ---------------------------------------------------------------------------
 
+async fn wait_before_stream_retry(
+    provider: &'static str,
+    operation: &'static str,
+    error_kind: &'static str,
+    attempt: u32,
+    max_attempts: u32,
+    retry: &RetryConfig,
+) {
+    let backoff = retry.backoff_for_attempt(attempt);
+    tracing::warn!(
+        provider,
+        operation,
+        error_kind,
+        attempt,
+        max_attempts,
+        ?backoff,
+        "LLM 流式请求发生暂态错误，准备重试当前调用"
+    );
+    tokio::time::sleep(backoff).await;
+}
+
+fn log_stream_retry_success(provider: &'static str, operation: &'static str, attempt: u32) {
+    if attempt > 1 {
+        tracing::info!(provider, operation, attempt, "LLM 流式请求重试成功");
+    }
+}
+
 /// Perform a streaming completion request and collect all events.
 pub async fn stream_openai(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
     body: &serde_json::Value,
+    retry: &RetryConfig,
 ) -> Result<Vec<StreamEvent>> {
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| LlmError::RequestFailed(format!("Stream request failed: {e}")))?;
+    let mut attempts = 0;
+    let max_attempts = retry.max_retries + 1;
+    loop {
+        attempts += 1;
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(body)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let retryable = is_retryable_reqwest_error(&error);
+                if retryable && attempts < max_attempts {
+                    wait_before_stream_retry(
+                        "openai_compat",
+                        "batch_stream",
+                        "transport_send",
+                        attempts,
+                        max_attempts,
+                        retry,
+                    )
+                    .await;
+                    continue;
+                }
+                let last_error = format!("Stream request failed: {error}");
+                return if retryable {
+                    Err(LlmError::RetriesExhausted {
+                        attempts,
+                        last_error,
+                    })
+                } else {
+                    Err(LlmError::RequestFailed(last_error))
+                };
+            }
+        };
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LlmError::ApiError {
-            status: status.as_u16(),
-            message: body,
-        });
+        let status = response.status();
+        if !status.is_success() {
+            let response_body = response.text().await.unwrap_or_default();
+            let error = LlmError::ApiError {
+                status: status.as_u16(),
+                message: response_body,
+            };
+            let retryable = error.is_retryable();
+            if retryable && attempts < max_attempts {
+                wait_before_stream_retry(
+                    "openai_compat",
+                    "batch_stream",
+                    "http_status",
+                    attempts,
+                    max_attempts,
+                    retry,
+                )
+                .await;
+                continue;
+            }
+            return if retryable {
+                Err(LlmError::RetriesExhausted {
+                    attempts,
+                    last_error: error.to_string(),
+                })
+            } else {
+                Err(error)
+            };
+        }
+
+        match response.text().await {
+            Ok(response_body) => {
+                log_stream_retry_success("openai_compat", "batch_stream", attempts);
+                return parse_sse_body(&response_body);
+            }
+            Err(error) => {
+                let retryable = is_retryable_reqwest_error(&error);
+                if retryable && attempts < max_attempts {
+                    wait_before_stream_retry(
+                        "openai_compat",
+                        "batch_stream",
+                        "transport_body",
+                        attempts,
+                        max_attempts,
+                        retry,
+                    )
+                    .await;
+                    continue;
+                }
+                let last_error = format!("Failed to read stream body: {error}");
+                return if retryable {
+                    Err(LlmError::RetriesExhausted {
+                        attempts,
+                        last_error,
+                    })
+                } else {
+                    Err(LlmError::StreamError(last_error))
+                };
+            }
+        }
     }
-
-    let body = response
-        .text()
-        .await
-        .map_err(|e| LlmError::StreamError(format!("Failed to read stream body: {e}")))?;
-
-    parse_sse_body(&body)
 }
 
 // ---------------------------------------------------------------------------
@@ -424,82 +529,194 @@ pub async fn stream_openai(
 /// Uses `response.bytes_stream()` to yield `StreamEvent` items in real-time
 /// as SSE frames arrive from the server. Returns a `mpsc::Receiver` that
 /// consumers can `.recv()` from asynchronously.
+#[allow(clippy::too_many_lines)]
 pub async fn stream_openai_incremental(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
     body: &serde_json::Value,
+    retry: &RetryConfig,
 ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
     use futures::StreamExt;
 
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| LlmError::RequestFailed(format!("Stream request failed: {e}")))?;
+    let mut attempts = 0;
+    let max_attempts = retry.max_retries + 1;
+    'attempt: loop {
+        attempts += 1;
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(body)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let retryable = is_retryable_reqwest_error(&error);
+                if retryable && attempts < max_attempts {
+                    wait_before_stream_retry(
+                        "openai_compat",
+                        "incremental_stream",
+                        "transport_send",
+                        attempts,
+                        max_attempts,
+                        retry,
+                    )
+                    .await;
+                    continue;
+                }
+                let last_error = format!("Stream request failed: {error}");
+                return if retryable {
+                    Err(LlmError::RetriesExhausted {
+                        attempts,
+                        last_error,
+                    })
+                } else {
+                    Err(LlmError::RequestFailed(last_error))
+                };
+            }
+        };
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LlmError::ApiError {
-            status: status.as_u16(),
-            message: body,
-        });
-    }
+        let status = response.status();
+        if !status.is_success() {
+            let error = LlmError::ApiError {
+                status: status.as_u16(),
+                message: response.text().await.unwrap_or_default(),
+            };
+            let retryable = error.is_retryable();
+            if retryable && attempts < max_attempts {
+                wait_before_stream_retry(
+                    "openai_compat",
+                    "incremental_stream",
+                    "http_status",
+                    attempts,
+                    max_attempts,
+                    retry,
+                )
+                .await;
+                continue;
+            }
+            return if retryable {
+                Err(LlmError::RetriesExhausted {
+                    attempts,
+                    last_error: error.to_string(),
+                })
+            } else {
+                Err(error)
+            };
+        }
 
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
-
-    // Spawn a background task to drive the byte stream
-    tokio::spawn(async move {
-        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut buffer = Vec::with_capacity(4096);
         let mut stream = response.bytes_stream();
-
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(bytes) => {
+        let (first_events, ended) = loop {
+            match stream.next().await {
+                Some(Ok(bytes)) => {
                     buffer.extend_from_slice(&bytes);
-
-                    // Extract and process all complete frames
-                    while let Some(frame_data) = extract_sse_frame(&mut buffer) {
-                        if let Some(events) = parse_single_sse_data(&frame_data) {
-                            for event in events {
-                                if tx.send(event).await.is_err() {
-                                    // Receiver dropped, stop
-                                    return;
-                                }
-                            }
-                        }
+                    let events = drain_openai_frames(&mut buffer);
+                    if !events.is_empty() {
+                        break (events, false);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Stream chunk error: {e}");
+                Some(Err(error)) => {
+                    let retryable = is_retryable_reqwest_error(&error);
+                    if retryable && attempts < max_attempts {
+                        wait_before_stream_retry(
+                            "openai_compat",
+                            "incremental_stream",
+                            "transport_body_before_first_event",
+                            attempts,
+                            max_attempts,
+                            retry,
+                        )
+                        .await;
+                        continue 'attempt;
+                    }
+                    let last_error = format!("Stream failed before first event: {error}");
+                    return if retryable {
+                        Err(LlmError::RetriesExhausted {
+                            attempts,
+                            last_error,
+                        })
+                    } else {
+                        Err(LlmError::StreamError(last_error))
+                    };
+                }
+                None => break (parse_openai_tail(&buffer), true),
+            }
+        };
+
+        log_stream_retry_success("openai_compat", "incremental_stream", attempts);
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            if !send_stream_events(&tx, first_events).await || ended {
+                return;
+            }
+
+            loop {
+                let chunk_result = tokio::select! {
+                    () = tx.closed() => return,
+                    chunk_result = stream.next() => chunk_result,
+                };
+                let Some(chunk_result) = chunk_result else {
                     break;
-                }
-            }
-        }
-
-        // Process any remaining data in buffer
-        if !buffer.is_empty() {
-            let remaining = String::from_utf8_lossy(&buffer);
-            for line in remaining.lines() {
-                let line = line.trim();
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Some(events) = parse_single_sse_data(data) {
-                        for event in events {
-                            if tx.send(event).await.is_err() {
-                                return;
-                            }
+                };
+                match chunk_result {
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&bytes);
+                        if !send_stream_events(&tx, drain_openai_frames(&mut buffer)).await {
+                            return;
                         }
+                    }
+                    Err(error) => {
+                        tracing::warn!("Stream chunk error after delivery: {error}");
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: format!("流式响应在输出后中断: {error}"),
+                            })
+                            .await;
+                        return;
                     }
                 }
             }
-        }
-    });
 
-    Ok(rx)
+            let _ = send_stream_events(&tx, parse_openai_tail(&buffer)).await;
+        });
+
+        return Ok(rx);
+    }
+}
+
+fn drain_openai_frames(buffer: &mut Vec<u8>) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    while let Some(frame_data) = extract_sse_frame(buffer) {
+        if let Some(frame_events) = parse_single_sse_data(&frame_data) {
+            events.extend(frame_events);
+        }
+    }
+    events
+}
+
+fn parse_openai_tail(buffer: &[u8]) -> Vec<StreamEvent> {
+    let remaining = String::from_utf8_lossy(buffer);
+    remaining
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data: "))
+        .filter_map(parse_single_sse_data)
+        .flatten()
+        .collect()
+}
+
+async fn send_stream_events(
+    sender: &tokio::sync::mpsc::Sender<StreamEvent>,
+    events: Vec<StreamEvent>,
+) -> bool {
+    for event in events {
+        if sender.send(event).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Perform a Gemini streaming request and collect all SSE events.
@@ -508,99 +725,320 @@ pub async fn stream_gemini(
     url: &str,
     headers: &[(&str, String)],
     body: &serde_json::Value,
+    retry: &RetryConfig,
 ) -> Result<Vec<StreamEvent>> {
-    let mut request = client.post(url);
-    for (name, value) in headers {
-        request = request.header(*name, value);
-    }
-    let response = request
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| LlmError::RequestFailed(format!("Gemini 流式请求失败: {e}")))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(LlmError::ApiError {
-            status: status.as_u16(),
-            message: response.text().await.unwrap_or_default(),
-        });
-    }
+    let mut attempts = 0;
+    let max_attempts = retry.max_retries + 1;
+    loop {
+        attempts += 1;
+        let mut request = client.post(url);
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        let response = match request.json(body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let retryable = is_retryable_reqwest_error(&error);
+                if retryable && attempts < max_attempts {
+                    wait_before_stream_retry(
+                        "gemini",
+                        "batch_stream",
+                        "transport_send",
+                        attempts,
+                        max_attempts,
+                        retry,
+                    )
+                    .await;
+                    continue;
+                }
+                let last_error = format!("Gemini 流式请求失败: {error}");
+                return if retryable {
+                    Err(LlmError::RetriesExhausted {
+                        attempts,
+                        last_error,
+                    })
+                } else {
+                    Err(LlmError::RequestFailed(last_error))
+                };
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let error = LlmError::ApiError {
+                status: status.as_u16(),
+                message: response.text().await.unwrap_or_default(),
+            };
+            let retryable = error.is_retryable();
+            if retryable && attempts < max_attempts {
+                wait_before_stream_retry(
+                    "gemini",
+                    "batch_stream",
+                    "http_status",
+                    attempts,
+                    max_attempts,
+                    retry,
+                )
+                .await;
+                continue;
+            }
+            return if retryable {
+                Err(LlmError::RetriesExhausted {
+                    attempts,
+                    last_error: error.to_string(),
+                })
+            } else {
+                Err(error)
+            };
+        }
 
-    let full = response
-        .text()
-        .await
-        .map_err(|e| LlmError::StreamError(format!("读取 Gemini 流式响应失败: {e}")))?;
-    parse_gemini_sse_body(&full)
+        match response.text().await {
+            Ok(full) => {
+                log_stream_retry_success("gemini", "batch_stream", attempts);
+                return parse_gemini_sse_body(&full);
+            }
+            Err(error) => {
+                let retryable = is_retryable_reqwest_error(&error);
+                if retryable && attempts < max_attempts {
+                    wait_before_stream_retry(
+                        "gemini",
+                        "batch_stream",
+                        "transport_body",
+                        attempts,
+                        max_attempts,
+                        retry,
+                    )
+                    .await;
+                    continue;
+                }
+                let last_error = format!("读取 Gemini 流式响应失败: {error}");
+                return if retryable {
+                    Err(LlmError::RetriesExhausted {
+                        attempts,
+                        last_error,
+                    })
+                } else {
+                    Err(LlmError::StreamError(last_error))
+                };
+            }
+        }
+    }
 }
 
 /// Perform a Gemini streaming request and emit events incrementally.
+#[allow(clippy::too_many_lines)]
 pub async fn stream_gemini_incremental(
     client: &reqwest::Client,
     url: &str,
     headers: &[(&str, String)],
     body: &serde_json::Value,
+    retry: &RetryConfig,
 ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
     use futures::StreamExt;
 
-    let mut request = client.post(url);
-    for (name, value) in headers {
-        request = request.header(*name, value);
-    }
-    let response = request
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| LlmError::RequestFailed(format!("Gemini 流式请求失败: {e}")))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(LlmError::ApiError {
-            status: status.as_u16(),
-            message: response.text().await.unwrap_or_default(),
-        });
-    }
+    let mut attempts = 0;
+    let max_attempts = retry.max_retries + 1;
+    'attempt: loop {
+        attempts += 1;
+        let mut request = client.post(url);
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        let response = match request.json(body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let retryable = is_retryable_reqwest_error(&error);
+                if retryable && attempts < max_attempts {
+                    wait_before_stream_retry(
+                        "gemini",
+                        "incremental_stream",
+                        "transport_send",
+                        attempts,
+                        max_attempts,
+                        retry,
+                    )
+                    .await;
+                    continue;
+                }
+                let last_error = format!("Gemini 流式请求失败: {error}");
+                return if retryable {
+                    Err(LlmError::RetriesExhausted {
+                        attempts,
+                        last_error,
+                    })
+                } else {
+                    Err(LlmError::RequestFailed(last_error))
+                };
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let error = LlmError::ApiError {
+                status: status.as_u16(),
+                message: response.text().await.unwrap_or_default(),
+            };
+            let retryable = error.is_retryable();
+            if retryable && attempts < max_attempts {
+                wait_before_stream_retry(
+                    "gemini",
+                    "incremental_stream",
+                    "http_status",
+                    attempts,
+                    max_attempts,
+                    retry,
+                )
+                .await;
+                continue;
+            }
+            return if retryable {
+                Err(LlmError::RetriesExhausted {
+                    attempts,
+                    last_error: error.to_string(),
+                })
+            } else {
+                Err(error)
+            };
+        }
 
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
-    tokio::spawn(async move {
         let mut buffer = Vec::with_capacity(4096);
         let mut stream = response.bytes_stream();
         let mut call_sequence = 0;
         let mut has_tool_use = false;
-        while let Some(chunk) = stream.next().await {
-            let Ok(bytes) = chunk else {
-                break;
-            };
-            buffer.extend_from_slice(&bytes);
-            while let Some(data) = extract_sse_frame(&mut buffer) {
-                let events = parse_gemini_data(&data, &mut call_sequence, &mut has_tool_use);
-                let Ok(events) = events else {
-                    tracing::warn!("Gemini SSE 帧解析失败");
-                    continue;
-                };
-                for event in events {
-                    if tx.send(event).await.is_err() {
-                        return;
+        let (first_events, ended) = loop {
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    buffer.extend_from_slice(&bytes);
+                    let events =
+                        drain_gemini_frames(&mut buffer, &mut call_sequence, &mut has_tool_use)?;
+                    if !events.is_empty() {
+                        break (events, false);
                     }
                 }
+                Some(Err(error)) => {
+                    let retryable = is_retryable_reqwest_error(&error);
+                    if retryable && attempts < max_attempts {
+                        wait_before_stream_retry(
+                            "gemini",
+                            "incremental_stream",
+                            "transport_body_before_first_event",
+                            attempts,
+                            max_attempts,
+                            retry,
+                        )
+                        .await;
+                        continue 'attempt;
+                    }
+                    let last_error = format!("Gemini 流在首事件前中断: {error}");
+                    return if retryable {
+                        Err(LlmError::RetriesExhausted {
+                            attempts,
+                            last_error,
+                        })
+                    } else {
+                        Err(LlmError::StreamError(last_error))
+                    };
+                }
+                None => {
+                    break (
+                        parse_gemini_tail(&buffer, &mut call_sequence, &mut has_tool_use)?,
+                        true,
+                    )
+                }
             }
-        }
+        };
 
-        if !buffer.is_empty() {
-            let remaining = String::from_utf8_lossy(&buffer);
-            for data in extract_all_sse_data(&remaining) {
-                let events = parse_gemini_data(&data, &mut call_sequence, &mut has_tool_use);
-                let Ok(events) = events else {
-                    tracing::warn!("Gemini SSE 尾帧解析失败");
-                    continue;
+        log_stream_retry_success("gemini", "incremental_stream", attempts);
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            if !send_stream_events(&tx, first_events).await || ended {
+                return;
+            }
+
+            loop {
+                let chunk = tokio::select! {
+                    () = tx.closed() => return,
+                    chunk = stream.next() => chunk,
                 };
-                for event in events {
-                    if tx.send(event).await.is_err() {
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&bytes);
+                        match drain_gemini_frames(
+                            &mut buffer,
+                            &mut call_sequence,
+                            &mut has_tool_use,
+                        ) {
+                            Ok(events) => {
+                                if !send_stream_events(&tx, events).await {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx
+                                    .send(StreamEvent::Error {
+                                        message: format!("Gemini SSE 帧解析失败: {error}"),
+                                    })
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: format!("Gemini 流式响应在输出后中断: {error}"),
+                            })
+                            .await;
                         return;
                     }
                 }
             }
-        }
-    });
-    Ok(rx)
+
+            match parse_gemini_tail(&buffer, &mut call_sequence, &mut has_tool_use) {
+                Ok(events) => {
+                    let _ = send_stream_events(&tx, events).await;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(StreamEvent::Error {
+                            message: format!("Gemini SSE 尾帧解析失败: {error}"),
+                        })
+                        .await;
+                }
+            }
+        });
+        return Ok(rx);
+    }
+}
+
+fn drain_gemini_frames(
+    buffer: &mut Vec<u8>,
+    call_sequence: &mut usize,
+    has_tool_use: &mut bool,
+) -> Result<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    while let Some(data) = extract_sse_frame(buffer) {
+        events.extend(parse_gemini_data(
+            data.as_str(),
+            call_sequence,
+            has_tool_use,
+        )?);
+    }
+    Ok(events)
+}
+
+fn parse_gemini_tail(
+    buffer: &[u8],
+    call_sequence: &mut usize,
+    has_tool_use: &mut bool,
+) -> Result<Vec<StreamEvent>> {
+    let remaining = String::from_utf8_lossy(buffer);
+    let mut events = Vec::new();
+    for data in extract_all_sse_data(&remaining) {
+        events.extend(parse_gemini_data(&data, call_sequence, has_tool_use)?);
+    }
+    Ok(events)
 }
 
 fn extract_all_sse_data(full: &str) -> Vec<String> {

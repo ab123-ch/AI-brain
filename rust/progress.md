@@ -768,3 +768,11 @@
 - Task 3 Gemini 当前调用隔离 RED 正确在首次断线返回旧 `RequestFailed`；接入共享 typed 分类后 `1 + 6 + 1` 测试 GREEN。
 - Gemini 传输错误和 HTTP 429 的耗尽测试分别先 RED，再实现 `RetriesExhausted { attempts: 6 }` 后 GREEN。
 - `cargo test -p brain-llm gemini::tests -- --nocapture` 通过：24 passed、0 failed。
+- Task 4 新增 `StreamEvent::Error`，类型合同先 RED（variant 不存在）再 GREEN。
+- OpenAI/Gemini 批量流故障注入均通过：前 5 次在含 `discard-me` 的截断响应体中失败，第 6 次成功，只返回 `stream-ok`。
+- OpenAI/Gemini 增量流首事件前断线测试均先 RED，再实现 priming 后以第 6 次请求成功且只交付一次事件。
+- OpenAI/Gemini 部分输出后断线测试均先 RED（receiver 静默关闭），实现后交付显式 `Error` 且服务端确认请求次数为 1。
+- receiver 取消合同先 RED（连接仍占用到超时），驱动器加入 `Sender::closed()` 竞争后 GREEN。
+- 严格 `cargo clippy -p brain-llm --all-targets -- -D warnings` 通过；`cargo test -p brain-llm --lib` 通过 115/115。
+- `cargo check -p brain-main -p ai-brain-cli` 通过，仅有仓库既有 warning；新增流事件未破坏实际消费链。
+- 原有用户整轮重试测试 `retry_reuses_only_the_last_user_message_without_duplication` 通过 1/1，确认该需求未被修改。

@@ -44,7 +44,7 @@ pub fn is_retryable_http_status(status: u16, message: &str) -> bool {
 /// 判断 reqwest 传输错误是否属于可重试的暂态失败。
 #[must_use]
 pub fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
-    if error.is_builder() || error.is_redirect() || error.is_decode() || error.is_status() {
+    if error.is_builder() || error.is_redirect() || error.is_status() {
         return false;
     }
 
@@ -68,6 +68,10 @@ pub fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
             }
         }
         source = current.source();
+    }
+
+    if error.is_decode() {
+        return false;
     }
 
     false
@@ -103,6 +107,41 @@ mod tests {
             .unwrap_err();
 
         assert!(is_retryable_reqwest_error(&error));
+    }
+
+    #[tokio::test]
+    async fn truncated_response_body_is_retryable_from_typed_error() {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let error = response.bytes_stream().next().await.unwrap().unwrap_err();
+
+        assert!(
+            is_retryable_reqwest_error(&error),
+            "flags: body={}, decode={}, request={}, source={:?}",
+            error.is_body(),
+            error.is_decode(),
+            error.is_request(),
+            std::error::Error::source(&error)
+        );
     }
 
     #[test]

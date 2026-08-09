@@ -798,7 +798,7 @@ Build an operational cockpit and conversation trace that expose the real runtime
 - [x] 以 RED 测试建立共享错误分类与默认策略合同。
 - [x] 实现 OpenAI 兼容普通完成的当前调用级重试。
 - [x] 实现 Gemini 普通完成的当前调用级重试。
-- [ ] 实现批量流和首事件前增量流重试。
+- [x] 实现批量流和首事件前增量流重试。
 - [ ] 运行定向、回归和仓库门禁。
 - [ ] 重建并重启智脑，验证 HTTP/日志和本地故障注入行为。
 
@@ -817,3 +817,5 @@ Build an operational cockpit and conversation trace that expose the real runtime
 | 现有增量流在后台 chunk 失败时只写日志并静默关闭 receiver，没有错误事件 | 实施规划审计 | 在 `brain-llm::StreamEvent` 增加内部统一的 `Error` 事件，保持现有 wildcard 消费者兼容，并用测试证明部分输出后不重发。 |
 | 首次创建实施计划的补丁在命令代码块处缺少 `+` 前缀，被 `apply_patch` 原子拒绝 | 实施计划写入 | 记录失败并改用完整带前缀的 Add File 补丁；没有计划文件被部分创建。 |
 | typed 断连 RED 测试使用 `Client::new()` 时被系统代理接管，本地断连变成 HTTP 502 | Task 1 RED | 证据是返回 remote proxy 的 502 而非 reqwest error；测试客户端显式 `.no_proxy()`，只修正故障注入边界后重跑 RED。 |
+| 截断响应体的 reqwest 错误同时标记为 decode，首版 typed 分类先排除 decode 导致增量流未重试 | Task 4 首事件前 RED | 先遍历错误源链识别 `UnexpectedEof`，再排除无 I/O 源的纯 decode 错误；保留“解析错误不重试”边界。 |
+| 全工作区 all-target check 在 Windows 编译 `runtime` 测试时引用 `std::os::unix`/`PermissionsExt::set_mode` 失败 | Task 4 兼容检查 | 保留无关历史测试不动；改跑 `brain-main` 与 `ai-brain-cli` 实际消费链，定向编译通过。 |

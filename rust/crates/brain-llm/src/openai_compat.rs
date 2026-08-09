@@ -673,10 +673,11 @@ impl LlmProvider for OpenAiCompatClient {
         let body = self.to_stream_api_body(request);
         let url = self.chat_url();
         let api_key = self.api_key.clone();
+        let retry = self.retry_config.clone();
 
-        Box::pin(
-            async move { crate::stream::stream_openai(&self.client, &url, &api_key, &body).await },
-        )
+        Box::pin(async move {
+            crate::stream::stream_openai(&self.client, &url, &api_key, &body, &retry).await
+        })
     }
 
     fn stream_incremental(
@@ -693,9 +694,11 @@ impl LlmProvider for OpenAiCompatClient {
         let body = self.to_stream_api_body(request);
         let url = self.chat_url();
         let api_key = self.api_key.clone();
+        let retry = self.retry_config.clone();
 
         Box::pin(async move {
-            crate::stream::stream_openai_incremental(&self.client, &url, &api_key, &body).await
+            crate::stream::stream_openai_incremental(&self.client, &url, &api_key, &body, &retry)
+                .await
         })
     }
 }
@@ -962,6 +965,245 @@ mod tests {
             LlmError::RetriesExhausted { attempts: 6, .. }
         ));
         assert_eq!(*attempts.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_stream_retries_transport_failure_before_exposing_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let server_captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for attempt in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = read_request_body(&mut socket).await;
+                server_captured.lock().unwrap().push(body);
+                if attempt < 5 {
+                    let discarded =
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"discard-me\"}}]}\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{discarded}",
+                        discarded.len() + 100
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    drop(socket);
+                    continue;
+                }
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"stream-ok\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let events = client
+            .stream_complete(minimal_request("batch-stream"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            events.first(),
+            Some(crate::types::StreamEvent::TextDelta { text }) if text == "stream-ok"
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, crate::types::StreamEvent::TextDelta { text } if text == "discard-me")
+        ));
+        assert_eq!(captured.lock().unwrap().len(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_stream_retries_disconnect_before_first_event() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            for attempt in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_request_body(&mut socket).await;
+                *server_attempts.lock().unwrap() += 1;
+                if attempt < 5 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    drop(socket);
+                    continue;
+                }
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"stream-ok\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let mut receiver = client
+            .stream_incremental(minimal_request("incremental-stream"))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+
+        assert!(matches!(
+            events.first(),
+            Some(crate::types::StreamEvent::TextDelta { text }) if text == "stream-ok"
+        ));
+        assert_eq!(*attempts.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_stream_reports_error_without_retry_after_first_event() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let server_attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            *server_attempts.lock().unwrap() += 1;
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() + 100
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            drop(socket);
+
+            if let Ok(Ok((mut retry_socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await
+            {
+                let _ = read_request_body(&mut retry_socket).await;
+                *server_attempts.lock().unwrap() += 1;
+            }
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let mut receiver = client
+            .stream_incremental(minimal_request("partial-stream"))
+            .await
+            .unwrap();
+        let first = receiver.recv().await.unwrap();
+        let second = receiver.recv().await.unwrap();
+
+        assert!(matches!(
+            first,
+            crate::types::StreamEvent::TextDelta { text } if text == "partial"
+        ));
+        assert!(matches!(
+            second,
+            crate::types::StreamEvent::Error { message } if message.contains("中断")
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(*attempts.lock().unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_incremental_receiver_stops_the_network_driver() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() + 100
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+
+            let mut byte = [0_u8; 1];
+            let closed = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    socket.read(&mut byte)
+                )
+                .await,
+                Ok(Ok(0))
+            );
+            let _ = closed_sender.send(closed);
+        });
+
+        let mut client = OpenAiCompatClient::new(
+            format!("http://{address}/v1"),
+            "test-key".into(),
+            "test-model".into(),
+            8,
+            0.0,
+        )
+        .with_retry_config(RetryConfig {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        });
+        client.client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let mut receiver = client
+            .stream_incremental(minimal_request("drop-receiver"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(crate::types::StreamEvent::TextDelta { text }) if text == "first"
+        ));
+        drop(receiver);
+
+        assert!(closed_receiver.await.unwrap());
     }
 
     async fn captured_provider_logs(status: &str, body: &str) -> String {

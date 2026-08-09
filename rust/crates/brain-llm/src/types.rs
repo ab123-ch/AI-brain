@@ -78,6 +78,8 @@ pub enum StreamEvent {
     ToolCallStart { id: String, name: String },
     /// A chunk of tool input JSON.
     ToolCallDelta { tool_use_id: String, delta: String },
+    /// The stream failed after incremental delivery began.
+    Error { message: String },
     /// The full response is complete.
     Done {
         finish_reason: Option<FinishReason>,
@@ -134,6 +136,18 @@ mod tests {
             FinishReason::MaxTokens
         );
         assert_eq!(FinishReason::from_api_str("unknown"), FinishReason::EndTurn);
+    }
+
+    #[test]
+    fn stream_error_event_carries_failure_message() {
+        let event = StreamEvent::Error {
+            message: "连接在输出后中断".into(),
+        };
+
+        assert!(matches!(
+            event,
+            StreamEvent::Error { message } if message == "连接在输出后中断"
+        ));
     }
 
     #[test]
