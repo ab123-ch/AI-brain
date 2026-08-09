@@ -913,6 +913,95 @@ impl TaskRepository {
             .collect()
     }
 
+    /// 在模型或工具尚未开始执行时，原子终结任务及其未运行节点。
+    ///
+    /// 已终结任务按幂等成功返回；若仍有运行节点，调用方必须先通过
+    /// `fail_node` 结算对应实例和预算。
+    pub fn fail_task_before_execution(
+        &self,
+        task_run_id: &str,
+        expected_version: u64,
+        error: &str,
+    ) -> Result<TaskRun> {
+        require_non_empty("预执行失败原因", error)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = task_from_connection(&transaction, task_run_id)?;
+        if task.state.is_terminal() {
+            transaction.commit()?;
+            return Ok(task);
+        }
+        ensure_version("task run", task_run_id, expected_version, task.version)?;
+
+        let running_nodes = transaction.query_row(
+            "SELECT COUNT(*) FROM task_nodes WHERE task_run_id = ?1 AND state = 'running'",
+            [task_run_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if running_nodes > 0 {
+            return Err(TaskEngineError::Invalid(format!(
+                "任务 `{task_run_id}` 仍有运行中节点"
+            )));
+        }
+
+        let mut statement = transaction.prepare(
+            "SELECT node_id FROM task_nodes
+             WHERE task_run_id = ?1
+               AND state IN ('waiting_dependency', 'ready', 'needs_input')
+             ORDER BY created_at, node_id",
+        )?;
+        let rows = statement.query_map([task_run_id], |row| row.get::<_, String>(0))?;
+        let node_ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let now = Utc::now().to_rfc3339();
+        for node_id in &node_ids {
+            transaction.execute(
+                "UPDATE task_nodes
+                 SET state = 'failed', current_instance_run_id = NULL,
+                     version = version + 1, updated_at = ?1
+                 WHERE node_id = ?2
+                   AND state IN ('waiting_dependency', 'ready', 'needs_input')",
+                params![now, node_id],
+            )?;
+            append_event(
+                &transaction,
+                task_run_id,
+                TaskEventKind::NodeFailed,
+                &json!({
+                    "node_id": node_id,
+                    "error": error,
+                    "phase": "pre_execution"
+                }),
+            )?;
+        }
+
+        let updated = transaction.execute(
+            "UPDATE task_runs
+             SET state = 'failed', version = version + 1, updated_at = ?1
+             WHERE task_run_id = ?2 AND version = ?3
+               AND state IN ('queued', 'running', 'paused_budget', 'needs_input')",
+            params![now, task_run_id, expected_version],
+        )?;
+        if updated != 1 {
+            return Err(TaskEngineError::CasConflict {
+                entity: "task run",
+                id: task_run_id.into(),
+                expected: expected_version,
+                actual: task_version(&transaction, task_run_id)?,
+            });
+        }
+        append_event(
+            &transaction,
+            task_run_id,
+            TaskEventKind::TaskFailed,
+            &json!({"error": error, "phase": "pre_execution"}),
+        )?;
+        let failed = task_from_connection(&transaction, task_run_id)?;
+        transaction.commit()?;
+        Ok(failed)
+    }
+
     pub fn fail_node(
         &self,
         instance_run_id: &str,

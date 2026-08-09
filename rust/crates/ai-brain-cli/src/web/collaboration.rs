@@ -2694,6 +2694,87 @@ impl CollaborationRepository {
         Ok(())
     }
 
+    /// 将尚未提交结果的运行中 Claim 精确回退为待重试状态。
+    ///
+    /// 仅匹配同一 run，并在同一事务中读取当前版本后执行 CAS；
+    /// 已经回退或已终结时按幂等成功处理。
+    pub fn release_active_for_retry(&self, claim: &ClaimedInboxItem) -> Result<()> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT state, run_id, version
+                 FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [claim.inbox_item_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((current_state, current_run_id, current_version)) = current else {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        };
+        if matches!(
+            current_state.as_str(),
+            "pending" | "completed" | "failed" | "cancelled"
+        ) {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if current_state != "running" || current_run_id.as_deref() != Some(claim.run_id.as_str()) {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let updated = transaction.execute(
+            "UPDATE member_inbox_items
+             SET state = 'pending', run_id = NULL, started_at = NULL,
+                 lease_expires_at = NULL, error = NULL, version = version + 1
+             WHERE inbox_item_id = ?1 AND run_id = ?2
+               AND state = 'running' AND version = ?3",
+            params![claim.inbox_item_id, claim.run_id, current_version],
+        )?;
+        if updated == 1 {
+            transaction.execute(
+                "UPDATE room_event_deliveries
+                 SET state = 'queued', decision_reason = NULL, updated_at = ?1
+                 WHERE inbox_item_id = ?2 AND state = 'running'",
+                params![now, claim.inbox_item_id],
+            )?;
+            enqueue_room_changed(
+                &transaction,
+                &claim.room_id,
+                "inbox",
+                &claim.inbox_item_id,
+                &format!(
+                    "inbox-active-released:{}:{}",
+                    claim.inbox_item_id, claim.run_id
+                ),
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+
+        let actual_version = transaction
+            .query_row(
+                "SELECT version FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [claim.inbox_item_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Err(CollaborationError::VersionConflict {
+            entity: "member inbox run",
+            id: claim.run_id.clone(),
+            expected: current_version,
+            actual: actual_version,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn member_history(&self, claim: &ClaimedInboxItem) -> Result<Vec<MemberHistoryMessage>> {
         let connection = self.connect()?;
@@ -3314,8 +3395,9 @@ impl CollaborationRepository {
             "UPDATE member_inbox_items
              SET state = 'running', run_id = ?1, lease_expires_at = NULL,
                  version = version + 1
-             WHERE inbox_item_id = ?2 AND state IN ('pending', 'leased', 'running')",
-            params![durable_run_id, claim.inbox_item_id],
+             WHERE inbox_item_id = ?2 AND state IN ('pending', 'leased', 'running')
+               AND version = ?3",
+            params![durable_run_id, claim.inbox_item_id, claim.version],
         )?;
         if updated != 1 {
             return Err(CollaborationError::RunNotActive(durable_run_id.into()));
@@ -3330,7 +3412,8 @@ impl CollaborationRepository {
 
         let mut durable_claim = claim.clone();
         durable_claim.run_id = durable_run_id.into();
-        if durable_claim.purpose == InboxPurpose::Participation {
+        durable_claim.version += 1;
+        let completion = if durable_claim.purpose == InboxPurpose::Participation {
             self.complete_participation_item(&durable_claim, answer)
         } else {
             self.complete_item(
@@ -3345,6 +3428,17 @@ impl CollaborationRepository {
                 },
                 event,
             })
+        };
+        match completion {
+            Ok(completion) => Ok(completion),
+            Err(error) => {
+                if let Err(release_error) = self.release_active_for_retry(&durable_claim) {
+                    return Err(CollaborationError::Config(format!(
+                        "投影持久结果失败且无法释放运行中 Claim: {error}; {release_error}"
+                    )));
+                }
+                Err(error)
+            }
         }
     }
 
@@ -3505,7 +3599,7 @@ impl CollaborationRepository {
         } else {
             "failed"
         };
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE member_inbox_items
              SET state = ?1, error = ?2, completed_at = ?3, version = version + 1
              WHERE inbox_item_id = ?4 AND run_id = ?5 AND state = 'running'",
@@ -3517,6 +3611,9 @@ impl CollaborationRepository {
                 claim.run_id,
             ],
         )?;
+        if updated != 1 {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        }
         settle_sleep_after_current(&transaction, &claim.member_id)?;
         enqueue_room_changed(
             &transaction,
@@ -7182,6 +7279,39 @@ mod tests {
     }
 
     #[test]
+    fn active_retry_release_tolerates_interrupt_version_bump() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "中断与失败结算并发",
+                RoomInputMode::Task,
+                "interrupt-before-retry-release",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+        let active = repository.activate_lease(&leased).unwrap();
+        repository
+            .request_interrupt("room-1", &member_id, &active.run_id)
+            .unwrap();
+
+        repository.release_active_for_retry(&active).unwrap();
+
+        let item = repository
+            .snapshot("room-1")
+            .unwrap()
+            .inbox
+            .into_iter()
+            .find(|item| item.inbox_item_id == active.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Pending);
+        assert!(item.run_id.is_none());
+    }
+
+    #[test]
     fn durable_task_result_reconciliation_appends_reply_once() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
@@ -8160,6 +8290,40 @@ mod tests {
         assert_eq!(item.run_id.as_deref(), Some("durable-instance-run"));
         assert_eq!(item.state, InboxState::Completed);
         assert!(!persisted.inbox.iter().any(|item| item.member_id == b));
+    }
+
+    #[test]
+    fn failed_durable_projection_releases_the_running_transition_for_retry() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "恢复一个无效的持久结果",
+                RoomInputMode::Task,
+                "invalid-durable-projection",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+
+        let error = repository
+            .reconcile_claim_result(&leased, "invalid-durable-run", Some("   "))
+            .unwrap_err();
+
+        assert!(matches!(error, CollaborationError::EmptyMemberReply));
+        let persisted = repository.snapshot("room-1").unwrap();
+        let item = persisted
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == leased.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Pending);
+        assert!(item.run_id.is_none());
+        let retried = repository.lease_next().unwrap().unwrap();
+        assert_eq!(retried.inbox_item_id, leased.inbox_item_id);
+        assert_ne!(retried.run_id, "invalid-durable-run");
     }
 
     #[test]

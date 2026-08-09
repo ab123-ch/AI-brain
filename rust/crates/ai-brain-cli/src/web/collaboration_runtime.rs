@@ -59,6 +59,13 @@ enum MemberCompletion {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreExecutionTaskDisposition {
+    Missing,
+    AlreadyTerminal(TaskRunState),
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MemberExecutionPolicy {
     model_policy: String,
@@ -1271,7 +1278,25 @@ impl CollaborationRuntime {
     }
 
     async fn fail_leased_claim(&self, claim: &ClaimedInboxItem, error: String) {
-        self.fail_existing_pre_execution_task(claim, &error).await;
+        let disposition = match self.fail_existing_pre_execution_task(claim, &error).await {
+            Ok(disposition) => disposition,
+            Err(task_error) => {
+                self.release_leased_claim_for_retry(
+                    claim,
+                    format!("结算预执行失败的持久任务失败: {task_error}; 原始错误: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
+        if disposition == PreExecutionTaskDisposition::AlreadyTerminal(TaskRunState::Completed) {
+            self.reconcile_durable_claim(claim).await;
+            return;
+        }
+        self.fail_claim_after_task_settled(claim, error).await;
+    }
+
+    async fn fail_claim_after_task_settled(&self, claim: &ClaimedInboxItem, error: String) {
         let repository = Arc::clone(&self.repository);
         let claim_for_activation = claim.clone();
         match tokio::task::spawn_blocking(move || repository.activate_lease(&claim_for_activation))
@@ -1283,36 +1308,84 @@ impl CollaborationRuntime {
                     run_id = %claim.run_id,
                     "激活失败任务的租约失败: {activation_error}; 原始错误: {error}"
                 );
-                let repository = Arc::clone(&self.repository);
-                let claim_for_release = claim.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    repository.release_lease(&claim_for_release)
-                })
+                self.release_leased_claim_for_retry(
+                    claim,
+                    format!("激活失败任务的租约失败: {activation_error}; 原始错误: {error}"),
+                )
                 .await;
+                return;
             }
             Err(join_error) => {
-                tracing::error!(
-                    run_id = %claim.run_id,
-                    "激活失败任务的租约线程异常: {join_error}; 原始错误: {error}"
-                );
+                self.release_leased_claim_for_retry(
+                    claim,
+                    format!("激活失败任务的租约线程异常: {join_error}; 原始错误: {error}"),
+                )
+                .await;
+                return;
             }
         }
         self.publish_snapshot(claim.room_id.clone()).await;
         self.dispatcher_notify.notify_waiters();
     }
 
-    async fn fail_existing_pre_execution_task(&self, claim: &ClaimedInboxItem, error: &str) {
+    async fn release_leased_claim_for_retry(&self, claim: &ClaimedInboxItem, reason: String) {
+        tracing::error!(run_id = %claim.run_id, "保留 Inbox 供重试: {reason}");
+        let repository = Arc::clone(&self.repository);
+        let claim_for_release = claim.clone();
+        match tokio::task::spawn_blocking(move || repository.release_lease(&claim_for_release))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(release_error)) => {
+                tracing::error!(run_id = %claim.run_id, "释放待重试成员租约失败: {release_error}");
+            }
+            Err(join_error) => {
+                tracing::error!(run_id = %claim.run_id, "释放待重试成员租约线程异常: {join_error}");
+            }
+        }
+        self.publish_snapshot(claim.room_id.clone()).await;
+        self.dispatcher_notify.notify_waiters();
+    }
+
+    async fn release_active_claim_for_retry(&self, claim: &ClaimedInboxItem, reason: String) {
+        tracing::error!(run_id = %claim.run_id, "回退运行中 Inbox 供重试: {reason}");
+        let repository = Arc::clone(&self.repository);
+        let claim_for_release = claim.clone();
+        match tokio::task::spawn_blocking(move || {
+            repository.release_active_for_retry(&claim_for_release)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(release_error)) => {
+                tracing::error!(run_id = %claim.run_id, "回退运行中 Inbox 失败: {release_error}");
+            }
+            Err(join_error) => {
+                tracing::error!(run_id = %claim.run_id, "回退运行中 Inbox 线程异常: {join_error}");
+            }
+        }
+        self.publish_snapshot(claim.room_id.clone()).await;
+        self.dispatcher_notify.notify_waiters();
+    }
+
+    async fn fail_existing_pre_execution_task(
+        &self,
+        claim: &ClaimedInboxItem,
+        error: &str,
+    ) -> Result<PreExecutionTaskDisposition, String> {
         let tasks = Arc::clone(&self.task_repository);
         let task_run_id = claim.task_run_id.clone();
         let durable_error = error.to_owned();
-        match tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let task = match tasks.task(&task_run_id) {
                 Ok(task) => task,
-                Err(TaskEngineError::NotFound { .. }) => return Ok(()),
+                Err(TaskEngineError::NotFound { .. }) => {
+                    return Ok(PreExecutionTaskDisposition::Missing);
+                }
                 Err(error) => return Err(error),
             };
             if task.state.is_terminal() {
-                return Ok(());
+                return Ok(PreExecutionTaskDisposition::AlreadyTerminal(task.state));
             }
             for node in tasks.nodes(&task_run_id)? {
                 let Some(instance_run_id) = node.current_instance_run_id else {
@@ -1323,18 +1396,28 @@ impl CollaborationRuntime {
                     tasks.fail_node(&instance_run_id, instance.version, &durable_error, false)?;
                 }
             }
-            Ok(())
+            let task = tasks.task(&task_run_id)?;
+            if task.state == TaskRunState::Failed {
+                return Ok(PreExecutionTaskDisposition::Failed);
+            }
+            if task.state.is_terminal() {
+                return Ok(PreExecutionTaskDisposition::AlreadyTerminal(task.state));
+            }
+            let failed =
+                tasks.fail_task_before_execution(&task_run_id, task.version, &durable_error)?;
+            if failed.state == TaskRunState::Failed {
+                Ok(PreExecutionTaskDisposition::Failed)
+            } else if failed.state.is_terminal() {
+                Ok(PreExecutionTaskDisposition::AlreadyTerminal(failed.state))
+            } else {
+                Err(TaskEngineError::Invalid(format!(
+                    "预执行失败后任务 `{task_run_id}` 仍处于非终态"
+                )))
+            }
         })
         .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(task_error)) => {
-                tracing::error!(run_id = %claim.run_id, "结算预执行失败的持久任务失败: {task_error}");
-            }
-            Err(join_error) => {
-                tracing::error!(run_id = %claim.run_id, "结算预执行失败的持久任务线程异常: {join_error}");
-            }
-        }
+        .map_err(|join_error| format!("结算预执行失败的持久任务线程异常: {join_error}"))?
+        .map_err(|task_error| format!("结算预执行失败的持久任务失败: {task_error}"))
     }
 
     async fn fail_active_claim(&self, claim: &ClaimedInboxItem, error: String) {
@@ -1347,8 +1430,22 @@ impl CollaborationRuntime {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(commit_error)) => tracing::error!("提交成员失败状态失败: {commit_error}"),
-            Err(join_error) => tracing::error!("提交成员失败状态线程异常: {join_error}"),
+            Ok(Err(commit_error)) => {
+                self.release_active_claim_for_retry(
+                    claim,
+                    format!("提交成员失败状态失败: {commit_error}"),
+                )
+                .await;
+                return;
+            }
+            Err(join_error) => {
+                self.release_active_claim_for_retry(
+                    claim,
+                    format!("提交成员失败状态线程异常: {join_error}"),
+                )
+                .await;
+                return;
+            }
         }
         self.broadcast(WebProgressEvent::MemberRunProgress {
             room_id: claim.room_id.clone(),
@@ -1369,58 +1466,68 @@ impl CollaborationRuntime {
 
     async fn reconcile_durable_claim(&self, claim: &ClaimedInboxItem) {
         let tasks = Arc::clone(&self.task_repository);
+        let repository = Arc::clone(&self.repository);
         let origin_id = claim.inbox_item_id.clone();
         let task_run_id = claim.task_run_id.clone();
         let result = tokio::task::spawn_blocking(move || {
-            tasks.completed_results("member_inbox").map(|results| {
-                results.into_iter().find(|result| {
-                    result.origin_id == origin_id && result.task_run_id == task_run_id
-                })
-            })
+            let durable = tasks
+                .completed_results("member_inbox")
+                .map_err(DurableResultRecoveryError::TaskRead)?
+                .into_iter()
+                .find(|result| result.origin_id == origin_id && result.task_run_id == task_run_id);
+            let Some(durable) = durable else {
+                return Ok(None);
+            };
+            reconcile_durable_result(
+                &repository,
+                &tasks,
+                &durable.origin_id,
+                &durable.task_run_id,
+                &durable.instance_run_id,
+                &durable.artifact.content,
+            )
+            .map(Some)
         })
         .await;
-        let durable = match result {
-            Ok(Ok(Some(result))) => result,
+        let disposition = match result {
+            Ok(Ok(Some(disposition))) => disposition,
             Ok(Ok(None)) => {
-                self.fail_leased_claim(claim, "持久任务已完成但缺少可恢复产物".into())
+                self.fail_claim_after_task_settled(claim, "持久任务已完成但缺少可恢复产物".into())
                     .await;
                 return;
             }
             Ok(Err(error)) => {
-                self.fail_leased_claim(claim, format!("读取可恢复任务产物失败: {error}"))
-                    .await;
+                self.release_leased_claim_for_retry(
+                    claim,
+                    format!("读取可恢复任务产物失败: {error}"),
+                )
+                .await;
                 return;
             }
             Err(error) => {
-                self.fail_leased_claim(claim, format!("读取可恢复任务产物线程失败: {error}"))
-                    .await;
+                self.release_leased_claim_for_retry(
+                    claim,
+                    format!("读取可恢复任务产物线程失败: {error}"),
+                )
+                .await;
                 return;
             }
         };
-        let repository = Arc::clone(&self.repository);
-        let claim_for_completion = claim.clone();
-        let event = tokio::task::spawn_blocking(move || {
-            let participation_answer =
-                if claim_for_completion.purpose == InboxPurpose::Participation {
-                    parse_participation_answer(&durable.artifact.content)
-                } else {
-                    Some(durable.artifact.content.clone())
-                };
-            repository.reconcile_claim_result(
-                &claim_for_completion,
-                &durable.instance_run_id,
-                participation_answer.as_deref(),
-            )
-        })
-        .await;
-        match event {
-            Ok(Ok(completion)) => {
+        match disposition {
+            DurableResultDisposition::Projected(completion) => {
                 if let Some(event) = completion.event {
                     self.broadcast(WebProgressEvent::RoomEventAppended { event });
                 }
             }
-            Ok(Err(error)) => tracing::error!("补齐持久成员回复失败: {error}"),
-            Err(error) => tracing::error!("补齐持久成员回复线程异常: {error}"),
+            DurableResultDisposition::AlreadySettled => {}
+            DurableResultDisposition::Rejected { reason } => {
+                self.fail_claim_after_task_settled(
+                    claim,
+                    format!("持久任务已完成但结果无法恢复: {reason}"),
+                )
+                .await;
+                return;
+            }
         }
         self.publish_snapshot(claim.room_id.clone()).await;
     }
@@ -1473,7 +1580,8 @@ impl CollaborationRuntime {
         match durable_state {
             Ok(Ok(instance)) if instance.state == InstanceRunState::Succeeded => {
                 let Some(artifact_id) = instance.artifact_id else {
-                    tracing::error!(run_id = %claim.run_id, "已完成任务缺少 artifact_id");
+                    self.release_active_claim_for_retry(claim, "已完成任务缺少 artifact_id".into())
+                        .await;
                     return;
                 };
                 let tasks = Arc::clone(&self.task_repository);
@@ -1514,10 +1622,20 @@ impl CollaborationRuntime {
                             }
                             Ok(Ok(_)) => {}
                             Ok(Err(commit_error)) => {
-                                tracing::error!("补偿提交成员完成事件失败: {commit_error}");
+                                self.release_active_claim_for_retry(
+                                    claim,
+                                    format!("补偿提交成员完成事件失败: {commit_error}"),
+                                )
+                                .await;
+                                return;
                             }
                             Err(join_error) => {
-                                tracing::error!("补偿提交成员完成事件线程异常: {join_error}");
+                                self.release_active_claim_for_retry(
+                                    claim,
+                                    format!("补偿提交成员完成事件线程异常: {join_error}"),
+                                )
+                                .await;
+                                return;
                             }
                         }
                         self.finish_run(claim, "completed", None);
@@ -1530,14 +1648,40 @@ impl CollaborationRuntime {
                         return;
                     }
                     Ok(Err(artifact_error)) => {
-                        tracing::error!("读取已完成任务产物失败: {artifact_error}");
+                        self.release_active_claim_for_retry(
+                            claim,
+                            format!("读取已完成任务产物失败: {artifact_error}"),
+                        )
+                        .await;
+                        return;
                     }
-                    Err(join_error) => tracing::error!("读取已完成任务产物线程异常: {join_error}"),
+                    Err(join_error) => {
+                        self.release_active_claim_for_retry(
+                            claim,
+                            format!("读取已完成任务产物线程异常: {join_error}"),
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
             Ok(Ok(_)) => {}
-            Ok(Err(task_error)) => tracing::error!("提交持久任务兜底终态失败: {task_error}"),
-            Err(join_error) => tracing::error!("提交持久任务兜底终态线程异常: {join_error}"),
+            Ok(Err(task_error)) => {
+                self.release_active_claim_for_retry(
+                    claim,
+                    format!("提交持久任务兜底终态失败: {task_error}"),
+                )
+                .await;
+                return;
+            }
+            Err(join_error) => {
+                self.release_active_claim_for_retry(
+                    claim,
+                    format!("提交持久任务兜底终态线程异常: {join_error}"),
+                )
+                .await;
+                return;
+            }
         }
         let repository = Arc::clone(&self.repository);
         let claim_for_failure = claim.clone();
@@ -1549,10 +1693,20 @@ impl CollaborationRuntime {
         {
             Ok(Ok(())) => {}
             Ok(Err(commit_error)) => {
-                tracing::error!("提交成员运行兜底终态失败: {commit_error}");
+                self.release_active_claim_for_retry(
+                    claim,
+                    format!("提交成员运行兜底终态失败: {commit_error}"),
+                )
+                .await;
+                return;
             }
             Err(join_error) => {
-                tracing::error!("成员运行兜底终态线程异常: {join_error}");
+                self.release_active_claim_for_retry(
+                    claim,
+                    format!("成员运行兜底终态线程异常: {join_error}"),
+                )
+                .await;
+                return;
             }
         }
         self.broadcast(WebProgressEvent::MemberRunProgress {
@@ -2126,8 +2280,8 @@ mod tests {
         context_request_for_claim, context_snapshot_from_task, parse_participation_answer,
         reconcile_durable_result, scheduler_limits, task_request_for_claim,
         validate_task_claim_identity, validated_task_context, with_model_policy_details,
-        CollaborationRuntime, CollaborationRuntimeServices, DurableResultDisposition,
-        DurableResultRecoveryError,
+        ClaimRunError, CollaborationRuntime, CollaborationRuntimeServices,
+        DurableResultDisposition, DurableResultRecoveryError,
     };
     use crate::orchestrator::{MemberQueryError, Orchestrator};
     use crate::web::collaboration::{
@@ -2136,6 +2290,7 @@ mod tests {
         DEFAULT_THREAD_KEY,
     };
     use crate::web::collaboration_tools::GroupMessageToolScope;
+    use crate::web::progress_adapter::WebProgressEvent;
     use brain_core::tool_executor::ToolExecutionContext;
     use brain_core::types::{MainBrainOutput, ProgressEvent};
     use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
@@ -2503,7 +2658,8 @@ mod tests {
         panic!("等待房间 {room_id} 成员回复超时");
     }
 
-    async fn assert_missing_frozen_directory_failure(existing_task: bool) {
+    async fn assert_missing_frozen_directory_failure(existing_task: bool, recovered_task: bool) {
+        assert!(!recovered_task || existing_task);
         let runtime_directory = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_path = workspace.path().canonicalize().unwrap();
@@ -2556,6 +2712,26 @@ mod tests {
             started_instance_run_id = Some(coordinated.started().instance.instance_run_id.clone());
             collaboration.release_lease(&claim).unwrap();
             drop(coordinated);
+            if recovered_task {
+                drop(coordinator);
+                drop(tasks);
+                let reopened = TaskRepository::open(collaboration.database_path()).unwrap();
+                let recovery = reopened.recover_inflight().unwrap();
+                assert_eq!(recovery.interrupted, 1);
+                assert_eq!(recovery.requeued, 1);
+                assert_eq!(
+                    reopened.task(&claim.task_run_id).unwrap().state,
+                    TaskRunState::Queued
+                );
+                assert_eq!(reopened.node(&node_id).unwrap().state, NodeState::Ready);
+                assert_eq!(
+                    reopened
+                        .instance(started_instance_run_id.as_deref().unwrap())
+                        .unwrap()
+                        .state,
+                    InstanceRunState::Interrupted
+                );
+            }
         }
         collaboration
             .sleep_member("room-missing-workspace", &member_id)
@@ -2601,18 +2777,372 @@ mod tests {
             let node = tasks.nodes(&task.task_run_id).unwrap().remove(0);
             assert_eq!(node.state, NodeState::Failed);
             let instance = tasks.instance(&instance_run_id).unwrap();
-            assert_eq!(instance.state, InstanceRunState::Failed);
-            assert!(instance
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("冻结工作目录")));
+            if recovered_task {
+                assert_eq!(instance.state, InstanceRunState::Interrupted);
+            } else {
+                assert_eq!(instance.state, InstanceRunState::Failed);
+                assert!(instance
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("冻结工作目录")));
+            }
         }
     }
 
     #[tokio::test]
     async fn missing_frozen_directory_stops_before_provider() {
-        assert_missing_frozen_directory_failure(false).await;
-        assert_missing_frozen_directory_failure(true).await;
+        assert_missing_frozen_directory_failure(false, false).await;
+        assert_missing_frozen_directory_failure(true, false).await;
+        assert_missing_frozen_directory_failure(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn task_settlement_error_releases_inbox_for_retry() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let task_directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room("room-task-settlement-error", "Task Settlement Error", &[])
+            .unwrap();
+        let posted = collaboration
+            .post_message(
+                "room-task-settlement-error",
+                &[room.room.default_member_id],
+                "触发预执行失败",
+                RoomInputMode::Task,
+                "task-settlement-error",
+            )
+            .unwrap();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+
+        let task_database = task_directory.path().join("task-runtime.db");
+        let tasks = Arc::new(TaskRepository::open(&task_database).unwrap());
+        let services = Arc::new(TestRuntimeServices {
+            tasks: Arc::clone(&tasks),
+            coordinator: TaskCoordinator::new(
+                Arc::clone(&tasks),
+                Scheduler::new(scheduler_limits(&config)).unwrap(),
+            ),
+            context_builder: Arc::new(ContextBuilder::new(
+                Arc::new(EmptyMemory),
+                Arc::new(UnavailableGraph),
+                Arc::new(ContentResolverRegistry::new()),
+            )),
+            query_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let runtime = CollaborationRuntime {
+            repository: Arc::clone(&collaboration),
+            task_repository: Arc::clone(&tasks),
+            coordinator: services.coordinator.clone(),
+            orchestrator: services,
+            events,
+            dispatcher_notify: Arc::new(tokio::sync::Notify::new()),
+            active_runs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            model_policy_details: llm_config.available_instance_model_policies(),
+            llm_config,
+        };
+
+        std::fs::remove_file(&task_database).unwrap();
+        std::fs::create_dir(&task_database).unwrap();
+        runtime
+            .fail_leased_claim(&claim, "冻结工作目录不可用".into())
+            .await;
+
+        let item = collaboration
+            .snapshot("room-task-settlement-error")
+            .unwrap()
+            .inbox
+            .into_iter()
+            .find(|item| item.inbox_item_id == posted.inbox_items[0].inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Pending);
+        assert!(item.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_task_settlement_error_releases_inbox_for_retry() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let task_directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room(
+                "room-active-settlement-error",
+                "Active Settlement Error",
+                &[],
+            )
+            .unwrap();
+        let posted = collaboration
+            .post_message(
+                "room-active-settlement-error",
+                &[room.room.default_member_id],
+                "触发运行中持久任务结算失败",
+                RoomInputMode::Task,
+                "active-settlement-error",
+            )
+            .unwrap();
+        let leased = collaboration.lease_next().unwrap().unwrap();
+        let context = built_context_snapshot_for_claim(&collaboration, &leased, &config);
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let model = llm_config.resolve_model_policy(&leased.model_policy);
+        let request = task_request_for_claim(&leased, &config, &model, &context);
+        let node_id = request.nodes[0].node_id.clone();
+
+        let task_database = task_directory.path().join("task-runtime.db");
+        let tasks = Arc::new(TaskRepository::open(&task_database).unwrap());
+        tasks.create_task(request).unwrap();
+        let coordinator = TaskCoordinator::new(
+            Arc::clone(&tasks),
+            Scheduler::new(scheduler_limits(&config)).unwrap(),
+        );
+        let coordinated = coordinator
+            .admit_node(&node_id, &leased.run_id, CancellationToken::new())
+            .await
+            .unwrap();
+        let active = collaboration.activate_lease(&leased).unwrap();
+        let services = Arc::new(TestRuntimeServices {
+            tasks: Arc::clone(&tasks),
+            coordinator: coordinator.clone(),
+            context_builder: Arc::new(ContextBuilder::new(
+                Arc::new(EmptyMemory),
+                Arc::new(UnavailableGraph),
+                Arc::new(ContentResolverRegistry::new()),
+            )),
+            query_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let runtime = CollaborationRuntime {
+            repository: Arc::clone(&collaboration),
+            task_repository: Arc::clone(&tasks),
+            coordinator,
+            orchestrator: services,
+            events,
+            dispatcher_notify: Arc::new(tokio::sync::Notify::new()),
+            active_runs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            model_policy_details: llm_config.available_instance_model_policies(),
+            llm_config,
+        };
+
+        std::fs::remove_file(&task_database).unwrap();
+        std::fs::create_dir(&task_database).unwrap();
+        runtime
+            .fail_unsettled_claim(
+                &active,
+                coordinated.started(),
+                ClaimRunError::pre_execution("持久任务结算数据库不可用"),
+            )
+            .await;
+
+        let item = collaboration
+            .snapshot("room-active-settlement-error")
+            .unwrap()
+            .inbox
+            .into_iter()
+            .find(|item| item.inbox_item_id == posted.inbox_items[0].inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Pending);
+        assert!(item.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_cancelled_claim_does_not_broadcast_failed_completion() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room("room-stale-cancelled-claim", "Stale Cancelled Claim", &[])
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-stale-cancelled-claim",
+                &[room.room.default_member_id],
+                "取消后忽略过期失败结算",
+                RoomInputMode::Task,
+                "stale-cancelled-claim",
+            )
+            .unwrap();
+        let leased = collaboration.lease_next().unwrap().unwrap();
+        let active = collaboration.activate_lease(&leased).unwrap();
+        collaboration
+            .request_interrupt(&active.room_id, &active.member_id, &active.run_id)
+            .unwrap();
+        collaboration.fail_item(&active, "运行已中断").unwrap();
+
+        let services = Arc::new(TestRuntimeServices::new(&collaboration, &config));
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let (events, mut event_receiver) = tokio::sync::broadcast::channel(8);
+        let runtime = CollaborationRuntime {
+            repository: Arc::clone(&collaboration),
+            task_repository: Arc::clone(&services.tasks),
+            coordinator: services.coordinator.clone(),
+            orchestrator: services,
+            events,
+            dispatcher_notify: Arc::new(tokio::sync::Notify::new()),
+            active_runs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            model_policy_details: llm_config.available_instance_model_policies(),
+            llm_config,
+        };
+
+        runtime
+            .fail_active_claim(&active, "过期运行失败".into())
+            .await;
+
+        let item = collaboration
+            .snapshot("room-stale-cancelled-claim")
+            .unwrap()
+            .inbox
+            .into_iter()
+            .find(|item| item.inbox_item_id == active.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Cancelled);
+        while let Ok(event) = event_receiver.try_recv() {
+            let false_terminal = match &event {
+                WebProgressEvent::MemberRunFinished { .. } => true,
+                WebProgressEvent::MemberRunProgress { event, .. } => matches!(
+                    event.as_ref(),
+                    WebProgressEvent::Error { .. } | WebProgressEvent::Done
+                ),
+                _ => false,
+            };
+            assert!(!false_terminal, "过期 Claim 不应广播终态事件: {event:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_task_reconciles_when_frozen_directory_is_missing() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                &workspace_path,
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room("room-completed-missing-workspace", "Completed Task", &[])
+            .unwrap();
+        let posted = collaboration
+            .post_message(
+                "room-completed-missing-workspace",
+                &[room.room.default_member_id],
+                "返回已经持久化的结果",
+                RoomInputMode::Task,
+                "completed-missing-workspace",
+            )
+            .unwrap();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+        let task_run_id = claim.task_run_id.clone();
+        let context = built_context_snapshot_for_claim(&collaboration, &claim, &config);
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let model = llm_config.resolve_model_policy(&claim.model_policy);
+        let request = task_request_for_claim(&claim, &config, &model, &context);
+        let node_id = request.nodes[0].node_id.clone();
+        let tasks = Arc::new(TaskRepository::open(collaboration.database_path()).unwrap());
+        tasks.create_task(request).unwrap();
+        let coordinator = TaskCoordinator::new(
+            Arc::clone(&tasks),
+            Scheduler::new(scheduler_limits(&config)).unwrap(),
+        );
+        let coordinated = coordinator
+            .admit_node(&node_id, &claim.run_id, CancellationToken::new())
+            .await
+            .unwrap();
+        let artifact = tasks
+            .store_artifact(
+                &claim.run_id,
+                "已经完成的持久回复",
+                "text/plain; charset=utf-8",
+            )
+            .unwrap();
+        let completion = tasks
+            .complete_node(
+                &claim.run_id,
+                coordinated.started().instance.version,
+                ActualUsage {
+                    input_tokens: 5,
+                    output_tokens: 3,
+                },
+                Some(&artifact.artifact_id),
+            )
+            .unwrap();
+        assert_eq!(completion.task.state, TaskRunState::Completed);
+        drop(coordinated);
+
+        let services = Arc::new(TestRuntimeServices {
+            tasks: Arc::clone(&tasks),
+            coordinator: coordinator.clone(),
+            context_builder: Arc::new(ContextBuilder::new(
+                Arc::new(EmptyMemory),
+                Arc::new(UnavailableGraph),
+                Arc::new(ContentResolverRegistry::new()),
+            )),
+            query_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let query_count = Arc::clone(&services.query_count);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let runtime = Arc::new(CollaborationRuntime {
+            repository: Arc::clone(&collaboration),
+            task_repository: Arc::clone(&tasks),
+            coordinator,
+            orchestrator: services,
+            events,
+            dispatcher_notify: Arc::new(tokio::sync::Notify::new()),
+            active_runs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            model_policy_details: llm_config.available_instance_model_policies(),
+            llm_config,
+        });
+
+        std::fs::remove_dir(&workspace_path).unwrap();
+        Arc::clone(&runtime).schedule_claim(claim).await;
+
+        let snapshot = collaboration
+            .snapshot("room-completed-missing-workspace")
+            .unwrap();
+        let item = snapshot
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == posted.inbox_items[0].inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Completed);
+        assert!(snapshot.events.iter().any(|event| {
+            event.kind == "member_message" && event.content == "已经完成的持久回复"
+        }));
+        assert_eq!(
+            tasks.task(&task_run_id).unwrap().state,
+            TaskRunState::Completed
+        );
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -2742,8 +3272,14 @@ mod tests {
             Scheduler::new(scheduler_limits(&config)).unwrap(),
         );
         let llm = Arc::new(RelativeReadToolLlm::new());
-        let mut orchestrator = Orchestrator::new().await.unwrap();
-        orchestrator.configure_collaboration_runtime_for_test(tasks, coordinator, llm.clone());
+        let orchestrator = Orchestrator::new_for_collaboration_test(
+            runtime_directory.path(),
+            tasks,
+            coordinator,
+            llm.clone(),
+        )
+        .await
+        .unwrap();
         let orchestrator = Arc::new(orchestrator);
         let llm_config = Arc::new(LlmConfig::default_config());
         let model_policy_details = llm_config.available_instance_model_policies();

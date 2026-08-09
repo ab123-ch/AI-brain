@@ -447,8 +447,11 @@ impl Orchestrator {
         let llm_config = LlmConfig::load_default().map_err(|e| {
             format!("LLM 配置加载失败: {e}\n请检查 ~/.config/ai-brain/config.toml 或设置 ZHIPU_API_KEY 环境变量")
         })?;
-
         let runtime_dir = crate::web::collaboration::default_runtime_dir();
+        Self::new_with_runtime(llm_config, runtime_dir).await
+    }
+
+    async fn new_with_runtime(llm_config: LlmConfig, runtime_dir: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|error| format!("创建运行时目录失败: {error}"))?;
         let collaboration_config =
@@ -964,6 +967,28 @@ impl Orchestrator {
 
     pub(crate) fn task_coordinator(&self) -> TaskCoordinator {
         self.task_coordinator.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_for_collaboration_test(
+        runtime_dir: &Path,
+        task_repository: Arc<TaskRepository>,
+        task_coordinator: TaskCoordinator,
+        member_llm: Arc<dyn brain_llm::LlmProvider>,
+    ) -> Result<Self, String> {
+        let mut llm_config = LlmConfig::default_config();
+        for provider in llm_config.llm.providers.values_mut() {
+            provider.api_key_env.clear();
+            provider.api_key = Some("collaboration-test-key".into());
+        }
+        let mut orchestrator =
+            Self::new_with_runtime(llm_config, runtime_dir.to_path_buf()).await?;
+        orchestrator.configure_collaboration_runtime_for_test(
+            task_repository,
+            task_coordinator,
+            member_llm,
+        );
+        Ok(orchestrator)
     }
 
     #[cfg(test)]

@@ -483,6 +483,7 @@ pub async fn run_tool_loop_with_config_and_context(
         execute_tool_calls(
             tool_executor,
             tool_execution_context,
+            tools,
             &response,
             messages,
             progress_tx,
@@ -617,9 +618,11 @@ fn pre_tool_use_hook_input(
 }
 
 /// 执行 LLM 响应中的所有工具调用，将结果追加到 messages
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_calls(
     tool_executor: &dyn ToolExecutor,
     tool_execution_context: &ToolExecutionContext,
+    advertised_tools: &[ToolDefinition],
     response: &ChatResponse,
     messages: &mut Vec<ChatMessage>,
     progress_tx: Option<&tokio::sync::mpsc::Sender<ProgressEvent>>,
@@ -628,6 +631,36 @@ async fn execute_tool_calls(
 ) {
     for tool_block in response.tool_calls() {
         if let ContentBlock::ToolUse { id, name, input } = tool_block {
+            if !advertised_tools.iter().any(|tool| tool.name == *name) {
+                let deny_msg = format!("未声明工具调用被拒绝: {name}");
+                tracing::warn!("{deny_msg}");
+                messages.push(ChatMessage::tool_result(id, &deny_msg, true));
+                turns.push(TurnRecord {
+                    role: TurnRole::ToolCall,
+                    content: String::new(),
+                    tool_call: Some(ToolCallRecord {
+                        tool_name: name.clone(),
+                        input: input.clone(),
+                        output: deny_msg.clone(),
+                        duration_ms: 0,
+                        is_error: true,
+                    }),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                });
+                send_progress(
+                    progress_tx,
+                    ProgressEvent::ToolDone {
+                        call_id: id.clone(),
+                        brain: "main".into(),
+                        tool_name: name.clone(),
+                        duration_ms: 0,
+                        output_preview: deny_msg,
+                        is_error: true,
+                    },
+                )
+                .await;
+                continue;
+            }
             let tool_call = ToolCall {
                 tool_name: name.clone(),
                 input: input.clone(),
@@ -932,6 +965,69 @@ mod tests {
         }
     }
 
+    struct ForcedToolLlm {
+        calls: AtomicUsize,
+        tool_name: &'static str,
+    }
+
+    impl ForcedToolLlm {
+        fn new(tool_name: &'static str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                tool_name,
+            }
+        }
+    }
+
+    impl LlmProvider for ForcedToolLlm {
+        fn model(&self) -> &'static str {
+            "forced-tool-stub"
+        }
+
+        fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let tool_name = self.tool_name;
+            Box::pin(async move {
+                let (content, finish_reason) = if call == 0 {
+                    (
+                        vec![ContentBlock::ToolUse {
+                            id: "forced-tool-call".into(),
+                            name: tool_name.into(),
+                            input: if tool_name == "AskUserQuestion" {
+                                serde_json::json!({"question": "不应等待的问题"})
+                            } else {
+                                serde_json::json!({"path": "secret.txt"})
+                            },
+                        }],
+                        FinishReason::ToolUse,
+                    )
+                } else {
+                    (
+                        vec![ContentBlock::text("未声明工具已被拒绝")],
+                        FinishReason::EndTurn,
+                    )
+                };
+                Ok(ChatResponse {
+                    content,
+                    model: "forced-tool-stub".into(),
+                    usage: TokenUsage::default(),
+                    finish_reason: Some(finish_reason),
+                })
+            })
+        }
+    }
+
+    fn test_tool_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: "测试工具".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
     impl LlmProvider for ToolCallingLlm {
         fn model(&self) -> &'static str {
             "tool-calling-stub"
@@ -1055,13 +1151,14 @@ mod tests {
         let context = ToolExecutionContext::new(working_directory.clone());
         let hook_input = pre_tool_use_hook_input(&context, "context_probe", &serde_json::json!({}));
         let mut messages = vec![ChatMessage::user("测试显式工具上下文")];
+        let advertised_tools = [test_tool_definition("context_probe")];
 
         let result = run_tool_loop_with_config_and_context(
             &llm,
             &executor,
             &context,
             &mut messages,
-            &[],
+            &advertised_tools,
             None,
             None,
             4096,
@@ -1101,7 +1198,7 @@ mod tests {
             Arc::new(ToolCallingLlm::new()),
             executor,
             context,
-            Vec::new(),
+            vec![test_tool_definition("context_probe")],
             4096,
             0.7,
         );
@@ -1113,6 +1210,83 @@ mod tests {
 
         assert_eq!(answer, "工具调用完成");
         assert_eq!(*seen.lock().unwrap(), vec![working_directory]);
+    }
+
+    #[tokio::test]
+    async fn unadvertised_tool_use_never_reaches_executor() {
+        let llm = ForcedToolLlm::new("read_file");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let executor = RecordingContextExecutor {
+            seen: Arc::clone(&seen),
+        };
+        let context = ToolExecutionContext::new(std::env::temp_dir());
+        let mut messages = vec![ChatMessage::user("禁止工具执行")];
+
+        let result = run_tool_loop_with_config_and_context(
+            &llm,
+            &executor,
+            &context,
+            &mut messages,
+            &[],
+            None,
+            None,
+            4096,
+            0.7,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response.text(), "未声明工具已被拒绝");
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolResult {
+                    content,
+                    is_error: true,
+                    ..
+                } if content.contains("未声明工具") && content.contains("read_file")
+            )));
+    }
+
+    #[tokio::test]
+    async fn unadvertised_ask_user_question_never_waits_for_user() {
+        let llm = ForcedToolLlm::new("AskUserQuestion");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let executor = RecordingContextExecutor {
+            seen: Arc::clone(&seen),
+        };
+        let context = ToolExecutionContext::new(std::env::temp_dir());
+        let mut messages = vec![ChatMessage::user("禁止询问用户")];
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(8);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_tool_loop_with_config_and_context(
+                &llm,
+                &executor,
+                &context,
+                &mut messages,
+                &[],
+                Some(&progress_tx),
+                None,
+                4096,
+                0.7,
+                None,
+            ),
+        )
+        .await
+        .expect("未声明 AskUserQuestion 不得进入等待")
+        .unwrap();
+
+        assert_eq!(result.response.text(), "未声明工具已被拒绝");
+        assert!(seen.lock().unwrap().is_empty());
+        while let Ok(event) = progress_rx.try_recv() {
+            assert!(!matches!(event, ProgressEvent::AskUser { .. }));
+        }
     }
 
     struct BlankThenTextLlm {
