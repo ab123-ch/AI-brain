@@ -1210,3 +1210,14 @@
 - Legacy Memory Novel behavior passes 14/14 after deleting its duplicate Canon rules; resident Novel passes 8/8 after replacing task types/state with Domain exports and explicitly preserving legacy error variants.
 - The compatibility actor can deserialize Domain checkpoints with new optional Candidate fields, while old checkpoints remain valid. Queue/model/resource/status behavior stays in `brain-novel`; transition validation no longer does.
 - Existing `brain_llm::ChatResponse` exposes exact prompt/completion/cache usage. The Workflow Writer executor can settle TaskEngine with provider usage instead of estimates and retain the raw structured response as the TaskArtifact while Candidate identity binds the validated draft content hash.
+
+## 2026-08-09 LLM Provider 单次调用自动重试
+
+- 生产失败底层是 Windows 10054 `ConnectionReset`；日志先成功完成第 13 次逻辑调用，第 14 次复用连接约 25 秒后被远端重置。
+- 当前 `OpenAiCompatClient::complete` 与 `GeminiClient::complete` 已有 Provider 内尝试循环，但默认仅额外重试 2 次，且把 `reqwest::Error` 转成字符串后调用 `LlmError::is_retryable`。
+- `error sending request for url (...)` 不含 `connection/timeout` 等现有关键词，所以本次连接重置被漏判并直接返回。
+- `RetryConfig` 当前定义在 `openai_compat.rs`，Gemini 与 `SharedHttpClient` 反向引用它；应迁移到独立共享模块并从 crate root 保持公开导出。
+- `stream_openai`/`stream_gemini` 在底层立即丢失 typed `reqwest::Error`；批量流重试应在低层仍持有 typed error 的边界实现。
+- 增量流在 response headers 后立即返回 receiver，后台 chunk 错误仅 warning + break；`StreamEvent` 没有错误 variant。要可靠区分“首事件前重试”和“部分输出后不重试”，需要由一个后台驱动器持有 attempts/delivered 状态，并用显式错误事件报告耗尽或部分流失败。
+- 现有真实 Gemini 增量测试使用 wildcard 分支，新增 `StreamEvent::Error` 不会破坏其 match；仓库未发现其他对 `brain_llm::StreamEvent` 的穷尽匹配。
+- OpenAI 兼容文件已有用户未提交 `.no_proxy()` 两行修改，本功能不得覆盖或提交为自己的既有变更。

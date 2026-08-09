@@ -782,3 +782,36 @@ Build an operational cockpit and conversation trace that expose the real runtime
 | Full `ai-brain` bin suite timed out in `orchestrator::tests::test_orchestrator_query` | Full regression run | 174/175 tests passed; re-run the external-model integration test separately to distinguish network latency from a code regression. |
 | Historical session backfill `jq` duration expression had incorrect precedence | First backfill attempt | Restored the untouched `.bak` copy immediately, reran with `set -e` and explicit parentheses, then validated the 9 messages and 4701-character response before restart. |
 | In-app browser lacked required `sandboxPolicy` metadata | Browser verification | Used installed Playwright 1.60 with system Chrome 149 and blocked only external CDN assets; desktop and 390px responsive checks passed. |
+
+## Current Task: LLM Provider 单次调用自动重试（2026-08-09）
+
+### Goal
+
+为 OpenAI 兼容与 Gemini 的普通/流式请求增加统一的结构化自动重试：额外重试 5 次，
+只重发当前失败的 Provider 调用，不触碰现有 `retry_last_user_message` 整轮用户重试。
+
+### Phases
+
+- [x] 诊断生产连接重置未重试的根因并确认需求边界。
+- [x] 完成并提交设计 `dc16714b`。
+- [x] 编写详细 TDD 实施计划。
+- [ ] 以 RED 测试建立共享错误分类与默认策略合同。
+- [ ] 实现普通完成的 OpenAI/Gemini 统一重试。
+- [ ] 实现批量流和首事件前增量流重试。
+- [ ] 运行定向、回归和仓库门禁。
+- [ ] 重建并重启智脑，验证 HTTP/日志和本地故障注入行为。
+
+### Decisions
+
+- 当前工作树的 `openai_compat.rs` 含用户未提交 `.no_proxy()` 改动；在原工作树就地实现并保留该行，不另建 worktree。
+- 网络错误在仍为 `reqwest::Error` 时通过 typed API/错误源链分类；禁止字符串包含判断。
+- HTTP 只重试 408/429/500/502/503/504，并保留确定性模型路由 503 排除。
+- 批量流可丢弃未公开事件并重试；增量流仅在首个事件交付前重试，交付后错误通过 `StreamEvent::Error` 显式报告且不重发。
+- 用户手动重试、主脑空响应重试、任务恢复和小说工作流重试均保持不变。
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---|---|
+| 现有增量流在后台 chunk 失败时只写日志并静默关闭 receiver，没有错误事件 | 实施规划审计 | 在 `brain-llm::StreamEvent` 增加内部统一的 `Error` 事件，保持现有 wildcard 消费者兼容，并用测试证明部分输出后不重发。 |
+| 首次创建实施计划的补丁在命令代码块处缺少 `+` 前缀，被 `apply_patch` 原子拒绝 | 实施计划写入 | 记录失败并改用完整带前缀的 Add File 补丁；没有计划文件被部分创建。 |

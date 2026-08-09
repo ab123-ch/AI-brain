@@ -742,3 +742,14 @@
 - Migrated resident Novel task/review types and state to Domain compatibility exports; resident actor/recovery tests pass 8/8 with legacy error matching preserved.
 - Confirmed the existing Novel LLM port exposes exact usage needed for TaskEngine settlement in the migrated Writer path.
 - Added and ran the production start-task recovery red contract; it fails only on the seven not-yet-implemented Workflow service/port APIs.
+
+## 2026-08-09 LLM Provider 单次调用自动重试
+
+- 恢复人格记忆 MCP 失败：本会话工具集中未暴露 `memory-system` 入口；继续使用仓库持久规划记录。
+- 诊断当前线上错误为第 14 次 LLM 调用复用连接时发生 Windows 10054，当前 DNS/TCP/TLS/直连/代理探针均正常。
+- 用户确认自动重试额外 5 次、覆盖所有网络 Provider，并明确不得修改现有用户整轮重试功能。
+- 核对 Codex 官方配置：普通 Provider HTTP 请求和 SSE 中断使用独立重试上限；本设计采用 Provider 内局部重试。
+- 设计已写入 `docs/superpowers/specs/2026-08-09-llm-provider-call-retry-design.md` 并以 `dc16714b` 单独提交。
+- 读取 `writing-plans` 与 `planning-with-files`，恢复旧规划记录并开始当前任务实施计划。
+- 审计发现当前 `StreamEvent` 无错误事件，增量流 chunk 失败会静默关闭 receiver；计划以兼容的新 Error 事件建立明确失败合同。
+- 实施计划已写入 `docs/superpowers/plans/2026-08-09-llm-provider-call-retry.md`；占位符、类型名称、规格覆盖和 diff check 自审通过。
