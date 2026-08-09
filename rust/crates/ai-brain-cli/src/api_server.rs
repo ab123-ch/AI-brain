@@ -368,6 +368,13 @@ pub async fn serve_web_remote(orch: Orchestrator, addr: &str, expected_host: &st
 }
 
 async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: Option<String>) {
+    let workspace_root = match std::env::current_dir().and_then(std::fs::canonicalize) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!("读取服务启动工作目录失败: {error}");
+            return;
+        }
+    };
     let base_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("ai-brain");
@@ -393,14 +400,17 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
             .iter()
             .map(|policy| policy.policy_id.clone()),
     );
-    let collaboration_repository =
-        match CollaborationRepository::new(&runtime_dir, collaboration_config) {
-            Ok(repository) => Arc::new(repository),
-            Err(error) => {
-                tracing::error!("初始化协作存储失败: {error}");
-                return;
-            }
-        };
+    let collaboration_repository = match CollaborationRepository::new_with_startup_working_directory(
+        &runtime_dir,
+        collaboration_config,
+        &workspace_root,
+    ) {
+        Ok(repository) => Arc::new(repository),
+        Err(error) => {
+            tracing::error!("初始化协作存储失败: {error}");
+            return;
+        }
+    };
     let orch = Arc::new(orch);
     let collaboration = match CollaborationRuntime::start(
         Arc::clone(&collaboration_repository),
@@ -420,9 +430,7 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         orch,
         sessions,
         collaboration,
-        workspace_root: std::env::current_dir()
-            .and_then(std::fs::canonicalize)
-            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        workspace_root: workspace_root.clone(),
     });
 
     let app = Router::new()

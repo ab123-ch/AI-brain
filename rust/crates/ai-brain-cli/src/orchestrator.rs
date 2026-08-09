@@ -115,6 +115,7 @@ fn install_builtin_skills(ai_brain_dir: &Path) -> Result<PathBuf, String> {
 use brain_bus::BrainBus;
 use brain_core::agent::{BrainAgent, StatelessBrain};
 use brain_core::config::BrainConfig;
+use brain_core::tool_executor::ToolExecutionContext;
 use brain_core::types::{
     BrainId, BrainResponse, BrainResponsePayload, BroadcastMessage, ContextSnapshot,
     EvaluationResult, MainBrainOutput, MasterOutput, MemoryStats, ProgressEvent,
@@ -421,6 +422,8 @@ pub struct Orchestrator {
     /// MCP 客户端池
     #[allow(dead_code)] // Task 8 会使用
     mcp_pool: Arc<McpClientPool>,
+    #[cfg(test)]
+    member_llm_override: Option<Arc<dyn brain_llm::LlmProvider>>,
 }
 
 /// 系统状态结构体（TUI 状态栏用）
@@ -950,6 +953,8 @@ impl Orchestrator {
             plugin_mgr,
             skill_catalog,
             mcp_pool,
+            #[cfg(test)]
+            member_llm_override: None,
         })
     }
 
@@ -959,6 +964,18 @@ impl Orchestrator {
 
     pub(crate) fn task_coordinator(&self) -> TaskCoordinator {
         self.task_coordinator.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_collaboration_runtime_for_test(
+        &mut self,
+        task_repository: Arc<TaskRepository>,
+        task_coordinator: TaskCoordinator,
+        member_llm: Arc<dyn brain_llm::LlmProvider>,
+    ) {
+        self.task_repository = task_repository;
+        self.task_coordinator = task_coordinator;
+        self.member_llm_override = Some(member_llm);
     }
 
     /// 提交查询
@@ -1210,6 +1227,7 @@ impl Orchestrator {
         model_policy: &str,
         reasoning_depth: &str,
         allow_tools: bool,
+        tool_execution_context: ToolExecutionContext,
         group_message_scope: Option<GroupMessageToolScope>,
     ) -> (
         tokio::sync::mpsc::Receiver<ProgressEvent>,
@@ -1231,7 +1249,7 @@ impl Orchestrator {
                 member_inputs_from_snapshot(&context_snapshot)
                     .map_err(MemberQueryError::before_execution)?;
             let (client, resolved_model_policy) =
-                create_member_execution_client(&llm_config, &model_policy)?;
+                this.member_execution_client(&llm_config, &model_policy)?;
             let max_tokens = resolve_member_reasoning_tokens(
                 resolved_model_policy.max_output_tokens,
                 &reasoning_depth,
@@ -1246,21 +1264,36 @@ impl Orchestrator {
                 })?;
                 if allow_tools {
                     if let Some(scope) = group_message_scope {
-                        template.fork_isolated_with_llm_and_executor(
-                            Arc::from(client),
+                        template.fork_isolated_with_llm_and_executor_in_context(
+                            client,
                             Arc::new(GroupMessageToolExecutor::new(
                                 template.tool_executor(),
                                 scope,
                             )),
+                            tool_execution_context,
                             vec![group_message_tool_definition()],
                             max_tokens,
                             temperature,
                         )
                     } else {
-                        template.fork_isolated_with_llm(Arc::from(client), max_tokens, temperature)
+                        template.fork_isolated_with_llm_and_executor_in_context(
+                            client,
+                            template.tool_executor(),
+                            tool_execution_context,
+                            Vec::new(),
+                            max_tokens,
+                            temperature,
+                        )
                     }
                 } else {
-                    template.fork_isolated_with_llm(Arc::from(client), max_tokens, temperature)
+                    template.fork_isolated_with_llm_and_executor_in_context(
+                        client,
+                        template.tool_executor(),
+                        tool_execution_context,
+                        Vec::new(),
+                        max_tokens,
+                        temperature,
+                    )
                 }
             };
             if !allow_tools {
@@ -1285,6 +1318,28 @@ impl Orchestrator {
         });
 
         (rx, handle, cancel)
+    }
+
+    fn member_execution_client(
+        &self,
+        llm_config: &LlmConfig,
+        policy_id: &str,
+    ) -> Result<
+        (
+            Arc<dyn brain_llm::LlmProvider>,
+            brain_llm::config::ResolvedModelPolicy,
+        ),
+        MemberQueryError,
+    > {
+        #[cfg(test)]
+        if let Some(client) = self.member_llm_override.as_ref() {
+            return Ok((
+                Arc::clone(client),
+                resolve_member_model_policy(llm_config, policy_id)?,
+            ));
+        }
+        let (client, policy) = create_member_execution_client(llm_config, policy_id)?;
+        Ok((Arc::from(client), policy))
     }
 
     fn query_streaming_with_memory_scope(

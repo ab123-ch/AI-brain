@@ -8,12 +8,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use brain_core::tool_executor::ToolExecutionContext;
 use brain_core::types::{MainBrainOutput, ProgressEvent};
 use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
 use brain_memory::conversation_memory::ConversationMemoryScope;
 use knowledge_core::{
     sha256_hex, ContextBlockInput, ContextBlockKind, ContextBudget, ContextBuilder, ContextRequest,
-    ContextSnapshot, NamespaceId, ResourceTypeId, ScopeRef, ScopeTypeId, SourceRef, TenantId,
+    ContextSnapshot, KnowledgeError, NamespaceId, ResourceTypeId, ScopeRef, ScopeTypeId, SourceRef,
+    TenantId,
 };
 use task_engine::{
     ActualUsage, AdmissionLease, BudgetLimits, BudgetRequest, InstanceRunState, NewTaskNode,
@@ -115,6 +117,7 @@ pub(crate) trait CollaborationRuntimeServices: Send + Sync {
         model_policy: &str,
         reasoning_depth: &str,
         allow_tools: bool,
+        tool_execution_context: ToolExecutionContext,
         group_message_scope: Option<GroupMessageToolScope>,
     ) -> (
         tokio::sync::mpsc::Receiver<ProgressEvent>,
@@ -145,6 +148,7 @@ impl CollaborationRuntimeServices for Orchestrator {
         model_policy: &str,
         reasoning_depth: &str,
         allow_tools: bool,
+        tool_execution_context: ToolExecutionContext,
         group_message_scope: Option<GroupMessageToolScope>,
     ) -> (
         tokio::sync::mpsc::Receiver<ProgressEvent>,
@@ -159,6 +163,7 @@ impl CollaborationRuntimeServices for Orchestrator {
             model_policy,
             reasoning_depth,
             allow_tools,
+            tool_execution_context,
             group_message_scope,
         )
     }
@@ -847,13 +852,14 @@ impl CollaborationRuntime {
     }
 
     async fn schedule_claim(self: Arc<Self>, claim: ClaimedInboxItem) {
-        let (task, context_snapshot, execution_policy) = match self.prepare_task(&claim).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.fail_leased_claim(&claim, error).await;
-                return;
-            }
-        };
+        let (task, context_snapshot, execution_policy, tool_execution_context) =
+            match self.prepare_task(&claim).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.fail_leased_claim(&claim, error).await;
+                    return;
+                }
+            };
         if task.state == TaskRunState::Completed {
             self.reconcile_durable_claim(&claim).await;
             return;
@@ -900,6 +906,7 @@ impl CollaborationRuntime {
             started,
             context_snapshot,
             execution_policy,
+            tool_execution_context,
         )
         .await;
     }
@@ -907,7 +914,16 @@ impl CollaborationRuntime {
     async fn prepare_task(
         &self,
         claim: &ClaimedInboxItem,
-    ) -> Result<(TaskRun, ContextSnapshot, MemberExecutionPolicy), String> {
+    ) -> Result<
+        (
+            TaskRun,
+            ContextSnapshot,
+            MemberExecutionPolicy,
+            ToolExecutionContext,
+        ),
+        String,
+    > {
+        let tool_execution_context = tool_execution_context_for_claim(claim)?;
         let task_run_id = claim.task_run_id.clone();
         let tasks = Arc::clone(&self.task_repository);
         let task_id_for_lookup = task_run_id.clone();
@@ -922,7 +938,7 @@ impl CollaborationRuntime {
         if let Some(task) = existing {
             let snapshot = validated_task_context(&task, claim)?;
             let policy = execution_policy_from_task(&task)?;
-            return Ok((task, snapshot, policy));
+            return Ok((task, snapshot, policy, tool_execution_context));
         }
 
         let model = self
@@ -942,7 +958,12 @@ impl CollaborationRuntime {
             let request = context_request_for_claim(&claim_for_context, &history, &context_config)?;
             context_builder
                 .build(&request)
-                .map_err(|error| error.to_string())
+                .map_err(|error| match error {
+                    KnowledgeError::BudgetExceeded(reason) => format!(
+                        "成员上下文 BudgetExceeded: {reason}；请缩短被回复引用或提高 task_input_token_limit"
+                    ),
+                    other => other.to_string(),
+                })
         })
         .await
         .map_err(|error| format!("构建成员上下文线程失败: {error}"))?
@@ -956,7 +977,7 @@ impl CollaborationRuntime {
             .map_err(|error| format!("创建持久任务失败: {error}"))?;
         let persisted_snapshot = validated_task_context(&task, claim)?;
         let policy = execution_policy_from_task(&task)?;
-        Ok((task, persisted_snapshot, policy))
+        Ok((task, persisted_snapshot, policy, tool_execution_context))
     }
 
     async fn execute_claim(
@@ -966,9 +987,16 @@ impl CollaborationRuntime {
         started: StartedNode,
         context_snapshot: ContextSnapshot,
         execution_policy: MemberExecutionPolicy,
+        tool_execution_context: ToolExecutionContext,
     ) {
         if let Err(error) = self
-            .run_claim(&claim, &started, context_snapshot, &execution_policy)
+            .run_claim(
+                &claim,
+                &started,
+                context_snapshot,
+                &execution_policy,
+                tool_execution_context,
+            )
             .await
         {
             tracing::warn!(
@@ -991,6 +1019,7 @@ impl CollaborationRuntime {
         started: &StartedNode,
         context_snapshot: ContextSnapshot,
         execution_policy: &MemberExecutionPolicy,
+        tool_execution_context: ToolExecutionContext,
     ) -> Result<(), ClaimRunError> {
         let memory_scope =
             ConversationMemoryScope::new(&claim.member_id, &claim.run_id).map_err(|error| {
@@ -1012,6 +1041,7 @@ impl CollaborationRuntime {
                 &execution_policy.model_policy,
                 &execution_policy.reasoning_depth,
                 execution_policy.allow_tools,
+                tool_execution_context,
                 group_message_scope,
             );
         self.active_runs.lock().await.insert(
@@ -1241,6 +1271,7 @@ impl CollaborationRuntime {
     }
 
     async fn fail_leased_claim(&self, claim: &ClaimedInboxItem, error: String) {
+        self.fail_existing_pre_execution_task(claim, &error).await;
         let repository = Arc::clone(&self.repository);
         let claim_for_activation = claim.clone();
         match tokio::task::spawn_blocking(move || repository.activate_lease(&claim_for_activation))
@@ -1268,6 +1299,42 @@ impl CollaborationRuntime {
         }
         self.publish_snapshot(claim.room_id.clone()).await;
         self.dispatcher_notify.notify_waiters();
+    }
+
+    async fn fail_existing_pre_execution_task(&self, claim: &ClaimedInboxItem, error: &str) {
+        let tasks = Arc::clone(&self.task_repository);
+        let task_run_id = claim.task_run_id.clone();
+        let durable_error = error.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            let task = match tasks.task(&task_run_id) {
+                Ok(task) => task,
+                Err(TaskEngineError::NotFound { .. }) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if task.state.is_terminal() {
+                return Ok(());
+            }
+            for node in tasks.nodes(&task_run_id)? {
+                let Some(instance_run_id) = node.current_instance_run_id else {
+                    continue;
+                };
+                let instance = tasks.instance(&instance_run_id)?;
+                if instance.state == InstanceRunState::Running {
+                    tasks.fail_node(&instance_run_id, instance.version, &durable_error, false)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(task_error)) => {
+                tracing::error!(run_id = %claim.run_id, "结算预执行失败的持久任务失败: {task_error}");
+            }
+            Err(join_error) => {
+                tracing::error!(run_id = %claim.run_id, "结算预执行失败的持久任务线程异常: {join_error}");
+            }
+        }
     }
 
     async fn fail_active_claim(&self, claim: &ClaimedInboxItem, error: String) {
@@ -1795,6 +1862,18 @@ fn execution_policy_from_task(task: &TaskRun) -> Result<MemberExecutionPolicy, S
     })
 }
 
+fn tool_execution_context_for_claim(
+    claim: &ClaimedInboxItem,
+) -> Result<ToolExecutionContext, String> {
+    let path = &claim.execution_working_directory;
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("冻结工作目录 {} 不可用: {error}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("冻结工作目录不是目录: {}", path.display()));
+    }
+    Ok(ToolExecutionContext::new(path.clone()))
+}
+
 fn context_request_for_claim(
     claim: &ClaimedInboxItem,
     history: &[MemberHistoryMessage],
@@ -2035,6 +2114,8 @@ fn task_request_for_claim(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -2048,15 +2129,20 @@ mod tests {
         CollaborationRuntime, CollaborationRuntimeServices, DurableResultDisposition,
         DurableResultRecoveryError,
     };
-    use crate::orchestrator::MemberQueryError;
+    use crate::orchestrator::{MemberQueryError, Orchestrator};
     use crate::web::collaboration::{
         CollaborationActor, CollaborationConfig, CollaborationRepository, InboxPurpose, InboxState,
         MemberAddress, MemberHistoryMessage, ParticipationDisposition, RoomInputMode,
         DEFAULT_THREAD_KEY,
     };
     use crate::web::collaboration_tools::GroupMessageToolScope;
+    use brain_core::tool_executor::ToolExecutionContext;
     use brain_core::types::{MainBrainOutput, ProgressEvent};
     use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
+    use brain_llm::{
+        ChatRequest, ChatResponse, ContentBlock as LlmContentBlock, FinishReason, LlmProvider,
+        TokenUsage,
+    };
     use brain_memory::conversation_memory::ConversationMemoryScope;
     use knowledge_core::{
         ContentResolverRegistry, ContextBlock, ContextBlockInput, ContextBlockKind, ContextBuilder,
@@ -2064,7 +2150,8 @@ mod tests {
         MemoryQuery, MemoryQueryPort, MemoryQueryResult,
     };
     use task_engine::{
-        ActualUsage, Scheduler, TaskCoordinator, TaskEngineError, TaskRepository, TaskRunState,
+        ActualUsage, InstanceRunState, NodeState, Scheduler, TaskCoordinator, TaskEngineError,
+        TaskRepository, TaskRunState,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -2225,6 +2312,66 @@ mod tests {
         query_count: Arc<AtomicUsize>,
     }
 
+    struct RelativeReadToolLlm {
+        calls: AtomicUsize,
+        first_call_barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl RelativeReadToolLlm {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                first_call_barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            }
+        }
+    }
+
+    impl LlmProvider for RelativeReadToolLlm {
+        fn model(&self) -> &'static str {
+            "relative-read-tool-test"
+        }
+
+        fn complete(
+            &self,
+            request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<ChatResponse>> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let tool_output = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    LlmContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                });
+            let barrier = Arc::clone(&self.first_call_barrier);
+            Box::pin(async move {
+                let (content, finish_reason) = if let Some(output) = tool_output {
+                    (
+                        vec![LlmContentBlock::text(format!("成员读取结果：{output}"))],
+                        FinishReason::EndTurn,
+                    )
+                } else {
+                    barrier.wait().await;
+                    (
+                        vec![LlmContentBlock::ToolUse {
+                            id: format!("relative-read-{call}"),
+                            name: "read_file".into(),
+                            input: serde_json::json!({"path": "same.txt"}),
+                        }],
+                        FinishReason::ToolUse,
+                    )
+                };
+                Ok(ChatResponse {
+                    content,
+                    model: "relative-read-tool-test".into(),
+                    usage: TokenUsage::default(),
+                    finish_reason: Some(finish_reason),
+                })
+            })
+        }
+    }
+
     impl TestRuntimeServices {
         fn new(collaboration: &CollaborationRepository, config: &CollaborationConfig) -> Self {
             let tasks = Arc::new(TaskRepository::open(collaboration.database_path()).unwrap());
@@ -2267,6 +2414,7 @@ mod tests {
             _model_policy: &str,
             _reasoning_depth: &str,
             _allow_tools: bool,
+            _tool_execution_context: ToolExecutionContext,
             _group_message_scope: Option<GroupMessageToolScope>,
         ) -> (
             tokio::sync::mpsc::Receiver<ProgressEvent>,
@@ -2312,6 +2460,343 @@ mod tests {
                 Some(reply_to_event_id),
             )
             .unwrap();
+    }
+
+    async fn wait_for_failed_inbox(
+        runtime: &CollaborationRuntime,
+        room_id: &str,
+        inbox_item_id: &str,
+        query_count: &AtomicUsize,
+    ) -> String {
+        for _ in 0..200 {
+            let snapshot = runtime.snapshot(room_id.to_owned()).await.unwrap();
+            let item = snapshot
+                .inbox
+                .iter()
+                .find(|item| item.inbox_item_id == inbox_item_id)
+                .unwrap();
+            if item.state == InboxState::Failed {
+                return item.error.clone().expect("失败 Inbox 应记录错误");
+            }
+            assert_eq!(
+                query_count.load(Ordering::Relaxed),
+                0,
+                "失败前不应调用 provider/query service"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("等待 Inbox {inbox_item_id} 失败终态超时");
+    }
+
+    async fn wait_for_member_reply(runtime: &CollaborationRuntime, room_id: &str) -> String {
+        for _ in 0..500 {
+            let snapshot = runtime.snapshot(room_id.to_owned()).await.unwrap();
+            if let Some(reply) = snapshot
+                .events
+                .iter()
+                .find(|event| event.kind == "member_message")
+            {
+                return reply.content.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("等待房间 {room_id} 成员回复超时");
+    }
+
+    async fn assert_missing_frozen_directory_failure(existing_task: bool) {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                &workspace_path,
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room("room-missing-workspace", "Missing Workspace Room", &[])
+            .unwrap();
+        let member_id = room.room.default_member_id;
+        let posted = collaboration
+            .post_message(
+                "room-missing-workspace",
+                std::slice::from_ref(&member_id),
+                "读取冻结目录中的文件",
+                RoomInputMode::Task,
+                if existing_task {
+                    "missing-workspace-existing-task"
+                } else {
+                    "missing-workspace-new-task"
+                },
+            )
+            .unwrap();
+        let inbox_item_id = posted.inbox_items[0].inbox_item_id.clone();
+
+        let mut started_instance_run_id = None;
+        if existing_task {
+            let claim = collaboration.lease_next().unwrap().unwrap();
+            let snapshot = built_context_snapshot_for_claim(&collaboration, &claim, &config);
+            let llm_config = LlmConfig::default_config();
+            let model = llm_config.resolve_model_policy(&claim.model_policy);
+            let tasks = Arc::new(TaskRepository::open(collaboration.database_path()).unwrap());
+            let request = task_request_for_claim(&claim, &config, &model, &snapshot);
+            let node_id = request.nodes[0].node_id.clone();
+            tasks.create_task(request).unwrap();
+            let coordinator = TaskCoordinator::new(
+                Arc::clone(&tasks),
+                Scheduler::new(scheduler_limits(&config)).unwrap(),
+            );
+            let coordinated = coordinator
+                .admit_node(&node_id, &claim.run_id, CancellationToken::new())
+                .await
+                .unwrap();
+            started_instance_run_id = Some(coordinated.started().instance.instance_run_id.clone());
+            collaboration.release_lease(&claim).unwrap();
+            drop(coordinated);
+        }
+        collaboration
+            .sleep_member("room-missing-workspace", &member_id)
+            .unwrap();
+
+        let services = Arc::new(TestRuntimeServices::new(&collaboration, &config));
+        let query_count = Arc::clone(&services.query_count);
+        let tasks = Arc::clone(&services.tasks);
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let model_policy_details = llm_config.available_instance_model_policies();
+        let runtime = CollaborationRuntime::start(
+            Arc::clone(&collaboration),
+            services,
+            llm_config,
+            model_policy_details,
+        )
+        .await
+        .unwrap();
+
+        std::fs::remove_dir(&workspace_path).unwrap();
+        runtime
+            .wake_member("room-missing-workspace".into(), member_id)
+            .await
+            .unwrap();
+
+        let error = wait_for_failed_inbox(
+            &runtime,
+            "room-missing-workspace",
+            &inbox_item_id,
+            &query_count,
+        )
+        .await;
+        assert!(error.contains("冻结工作目录"), "unexpected error: {error}");
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
+
+        if let Some(instance_run_id) = started_instance_run_id {
+            let task_run_id = posted.inbox_items[0]
+                .task_run_id
+                .as_deref()
+                .expect("Inbox 应冻结 task_run_id");
+            let task = tasks.task(task_run_id).unwrap();
+            assert_eq!(task.state, TaskRunState::Failed);
+            let node = tasks.nodes(&task.task_run_id).unwrap().remove(0);
+            assert_eq!(node.state, NodeState::Failed);
+            let instance = tasks.instance(&instance_run_id).unwrap();
+            assert_eq!(instance.state, InstanceRunState::Failed);
+            assert!(instance
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("冻结工作目录")));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_frozen_directory_stops_before_provider() {
+        assert_missing_frozen_directory_failure(false).await;
+        assert_missing_frozen_directory_failure(true).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_required_reply_stops_before_provider() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig {
+            task_input_token_limit: 256,
+            max_history_events_per_run: 0,
+            ..CollaborationConfig::default()
+        };
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room("room-oversized-reply", "Oversized Reply Room", &[])
+            .unwrap();
+        let member_id = room.room.default_member_id;
+        collaboration
+            .post_message(
+                "room-oversized-reply",
+                std::slice::from_ref(&member_id),
+                "创建长引用目标",
+                RoomInputMode::Chat,
+                "oversized-reply-target",
+            )
+            .unwrap();
+        let target_claim = collaboration.claim_next().unwrap().unwrap();
+        let target = collaboration
+            .complete_item(&target_claim, &"不可截断的长引用".repeat(1_000))
+            .unwrap()
+            .unwrap();
+        post_reply_for_test(
+            &collaboration,
+            "room-oversized-reply",
+            &member_id,
+            "请根据引用回答",
+            "oversized-reply-current",
+            &target.event_id,
+        );
+        let inbox_item_id = collaboration
+            .snapshot("room-oversized-reply")
+            .unwrap()
+            .inbox
+            .into_iter()
+            .find(|item| item.state == InboxState::Pending)
+            .unwrap()
+            .inbox_item_id;
+
+        let services = Arc::new(TestRuntimeServices::new(&collaboration, &config));
+        let query_count = Arc::clone(&services.query_count);
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let model_policy_details = llm_config.available_instance_model_policies();
+        let runtime = CollaborationRuntime::start(
+            Arc::clone(&collaboration),
+            services,
+            llm_config,
+            model_policy_details,
+        )
+        .await
+        .unwrap();
+
+        let error = wait_for_failed_inbox(
+            &runtime,
+            "room-oversized-reply",
+            &inbox_item_id,
+            &query_count,
+        )
+        .await;
+        assert!(
+            error.contains("BudgetExceeded"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("请缩短被回复引用或提高 task_input_token_limit"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_rooms_use_isolated_working_directories() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        std::fs::write(workspace_a.path().join("same.txt"), "ROOM-A-CONTENT").unwrap();
+        std::fs::write(workspace_b.path().join("same.txt"), "ROOM-B-CONTENT").unwrap();
+        let workspace_a = workspace_a.path().canonicalize().unwrap();
+        let workspace_b = workspace_b.path().canonicalize().unwrap();
+        let process_working_directory = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let config = CollaborationConfig {
+            max_workers: 2,
+            max_global_runs: 2,
+            max_runs_per_room: 1,
+            max_runs_per_member: 1,
+            max_runs_per_provider: 2,
+            max_runs_per_profile: 2,
+            max_runs_per_task: 1,
+            ..CollaborationConfig::default()
+        };
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                &workspace_a,
+            )
+            .unwrap(),
+        );
+        let room_a = collaboration.ensure_room("room-a", "Room A", &[]).unwrap();
+        let room_b = collaboration.ensure_room("room-b", "Room B", &[]).unwrap();
+        collaboration
+            .update_room_working_directory(
+                "room-b",
+                workspace_b.to_str().unwrap(),
+                room_b.room.version,
+            )
+            .unwrap();
+
+        let tasks = Arc::new(TaskRepository::open(collaboration.database_path()).unwrap());
+        let coordinator = TaskCoordinator::new(
+            Arc::clone(&tasks),
+            Scheduler::new(scheduler_limits(&config)).unwrap(),
+        );
+        let llm = Arc::new(RelativeReadToolLlm::new());
+        let mut orchestrator = Orchestrator::new().await.unwrap();
+        orchestrator.configure_collaboration_runtime_for_test(tasks, coordinator, llm.clone());
+        let orchestrator = Arc::new(orchestrator);
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let model_policy_details = llm_config.available_instance_model_policies();
+        let runtime = CollaborationRuntime::start(
+            Arc::clone(&collaboration),
+            Arc::clone(&orchestrator),
+            llm_config,
+            model_policy_details,
+        )
+        .await
+        .unwrap();
+
+        let (posted_a, posted_b) = tokio::join!(
+            runtime.post_message(
+                "room-a".into(),
+                vec![room_a.room.default_member_id],
+                "读取相对文件".into(),
+                RoomInputMode::Task,
+                "read-room-a".into(),
+            ),
+            runtime.post_message(
+                "room-b".into(),
+                vec![room_b.room.default_member_id],
+                "读取相对文件".into(),
+                RoomInputMode::Task,
+                "read-room-b".into(),
+            ),
+        );
+        posted_a.unwrap();
+        posted_b.unwrap();
+
+        let (reply_a, reply_b) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                wait_for_member_reply(&runtime, "room-a"),
+                wait_for_member_reply(&runtime, "room-b"),
+            )
+        })
+        .await
+        .expect("两个房间的并发成员运行应完成");
+        assert!(
+            reply_a.contains("ROOM-A-CONTENT"),
+            "room A reply: {reply_a}"
+        );
+        assert!(
+            reply_b.contains("ROOM-B-CONTENT"),
+            "room B reply: {reply_b}"
+        );
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            process_working_directory
+        );
+        orchestrator.shutdown();
     }
 
     #[test]
