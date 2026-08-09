@@ -792,6 +792,41 @@ pub struct ClaimedInboxItem {
     pub version: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ClaimCandidate {
+    inbox_item_id: String,
+    room_id: Option<String>,
+    member_id: String,
+    member_name: String,
+    profile_id: String,
+    model_policy: String,
+    reasoning_depth: String,
+    source_event_id: String,
+    source_event_found: bool,
+    source_event_seq: Option<u64>,
+    input: Option<String>,
+    mode: String,
+    task_run_id: String,
+    version: u64,
+    thread_key: String,
+    purpose: String,
+    conversation_root_event_id: String,
+    context_through_seq: Option<u64>,
+    response_to_event_id: String,
+    group_enabled: Option<bool>,
+    execution_working_directory: Option<String>,
+    parent_event_id: Option<String>,
+    reply_event_id: Option<String>,
+    reply_room_id: Option<String>,
+    reply_sequence: Option<u64>,
+    reply_sender_kind: Option<String>,
+    reply_sender_id: Option<String>,
+    reply_sender_name: Option<String>,
+    reply_kind: Option<String>,
+    reply_content: Option<String>,
+    reply_created_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MemberReplyEventContext<'a> {
     room_id: &'a str,
@@ -2414,15 +2449,28 @@ impl CollaborationRepository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate = transaction
             .query_row(
-                "SELECT i.inbox_item_id, e.room_id, i.member_id, m.display_name,
-                        m.profile_id, m.model_policy, m.reasoning_depth,
-                        i.source_event_id, e.sequence, e.content, i.mode, i.task_run_id, i.version,
-                        i.thread_key, i.purpose,
-                        COALESCE(i.conversation_root_event_id, i.source_event_id),
+                "SELECT i.inbox_item_id AS inbox_item_id,
+                        e.room_id AS room_id,
+                        i.member_id AS member_id,
+                        m.display_name AS member_name,
+                        m.profile_id AS profile_id,
+                        m.model_policy AS model_policy,
+                        m.reasoning_depth AS reasoning_depth,
+                        i.source_event_id AS source_event_id,
+                        e.event_id IS NOT NULL AS source_event_found,
+                        e.sequence AS source_event_seq,
+                        e.content AS input,
+                        i.mode AS mode,
+                        i.task_run_id AS task_run_id,
+                        i.version AS version,
+                        i.thread_key AS thread_key,
+                        i.purpose AS purpose,
+                        COALESCE(i.conversation_root_event_id, i.source_event_id)
+                            AS conversation_root_event_id,
                         CASE WHEN i.purpose = 'participation'
                              THEN CASE WHEN i.context_through_seq > 0
                                        THEN i.context_through_seq ELSE room.latest_event_seq END
-                             ELSE e.sequence END,
+                             ELSE e.sequence END AS context_through_seq,
                         CASE WHEN i.purpose = 'participation' THEN COALESCE((
                             SELECT delivered.event_id
                             FROM room_event_deliveries delivery
@@ -2432,14 +2480,26 @@ impl CollaborationRepository {
                                   = COALESCE(i.conversation_root_event_id, i.source_event_id)
                               AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
                                   THEN i.context_through_seq ELSE room.latest_event_seq END
-                              AND delivered.invalidated_at IS NULL
-                            ORDER BY delivered.sequence DESC LIMIT 1
-                        ), i.source_event_id) ELSE i.source_event_id END,
-                         e.group_enabled, COALESCE(e.execution_working_directory, '')
+                               AND delivered.invalidated_at IS NULL
+                             ORDER BY delivered.sequence DESC LIMIT 1
+                        ), i.source_event_id) ELSE i.source_event_id END AS response_to_event_id,
+                        e.group_enabled AS group_enabled,
+                        e.execution_working_directory AS execution_working_directory,
+                        e.parent_event_id AS parent_event_id,
+                        parent.event_id AS reply_event_id,
+                        parent.room_id AS reply_room_id,
+                        parent.sequence AS reply_sequence,
+                        parent.sender_kind AS reply_sender_kind,
+                        parent.sender_id AS reply_sender_id,
+                        parent.sender_name AS reply_sender_name,
+                        parent.kind AS reply_kind,
+                        parent.content AS reply_content,
+                        parent.created_at AS reply_created_at
                  FROM member_inbox_items i
                  JOIN brain_members m ON m.member_id = i.member_id
-                 JOIN room_events e ON e.event_id = i.source_event_id
-                 JOIN collaboration_rooms room ON room.room_id = e.room_id
+                 LEFT JOIN room_events e ON e.event_id = i.source_event_id
+                 LEFT JOIN collaboration_rooms room ON room.room_id = e.room_id
+                 LEFT JOIN room_events parent ON parent.event_id = e.parent_event_id
                  WHERE i.state = 'pending'
                    AND e.invalidated_at IS NULL
                    AND m.availability = 'active'
@@ -2453,64 +2513,16 @@ impl CollaborationRepository {
                           i.created_at, i.rowid
                  LIMIT 1",
                 [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, u64>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, String>(10)?,
-                        row.get::<_, String>(11)?,
-                        row.get::<_, u64>(12)?,
-                        row.get::<_, String>(13)?,
-                        row.get::<_, String>(14)?,
-                        row.get::<_, String>(15)?,
-                        row.get::<_, u64>(16)?,
-                        row.get::<_, String>(17)?,
-                        row.get::<_, bool>(18)?,
-                        row.get::<_, Option<String>>(19)?,
-                    ))
-                },
+                claimed_inbox_from_row,
             )
             .optional()?;
-        let Some((
-            inbox_item_id,
-            room_id,
-            member_id,
-            member_name,
-            profile_id,
-            model_policy,
-            reasoning_depth,
-            source_event_id,
-            source_event_seq,
-            input,
-            mode,
-            task_run_id,
-            version,
-            thread_key,
-            purpose,
-            conversation_root_event_id,
-            context_through_seq,
-            response_to_event_id,
-            group_enabled,
-            execution_working_directory,
-        )) = candidate
-        else {
+        let Some(candidate) = candidate else {
             transaction.commit()?;
             return Ok(None);
         };
-        let execution_working_directory =
-            required_execution_working_directory(execution_working_directory.unwrap_or_default())?;
-        let reply_reference = event_by_id(&transaction, &source_event_id)?
-            .ok_or_else(|| CollaborationError::Config("Inbox 来源事件不存在".into()))?
-            .reply_reference;
         let run_id = format!("run-{}", Uuid::new_v4());
+        let claim =
+            claimed_inbox_from_candidate(&candidate, run_id.clone(), candidate.version + 1)?;
         let lease_expires_at = Utc::now() + chrono::Duration::minutes(5);
         let updated = transaction.execute(
             "UPDATE member_inbox_items
@@ -2518,11 +2530,11 @@ impl CollaborationRepository {
                  context_through_seq = ?3, version = version + 1
              WHERE inbox_item_id = ?4 AND state = 'pending' AND version = ?5",
             params![
-                run_id,
+                &run_id,
                 lease_expires_at.to_rfc3339(),
-                context_through_seq,
-                inbox_item_id,
-                version
+                claim.context_through_seq,
+                &candidate.inbox_item_id,
+                candidate.version
             ],
         )?;
         if updated == 0 {
@@ -2533,44 +2545,17 @@ impl CollaborationRepository {
             "UPDATE room_event_deliveries
              SET state = 'running', updated_at = ?1
              WHERE inbox_item_id = ?2 AND state IN ('queued', 'deferred')",
-            params![Utc::now().to_rfc3339(), inbox_item_id],
+            params![Utc::now().to_rfc3339(), &candidate.inbox_item_id],
         )?;
         enqueue_room_changed(
             &transaction,
-            &room_id,
+            &claim.room_id,
             "inbox",
-            &inbox_item_id,
-            &format!("inbox-leased:{inbox_item_id}:{run_id}"),
+            &candidate.inbox_item_id,
+            &format!("inbox-leased:{}:{run_id}", candidate.inbox_item_id),
         )?;
         transaction.commit()?;
-        Ok(Some(ClaimedInboxItem {
-            inbox_item_id,
-            room_id,
-            member_id,
-            member_name,
-            profile_id,
-            model_policy,
-            reasoning_depth,
-            source_event_id,
-            source_event_seq,
-            thread_key,
-            purpose: InboxPurpose::from_db(&purpose),
-            conversation_root_event_id,
-            context_through_seq,
-            response_to_event_id,
-            group_enabled,
-            execution_working_directory,
-            reply_reference,
-            input,
-            mode: if mode == "task" {
-                RoomInputMode::Task
-            } else {
-                RoomInputMode::Chat
-            },
-            run_id,
-            task_run_id,
-            version: version + 1,
-        }))
+        Ok(Some(claim))
     }
 
     pub fn claim_for_reconciliation(
@@ -2580,15 +2565,28 @@ impl CollaborationRepository {
         durable_run_id: &str,
     ) -> Result<Option<ClaimedInboxItem>> {
         let connection = self.connect()?;
-        let claim = connection
+        let candidate = connection
             .query_row(
-                "SELECT i.inbox_item_id, e.room_id, i.member_id, m.display_name,
-                        m.profile_id, m.model_policy, m.reasoning_depth,
-                        i.source_event_id, e.sequence, e.content, i.mode, i.task_run_id, i.version,
-                        i.thread_key, i.purpose,
-                        COALESCE(i.conversation_root_event_id, i.source_event_id),
+                "SELECT i.inbox_item_id AS inbox_item_id,
+                        e.room_id AS room_id,
+                        i.member_id AS member_id,
+                        m.display_name AS member_name,
+                        m.profile_id AS profile_id,
+                        m.model_policy AS model_policy,
+                        m.reasoning_depth AS reasoning_depth,
+                        i.source_event_id AS source_event_id,
+                        e.event_id IS NOT NULL AS source_event_found,
+                        e.sequence AS source_event_seq,
+                        e.content AS input,
+                        i.mode AS mode,
+                        i.task_run_id AS task_run_id,
+                        i.version AS version,
+                        i.thread_key AS thread_key,
+                        i.purpose AS purpose,
+                        COALESCE(i.conversation_root_event_id, i.source_event_id)
+                            AS conversation_root_event_id,
                         CASE WHEN i.purpose = 'participation' AND i.context_through_seq > 0
-                             THEN i.context_through_seq ELSE e.sequence END,
+                             THEN i.context_through_seq ELSE e.sequence END AS context_through_seq,
                         CASE WHEN i.purpose = 'participation' THEN COALESCE((
                             SELECT delivered.event_id
                             FROM room_event_deliveries delivery
@@ -2598,63 +2596,36 @@ impl CollaborationRepository {
                                   = COALESCE(i.conversation_root_event_id, i.source_event_id)
                               AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
                                   THEN i.context_through_seq ELSE e.sequence END
-                              AND delivered.invalidated_at IS NULL
-                            ORDER BY delivered.sequence DESC LIMIT 1
-                        ), i.source_event_id) ELSE i.source_event_id END,
-                         e.group_enabled, COALESCE(e.execution_working_directory, '')
+                               AND delivered.invalidated_at IS NULL
+                             ORDER BY delivered.sequence DESC LIMIT 1
+                        ), i.source_event_id) ELSE i.source_event_id END AS response_to_event_id,
+                        e.group_enabled AS group_enabled,
+                        e.execution_working_directory AS execution_working_directory,
+                        e.parent_event_id AS parent_event_id,
+                        parent.event_id AS reply_event_id,
+                        parent.room_id AS reply_room_id,
+                        parent.sequence AS reply_sequence,
+                        parent.sender_kind AS reply_sender_kind,
+                        parent.sender_id AS reply_sender_id,
+                        parent.sender_name AS reply_sender_name,
+                        parent.kind AS reply_kind,
+                        parent.content AS reply_content,
+                        parent.created_at AS reply_created_at
                  FROM member_inbox_items i
                  JOIN brain_members m ON m.member_id = i.member_id
-                 JOIN room_events e ON e.event_id = i.source_event_id
+                 LEFT JOIN room_events e ON e.event_id = i.source_event_id
+                 LEFT JOIN room_events parent ON parent.event_id = e.parent_event_id
                  WHERE i.inbox_item_id = ?1 AND i.task_run_id = ?2
                    AND i.state NOT IN ('completed', 'cancelled')
                    AND e.invalidated_at IS NULL",
                 params![inbox_item_id, task_run_id],
-                |row| {
-                    let mode: String = row.get(10)?;
-                    Ok(ClaimedInboxItem {
-                        inbox_item_id: row.get(0)?,
-                        room_id: row.get(1)?,
-                        member_id: row.get(2)?,
-                        member_name: row.get(3)?,
-                        profile_id: row.get(4)?,
-                        model_policy: row.get(5)?,
-                        reasoning_depth: row.get(6)?,
-                        source_event_id: row.get(7)?,
-                        source_event_seq: row.get(8)?,
-                        input: row.get(9)?,
-                        mode: if mode == "task" {
-                            RoomInputMode::Task
-                        } else {
-                            RoomInputMode::Chat
-                        },
-                        run_id: durable_run_id.into(),
-                        task_run_id: row.get(11)?,
-                        version: row.get(12)?,
-                        thread_key: row.get(13)?,
-                        purpose: InboxPurpose::from_db(&row.get::<_, String>(14)?),
-                        conversation_root_event_id: row.get(15)?,
-                        context_through_seq: row.get(16)?,
-                        response_to_event_id: row.get(17)?,
-                        group_enabled: row.get(18)?,
-                        execution_working_directory: PathBuf::from(row.get::<_, String>(19)?),
-                        reply_reference: None,
-                    })
-                },
+                claimed_inbox_from_row,
             )
             .optional()?;
-        let Some(mut claim) = claim else {
+        let Some(candidate) = candidate else {
             return Ok(None);
         };
-        claim.execution_working_directory = required_execution_working_directory(
-            claim
-                .execution_working_directory
-                .to_string_lossy()
-                .into_owned(),
-        )?;
-        claim.reply_reference = event_by_id(&connection, &claim.source_event_id)?
-            .ok_or_else(|| CollaborationError::Config("Inbox 来源事件不存在".into()))?
-            .reply_reference;
-        Ok(Some(claim))
+        claimed_inbox_from_candidate(&candidate, durable_run_id.into(), candidate.version).map(Some)
     }
 
     pub fn activate_lease(&self, claim: &ClaimedInboxItem) -> Result<ClaimedInboxItem> {
@@ -4446,6 +4417,194 @@ fn ensure_room_exists(transaction: &Transaction<'_>, room_id: &str) -> Result<()
     }
 }
 
+fn claimed_inbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimCandidate> {
+    Ok(ClaimCandidate {
+        inbox_item_id: row.get("inbox_item_id")?,
+        room_id: row.get("room_id")?,
+        member_id: row.get("member_id")?,
+        member_name: row.get("member_name")?,
+        profile_id: row.get("profile_id")?,
+        model_policy: row.get("model_policy")?,
+        reasoning_depth: row.get("reasoning_depth")?,
+        source_event_id: row.get("source_event_id")?,
+        source_event_found: row.get("source_event_found")?,
+        source_event_seq: row.get("source_event_seq")?,
+        input: row.get("input")?,
+        mode: row.get("mode")?,
+        task_run_id: row.get("task_run_id")?,
+        version: row.get("version")?,
+        thread_key: row.get("thread_key")?,
+        purpose: row.get("purpose")?,
+        conversation_root_event_id: row.get("conversation_root_event_id")?,
+        context_through_seq: row.get("context_through_seq")?,
+        response_to_event_id: row.get("response_to_event_id")?,
+        group_enabled: row.get("group_enabled")?,
+        execution_working_directory: row.get("execution_working_directory")?,
+        parent_event_id: row.get("parent_event_id")?,
+        reply_event_id: row.get("reply_event_id")?,
+        reply_room_id: row.get("reply_room_id")?,
+        reply_sequence: row.get("reply_sequence")?,
+        reply_sender_kind: row.get("reply_sender_kind")?,
+        reply_sender_id: row.get("reply_sender_id")?,
+        reply_sender_name: row.get("reply_sender_name")?,
+        reply_kind: row.get("reply_kind")?,
+        reply_content: row.get("reply_content")?,
+        reply_created_at: row.get("reply_created_at")?,
+    })
+}
+
+fn claimed_inbox_from_candidate(
+    candidate: &ClaimCandidate,
+    run_id: String,
+    version: u64,
+) -> Result<ClaimedInboxItem> {
+    if !candidate.source_event_found {
+        return Err(CollaborationError::Config(format!(
+            "Inbox 来源用户事件 {} 不存在",
+            candidate.source_event_id
+        )));
+    }
+    let missing_source_field = |field: &str| {
+        CollaborationError::Config(format!(
+            "Inbox 来源用户事件 {} 缺少{field}",
+            candidate.source_event_id
+        ))
+    };
+    let room_id = candidate
+        .room_id
+        .clone()
+        .ok_or_else(|| missing_source_field("房间"))?;
+    let source_event_seq = candidate
+        .source_event_seq
+        .ok_or_else(|| missing_source_field("事件序号"))?;
+    let input = candidate
+        .input
+        .clone()
+        .ok_or_else(|| missing_source_field("正文"))?;
+    let context_through_seq = candidate
+        .context_through_seq
+        .ok_or_else(|| missing_source_field("上下文截止序号"))?;
+    let group_enabled = candidate
+        .group_enabled
+        .ok_or_else(|| missing_source_field("群聊标记"))?;
+    let execution_working_directory = required_execution_working_directory(
+        candidate
+            .execution_working_directory
+            .clone()
+            .unwrap_or_default(),
+    )?;
+    let reply_reference = reply_reference_from_candidate(candidate, &room_id)?;
+    Ok(ClaimedInboxItem {
+        inbox_item_id: candidate.inbox_item_id.clone(),
+        room_id,
+        member_id: candidate.member_id.clone(),
+        member_name: candidate.member_name.clone(),
+        profile_id: candidate.profile_id.clone(),
+        model_policy: candidate.model_policy.clone(),
+        reasoning_depth: candidate.reasoning_depth.clone(),
+        source_event_id: candidate.source_event_id.clone(),
+        source_event_seq,
+        thread_key: candidate.thread_key.clone(),
+        purpose: InboxPurpose::from_db(&candidate.purpose),
+        conversation_root_event_id: candidate.conversation_root_event_id.clone(),
+        context_through_seq,
+        response_to_event_id: candidate.response_to_event_id.clone(),
+        group_enabled,
+        execution_working_directory,
+        reply_reference,
+        input,
+        mode: if candidate.mode == "task" {
+            RoomInputMode::Task
+        } else {
+            RoomInputMode::Chat
+        },
+        run_id,
+        task_run_id: candidate.task_run_id.clone(),
+        version,
+    })
+}
+
+fn reply_reference_from_candidate(
+    candidate: &ClaimCandidate,
+    room_id: &str,
+) -> Result<Option<RoomEventReferenceView>> {
+    let Some(parent_event_id) = candidate.parent_event_id.as_deref() else {
+        if candidate.reply_event_id.is_some() {
+            return Err(CollaborationError::Config(format!(
+                "Inbox 来源事件 {} 的回复目标关联异常",
+                candidate.source_event_id
+            )));
+        }
+        return Ok(None);
+    };
+    let reply_event_id = candidate.reply_event_id.as_deref().ok_or_else(|| {
+        CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 不存在",
+            candidate.source_event_id, parent_event_id
+        ))
+    })?;
+    if reply_event_id != parent_event_id {
+        return Err(CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标关联异常",
+            candidate.source_event_id
+        )));
+    }
+    let reply_room_id = candidate.reply_room_id.as_deref().ok_or_else(|| {
+        CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 缺少房间",
+            candidate.source_event_id, parent_event_id
+        ))
+    })?;
+    if reply_room_id != room_id {
+        return Err(CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 不属于同一房间",
+            candidate.source_event_id, parent_event_id
+        )));
+    }
+    let missing_column = |column: &str| {
+        CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 缺少{column}",
+            candidate.source_event_id, parent_event_id
+        ))
+    };
+    let content = candidate
+        .reply_content
+        .clone()
+        .ok_or_else(|| missing_column("正文"))?;
+    let created_at = candidate
+        .reply_created_at
+        .as_deref()
+        .ok_or_else(|| missing_column("创建时间"))?;
+    let created_at = DateTime::parse_from_rfc3339(created_at)
+        .map_err(|_| missing_column("有效创建时间"))?
+        .with_timezone(&Utc);
+    Ok(Some(RoomEventReferenceView {
+        event_id: reply_event_id.into(),
+        sequence: candidate
+            .reply_sequence
+            .ok_or_else(|| missing_column("事件序号"))?,
+        sender_kind: candidate
+            .reply_sender_kind
+            .clone()
+            .ok_or_else(|| missing_column("发送者类型"))?,
+        sender_id: candidate
+            .reply_sender_id
+            .clone()
+            .ok_or_else(|| missing_column("发送者 ID"))?,
+        sender_name: candidate
+            .reply_sender_name
+            .clone()
+            .ok_or_else(|| missing_column("发送者名称"))?,
+        kind: candidate
+            .reply_kind
+            .clone()
+            .ok_or_else(|| missing_column("事件类型"))?,
+        content_hash: history_content_hash(&content),
+        content,
+        created_at,
+    }))
+}
+
 fn required_execution_working_directory(value: String) -> Result<PathBuf> {
     let value = value.trim();
     if value.is_empty() {
@@ -5636,7 +5795,100 @@ mod tests {
                 CollaborationError::Config(message)
                     if message == "房间事件缺少冻结的执行工作目录"
             ));
+            let error = repository
+                .claim_for_reconciliation(
+                    &posted.inbox_items[0].inbox_item_id,
+                    posted.inbox_items[0].task_run_id.as_deref().unwrap(),
+                    "invalid-directory-reconciliation",
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CollaborationError::Config(message)
+                    if message == "房间事件缺少冻结的执行工作目录"
+            ));
         }
+    }
+
+    #[test]
+    fn claim_preserves_reply_and_directory_rejects_missing_source_event() {
+        let lease_runtime = tempfile::tempdir().unwrap();
+        let lease_repository =
+            CollaborationRepository::new(lease_runtime.path(), CollaborationConfig::default())
+                .unwrap();
+        let lease_room = lease_repository
+            .ensure_room("lease-room", "Lease Room", &[])
+            .unwrap();
+        lease_repository
+            .post_message(
+                "lease-room",
+                &[lease_room.room.default_member_id],
+                "missing lease source",
+                RoomInputMode::Chat,
+                "missing-lease-source",
+            )
+            .unwrap();
+        let lease_connection = lease_repository.connect().unwrap();
+        lease_connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        lease_connection
+            .execute(
+                "UPDATE member_inbox_items SET source_event_id = 'missing-lease-event'",
+                [],
+            )
+            .unwrap();
+        drop(lease_connection);
+
+        let error = lease_repository.lease_next().unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::Config(message)
+                if message == "Inbox 来源用户事件 missing-lease-event 不存在"
+        ));
+
+        let reconcile_runtime = tempfile::tempdir().unwrap();
+        let reconcile_repository =
+            CollaborationRepository::new(reconcile_runtime.path(), CollaborationConfig::default())
+                .unwrap();
+        let reconcile_room = reconcile_repository
+            .ensure_room("reconcile-room", "Reconcile Room", &[])
+            .unwrap();
+        reconcile_repository
+            .post_message(
+                "reconcile-room",
+                &[reconcile_room.room.default_member_id],
+                "missing reconciliation source",
+                RoomInputMode::Chat,
+                "missing-reconciliation-source",
+            )
+            .unwrap();
+        let lease = reconcile_repository.lease_next().unwrap().unwrap();
+        let reconcile_connection = reconcile_repository.connect().unwrap();
+        reconcile_connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        reconcile_connection
+            .execute(
+                "UPDATE member_inbox_items SET source_event_id = 'missing-reconciliation-event'
+                 WHERE inbox_item_id = ?1",
+                [&lease.inbox_item_id],
+            )
+            .unwrap();
+        drop(reconcile_connection);
+
+        let error = reconcile_repository
+            .claim_for_reconciliation(
+                &lease.inbox_item_id,
+                &lease.task_run_id,
+                "missing-source-durable-run",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::Config(message)
+                if message == "Inbox 来源用户事件 missing-reconciliation-event 不存在"
+        ));
     }
 
     mod reply_target {
@@ -5766,6 +6018,69 @@ mod tests {
                 claim.execution_working_directory
             );
             assert_eq!(recovered.reply_reference, claim.reply_reference);
+        }
+
+        #[test]
+        fn claim_preserves_reply_and_directory() {
+            let workspace = tempfile::tempdir().unwrap();
+            let canonical_workspace = workspace.path().canonicalize().unwrap();
+            let (_runtime, repository) = repository_with_workspace(workspace.path());
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let member_id = snapshot.room.default_member_id;
+            let _root = repository
+                .post_message(
+                    "room-1",
+                    std::slice::from_ref(&member_id),
+                    "root",
+                    RoomInputMode::Chat,
+                    "claim-reply-root",
+                )
+                .unwrap();
+            let root_claim = repository.claim_next().unwrap().unwrap();
+            let target = repository
+                .complete_item(&root_claim, "member target")
+                .unwrap()
+                .unwrap();
+            let posted = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "reply to target",
+                "claim-reply-source",
+                Some(&target.event_id),
+            );
+
+            let lease = repository.lease_next().unwrap().unwrap();
+            assert_eq!(lease.source_event_id, posted.event.event_id);
+            assert_eq!(lease.execution_working_directory, canonical_workspace);
+            let reference = lease.reply_reference.as_ref().unwrap();
+            assert_eq!(reference.event_id, target.event_id);
+            assert_eq!(reference.sequence, target.sequence);
+            assert_eq!(
+                reference.content_hash,
+                history_content_hash(&target.content)
+            );
+
+            repository
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE room_events SET invalidated_at = ?1 WHERE event_id = ?2",
+                    params![Utc::now().to_rfc3339(), target.event_id],
+                )
+                .unwrap();
+
+            let recovered = repository
+                .claim_for_reconciliation(
+                    &lease.inbox_item_id,
+                    &lease.task_run_id,
+                    "durable-claim-reply-run",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.source_event_id, posted.event.event_id);
+            assert_eq!(recovered.execution_working_directory, canonical_workspace);
+            assert_eq!(recovered.reply_reference, lease.reply_reference);
         }
 
         #[test]
