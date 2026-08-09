@@ -2810,6 +2810,7 @@ mod tests {
 
     struct RelativeReadToolLlm {
         calls: AtomicUsize,
+        tool_request_calls: AtomicUsize,
         first_call_barrier: Arc<tokio::sync::Barrier>,
     }
 
@@ -2817,6 +2818,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                tool_request_calls: AtomicUsize::new(0),
                 first_call_barrier: Arc::new(tokio::sync::Barrier::new(2)),
             }
         }
@@ -2926,6 +2928,9 @@ mod tests {
                     LlmContentBlock::ToolResult { content, .. } => Some(content.clone()),
                     _ => None,
                 });
+            // 仅同步最初两个并发首轮；ToolResult 回合与后续串行任务不得重入屏障。
+            let wait_at_barrier =
+                tool_output.is_none() && self.tool_request_calls.fetch_add(1, Ordering::SeqCst) < 2;
             let barrier = Arc::clone(&self.first_call_barrier);
             Box::pin(async move {
                 let (content, finish_reason) = if let Some(output) = tool_output {
@@ -2934,7 +2939,9 @@ mod tests {
                         FinishReason::EndTurn,
                     )
                 } else {
-                    barrier.wait().await;
+                    if wait_at_barrier {
+                        barrier.wait().await;
+                    }
                     (
                         vec![LlmContentBlock::ToolUse {
                             id: format!("relative-read-{call}"),
@@ -3083,6 +3090,74 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("等待房间 {room_id} 成员回复超时");
+    }
+
+    async fn wait_for_running_task(
+        tasks: &TaskRepository,
+        task_run_id: &str,
+    ) -> task_engine::TaskRun {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match tasks.task(task_run_id) {
+                    Ok(task) if task.state == TaskRunState::Running => break task,
+                    Ok(_) | Err(TaskEngineError::NotFound { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("读取持久 Task {task_run_id} 失败: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("等待持久 Task {task_run_id} 进入运行态超时"))
+    }
+
+    fn seed_room_window_fillers(
+        collaboration: &CollaborationRepository,
+        room_id: &str,
+        working_directory: &Path,
+        count: u64,
+    ) {
+        let mut connection = rusqlite::Connection::open(collaboration.database_path()).unwrap();
+        let transaction = connection.transaction().unwrap();
+        let latest_sequence: u64 = transaction
+            .query_row(
+                "SELECT latest_event_seq FROM collaboration_rooms WHERE room_id = ?1",
+                [room_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        for offset in 1..=count {
+            let sequence = latest_sequence + offset;
+            let event_id = format!("reopen-recovery-window-filler-{sequence}");
+            transaction
+                .execute(
+                    "INSERT INTO room_events(
+                         event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                         kind, content, conversation_root_event_id, group_enabled,
+                         conversation_mode, idempotency_key, execution_working_directory,
+                         created_at
+                     ) VALUES (
+                         ?1, ?2, ?3, 'service', 'service', '系统',
+                         'window_filler', ?1, ?1, 0, 'chat', ?1, ?4, ?5
+                     )",
+                    rusqlite::params![
+                        event_id,
+                        room_id,
+                        sequence,
+                        working_directory.display().to_string(),
+                        &now
+                    ],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "UPDATE collaboration_rooms SET latest_event_seq = ?1 WHERE room_id = ?2",
+                rusqlite::params![latest_sequence + count, room_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
     }
 
     #[tokio::test]
@@ -4681,6 +4756,442 @@ mod tests {
             "room B reply: {reply_b}"
         );
         assert_eq!(llm.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            process_working_directory
+        );
+    }
+
+    // 该验收必须在一条时序中证明跨重启的目录、回复引用、Task 快照与工具执行一致性。
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn room_directory_and_reply_context_survive_reopen_and_recovery() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let workspace_c = tempfile::tempdir().unwrap();
+        std::fs::write(workspace_a.path().join("same.txt"), "STARTUP-A-CONTENT").unwrap();
+        std::fs::write(workspace_b.path().join("same.txt"), "UPDATED-B-CONTENT").unwrap();
+        std::fs::write(workspace_c.path().join("same.txt"), "REOPEN-C-CONTENT").unwrap();
+        let workspace_a = workspace_a.path().canonicalize().unwrap();
+        let workspace_b = workspace_b.path().canonicalize().unwrap();
+        let workspace_c = workspace_c.path().canonicalize().unwrap();
+        let process_working_directory = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let config = CollaborationConfig {
+            max_workers: 2,
+            max_global_runs: 2,
+            max_runs_per_room: 2,
+            max_runs_per_provider: 2,
+            max_runs_per_profile: 2,
+            ..CollaborationConfig::default()
+        };
+
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                &workspace_a,
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room("room-reopen-recovery", "Reopen Recovery", &[])
+            .unwrap();
+        assert_eq!(
+            Path::new(&room.room.working_directory),
+            workspace_a.as_path()
+        );
+        let member_a = room.room.default_member_id;
+        let member_b = collaboration
+            .create_member("room-reopen-recovery", "智脑 B", None, None)
+            .unwrap()
+            .member_id;
+        let member_c = collaboration
+            .create_member("room-reopen-recovery", "智脑 C", None, None)
+            .unwrap()
+            .member_id;
+
+        let target_input = collaboration
+            .post_message(
+                "room-reopen-recovery",
+                std::slice::from_ref(&member_a),
+                "创建稍后要回复的成员事件",
+                RoomInputMode::Chat,
+                "reopen-recovery-target-input",
+            )
+            .unwrap();
+        let target_claim = collaboration.claim_next().unwrap().unwrap();
+        assert_eq!(target_claim.source_event_id, target_input.event.event_id);
+        let target = collaboration
+            .complete_item(&target_claim, "窗口外的成员回复目标")
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.sender_kind, "member");
+        assert_eq!(target.kind, "member_message");
+        assert_eq!(target.sender_id, member_a);
+        let old_post = collaboration
+            .post_message(
+                "room-reopen-recovery",
+                std::slice::from_ref(&member_a),
+                "仍应在启动目录 A 执行的旧消息",
+                RoomInputMode::Chat,
+                "reopen-recovery-old-input",
+            )
+            .unwrap();
+
+        let before_update = collaboration.snapshot("room-reopen-recovery").unwrap();
+        let updated_room = collaboration
+            .update_room_working_directory(
+                "room-reopen-recovery",
+                workspace_b.to_str().unwrap(),
+                before_update.room.version,
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(&updated_room.working_directory),
+            workspace_b.as_path()
+        );
+
+        seed_room_window_fillers(&collaboration, "room-reopen-recovery", &workspace_b, 305);
+
+        let before_reply = collaboration.snapshot("room-reopen-recovery").unwrap();
+        assert!(before_reply.has_earlier_events);
+        assert!(before_reply
+            .events
+            .iter()
+            .all(|event| event.event_id != target.event_id));
+        let recipients = [&member_a, &member_b]
+            .into_iter()
+            .map(|member_id| MemberAddress {
+                member_id: member_id.clone(),
+                expected_version: before_reply
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == *member_id)
+                    .unwrap()
+                    .version,
+            })
+            .collect::<Vec<_>>();
+        let reply_post = collaboration
+            .post_group_message_checked_with_reply(
+                &CollaborationActor::local(),
+                "room-reopen-recovery",
+                &recipients,
+                "在更新后的目录 B 回复窗口外成员事件",
+                RoomInputMode::Chat,
+                DEFAULT_THREAD_KEY,
+                before_reply.room.version,
+                "reopen-recovery-reply-input",
+                Some(&target.event_id),
+            )
+            .unwrap();
+        let mut expected_member_ids = vec![member_a.clone(), member_b.clone()];
+        expected_member_ids.sort();
+        let mut posted_member_ids = reply_post
+            .inbox_items
+            .iter()
+            .map(|item| item.member_id.clone())
+            .collect::<Vec<_>>();
+        posted_member_ids.sort();
+        assert_eq!(posted_member_ids, expected_member_ids);
+        assert!(reply_post
+            .inbox_items
+            .iter()
+            .all(|item| item.member_id != member_c));
+
+        let old_task_run_id = old_post.inbox_items[0]
+            .task_run_id
+            .as_deref()
+            .unwrap()
+            .to_owned();
+        let reply_task_run_id = reply_post
+            .inbox_items
+            .iter()
+            .find(|item| item.member_id == member_b)
+            .and_then(|item| item.task_run_id.clone())
+            .unwrap();
+        let pre_reopen_repository = Arc::clone(&collaboration);
+        let pre_reopen_config = config.clone();
+        let old_task_run_id_for_thread = old_task_run_id.clone();
+        let reply_task_run_id_for_thread = reply_task_run_id.clone();
+        std::thread::spawn(move || {
+            let private_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            private_runtime.block_on(async move {
+                let services = Arc::new(TestRuntimeServices::new(
+                    &pre_reopen_repository,
+                    &pre_reopen_config,
+                ));
+                let tasks = Arc::clone(&services.tasks);
+                let llm_config = Arc::new(LlmConfig::default_config());
+                let model_policy_details = llm_config.available_instance_model_policies();
+                let first_runtime = CollaborationRuntime::start(
+                    pre_reopen_repository,
+                    services,
+                    llm_config,
+                    model_policy_details,
+                )
+                .await
+                .unwrap();
+                let old_task = wait_for_running_task(&tasks, &old_task_run_id_for_thread).await;
+                let reply_task = wait_for_running_task(&tasks, &reply_task_run_id_for_thread).await;
+                assert_eq!(old_task.state, TaskRunState::Running);
+                assert_eq!(reply_task.state, TaskRunState::Running);
+                drop(first_runtime);
+            });
+            private_runtime.shutdown_timeout(Duration::from_secs(5));
+        })
+        .join()
+        .expect("重开前的私有协作 runtime 应安全停止");
+        drop(collaboration);
+
+        let reopened = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                &workspace_c,
+            )
+            .unwrap(),
+        );
+        let tasks = TaskRepository::open(reopened.database_path()).unwrap();
+        assert_eq!(
+            tasks.task(&old_task_run_id).unwrap().state,
+            TaskRunState::Running
+        );
+        assert_eq!(
+            tasks.task(&reply_task_run_id).unwrap().state,
+            TaskRunState::Running
+        );
+        let task_recovery = tasks.recover_inflight().unwrap();
+        assert_eq!(task_recovery.interrupted, 2);
+        assert_eq!(task_recovery.requeued, 2);
+        let persisted_reply_task = tasks.task(&reply_task_run_id).unwrap();
+        assert_eq!(persisted_reply_task.state, TaskRunState::Queued);
+        assert_eq!(persisted_reply_task.config_version, "collaboration-task-v4");
+
+        let reopened_snapshot = reopened.snapshot("room-reopen-recovery").unwrap();
+        assert_eq!(
+            Path::new(&reopened_snapshot.room.working_directory),
+            workspace_b.as_path()
+        );
+        assert_ne!(
+            Path::new(&reopened_snapshot.room.working_directory),
+            workspace_c.as_path()
+        );
+        assert!(reopened_snapshot.has_earlier_events);
+        assert!(reopened_snapshot
+            .events
+            .iter()
+            .all(|event| event.event_id != target.event_id));
+        let projected_reply = reopened_snapshot
+            .events
+            .iter()
+            .find(|event| event.event_id == reply_post.event.event_id)
+            .unwrap();
+        let projected_reference = projected_reply.reply_reference.as_ref().unwrap();
+        assert_eq!(projected_reference.event_id, target.event_id);
+        assert_eq!(projected_reference.sequence, target.sequence);
+        assert_eq!(
+            projected_reference.content_hash,
+            knowledge_core::sha256_hex(target.content.as_bytes())
+        );
+        let older_page = reopened
+            .events_before("room-reopen-recovery", target.sequence + 1, 10)
+            .unwrap();
+        assert!(older_page
+            .events
+            .iter()
+            .any(|event| event.event_id == target.event_id));
+
+        let old_item = &old_post.inbox_items[0];
+        let old_claim = reopened
+            .claim_for_reconciliation(
+                &old_item.inbox_item_id,
+                old_item.task_run_id.as_deref().unwrap(),
+                "reopen-recovery-inspect-old",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_claim.execution_working_directory, workspace_a);
+        assert!(old_claim.reply_reference.is_none());
+
+        let reply_claims = reply_post
+            .inbox_items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                reopened
+                    .claim_for_reconciliation(
+                        &item.inbox_item_id,
+                        item.task_run_id.as_deref().unwrap(),
+                        &format!("reopen-recovery-inspect-reply-{index}"),
+                    )
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut claimed_member_ids = reply_claims
+            .iter()
+            .map(|claim| claim.member_id.clone())
+            .collect::<Vec<_>>();
+        claimed_member_ids.sort();
+        assert_eq!(claimed_member_ids, expected_member_ids);
+        assert!(reply_claims
+            .iter()
+            .all(|claim| claim.execution_working_directory == workspace_b));
+        let first_reference = reply_claims[0].reply_reference.as_ref().unwrap();
+        let second_reference = reply_claims[1].reply_reference.as_ref().unwrap();
+        assert_eq!(first_reference.event_id, target.event_id);
+        assert_eq!(first_reference.event_id, second_reference.event_id);
+        assert_eq!(first_reference.content_hash, second_reference.content_hash);
+
+        let persisted_reply_claim = reply_claims
+            .iter()
+            .find(|claim| claim.member_id == member_b)
+            .unwrap();
+        let persisted_reference = persisted_reply_claim.reply_reference.as_ref().unwrap();
+        let frozen_context =
+            validated_task_context(&persisted_reply_task, persisted_reply_claim).unwrap();
+        assert_eq!(persisted_reply_task.config_version, "collaboration-task-v4");
+        assert_eq!(persisted_reply_task.task_run_id, reply_task_run_id);
+        assert_eq!(
+            frozen_context
+                .blocks
+                .iter()
+                .filter(|block| block.kind == ContextBlockKind::ConversationReference)
+                .count(),
+            1
+        );
+        assert_eq!(
+            persisted_reply_task.resolved_config["reply_reference"]["event_id"],
+            target.event_id
+        );
+        assert_eq!(
+            persisted_reply_task.resolved_config["reply_reference"]["content_hash"],
+            persisted_reference.content_hash
+        );
+
+        let llm_config = Arc::new(LlmConfig::default_config());
+        let reply_inbox = reopened_snapshot
+            .inbox
+            .iter()
+            .filter(|item| item.source_event_id == reply_post.event.event_id)
+            .collect::<Vec<_>>();
+        let mut snapshot_member_ids = reply_inbox
+            .iter()
+            .map(|item| item.member_id.clone())
+            .collect::<Vec<_>>();
+        snapshot_member_ids.sort();
+        assert_eq!(snapshot_member_ids, expected_member_ids);
+        assert!(reply_inbox.iter().all(|item| item.member_id != member_c));
+
+        let llm = Arc::new(RelativeReadToolLlm::new());
+        let services = Arc::new(MemberRunnerTestServices::new(
+            &reopened,
+            &config,
+            runtime_directory.path(),
+            Arc::clone(&llm),
+        ));
+        let model_policy_details = llm_config.available_instance_model_policies();
+        let runtime = CollaborationRuntime::start(
+            Arc::clone(&reopened),
+            services,
+            llm_config,
+            model_policy_details,
+        )
+        .await
+        .unwrap();
+
+        let (old_reply, updated_replies) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = runtime
+                    .snapshot("room-reopen-recovery".into())
+                    .await
+                    .unwrap();
+                let old_reply = snapshot.events.iter().find(|event| {
+                    event.kind == "member_message"
+                        && event.sender_id == member_a
+                        && event.content.contains("STARTUP-A-CONTENT")
+                });
+                let updated_replies = snapshot
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "member_message"
+                            && event.parent_event_id.as_deref()
+                                == Some(reply_post.event.event_id.as_str())
+                            && event.content.contains("UPDATED-B-CONTENT")
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(old_reply) = old_reply.filter(|_| updated_replies.len() == 2) {
+                    break (old_reply.clone(), updated_replies);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "恢复后的旧消息与两个定向回复应全部完成；当前 LLM 调用数={}",
+                llm.calls.load(Ordering::SeqCst)
+            )
+        });
+        assert_eq!(
+            old_reply.parent_event_id.as_deref(),
+            Some(old_post.event.event_id.as_str())
+        );
+        let mut updated_sender_ids = updated_replies
+            .iter()
+            .map(|event| event.sender_id.clone())
+            .collect::<Vec<_>>();
+        updated_sender_ids.sort();
+        assert_eq!(updated_sender_ids, expected_member_ids);
+        assert!(updated_replies.iter().all(|event| {
+            event.parent_event_id.as_deref() == Some(reply_post.event.event_id.as_str())
+                && event.content.contains("UPDATED-B-CONTENT")
+        }));
+
+        let final_snapshot = runtime
+            .snapshot("room-reopen-recovery".into())
+            .await
+            .unwrap();
+        let final_reply_inbox = final_snapshot
+            .inbox
+            .iter()
+            .filter(|item| item.source_event_id == reply_post.event.event_id)
+            .collect::<Vec<_>>();
+        assert_eq!(final_reply_inbox.len(), 2);
+        assert!(final_reply_inbox
+            .iter()
+            .all(|item| item.state == InboxState::Completed));
+        assert!(reply_post.inbox_items.iter().all(|item| {
+            tasks
+                .task(item.task_run_id.as_deref().unwrap())
+                .unwrap()
+                .state
+                == TaskRunState::Completed
+        }));
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(llm.tool_request_calls.load(Ordering::SeqCst), 3);
+
+        let connection = rusqlite::Connection::open(reopened.database_path()).unwrap();
+        let persisted_directory = |event_id: &str| {
+            connection
+                .query_row(
+                    "SELECT execution_working_directory FROM room_events WHERE event_id = ?1",
+                    [event_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(std::path::PathBuf::from)
+                .unwrap()
+        };
+        assert_eq!(persisted_directory(&old_reply.event_id), workspace_a);
+        assert!(updated_replies
+            .iter()
+            .all(|reply| persisted_directory(&reply.event_id) == workspace_b));
         assert_eq!(
             std::env::current_dir().unwrap().canonicalize().unwrap(),
             process_working_directory
