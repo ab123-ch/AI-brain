@@ -792,6 +792,29 @@ pub struct ClaimedInboxItem {
     pub version: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MemberReplyEventContext<'a> {
+    room_id: &'a str,
+    member_id: &'a str,
+    member_name: &'a str,
+    run_id: &'a str,
+    response_to_event_id: &'a str,
+    execution_working_directory: &'a Path,
+}
+
+impl<'a> From<&'a ClaimedInboxItem> for MemberReplyEventContext<'a> {
+    fn from(claim: &'a ClaimedInboxItem) -> Self {
+        Self {
+            room_id: &claim.room_id,
+            member_id: &claim.member_id,
+            member_name: &claim.member_name,
+            run_id: &claim.run_id,
+            response_to_event_id: &claim.response_to_event_id,
+            execution_working_directory: &claim.execution_working_directory,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberHistoryMessage {
     pub event_id: String,
@@ -2859,7 +2882,7 @@ impl CollaborationRepository {
     fn append_member_reply_event(
         &self,
         transaction: &Transaction<'_>,
-        claim: &ClaimedInboxItem,
+        context: MemberReplyEventContext<'_>,
         answer: &str,
         idempotency_key: &str,
         now: &DateTime<Utc>,
@@ -2870,7 +2893,7 @@ impl CollaborationRepository {
                         debate_depth, group_enabled, conversation_mode
                  FROM room_events
                  WHERE room_id = ?1 AND event_id = ?2",
-                params![claim.room_id, claim.response_to_event_id],
+                params![context.room_id, context.response_to_event_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2896,7 +2919,7 @@ impl CollaborationRepository {
             0
         };
         let event_id = format!("event-{}", Uuid::new_v4());
-        let sequence = allocate_room_sequence(transaction, &claim.room_id)?;
+        let sequence = allocate_room_sequence(transaction, context.room_id)?;
         transaction.execute(
             "INSERT INTO room_events(
                  event_id, room_id, sequence, sender_kind, sender_id, sender_name,
@@ -2909,34 +2932,34 @@ impl CollaborationRepository {
               )",
             params![
                 event_id,
-                claim.room_id,
+                context.room_id,
                 sequence,
-                claim.member_id,
-                claim.member_name,
+                context.member_id,
+                context.member_name,
                 answer,
-                claim.run_id,
+                context.run_id,
                 parent_event_id,
                 conversation_root_event_id,
                 debate_depth,
                 group_enabled,
                 conversation_mode.as_db(),
                 idempotency_key,
-                claim.execution_working_directory.display().to_string(),
+                context.execution_working_directory.display().to_string(),
                 now.to_rfc3339(),
             ],
         )?;
         let event = RoomEventView {
             event_id: event_id.clone(),
-            room_id: claim.room_id.clone(),
+            room_id: context.room_id.into(),
             sequence,
             sender_kind: "member".into(),
-            sender_id: claim.member_id.clone(),
-            sender_name: claim.member_name.clone(),
+            sender_id: context.member_id.into(),
+            sender_name: context.member_name.into(),
             recipients: Vec::new(),
             audience: Vec::new(),
             kind: "member_message".into(),
             content: answer.into(),
-            run_id: Some(claim.run_id.clone()),
+            run_id: Some(context.run_id.into()),
             parent_event_id: Some(parent_event_id),
             reply_reference: None,
             conversation_root_event_id,
@@ -3105,7 +3128,7 @@ impl CollaborationRepository {
         } else {
             let event = self.append_member_reply_event(
                 &transaction,
-                claim,
+                claim.into(),
                 answer,
                 &format!("run-result:{}", claim.run_id),
                 &now,
@@ -3200,7 +3223,7 @@ impl CollaborationRepository {
             if within_limits {
                 let event = self.append_member_reply_event(
                     &transaction,
-                    claim,
+                    claim.into(),
                     answer,
                     &format!("run-result:{}", claim.run_id),
                     &now,
@@ -3357,10 +3380,23 @@ impl CollaborationRepository {
         let item = transaction
             .query_row(
                 "SELECT e.room_id, i.member_id, m.display_name, i.cancel_requested,
-                        i.reply_event_id, i.state, e.execution_working_directory
+                        i.reply_event_id, i.state, e.execution_working_directory,
+                        CASE WHEN i.purpose = 'participation' THEN COALESCE((
+                            SELECT delivered.event_id
+                            FROM room_event_deliveries delivery
+                            JOIN room_events delivered ON delivered.event_id = delivery.event_id
+                            WHERE delivery.member_id = i.member_id
+                              AND COALESCE(delivered.conversation_root_event_id, delivered.event_id)
+                                  = COALESCE(i.conversation_root_event_id, i.source_event_id)
+                              AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
+                                  THEN i.context_through_seq ELSE room.latest_event_seq END
+                              AND delivered.invalidated_at IS NULL
+                            ORDER BY delivered.sequence DESC LIMIT 1
+                        ), i.source_event_id) ELSE i.source_event_id END
                  FROM member_inbox_items i
                  JOIN room_events e ON e.event_id = i.source_event_id
                  JOIN brain_members m ON m.member_id = i.member_id
+                 JOIN collaboration_rooms room ON room.room_id = e.room_id
                  WHERE i.inbox_item_id = ?1 AND i.run_id = ?2
                    AND e.invalidated_at IS NULL",
                 params![inbox_item_id, run_id],
@@ -3373,6 +3409,7 @@ impl CollaborationRepository {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -3385,6 +3422,7 @@ impl CollaborationRepository {
             reply_event_id,
             state,
             execution_working_directory,
+            response_to_event_id,
         )) = item
         else {
             return Err(CollaborationError::RunNotActive(run_id.into()));
@@ -3426,50 +3464,21 @@ impl CollaborationRepository {
             if let Some(event) = event_by_idempotency(&transaction, &room_id, &idempotency_key)? {
                 event
             } else {
-                let event_id = format!("event-{}", Uuid::new_v4());
-                let sequence = allocate_room_sequence(&transaction, &room_id)?;
                 let now = Utc::now();
-                transaction.execute(
-                    "INSERT INTO room_events(
-                     event_id, room_id, sequence, sender_kind, sender_id, sender_name,
-                      kind, content, run_id, idempotency_key,
-                      execution_working_directory, created_at
-                  ) VALUES (
-                      ?1, ?2, ?3, 'member', ?4, ?5, 'member_message', ?6, ?7, ?8, ?9, ?10
-                  )",
-                    params![
-                        event_id,
-                        room_id,
-                        sequence,
-                        member_id,
-                        member_name,
-                        answer,
+                self.append_member_reply_event(
+                    &transaction,
+                    MemberReplyEventContext {
+                        room_id: &room_id,
+                        member_id: &member_id,
+                        member_name: &member_name,
                         run_id,
-                        idempotency_key,
-                        execution_working_directory.display().to_string(),
-                        now.to_rfc3339(),
-                    ],
-                )?;
-                RoomEventView {
-                    event_id: event_id.clone(),
-                    room_id: room_id.clone(),
-                    sequence,
-                    sender_kind: "member".into(),
-                    sender_id: member_id.clone(),
-                    sender_name: member_name.clone(),
-                    recipients: Vec::new(),
-                    audience: Vec::new(),
-                    kind: "member_message".into(),
-                    content: answer.into(),
-                    run_id: Some(run_id.into()),
-                    parent_event_id: None,
-                    reply_reference: None,
-                    conversation_root_event_id: event_id,
-                    debate_depth: 0,
-                    group_enabled: false,
-                    conversation_mode: RoomInputMode::Chat,
-                    created_at: now,
-                }
+                        response_to_event_id: &response_to_event_id,
+                        execution_working_directory: &execution_working_directory,
+                    },
+                    answer,
+                    &idempotency_key,
+                    &now,
+                )?
             };
         transaction.execute(
             "UPDATE member_inbox_items
@@ -6720,6 +6729,92 @@ mod tests {
         assert_eq!(snapshot.inbox[0].state, InboxState::Completed);
         assert_eq!(
             snapshot
+                .events
+                .iter()
+                .filter(|event| event.kind == "member_message")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_task_result_reconciliation_preserves_reply_metadata() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        let posted = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "需要恢复完整回复上下文的任务",
+                RoomInputMode::Task,
+                "reconcile-metadata-command",
+            )
+            .unwrap();
+        let claim = repository.claim_next().unwrap().unwrap();
+        assert_eq!(claim.response_to_event_id, posted.event.event_id);
+        assert_eq!(claim.mode, RoomInputMode::Task);
+        assert!(claim.group_enabled);
+
+        let event = repository
+            .reconcile_completed_item(
+                &posted.inbox_items[0].inbox_item_id,
+                &claim.run_id,
+                "恢复后仍属于原任务线程的回复",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event.parent_event_id.as_deref(),
+            Some(claim.response_to_event_id.as_str())
+        );
+        assert_eq!(
+            event.conversation_root_event_id,
+            posted.event.conversation_root_event_id
+        );
+        assert_eq!(event.debate_depth, posted.event.debate_depth + 1);
+        assert!(event.group_enabled);
+        assert_eq!(event.conversation_mode, RoomInputMode::Task);
+        assert_eq!(
+            event.reply_reference,
+            Some(RoomEventReferenceView {
+                event_id: posted.event.event_id.clone(),
+                sequence: posted.event.sequence,
+                sender_kind: posted.event.sender_kind.clone(),
+                sender_id: posted.event.sender_id.clone(),
+                sender_name: posted.event.sender_name.clone(),
+                kind: posted.event.kind.clone(),
+                content: posted.event.content.clone(),
+                content_hash: history_content_hash(&posted.event.content),
+                created_at: posted.event.created_at,
+            })
+        );
+        let persisted_directory: String = repository
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT execution_working_directory FROM room_events WHERE event_id = ?1",
+                [event.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(persisted_directory),
+            claim.execution_working_directory
+        );
+
+        assert!(repository
+            .reconcile_completed_item(
+                &posted.inbox_items[0].inbox_item_id,
+                &claim.run_id,
+                "重复恢复不应新增回复",
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repository
+                .snapshot("room-1")
+                .unwrap()
                 .events
                 .iter()
                 .filter(|event| event.kind == "member_message")
