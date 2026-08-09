@@ -2522,7 +2522,19 @@ impl CollaborationRepository {
         };
         let run_id = format!("run-{}", Uuid::new_v4());
         let claim =
-            claimed_inbox_from_candidate(&candidate, run_id.clone(), candidate.version + 1)?;
+            match claimed_inbox_from_candidate(&candidate, run_id.clone(), candidate.version + 1) {
+                Ok(claim) => claim,
+                Err(error @ CollaborationError::Config(_)) => {
+                    let quarantined =
+                        quarantine_corrupt_claim(&transaction, &candidate, &error.to_string())?;
+                    transaction.commit()?;
+                    if quarantined {
+                        return Err(error);
+                    }
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
         let lease_expires_at = Utc::now() + chrono::Duration::minutes(5);
         let updated = transaction.execute(
             "UPDATE member_inbox_items
@@ -4524,6 +4536,51 @@ fn claimed_inbox_from_candidate(
     })
 }
 
+fn quarantine_corrupt_claim(
+    transaction: &Transaction<'_>,
+    candidate: &ClaimCandidate,
+    error: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let updated = transaction.execute(
+        "UPDATE member_inbox_items
+         SET state = 'failed', run_id = NULL, lease_expires_at = NULL,
+             error = ?1, completed_at = ?2, version = version + 1
+         WHERE inbox_item_id = ?3 AND state = 'pending' AND version = ?4",
+        params![error, &now, &candidate.inbox_item_id, candidate.version],
+    )?;
+    if updated != 1 {
+        return Ok(false);
+    }
+    transaction.execute(
+        "UPDATE room_event_deliveries
+         SET state = 'suppressed', decision_reason = ?1, updated_at = ?2
+         WHERE inbox_item_id = ?3 AND state IN ('queued', 'deferred', 'running')",
+        params![error, &now, &candidate.inbox_item_id],
+    )?;
+    if let Some(room_id) = candidate.room_id.as_deref() {
+        let room_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM collaboration_rooms WHERE room_id = ?1)",
+            [room_id],
+            |row| row.get(0),
+        )?;
+        if room_exists {
+            enqueue_room_changed(
+                transaction,
+                room_id,
+                "inbox",
+                &candidate.inbox_item_id,
+                &format!(
+                    "inbox-corrupt:{}:{}",
+                    candidate.inbox_item_id,
+                    candidate.version + 1
+                ),
+            )?;
+        }
+    }
+    Ok(true)
+}
+
 fn reply_reference_from_candidate(
     candidate: &ClaimCandidate,
     room_id: &str,
@@ -5761,26 +5818,25 @@ mod tests {
 
     #[test]
     fn message_freezes_room_working_directory_rejects_missing_or_empty_event_directory() {
-        let runtime = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let repository = CollaborationRepository::new_with_startup_working_directory(
-            runtime.path(),
-            CollaborationConfig::default(),
-            workspace.path(),
-        )
-        .unwrap();
-        let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
-        let posted = repository
-            .post_message(
-                "room-1",
-                &[snapshot.room.default_member_id],
-                "U1",
-                RoomInputMode::Chat,
-                "freeze-invalid-directory",
+        for (index, invalid) in [None, Some("")].into_iter().enumerate() {
+            let runtime = tempfile::tempdir().unwrap();
+            let repository = CollaborationRepository::new_with_startup_working_directory(
+                runtime.path(),
+                CollaborationConfig::default(),
+                workspace.path(),
             )
             .unwrap();
-
-        for invalid in [None, Some("")] {
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let posted = repository
+                .post_message(
+                    "room-1",
+                    &[snapshot.room.default_member_id],
+                    "U1",
+                    RoomInputMode::Chat,
+                    &format!("freeze-invalid-directory-{index}"),
+                )
+                .unwrap();
             repository
                 .connect()
                 .unwrap()
@@ -5819,8 +5875,8 @@ mod tests {
         let lease_room = lease_repository
             .ensure_room("lease-room", "Lease Room", &[])
             .unwrap();
-        lease_repository
-            .post_message(
+        let lease_post = lease_repository
+            .post_group_message(
                 "lease-room",
                 &[lease_room.room.default_member_id],
                 "missing lease source",
@@ -5846,6 +5902,45 @@ mod tests {
             CollaborationError::Config(message)
                 if message == "Inbox 来源用户事件 missing-lease-event 不存在"
         ));
+        let missing_inbox_id = &lease_post.inbox_items[0].inbox_item_id;
+        let connection = lease_repository.connect().unwrap();
+        let (state, stored_error, completed_at): (String, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT state, error, completed_at FROM member_inbox_items
+                     WHERE inbox_item_id = ?1",
+                    [missing_inbox_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(state, "failed");
+        assert!(stored_error
+            .as_deref()
+            .is_some_and(|message| message.contains("missing-lease-event")));
+        assert!(completed_at.is_some());
+        let (delivery_state, delivery_reason): (String, Option<String>) = connection
+            .query_row(
+                "SELECT state, decision_reason FROM room_event_deliveries
+                 WHERE inbox_item_id = ?1",
+                [missing_inbox_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delivery_state, "suppressed");
+        assert!(delivery_reason
+            .as_deref()
+            .is_some_and(|message| message.contains("missing-lease-event")));
+        let fabricated_outbox: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_outbox_events
+                 WHERE aggregate_kind = 'inbox' AND aggregate_id = ?1
+                   AND idempotency_key LIKE 'inbox-corrupt:%'",
+                [missing_inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fabricated_outbox, 0);
+        drop(connection);
 
         let reconcile_runtime = tempfile::tempdir().unwrap();
         let reconcile_repository =
@@ -5889,6 +5984,85 @@ mod tests {
             CollaborationError::Config(message)
                 if message == "Inbox 来源用户事件 missing-reconciliation-event 不存在"
         ));
+    }
+
+    #[test]
+    fn claim_preserves_reply_and_directory_quarantines_corrupt_head() {
+        let (_directory, repository) = repository();
+        let room = ensure(&repository);
+        let member_id = room.room.default_member_id;
+        let first = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "损坏的队首消息",
+                RoomInputMode::Chat,
+                "corrupt-head-first",
+            )
+            .unwrap();
+        let second = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "健康的后续消息",
+                RoomInputMode::Chat,
+                "corrupt-head-second",
+            )
+            .unwrap();
+        let first_inbox_id = &first.inbox_items[0].inbox_item_id;
+        repository
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE room_events SET execution_working_directory = '' WHERE event_id = ?1",
+                [&first.event.event_id],
+            )
+            .unwrap();
+
+        let error = repository.lease_next().unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::Config(message)
+                if message == "房间事件缺少冻结的执行工作目录"
+        ));
+
+        let snapshot = repository.snapshot("room-1").unwrap();
+        let quarantined = snapshot
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == *first_inbox_id)
+            .unwrap();
+        assert_eq!(quarantined.state, InboxState::Failed);
+        assert!(quarantined
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("冻结的执行工作目录")));
+        assert!(quarantined.completed_at.is_some());
+        let delivery = snapshot
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.inbox_item_id.as_deref() == Some(first_inbox_id))
+            .unwrap();
+        assert_eq!(delivery.state, DeliveryState::Suppressed);
+        assert!(delivery
+            .decision_reason
+            .as_deref()
+            .is_some_and(|message| message.contains("冻结的执行工作目录")));
+        let outbox_count: usize = repository
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_outbox_events
+                 WHERE aggregate_kind = 'inbox' AND aggregate_id = ?1
+                   AND idempotency_key LIKE 'inbox-corrupt:%'",
+                [first_inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 1);
+
+        let healthy = repository.lease_next().unwrap().unwrap();
+        assert_eq!(healthy.source_event_id, second.event.event_id);
     }
 
     mod reply_target {

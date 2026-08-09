@@ -129,9 +129,11 @@ impl CollaborationRuntime {
         let mut reconciled = 0_usize;
         for result in durable_results {
             let result_repository = Arc::clone(&repository);
+            let result_tasks = Arc::clone(&task_repository);
             let projected = tokio::task::spawn_blocking(move || {
                 reconcile_durable_result(
                     &result_repository,
+                    &result_tasks,
                     &result.origin_id,
                     &result.task_run_id,
                     &result.instance_run_id,
@@ -804,8 +806,7 @@ impl CollaborationRuntime {
             Err(error) => return Err(format!("读取持久任务失败: {error}")),
         };
         if let Some(task) = existing {
-            validate_task_claim_identity(&task, claim)?;
-            let snapshot = context_snapshot_from_task(&task)?;
+            let snapshot = validated_task_context(&task, claim)?;
             let policy = execution_policy_from_task(&task)?;
             return Ok((task, snapshot, policy));
         }
@@ -839,7 +840,7 @@ impl CollaborationRuntime {
             .await
             .map_err(|error| format!("创建持久任务线程失败: {error}"))?
             .map_err(|error| format!("创建持久任务失败: {error}"))?;
-        let persisted_snapshot = context_snapshot_from_task(&task)?;
+        let persisted_snapshot = validated_task_context(&task, claim)?;
         let policy = execution_policy_from_task(&task)?;
         Ok((task, persisted_snapshot, policy))
     }
@@ -1429,6 +1430,7 @@ fn parse_participation_answer(answer: &str) -> Option<String> {
 
 fn reconcile_durable_result(
     repository: &CollaborationRepository,
+    task_repository: &TaskRepository,
     inbox_item_id: &str,
     task_run_id: &str,
     durable_run_id: &str,
@@ -1439,6 +1441,10 @@ fn reconcile_durable_result(
     else {
         return Ok(None);
     };
+    let task = task_repository.task(task_run_id).map_err(|error| {
+        CollaborationError::Config(format!("读取成员持久任务 {task_run_id} 失败: {error}"))
+    })?;
+    validated_task_context(&task, &claim).map_err(CollaborationError::Config)?;
     let answer = if claim.purpose == InboxPurpose::Participation {
         parse_participation_answer(artifact_content)
     } else {
@@ -1533,16 +1539,16 @@ fn validate_task_claim_identity(task: &TaskRun, claim: &ClaimedInboxItem) -> Res
     let reply_reference: Option<RoomEventReferenceView> =
         serde_json::from_value(reply_reference)
             .map_err(|error| format!("解析持久任务回复引用失败: {error}"))?;
-    let reply_reference_matches = match (reply_reference.as_ref(), claim.reply_reference.as_ref()) {
-        (None, None) => true,
-        (Some(actual), Some(expected)) => {
-            actual.event_id == expected.event_id
-                && actual.sequence == expected.sequence
-                && actual.content_hash == expected.content_hash
+    if let Some(reference) = reply_reference.as_ref() {
+        let actual_hash = sha256_hex(reference.content.as_bytes());
+        if actual_hash != reference.content_hash {
+            return Err(format!(
+                "持久任务 {} 的冻结回复引用正文哈希不一致",
+                task.task_run_id
+            ));
         }
-        _ => false,
-    };
-    if !reply_reference_matches {
+    }
+    if reply_reference.as_ref() != claim.reply_reference.as_ref() {
         return Err(format!(
             "持久任务 {} 的冻结回复引用与当前租约不一致",
             task.task_run_id
@@ -1570,6 +1576,61 @@ fn context_snapshot_from_task(task: &TaskRun) -> Result<ContextSnapshot, String>
         .validate()
         .map_err(|error| format!("校验持久上下文快照失败: {error}"))?;
     Ok(snapshot)
+}
+
+fn validated_task_context(
+    task: &TaskRun,
+    claim: &ClaimedInboxItem,
+) -> Result<ContextSnapshot, String> {
+    validate_task_claim_identity(task, claim)?;
+    let snapshot = context_snapshot_from_task(task)?;
+    if task.config_version == COLLABORATION_TASK_V4 {
+        validate_v4_reply_context(task, claim, &snapshot)?;
+    }
+    Ok(snapshot)
+}
+
+fn validate_v4_reply_context(
+    task: &TaskRun,
+    claim: &ClaimedInboxItem,
+    snapshot: &ContextSnapshot,
+) -> Result<(), String> {
+    let references = snapshot
+        .blocks
+        .iter()
+        .filter(|block| block.kind == ContextBlockKind::ConversationReference)
+        .collect::<Vec<_>>();
+    let Some(reference) = claim.reply_reference.as_ref() else {
+        if references.is_empty() {
+            return Ok(());
+        }
+        return Err(format!(
+            "持久任务 {} 的冻结上下文包含意外的回复引用",
+            task.task_run_id
+        ));
+    };
+    if references.len() != 1 {
+        return Err(format!(
+            "持久任务 {} 的冻结上下文必须且只能包含一个回复引用",
+            task.task_run_id
+        ));
+    }
+
+    let actual = references[0];
+    let expected = reply_reference_block(reference);
+    if actual.block_id != expected.block_id
+        || actual.content != expected.content
+        || actual.source_ref != expected.source_ref
+        || actual.source_revision != expected.source_revision
+        || actual.source_hash != expected.source_hash
+        || actual.truncated
+    {
+        return Err(format!(
+            "持久任务 {} 的冻结上下文回复引用与当前租约不一致",
+            task.task_run_id
+        ));
+    }
+    Ok(())
 }
 
 fn execution_policy_from_task(task: &TaskRun) -> Result<MemberExecutionPolicy, String> {
@@ -1641,25 +1702,7 @@ fn context_request_for_claim(
             member_policy_for_claim(claim),
         ));
     if let Some(reference) = claim.reply_reference.as_ref() {
-        let reference_source = SourceRef::new(
-            namespace.clone(),
-            ResourceTypeId::from("conversation.turn"),
-            reference.event_id.clone(),
-            Some(reference.sequence.to_string()),
-            Some(reference.content_hash.clone()),
-        );
-        request = request.with_required_block(
-            ContextBlockInput::new(
-                format!("reply-reference:{}", reference.event_id),
-                ContextBlockKind::ConversationReference,
-                reply_reference_content(reference),
-            )
-            .with_source_metadata(
-                reference_source,
-                Some(reference.sequence),
-                Some(reference.content_hash.clone()),
-            ),
-        );
+        request = request.with_required_block(reply_reference_block(reference));
     }
     request = request.with_required_block(
         ContextBlockInput::new(
@@ -1707,6 +1750,26 @@ fn context_request_for_claim(
         );
     }
     Ok(request)
+}
+
+fn reply_reference_block(reference: &RoomEventReferenceView) -> ContextBlockInput {
+    let source = SourceRef::new(
+        NamespaceId::from("platform.core"),
+        ResourceTypeId::from("conversation.turn"),
+        reference.event_id.clone(),
+        Some(reference.sequence.to_string()),
+        Some(reference.content_hash.clone()),
+    );
+    ContextBlockInput::new(
+        format!("reply-reference:{}", reference.event_id),
+        ContextBlockKind::ConversationReference,
+        reply_reference_content(reference),
+    )
+    .with_source_metadata(
+        source,
+        Some(reference.sequence),
+        Some(reference.content_hash.clone()),
+    )
 }
 
 fn reply_reference_content(
@@ -1832,7 +1895,7 @@ mod tests {
     use super::{
         context_request_for_claim, context_snapshot_from_task, parse_participation_answer,
         reconcile_durable_result, scheduler_limits, task_request_for_claim,
-        validate_task_claim_identity, with_model_policy_details,
+        validate_task_claim_identity, validated_task_context, with_model_policy_details,
     };
     use crate::web::collaboration::{
         CollaborationActor, CollaborationConfig, CollaborationRepository, InboxPurpose, InboxState,
@@ -1869,6 +1932,115 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn built_context_snapshot_for_claim(
+        collaboration: &CollaborationRepository,
+        claim: &crate::web::collaboration::ClaimedInboxItem,
+        config: &CollaborationConfig,
+    ) -> ContextSnapshot {
+        let history = collaboration.member_history(claim).unwrap();
+        let request = context_request_for_claim(claim, &history, config).unwrap();
+        ContextBuilder::new(
+            Arc::new(EmptyMemory),
+            Arc::new(UnavailableGraph),
+            Arc::new(ContentResolverRegistry::new()),
+        )
+        .build(&request)
+        .unwrap()
+    }
+
+    fn rebuild_reference_block(
+        snapshot: &ContextSnapshot,
+        mutation: impl FnOnce(&mut ContextBlockInput),
+    ) -> ContextSnapshot {
+        let mut blocks = snapshot.blocks.clone();
+        let reference_index = blocks
+            .iter()
+            .position(|block| block.kind == ContextBlockKind::ConversationReference)
+            .unwrap();
+        let reference = &blocks[reference_index];
+        let mut input = ContextBlockInput {
+            block_id: reference.block_id.clone(),
+            kind: reference.kind,
+            content: reference.content.clone(),
+            source_ref: reference.source_ref.clone(),
+            content_ref: reference.content_ref.clone(),
+            source_revision: reference.source_revision,
+            source_hash: reference.source_hash.clone(),
+            trust: reference.trust,
+        };
+        mutation(&mut input);
+        blocks[reference_index] = ContextBlock::from_input(input).unwrap();
+        ContextSnapshot::new(format!("{}-tampered", snapshot.context_snapshot_id), blocks).unwrap()
+    }
+
+    async fn complete_durable_claim_without_projection(
+        collaboration: &CollaborationRepository,
+        config: &CollaborationConfig,
+        claim: &crate::web::collaboration::ClaimedInboxItem,
+        context: &ContextSnapshot,
+        artifact_content: &str,
+    ) -> task_engine::TaskRun {
+        let llm = LlmConfig::default_config();
+        let model = llm.resolve_model_policy(&claim.model_policy);
+        let request = task_request_for_claim(claim, config, &model, context);
+        let node_id = request.nodes[0].node_id.clone();
+        let tasks = Arc::new(TaskRepository::open(collaboration.database_path()).unwrap());
+        let task = tasks.create_task(request).unwrap();
+        let coordinator = TaskCoordinator::new(
+            Arc::clone(&tasks),
+            Scheduler::new(scheduler_limits(config)).unwrap(),
+        );
+        let coordinated = coordinator
+            .admit_node(&node_id, &claim.run_id, CancellationToken::new())
+            .await
+            .unwrap();
+        let active = collaboration.activate_lease(claim).unwrap();
+        let artifact = tasks
+            .store_artifact(
+                &active.run_id,
+                artifact_content,
+                "text/plain; charset=utf-8",
+            )
+            .unwrap();
+        tasks
+            .complete_node(
+                &active.run_id,
+                coordinated.started().instance.version,
+                ActualUsage {
+                    input_tokens: 12,
+                    output_tokens: 6,
+                },
+                Some(&artifact.artifact_id),
+            )
+            .unwrap();
+        drop(coordinated);
+        task
+    }
+
+    fn rewrite_task_config_for_test(
+        collaboration: &CollaborationRepository,
+        task: &task_engine::TaskRun,
+        config_version: &str,
+        resolved_config: &serde_json::Value,
+    ) {
+        let config_json = serde_json::to_string(resolved_config).unwrap();
+        let config_hash = knowledge_core::sha256_hex(config_json.as_bytes());
+        rusqlite::Connection::open(collaboration.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE task_config_snapshots
+                 SET config_version = ?1, resolved_config_json = ?2, content_hash = ?3
+                 WHERE config_snapshot_id = ?4",
+                rusqlite::params![
+                    config_version,
+                    config_json,
+                    config_hash,
+                    &task.config_snapshot_id
+                ],
+            )
+            .unwrap();
     }
 
     struct EmptyMemory;
@@ -2222,7 +2394,7 @@ mod tests {
         let reference = claim.reply_reference.as_ref().unwrap();
         let llm = LlmConfig::default_config();
         let model = llm.resolve_model_policy(&claim.model_policy);
-        let context = task_context_snapshot("context-task-v4", &claim.input);
+        let context = built_context_snapshot_for_claim(&collaboration, &claim, &config);
         let request = task_request_for_claim(&claim, &config, &model, &context);
 
         assert_eq!(request.config_version, "collaboration-task-v4");
@@ -2245,8 +2417,7 @@ mod tests {
 
         let tasks = TaskRepository::open(collaboration.database_path()).unwrap();
         let task = tasks.create_task(request).unwrap();
-        validate_task_claim_identity(&task, &claim).unwrap();
-        assert_eq!(context_snapshot_from_task(&task).unwrap(), context);
+        assert_eq!(validated_task_context(&task, &claim).unwrap(), context);
 
         let mut tampered_directory = task.clone();
         tampered_directory.resolved_config["execution_working_directory"] =
@@ -2263,10 +2434,79 @@ mod tests {
             serde_json::json!(reference.sequence + 1);
         assert!(validate_task_claim_identity(&tampered_sequence, &claim).is_err());
 
-        let mut tampered_hash = task;
+        let mut tampered_hash = task.clone();
         tampered_hash.resolved_config["reply_reference"]["content_hash"] =
             serde_json::json!("tampered-content-hash");
         assert!(validate_task_claim_identity(&tampered_hash, &claim).is_err());
+
+        let mut tampered_content = task.clone();
+        tampered_content.resolved_config["reply_reference"]["content"] =
+            serde_json::json!("篡改后仍保留旧哈希的正文");
+        assert!(validate_task_claim_identity(&tampered_content, &claim).is_err());
+
+        let mut invalid_hash_claim = claim.clone();
+        invalid_hash_claim.reply_reference.as_mut().unwrap().content =
+            "租约与任务同时携带的错误正文哈希".into();
+        let mut invalid_hash_task = task.clone();
+        invalid_hash_task.resolved_config["reply_reference"] =
+            serde_json::to_value(&invalid_hash_claim.reply_reference).unwrap();
+        assert!(validate_task_claim_identity(&invalid_hash_task, &invalid_hash_claim).is_err());
+
+        let mut tampered_sender = task.clone();
+        tampered_sender.resolved_config["reply_reference"]["sender_name"] =
+            serde_json::json!("伪造发送者");
+        assert!(validate_task_claim_identity(&tampered_sender, &claim).is_err());
+
+        let missing_reference = task_context_snapshot("context-missing-reference", &claim.input);
+        let mut missing_reference_task = task.clone();
+        missing_reference_task.resolved_config["context_snapshot"] =
+            serde_json::to_value(missing_reference).unwrap();
+        assert!(validated_task_context(&missing_reference_task, &claim).is_err());
+
+        for mismatch in [
+            "block_id",
+            "source_resource_id",
+            "source_ref_revision",
+            "source_revision",
+            "source_hash",
+            "content",
+        ] {
+            let mismatched_snapshot = rebuild_reference_block(&context, |input| match mismatch {
+                "block_id" => input.block_id.push_str("-tampered"),
+                "source_resource_id" => {
+                    input.source_ref.as_mut().unwrap().resource_id = "tampered-event".into();
+                }
+                "source_ref_revision" => {
+                    input.source_ref.as_mut().unwrap().version = Some("999999".into());
+                }
+                "source_revision" => input.source_revision = Some(reference.sequence + 1),
+                "source_hash" => input.source_hash = Some("tampered-source-hash".into()),
+                "content" => input.content.push_str("\n篡改引用正文"),
+                _ => unreachable!(),
+            });
+            mismatched_snapshot.validate().unwrap();
+            let mut mismatched_task = task.clone();
+            mismatched_task.resolved_config["context_snapshot"] =
+                serde_json::to_value(mismatched_snapshot).unwrap();
+            assert!(
+                validated_task_context(&mismatched_task, &claim).is_err(),
+                "字段 {mismatch} 不匹配时必须拒绝持久任务"
+            );
+        }
+
+        let mut duplicated_blocks = context.blocks.clone();
+        let duplicated_reference = duplicated_blocks
+            .iter()
+            .find(|block| block.kind == ContextBlockKind::ConversationReference)
+            .unwrap()
+            .clone();
+        duplicated_blocks.push(duplicated_reference);
+        let duplicated_reference =
+            ContextSnapshot::new("context-duplicated-reference", duplicated_blocks).unwrap();
+        let mut duplicated_reference_task = task;
+        duplicated_reference_task.resolved_config["context_snapshot"] =
+            serde_json::to_value(duplicated_reference).unwrap();
+        assert!(validated_task_context(&duplicated_reference_task, &claim).is_err());
     }
 
     #[test]
@@ -2302,6 +2542,23 @@ mod tests {
         let mut v4 = created.clone();
         v4.config_version = "collaboration-task-v4".into();
         assert_eq!(context_snapshot_from_task(&v4).unwrap(), context);
+        validated_task_context(&v4, &claim).unwrap();
+
+        let mut unexpected_blocks = context.blocks.clone();
+        unexpected_blocks.push(
+            ContextBlock::from_input(ContextBlockInput::new(
+                "unexpected-reply-reference",
+                ContextBlockKind::ConversationReference,
+                "无回复任务不应携带引用",
+            ))
+            .unwrap(),
+        );
+        let unexpected_reference =
+            ContextSnapshot::new("context-unexpected-reference", unexpected_blocks).unwrap();
+        let mut unexpected_reference_task = v4.clone();
+        unexpected_reference_task.resolved_config["context_snapshot"] =
+            serde_json::to_value(unexpected_reference).unwrap();
+        assert!(validated_task_context(&unexpected_reference_task, &claim).is_err());
 
         for invalid_version in [
             "collaboration-task-v2",
@@ -2388,10 +2645,114 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.execution_working_directory, source_workspace);
         assert_ne!(recovered.execution_working_directory, current_workspace);
-        validate_task_claim_identity(&historical_task, &recovered).unwrap();
         assert_eq!(
-            context_snapshot_from_task(&historical_task).unwrap(),
+            validated_task_context(&historical_task, &recovered).unwrap(),
             context
+        );
+    }
+
+    #[tokio::test]
+    async fn collaboration_task_v3_completed_result_restart_uses_source_event_directory() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let source_workspace = tempfile::tempdir().unwrap();
+        let current_workspace = tempfile::tempdir().unwrap();
+        let source_workspace = source_workspace.path().canonicalize().unwrap();
+        let current_workspace = current_workspace.path().canonicalize().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new_with_startup_working_directory(
+            runtime_directory.path(),
+            config.clone(),
+            &source_workspace,
+        )
+        .unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Completed v3 Room", &[])
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&room.room.default_member_id),
+                "历史 v3 完成结果",
+                RoomInputMode::Task,
+                "completed-v3-result",
+            )
+            .unwrap();
+        let snapshot = collaboration.snapshot("room-1").unwrap();
+        collaboration
+            .update_room_working_directory(
+                "room-1",
+                current_workspace.to_string_lossy().as_ref(),
+                snapshot.room.version,
+            )
+            .unwrap();
+        let lease = collaboration.lease_next().unwrap().unwrap();
+        assert_eq!(lease.execution_working_directory, source_workspace);
+        let context = task_context_snapshot("context-completed-v3", &lease.input);
+        let task = complete_durable_claim_without_projection(
+            &collaboration,
+            &config,
+            &lease,
+            &context,
+            "历史 v3 恢复回复",
+        )
+        .await;
+        let mut resolved_config = task.resolved_config.clone();
+        let config_object = resolved_config.as_object_mut().unwrap();
+        config_object.remove("execution_working_directory");
+        config_object.remove("reply_to_event_id");
+        config_object.remove("reply_reference");
+        rewrite_task_config_for_test(
+            &collaboration,
+            &task,
+            "collaboration-task-v3",
+            &resolved_config,
+        );
+        drop(collaboration);
+
+        let reopened_collaboration = CollaborationRepository::new_with_startup_working_directory(
+            runtime_directory.path(),
+            config,
+            &current_workspace,
+        )
+        .unwrap();
+        let reopened_tasks = TaskRepository::open(reopened_collaboration.database_path()).unwrap();
+        let results = reopened_tasks.completed_results("member_inbox").unwrap();
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        let completion = reconcile_durable_result(
+            &reopened_collaboration,
+            &reopened_tasks,
+            &result.origin_id,
+            &result.task_run_id,
+            &result.instance_run_id,
+            &result.artifact.content,
+        )
+        .unwrap()
+        .unwrap();
+        let event = completion.event.unwrap();
+        assert_eq!(event.content, "历史 v3 恢复回复");
+        let persisted_directory: String =
+            rusqlite::Connection::open(reopened_collaboration.database_path())
+                .unwrap()
+                .query_row(
+                    "SELECT execution_working_directory FROM room_events WHERE event_id = ?1",
+                    [&event.event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(persisted_directory),
+            source_workspace
+        );
+        assert_eq!(
+            std::path::PathBuf::from(
+                reopened_collaboration
+                    .snapshot("room-1")
+                    .unwrap()
+                    .room
+                    .working_directory
+            ),
+            current_workspace
         );
     }
 
@@ -2440,6 +2801,7 @@ mod tests {
         tasks.create_task(request).unwrap();
         assert!(reconcile_durable_result(
             &collaboration,
+            &tasks,
             &claim.inbox_item_id,
             &first.task_run_id,
             "old-durable-run",
@@ -2452,8 +2814,8 @@ mod tests {
     #[test]
     fn durable_direct_group_result_appends_a_public_room_reply() {
         let directory = tempfile::tempdir().unwrap();
-        let collaboration =
-            CollaborationRepository::new(directory.path(), CollaborationConfig::default()).unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
         let room = collaboration
             .ensure_room("room-1", "Task Room", &[])
             .unwrap();
@@ -2467,9 +2829,17 @@ mod tests {
             )
             .unwrap();
         let direct = collaboration.lease_next().unwrap().unwrap();
+        let llm = LlmConfig::default_config();
+        let model = llm.resolve_model_policy(&direct.model_policy);
+        let context = task_context_snapshot("context-durable-direct", &direct.input);
+        let tasks = TaskRepository::open(collaboration.database_path()).unwrap();
+        tasks
+            .create_task(task_request_for_claim(&direct, &config, &model, &context))
+            .unwrap();
 
         let completion = reconcile_durable_result(
             &collaboration,
+            &tasks,
             &direct.inbox_item_id,
             &direct.task_run_id,
             "durable-direct-run",
@@ -2486,6 +2856,150 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == "member_message" && event.content == "明确的回复"));
+    }
+
+    #[tokio::test]
+    async fn completed_result_restart_rejects_an_unsupported_task_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Restart Validation Room", &[])
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&room.room.default_member_id),
+                "完成后等待重启恢复",
+                RoomInputMode::Task,
+                "restart-completed-result",
+            )
+            .unwrap();
+        let lease = collaboration.lease_next().unwrap().unwrap();
+        let context = task_context_snapshot("context-restart-result", &lease.input);
+        let task = complete_durable_claim_without_projection(
+            &collaboration,
+            &config,
+            &lease,
+            &context,
+            "不应被投影的完成结果",
+        )
+        .await;
+
+        rewrite_task_config_for_test(
+            &collaboration,
+            &task,
+            "collaboration-task-v5",
+            &task.resolved_config,
+        );
+        drop(collaboration);
+
+        let reopened_collaboration =
+            CollaborationRepository::new(directory.path(), config).unwrap();
+        let reopened_tasks = TaskRepository::open(reopened_collaboration.database_path()).unwrap();
+        let results = reopened_tasks.completed_results("member_inbox").unwrap();
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+
+        let error = reconcile_durable_result(
+            &reopened_collaboration,
+            &reopened_tasks,
+            &result.origin_id,
+            &result.task_run_id,
+            &result.instance_run_id,
+            &result.artifact.content,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("不支持的配置"));
+        let snapshot = reopened_collaboration.snapshot("room-1").unwrap();
+        assert!(snapshot
+            .events
+            .iter()
+            .all(|event| event.kind != "member_message"));
+        assert_ne!(snapshot.inbox[0].state, InboxState::Completed);
+    }
+
+    #[tokio::test]
+    async fn completed_result_restart_rejects_an_invalid_v4_reply_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
+        let room = collaboration
+            .ensure_room("room-1", "Restart Reply Validation Room", &[])
+            .unwrap();
+        let member_id = room.room.default_member_id;
+        collaboration
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "创建重启回复目标",
+                RoomInputMode::Chat,
+                "restart-reply-target",
+            )
+            .unwrap();
+        let target_claim = collaboration.claim_next().unwrap().unwrap();
+        let target = collaboration
+            .complete_item(&target_claim, "重启回复目标")
+            .unwrap()
+            .unwrap();
+        post_reply_for_test(
+            &collaboration,
+            "room-1",
+            &member_id,
+            "完成后等待重启投影",
+            "restart-reply-result",
+            &target.event_id,
+        );
+        let lease = collaboration.lease_next().unwrap().unwrap();
+        let context = built_context_snapshot_for_claim(&collaboration, &lease, &config);
+        let task = complete_durable_claim_without_projection(
+            &collaboration,
+            &config,
+            &lease,
+            &context,
+            "不应投影的 v4 回复",
+        )
+        .await;
+
+        let missing_reference =
+            task_context_snapshot("context-restart-missing-reference", &lease.input);
+        let mut resolved_config = task.resolved_config.clone();
+        resolved_config["context_snapshot"] = serde_json::to_value(missing_reference).unwrap();
+        rewrite_task_config_for_test(
+            &collaboration,
+            &task,
+            "collaboration-task-v4",
+            &resolved_config,
+        );
+        drop(collaboration);
+
+        let reopened_collaboration =
+            CollaborationRepository::new(directory.path(), config).unwrap();
+        let reopened_tasks = TaskRepository::open(reopened_collaboration.database_path()).unwrap();
+        let results = reopened_tasks.completed_results("member_inbox").unwrap();
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        let error = reconcile_durable_result(
+            &reopened_collaboration,
+            &reopened_tasks,
+            &result.origin_id,
+            &result.task_run_id,
+            &result.instance_run_id,
+            &result.artifact.content,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("必须且只能包含一个回复引用"));
+        let snapshot = reopened_collaboration.snapshot("room-1").unwrap();
+        assert!(snapshot
+            .events
+            .iter()
+            .all(|event| event.content != "不应投影的 v4 回复"));
+        let inbox = snapshot
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == lease.inbox_item_id)
+            .unwrap();
+        assert_ne!(inbox.state, InboxState::Completed);
     }
 
     #[test]
