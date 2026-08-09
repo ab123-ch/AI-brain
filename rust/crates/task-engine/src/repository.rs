@@ -927,11 +927,13 @@ impl TaskRepository {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = task_from_connection(&transaction, task_run_id)?;
-        if task.state.is_terminal() {
+        if matches!(
+            task.state,
+            TaskRunState::Completed | TaskRunState::Cancelled
+        ) {
             transaction.commit()?;
             return Ok(task);
         }
-        ensure_version("task run", task_run_id, expected_version, task.version)?;
 
         let running_nodes = transaction.query_row(
             "SELECT COUNT(*) FROM task_nodes WHERE task_run_id = ?1 AND state = 'running'",
@@ -953,6 +955,12 @@ impl TaskRepository {
         let rows = statement.query_map([task_run_id], |row| row.get::<_, String>(0))?;
         let node_ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
+
+        if task.state == TaskRunState::Failed && node_ids.is_empty() {
+            transaction.commit()?;
+            return Ok(task);
+        }
+        ensure_version("task run", task_run_id, expected_version, task.version)?;
 
         let now = Utc::now().to_rfc3339();
         for node_id in &node_ids {
@@ -976,27 +984,29 @@ impl TaskRepository {
             )?;
         }
 
-        let updated = transaction.execute(
-            "UPDATE task_runs
-             SET state = 'failed', version = version + 1, updated_at = ?1
-             WHERE task_run_id = ?2 AND version = ?3
-               AND state IN ('queued', 'running', 'paused_budget', 'needs_input')",
-            params![now, task_run_id, expected_version],
-        )?;
-        if updated != 1 {
-            return Err(TaskEngineError::CasConflict {
-                entity: "task run",
-                id: task_run_id.into(),
-                expected: expected_version,
-                actual: task_version(&transaction, task_run_id)?,
-            });
+        if task.state != TaskRunState::Failed {
+            let updated = transaction.execute(
+                "UPDATE task_runs
+                 SET state = 'failed', version = version + 1, updated_at = ?1
+                 WHERE task_run_id = ?2 AND version = ?3
+                   AND state IN ('queued', 'running', 'paused_budget', 'needs_input')",
+                params![now, task_run_id, expected_version],
+            )?;
+            if updated != 1 {
+                return Err(TaskEngineError::CasConflict {
+                    entity: "task run",
+                    id: task_run_id.into(),
+                    expected: expected_version,
+                    actual: task_version(&transaction, task_run_id)?,
+                });
+            }
+            append_event(
+                &transaction,
+                task_run_id,
+                TaskEventKind::TaskFailed,
+                &json!({"error": error, "phase": "pre_execution"}),
+            )?;
         }
-        append_event(
-            &transaction,
-            task_run_id,
-            TaskEventKind::TaskFailed,
-            &json!({"error": error, "phase": "pre_execution"}),
-        )?;
         let failed = task_from_connection(&transaction, task_run_id)?;
         transaction.commit()?;
         Ok(failed)

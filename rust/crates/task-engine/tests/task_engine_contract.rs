@@ -442,6 +442,68 @@ fn pre_execution_failure_fails_recovered_task_and_preserves_interrupted_instance
 }
 
 #[test]
+fn pre_execution_failure_closes_unstarted_nodes_after_running_failure() {
+    let (_directory, repository) = repository();
+    repository
+        .create_task(task("task-partially-running-pre-execution"))
+        .unwrap();
+    let draft = repository.node("draft").unwrap();
+    let started = repository
+        .start_node("draft", draft.version, "instance-partially-running")
+        .unwrap();
+
+    repository
+        .fail_node(
+            &started.instance.instance_run_id,
+            started.instance.version,
+            "运行节点预执行失败",
+            false,
+        )
+        .unwrap();
+    let failed_task = repository
+        .task("task-partially-running-pre-execution")
+        .unwrap();
+    assert_eq!(failed_task.state, TaskRunState::Failed);
+    assert_eq!(
+        repository
+            .budget_reservation(&started.reservation.reservation_id)
+            .unwrap()
+            .state,
+        BudgetReservationState::Released
+    );
+
+    repository
+        .fail_task_before_execution(
+            &failed_task.task_run_id,
+            failed_task.version,
+            "终结尚未启动的剩余节点",
+        )
+        .unwrap();
+
+    assert!(repository
+        .nodes(&failed_task.task_run_id)
+        .unwrap()
+        .iter()
+        .all(|node| node.state == NodeState::Failed));
+    let events = repository.events(&failed_task.task_run_id, 0).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == TaskEventKind::TaskFailed)
+            .count(),
+        1,
+        "Task 已失败时不应重复写 TaskFailed"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == TaskEventKind::NodeFailed)
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn pre_execution_failure_preserves_completed_and_cancelled_tasks() {
     let (_directory, repository) = repository();
 

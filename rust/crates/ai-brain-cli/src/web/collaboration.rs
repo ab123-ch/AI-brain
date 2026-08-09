@@ -588,6 +588,19 @@ pub enum ParticipationDisposition {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxFailureDisposition {
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimReleaseDisposition {
+    Released,
+    AlreadyPending,
+    AlreadyTerminal(InboxState),
+}
+
 impl InboxState {
     fn from_db(value: &str) -> Self {
         match value {
@@ -2671,7 +2684,7 @@ impl CollaborationRepository {
         Ok(active)
     }
 
-    pub fn release_lease(&self, claim: &ClaimedInboxItem) -> Result<()> {
+    pub fn release_lease(&self, claim: &ClaimedInboxItem) -> Result<ClaimReleaseDisposition> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
@@ -2689,16 +2702,39 @@ impl CollaborationRepository {
                 &claim.inbox_item_id,
                 &format!("inbox-released:{}:{}", claim.inbox_item_id, claim.run_id),
             )?;
+            transaction.commit()?;
+            return Ok(ClaimReleaseDisposition::Released);
         }
+        let current = transaction
+            .query_row(
+                "SELECT state, run_id FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [claim.inbox_item_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((state, run_id)) = current else {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        };
+        let state = InboxState::from_db(&state);
+        let disposition = match state {
+            InboxState::Pending if run_id.is_none() => ClaimReleaseDisposition::AlreadyPending,
+            InboxState::Completed | InboxState::Failed | InboxState::Cancelled => {
+                ClaimReleaseDisposition::AlreadyTerminal(state)
+            }
+            _ => return Err(CollaborationError::RunNotActive(claim.run_id.clone())),
+        };
         transaction.commit()?;
-        Ok(())
+        Ok(disposition)
     }
 
     /// 将尚未提交结果的运行中 Claim 精确回退为待重试状态。
     ///
     /// 仅匹配同一 run，并在同一事务中读取当前版本后执行 CAS；
     /// 已经回退或已终结时按幂等成功处理。
-    pub fn release_active_for_retry(&self, claim: &ClaimedInboxItem) -> Result<()> {
+    pub fn release_active_for_retry(
+        &self,
+        claim: &ClaimedInboxItem,
+    ) -> Result<ClaimReleaseDisposition> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = transaction
@@ -2718,12 +2754,14 @@ impl CollaborationRepository {
         let Some((current_state, current_run_id, current_version)) = current else {
             return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
         };
-        if matches!(
-            current_state.as_str(),
-            "pending" | "completed" | "failed" | "cancelled"
-        ) {
+        if current_state == "pending" && current_run_id.is_none() {
             transaction.commit()?;
-            return Ok(());
+            return Ok(ClaimReleaseDisposition::AlreadyPending);
+        }
+        if matches!(current_state.as_str(), "completed" | "failed" | "cancelled") {
+            let state = InboxState::from_db(&current_state);
+            transaction.commit()?;
+            return Ok(ClaimReleaseDisposition::AlreadyTerminal(state));
         }
         if current_state != "running" || current_run_id.as_deref() != Some(claim.run_id.as_str()) {
             return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
@@ -2756,7 +2794,7 @@ impl CollaborationRepository {
                 ),
             )?;
             transaction.commit()?;
-            return Ok(());
+            return Ok(ClaimReleaseDisposition::Released);
         }
 
         let actual_version = transaction
@@ -3572,7 +3610,7 @@ impl CollaborationRepository {
                 let rollback = if current_state == "failed" {
                     self.restore_failed_reconciliation(&durable_claim, current_run_id.as_deref())
                 } else {
-                    self.release_active_for_retry(&durable_claim)
+                    self.release_active_for_retry(&durable_claim).map(|_| ())
                 };
                 if let Err(release_error) = rollback {
                     return Err(CollaborationError::Config(format!(
@@ -3724,7 +3762,33 @@ impl CollaborationRepository {
         Ok(Some(event))
     }
 
-    pub fn fail_item(&self, claim: &ClaimedInboxItem, error: &str) -> Result<()> {
+    pub fn fail_item(
+        &self,
+        claim: &ClaimedInboxItem,
+        error: &str,
+    ) -> Result<InboxFailureDisposition> {
+        self.fail_item_with_expected_disposition(claim, error, None)
+    }
+
+    /// 按已经在线性化的 Task 终态提交 Inbox 失败结果。
+    ///
+    /// 失败结算先于迟到的取消请求完成时，调用方必须保持 Task 与 Inbox
+    /// 的终态一致；返回值仍是本事务实际提交的终态。
+    pub fn fail_item_with_disposition(
+        &self,
+        claim: &ClaimedInboxItem,
+        error: &str,
+        disposition: InboxFailureDisposition,
+    ) -> Result<InboxFailureDisposition> {
+        self.fail_item_with_expected_disposition(claim, error, Some(disposition))
+    }
+
+    fn fail_item_with_expected_disposition(
+        &self,
+        claim: &ClaimedInboxItem,
+        error: &str,
+        expected_disposition: Option<InboxFailureDisposition>,
+    ) -> Result<InboxFailureDisposition> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cancel_requested: bool = transaction
@@ -3736,10 +3800,14 @@ impl CollaborationRepository {
             )
             .optional()?
             .unwrap_or(false);
-        let state = if cancel_requested {
-            "cancelled"
+        let disposition = expected_disposition.unwrap_or(if cancel_requested {
+            InboxFailureDisposition::Cancelled
         } else {
-            "failed"
+            InboxFailureDisposition::Failed
+        });
+        let state = match disposition {
+            InboxFailureDisposition::Failed => "failed",
+            InboxFailureDisposition::Cancelled => "cancelled",
         };
         let updated = transaction.execute(
             "UPDATE member_inbox_items
@@ -3765,7 +3833,7 @@ impl CollaborationRepository {
             &format!("inbox-failed:{}:{}", claim.inbox_item_id, claim.run_id),
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(disposition)
     }
 
     pub fn request_interrupt(&self, room_id: &str, member_id: &str, run_id: &str) -> Result<()> {
@@ -7395,7 +7463,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_lease_release_does_not_emit_room_change() {
+    fn stale_lease_release_reports_that_running_claim_was_not_released() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         acknowledge_pending_outbox(&repository);
@@ -7412,8 +7480,9 @@ mod tests {
         let active = repository.activate_lease(&lease).unwrap();
         acknowledge_pending_outbox(&repository);
 
-        repository.release_lease(&lease).unwrap();
+        let error = repository.release_lease(&lease).unwrap_err();
 
+        assert!(matches!(error, CollaborationError::RunNotActive(_)));
         assert!(repository.pending_outbox_events(100).unwrap().is_empty());
         let item = &repository.snapshot("room-1").unwrap().inbox[0];
         assert_eq!(item.state, InboxState::Running);
