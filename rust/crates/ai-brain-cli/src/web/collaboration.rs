@@ -1447,12 +1447,13 @@ impl CollaborationRepository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let default_member_id = format!("member-{room_id}-main");
         let now = Utc::now();
-        transaction.execute(
+        let mut changed = transaction.execute(
             "INSERT INTO collaboration_rooms(
                  room_id, title, working_directory, default_member_id,
                  latest_event_seq, version, created_at
              ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)
-             ON CONFLICT(room_id) DO UPDATE SET title = excluded.title",
+             ON CONFLICT(room_id) DO UPDATE SET title = excluded.title
+             WHERE collaboration_rooms.title <> excluded.title",
             params![
                 room_id,
                 title,
@@ -1460,8 +1461,8 @@ impl CollaborationRepository {
                 default_member_id,
                 now.to_rfc3339(),
             ],
-        )?;
-        transaction.execute(
+        )? > 0;
+        changed |= transaction.execute(
             "INSERT INTO brain_members(
                  member_id, room_id, display_name, template_id, profile_id, model_policy,
                  reasoning_depth, availability, version, created_at, last_woken_at
@@ -1476,7 +1477,7 @@ impl CollaborationRepository {
                 self.config.default_reasoning_depth,
                 now.to_rfc3339(),
             ],
-        )?;
+        )? > 0;
         ensure_local_owner_membership(&transaction, room_id, &now)?;
         let execution_working_directory: String = transaction.query_row(
             "SELECT working_directory FROM collaboration_rooms WHERE room_id = ?1",
@@ -1531,6 +1532,7 @@ impl CollaborationRepository {
                     message.timestamp.to_rfc3339(),
                 ],
             )?;
+            changed = true;
             if message.role == "user" {
                 transaction.execute(
                     "INSERT INTO room_event_recipients(event_id, member_id) VALUES (?1, ?2)",
@@ -1538,13 +1540,15 @@ impl CollaborationRepository {
                 )?;
             }
         }
-        enqueue_room_changed(
-            &transaction,
-            room_id,
-            "room",
-            room_id,
-            &format!("room-ensured:{room_id}"),
-        )?;
+        if changed {
+            enqueue_room_changed(
+                &transaction,
+                room_id,
+                "room",
+                room_id,
+                &format!("room-ensured:{room_id}:{}", Uuid::new_v4()),
+            )?;
+        }
         transaction.commit()?;
         self.snapshot(room_id)
     }
@@ -4755,6 +4759,8 @@ fn enqueue_room_changed(
         if updated != 1 {
             return Err(CollaborationError::RoomNotFound(room_id.into()));
         }
+    } else {
+        ensure_room_exists(transaction, room_id)?;
     }
     Ok(())
 }
@@ -7425,8 +7431,20 @@ mod tests {
     #[test]
     fn collaboration_snapshot_state_revision_tracks_inbox_only_mutations() {
         let (_directory, repository) = repository();
-        let snapshot = ensure(&repository);
-        let member_id = snapshot.room.default_member_id;
+        let initial = ensure(&repository);
+        let member_id = initial.room.default_member_id.clone();
+        let renamed = repository
+            .ensure_room("room-1", "Renamed Room", &[])
+            .unwrap();
+        assert_eq!(renamed.room.title, "Renamed Room");
+        assert_eq!(renamed.room.version, initial.room.version);
+        assert_eq!(renamed.room.latest_event_seq, initial.room.latest_event_seq);
+        assert!(renamed.room.state_revision > initial.room.state_revision);
+
+        let unchanged = repository
+            .ensure_room("room-1", "Renamed Room", &[])
+            .unwrap();
+        assert_eq!(unchanged.room.state_revision, renamed.room.state_revision);
         repository
             .post_message(
                 "room-1",
@@ -7449,6 +7467,26 @@ mod tests {
         assert!(after_lease.room.state_revision > before.room.state_revision);
         assert_eq!(after_lease.inbox[0].state, InboxState::Leased);
         assert!(after_lease.inbox[0].version > before.inbox[0].version);
+
+        let mut connection = repository.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let duplicate_key = "duplicate-missing-room-invariant";
+        enqueue_room_changed(&transaction, "room-1", "room", "room-1", duplicate_key).unwrap();
+        let error = enqueue_room_changed(
+            &transaction,
+            "missing-room",
+            "room",
+            "missing-room",
+            duplicate_key,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::RoomNotFound(room_id) if room_id == "missing-room"
+        ));
+        transaction.rollback().unwrap();
     }
 
     #[test]
