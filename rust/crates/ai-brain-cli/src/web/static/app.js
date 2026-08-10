@@ -28,6 +28,16 @@ const expandedCommunicationIds = new Set();
 const collapsedCommunicationIds = new Set();
 let roomSnapshot = null;
 let roomMode = 'chat';
+let replyState = null;
+let pendingRoomPost = null;
+let pendingRoomOperation = null;
+let authoritativeRoomEventSequence = 0;
+let authoritativeRoomSnapshotVersion = 0;
+let authoritativeRoomStateRevision = 0;
+let hasEarlierRoomEvents = false;
+let hasLoadedEarlierRoomEvents = false;
+let preserveTimelineAnchor = false;
+let pendingRoomDirectoryUpdate = null;
 const selectedMemberIds = new Set();
 const memberRunStates = new Map();
 const modelCatalog = window.ModelCatalog;
@@ -95,8 +105,15 @@ const $addMemberBtn = document.getElementById('add-member-btn');
 const $roomTitle = document.getElementById('room-title');
 const $roomSequence = document.getElementById('room-sequence');
 const $roomRefreshBtn = document.getElementById('room-refresh-btn');
+const $roomWorkingDirectory = document.getElementById('room-working-directory');
+const $roomDirectoryBtn = document.getElementById('room-directory-btn');
+const $loadEarlierEvents = document.getElementById('load-earlier-events');
 const $roomMode = document.getElementById('room-mode');
 const $recipientSelector = document.getElementById('recipient-selector');
+const $replyPreview = document.getElementById('reply-preview');
+const $replyPreviewSender = document.getElementById('reply-preview-sender');
+const $replyPreviewContent = document.getElementById('reply-preview-content');
+const $replyCancel = document.getElementById('reply-cancel');
 const $memberModal = document.getElementById('member-modal');
 const $memberForm = document.getElementById('member-form');
 const $memberModalTitle = document.getElementById('member-modal-title');
@@ -107,6 +124,12 @@ const $memberVersion = document.getElementById('member-version');
 const $memberName = document.getElementById('member-name');
 const $memberModel = document.getElementById('member-model');
 const $memberDepth = document.getElementById('member-depth');
+const $roomDirectoryModal = document.getElementById('room-directory-modal');
+const $roomDirectoryForm = document.getElementById('room-directory-form');
+const $roomDirectoryInput = document.getElementById('room-directory-input');
+const $roomDirectoryModalClose = document.getElementById('room-directory-modal-close');
+const $roomDirectoryModalCancel = document.getElementById('room-directory-modal-cancel');
+const $roomDirectorySubmit = document.getElementById('room-directory-submit');
 const $toastRegion = document.getElementById('toast-region');
 
 // ── Cockpit State ───────────────────────────────────────────────
@@ -179,6 +202,7 @@ function connect() {
     ws.onclose = () => {
         console.log('WebSocket closed');
         stopHeartbeat();
+        failPendingRoomOperation();
         setConnectionState('offline');
         addBrainEvent('WebSocket 已断开，等待重连');
         if (reconnectAttempts < MAX_RECONNECT) {
@@ -199,7 +223,9 @@ function connect() {
 function send(type, data = {}) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type, ...data }));
+        return true;
     }
+    return false;
 }
 
 // ── Heartbeat ────────────────────────────────────────────────────
@@ -283,6 +309,18 @@ function handleServerMessage(data) {
             if (data.room_id === activeSessionId) {
                 (data.events || []).forEach((event) => mergeRoomEvent(event));
             }
+            break;
+
+        case 'room_events_loaded_before':
+            handleRoomEventsLoadedBefore(data);
+            break;
+
+        case 'room_message_accepted':
+            handleRoomMessageAccepted(data);
+            break;
+
+        case 'room_working_directory_accepted':
+            handleRoomWorkingDirectoryAccepted(data);
             break;
 
         case 'member_changed':
@@ -375,7 +413,12 @@ function handleServerMessage(data) {
         case 'session_switched':
             activeSessionId = data.session_id;
             roomSnapshot = null;
+            resetRoomLocalState();
             selectedMemberIds.clear();
+            memberRunStates.clear();
+            $input.value = '';
+            $input.style.height = 'auto';
+            closeRoomDirectoryModal();
             sessionFiles = data.files || [];
             currentTurnFiles = [];
             turnFileBaseline = new Map(sessionFiles.map((file) => [file.path, file.updated_at]));
@@ -413,9 +456,11 @@ function handleServerMessage(data) {
             break;
 
         case 'error':
+            if (!RoomReply.shouldHandleRoomError(data, activeSessionId)) break;
             brainState.metrics.errors += 1;
             addBrainEvent(`错误: ${data.message}`);
             if (roomSnapshot?.room?.room_id === activeSessionId) {
+                failPendingRoomOperation(data);
                 showToast(data.message);
                 break;
             }
@@ -433,14 +478,101 @@ function handleServerMessage(data) {
 }
 
 // ── Collaboration Room ─────────────────────────────────────────
+function resetRoomLocalState() {
+    const reset = RoomReply.resetRoomUiState();
+    replyState = reset.replyState;
+    pendingRoomPost = reset.pendingRoomPost;
+    pendingRoomOperation = reset.pendingRoomOperation;
+    authoritativeRoomEventSequence = reset.authoritativeRoomEventSequence;
+    authoritativeRoomSnapshotVersion = reset.authoritativeRoomSnapshotVersion;
+    authoritativeRoomStateRevision = reset.authoritativeRoomStateRevision;
+    hasEarlierRoomEvents = reset.hasEarlierRoomEvents;
+    hasLoadedEarlierRoomEvents = reset.hasLoadedEarlierRoomEvents;
+    preserveTimelineAnchor = reset.preserveTimelineAnchor;
+    pendingRoomDirectoryUpdate = null;
+    renderReplyPreview();
+    updateRoomOperationControls();
+}
+
+function beginPendingRoomOperation(operation) {
+    const result = RoomReply.beginRoomOperation(pendingRoomOperation, operation);
+    pendingRoomOperation = result.pending;
+    if (result.started) updateRoomOperationControls();
+    return result.started;
+}
+
+function settlePendingRoomOperation(event) {
+    const result = RoomReply.settleRoomOperation(pendingRoomOperation, event);
+    if (result.settled) {
+        pendingRoomOperation = result.pending;
+        updateRoomOperationControls();
+    }
+    return result;
+}
+
+function failPendingRoomOperation(error = null) {
+    const scopedError = error || RoomReply.buildRoomOperationError(pendingRoomOperation);
+    const result = settlePendingRoomOperation(scopedError);
+    if (!result.settled) return result;
+    if (result.operationType === 'post') {
+        pendingRoomPost = null;
+    } else if (result.operationType === 'directory' && pendingRoomDirectoryUpdate) {
+        pendingRoomDirectoryUpdate.failed = true;
+    }
+    return result;
+}
+
+function updateRoomOperationControls() {
+    const controls = RoomReply.roomOperationControls(pendingRoomOperation);
+    $roomDirectoryBtn.disabled = controls.directoryDisabled;
+    $roomDirectorySubmit.disabled = controls.directoryDisabled;
+    $loadEarlierEvents.disabled = controls.paginationDisabled;
+    updateSendButton();
+}
+
 function applyRoomSnapshot(snapshot) {
     if (!snapshot?.room || snapshot.room.room_id !== activeSessionId) return;
+    const sameRoom = roomSnapshot?.room?.room_id === snapshot.room.room_id;
+    if (!RoomReply.shouldApplyRoomSnapshot(sameRoom ? {
+        roomId: snapshot.room.room_id,
+        stateRevision: authoritativeRoomStateRevision,
+        version: authoritativeRoomSnapshotVersion,
+        eventSequence: authoritativeRoomEventSequence,
+    } : null, snapshot)) return;
+    const authoritativeEvents = snapshot.events || [];
+    const snapshotEventSequence = Number(snapshot.room.latest_event_seq || 0);
+    const events = sameRoom
+        ? RoomReply.mergeSnapshotWindow(
+            roomSnapshot.events,
+            authoritativeEvents,
+            snapshotEventSequence,
+            hasLoadedEarlierRoomEvents,
+        )
+        : [...authoritativeEvents];
+    hasEarlierRoomEvents = RoomReply.resolveHasEarlierEvents({
+        snapshotHasEarlier: snapshot.has_earlier_events,
+        currentHasEarlier: hasEarlierRoomEvents,
+        hasLoadedEarlier: sameRoom && hasLoadedEarlierRoomEvents,
+    });
     roomSnapshot = {
         ...snapshot,
+        room: {
+            ...snapshot.room,
+            latest_event_seq: sameRoom
+                ? Math.max(
+                    snapshotEventSequence,
+                    Number(roomSnapshot.room.latest_event_seq || 0),
+                )
+                : snapshotEventSequence,
+        },
         members: snapshot.members || [],
-        events: snapshot.events || [],
+        events,
         inbox: snapshot.inbox || [],
     };
+    authoritativeRoomEventSequence = snapshotEventSequence;
+    authoritativeRoomSnapshotVersion = Number(snapshot.room.version || 0);
+    authoritativeRoomStateRevision = Number(snapshot.room.state_revision || 0);
+    replyState = RoomReply.reconcileReplyState(replyState, roomSnapshot.events);
     roomSnapshot.members.forEach((member) => {
         ensureBrainNode(member.member_id, {
             label: member.display_name,
@@ -454,9 +586,9 @@ function applyRoomSnapshot(snapshot) {
         );
     });
     reconcileSelectedMembers();
-    renderCollaborationRoom();
+    renderCollaborationRoom({ scrollToLatest: true });
     setInputEnabled(true);
-    updateSendButton();
+    updateRoomOperationControls();
 }
 
 function reconcileSelectedMembers() {
@@ -469,14 +601,33 @@ function reconcileSelectedMembers() {
     return changed;
 }
 
-function renderCollaborationRoom() {
+function renderCollaborationRoom({ scrollToLatest = false } = {}) {
     if (!roomSnapshot) return;
     $roomTitle.textContent = roomSnapshot.room.title || '当前会话';
     $roomSequence.textContent = `${roomSnapshot.room.latest_event_seq || 0} 条事件`;
+    $roomWorkingDirectory.textContent = roomSnapshot.room.working_directory || '';
+    $roomWorkingDirectory.title = roomSnapshot.room.working_directory || '';
     $memberCapacity.textContent = `${roomSnapshot.members.filter((member) => member.availability !== 'archived').length} / ${roomSnapshot.max_members}`;
+    renderEarlierEventsControl();
+    renderReplyPreview();
     renderMemberList();
     renderRecipientSelector();
-    renderRoomTimeline();
+    renderRoomTimeline({ scrollToLatest });
+}
+
+function renderEarlierEventsControl() {
+    $loadEarlierEvents.classList.toggle('hidden', !hasEarlierRoomEvents);
+}
+
+function renderReplyPreview() {
+    $replyPreview.classList.toggle('hidden', !replyState);
+    if (!replyState) {
+        $replyPreviewSender.textContent = '';
+        $replyPreviewContent.textContent = '';
+        return;
+    }
+    $replyPreviewSender.textContent = `回复 ${replyState.sender_name || '消息'}`;
+    $replyPreviewContent.textContent = truncate(String(replyState.content || ''), 160);
 }
 
 function renderMemberList() {
@@ -611,8 +762,9 @@ function syncMentionRecipients() {
     }
 }
 
-function renderRoomTimeline() {
+function renderRoomTimeline({ scrollToLatest = false } = {}) {
     if (!roomSnapshot) return;
+    const viewport = RoomReply.captureTimelineViewport($messages);
     $messages.innerHTML = '';
     const entries = [];
     const lastVisibleUserEventId = roomSnapshot.events
@@ -646,7 +798,14 @@ function renderRoomTimeline() {
         $messages.appendChild(empty);
     }
     refreshIcons();
-    scrollToBottom();
+    const scrollPolicy = preserveTimelineAnchor
+        ? 'prepend'
+        : scrollToLatest ? 'latest' : 'follow-if-near-bottom';
+    $messages.scrollTop = RoomReply.timelineScrollTarget(
+        viewport,
+        $messages.scrollHeight,
+        scrollPolicy,
+    );
 }
 
 function renderRoomEvent(event, isLastUserEvent = false) {
@@ -679,24 +838,58 @@ function renderRoomEvent(event, isLastUserEvent = false) {
         content.textContent = event.content;
     }
     message.appendChild(metadata);
+    if (event.reply_reference) {
+        message.appendChild(createRoomReplyReference(event.reply_reference));
+    }
     message.appendChild(content);
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    if (RoomReply.canReplyToEvent(event)) {
+        actions.appendChild(createMessageAction('reply', '回复这条消息', () => {
+            beginRoomReply(event);
+        }));
+    }
     if (isLastUserEvent) {
-        const actions = document.createElement('div');
-        actions.className = 'msg-actions';
         actions.appendChild(createMessageAction('rotate-ccw', '重试最后一条消息', () => {
             roomSnapshot.events = roomSnapshot.events.filter(
                 (candidate) => candidate.sequence <= event.sequence,
             );
             roomSnapshot.inbox = [];
+            replyState = RoomReply.reconcileReplyState(replyState, roomSnapshot.events);
             memberRunStates.clear();
-            renderCollaborationRoom();
+            renderCollaborationRoom({ scrollToLatest: true });
             showToast('正在重试最后一条消息');
             send('retry_last_user_message', { message_id: event.event_id });
         }));
+    }
+    if (actions.childElementCount > 0) {
         message.classList.add('has-actions');
         message.appendChild(actions);
     }
     $messages.appendChild(message);
+}
+
+function createRoomReplyReference(reference) {
+    const card = document.createElement('div');
+    card.className = 'room-reply-reference';
+    const sender = document.createElement('strong');
+    sender.textContent = `回复 ${reference.sender_name || '消息'}`;
+    const body = document.createElement('span');
+    body.textContent = String(reference.content || '');
+    card.appendChild(sender);
+    card.appendChild(body);
+    return card;
+}
+
+function beginRoomReply(event) {
+    const selection = RoomReply.beginReply(event, roomSnapshot.members);
+    replyState = selection.reply;
+    if (selection.auto_recipient_id) {
+        setMemberSelected(selection.auto_recipient_id, true);
+    }
+    if (selection.warning) showToast(selection.warning);
+    renderReplyPreview();
+    $input.focus();
 }
 
 function renderRunItem(item) {
@@ -778,6 +971,7 @@ function runStatusLabel(state) {
 
 function handleMemberRunProgress(data) {
     if (data.room_id !== activeSessionId || !data.event) return;
+    const shouldFollowLatest = RoomReply.isTimelineNearBottom($messages);
     const state = ensureMemberRunState(data.run_id, data.member_id, data.room_id);
     const inbox = roomSnapshot?.inbox.find((item) => item.run_id === data.run_id);
     state.purpose = inbox?.purpose || state.purpose;
@@ -828,7 +1022,9 @@ function handleMemberRunProgress(data) {
     updateRunElement(state);
     const member = roomSnapshot?.members.find((candidate) => candidate.member_id === data.member_id);
     updateAgentStatus(data.member_id, state.statusText || '运行中', member?.display_name || data.member_id);
-    scrollToBottom();
+    if (shouldFollowLatest && !preserveTimelineAnchor) {
+        $messages.scrollTop = $messages.scrollHeight;
+    }
 }
 
 function handleMemberRunFinished(data) {
@@ -848,34 +1044,89 @@ function handleMemberRunFinished(data) {
 
 function mergeRoomEvent(event) {
     if (!roomSnapshot || event.room_id !== activeSessionId) return;
-    if (!roomSnapshot.events.some((candidate) => candidate.event_id === event.event_id)) {
-        roomSnapshot.events.push(event);
-        roomSnapshot.room.latest_event_seq = Math.max(
-            roomSnapshot.room.latest_event_seq || 0,
-            event.sequence || 0,
-        );
-    }
+    const appendResult = RoomReply.appendRoomEvent(
+        roomSnapshot.events,
+        event,
+        authoritativeRoomEventSequence,
+    );
+    roomSnapshot.events = appendResult.events;
+    if (!appendResult.appended) return;
+    roomSnapshot.room.latest_event_seq = Math.max(
+        roomSnapshot.room.latest_event_seq || 0,
+        event.sequence || 0,
+    );
     if (event.run_id) {
         const inbox = roomSnapshot.inbox.find((item) => item.run_id === event.run_id);
         if (inbox) inbox.state = 'completed';
     }
+    renderCollaborationRoom({ scrollToLatest: appendResult.appended });
+}
+
+function handleRoomEventsLoadedBefore(data) {
+    if (!roomSnapshot || data.room_id !== activeSessionId) return;
+    const operationResult = settlePendingRoomOperation(data);
+    if (!operationResult.settled || operationResult.operationType !== 'pagination') return;
+    preserveTimelineAnchor = true;
+    roomSnapshot.events = RoomReply.mergeEventsBySequence(
+        roomSnapshot.events,
+        data.events || [],
+    );
+    replyState = RoomReply.reconcileReplyState(replyState, roomSnapshot.events);
+    hasLoadedEarlierRoomEvents = true;
+    hasEarlierRoomEvents = Boolean(data.has_more);
     renderCollaborationRoom();
+    preserveTimelineAnchor = false;
+}
+
+function handleRoomMessageAccepted(data) {
+    const operationResult = settlePendingRoomOperation(data);
+    if (!operationResult.settled || operationResult.operationType !== 'post') return;
+    pendingRoomPost = null;
+    replyState = null;
+    $input.value = '';
+    $input.style.height = 'auto';
+    selectedMemberIds.clear();
+    renderReplyPreview();
+    renderMemberList();
+    renderRecipientSelector();
+    updateRoomOperationControls();
+}
+
+function handleRoomWorkingDirectoryAccepted(data) {
+    const accepted = RoomReply.settleRoomOperation(pendingRoomOperation, data);
+    if (!accepted.settled || accepted.operationType !== 'directory') return;
+    applyRoomSnapshot(data.snapshot);
+    const operationResult = settlePendingRoomOperation(data);
+    if (!operationResult.settled || operationResult.operationType !== 'directory') return;
+    pendingRoomDirectoryUpdate = null;
+    closeRoomDirectoryModal();
+    setInputEnabled(true);
 }
 
 function mergeMember(member) {
     if (!roomSnapshot || member.room_id !== activeSessionId) return;
-    const index = roomSnapshot.members.findIndex((candidate) => candidate.member_id === member.member_id);
-    if (index >= 0) roomSnapshot.members[index] = member;
-    else roomSnapshot.members.push(member);
+    const result = RoomReply.mergeVersionedEntity(
+        roomSnapshot.members,
+        member,
+        'member_id',
+        true,
+    );
+    if (!result.changed) return;
+    roomSnapshot.members = result.items;
     reconcileSelectedMembers();
     renderCollaborationRoom();
 }
 
 function mergeInboxItem(roomId, item) {
     if (!roomSnapshot || roomId !== activeSessionId) return;
-    const index = roomSnapshot.inbox.findIndex((candidate) => candidate.inbox_item_id === item.inbox_item_id);
-    if (index >= 0) roomSnapshot.inbox[index] = item;
-    else roomSnapshot.inbox.push(item);
+    const result = RoomReply.mergeVersionedEntity(
+        roomSnapshot.inbox,
+        item,
+        'inbox_item_id',
+        false,
+    );
+    if (!result.changed) return;
+    roomSnapshot.inbox = result.items;
     renderCollaborationRoom();
 }
 
@@ -965,6 +1216,62 @@ function closeMemberModal() {
     $memberVersion.value = '';
 }
 
+function openRoomDirectoryModal() {
+    if (!roomSnapshot || pendingRoomOperation) return;
+    const retainedFailure = pendingRoomDirectoryUpdate?.failed
+        && pendingRoomDirectoryUpdate.roomId === roomSnapshot.room.room_id;
+    if (!retainedFailure) {
+        pendingRoomDirectoryUpdate = null;
+        $roomDirectoryInput.value = roomSnapshot.room.working_directory || '';
+    }
+    $roomDirectoryModal.classList.remove('hidden');
+    setTimeout(() => {
+        $roomDirectoryInput.focus();
+        $roomDirectoryInput.select();
+    }, 0);
+    refreshIcons();
+}
+
+function closeRoomDirectoryModal() {
+    $roomDirectoryModal.classList.add('hidden');
+    if (pendingRoomOperation?.type !== 'directory') {
+        pendingRoomDirectoryUpdate = null;
+    }
+    updateRoomOperationControls();
+}
+
+function submitRoomDirectoryForm() {
+    if (!roomSnapshot) return;
+    const workingDirectory = $roomDirectoryInput.value.trim();
+    if (!workingDirectory) return;
+    const commandId = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const operation = {
+        type: 'directory',
+        roomId: roomSnapshot.room.room_id,
+        commandId,
+        expectedVersion: Number(roomSnapshot.room.version),
+        previousDirectory: roomSnapshot.room.working_directory || '',
+        requestedDirectory: workingDirectory,
+        failed: false,
+    };
+    if (!beginPendingRoomOperation(operation)) {
+        showToast('请等待当前房间操作完成');
+        return;
+    }
+    pendingRoomDirectoryUpdate = pendingRoomOperation;
+    const sent = send('update_room_working_directory', {
+        working_directory: workingDirectory,
+        expected_room_version: pendingRoomDirectoryUpdate.expectedVersion,
+        command_id: commandId,
+    });
+    if (!sent) {
+        failPendingRoomOperation();
+        showToast('连接不可用，目录未更新');
+    }
+}
+
 function fillModelSelect(select, selected) {
     const details = roomSnapshot?.model_policy_details || [];
     const policies = roomSnapshot?.model_policies || [];
@@ -1017,6 +1324,11 @@ function submitMemberForm() {
 }
 
 function submitCollaborationMessage() {
+    if (!roomSnapshot) return;
+    if (pendingRoomOperation) {
+        showToast('请等待当前房间操作完成');
+        return;
+    }
     const content = $input.value.trim();
     if (!content) return;
     syncMentionRecipients();
@@ -1034,19 +1346,25 @@ function submitCollaborationMessage() {
     const commandId = globalThis.crypto?.randomUUID
         ? globalThis.crypto.randomUUID()
         : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    send('post_room_message', {
+    const payload = RoomReply.buildRoomPostPayload({
         recipients,
         content,
         mode: roomMode,
-        thread_key: 'room',
-        expected_room_version: Number(roomSnapshot.room.version),
-        command_id: commandId,
+        expectedRoomVersion: roomSnapshot.room.version,
+        commandId,
+        replyState,
     });
-    $input.value = '';
-    $input.style.height = 'auto';
-    selectedMemberIds.clear();
-    renderMemberList();
-    renderRecipientSelector();
+    const operation = {
+        type: 'post',
+        commandId,
+        roomId: roomSnapshot.room.room_id,
+    };
+    if (!beginPendingRoomOperation(operation)) return;
+    pendingRoomPost = pendingRoomOperation;
+    if (!send('post_room_message', payload)) {
+        failPendingRoomOperation();
+        showToast('连接不可用，消息未发送');
+    }
 }
 
 // ── Streaming Text (Typewriter) ─────────────────────────────────
@@ -1641,12 +1959,17 @@ function attachDeleteAction(el, messageIndex) {
 function setInputEnabled(enabled) {
     const effectiveEnabled = roomSnapshot ? true : enabled;
     $input.disabled = !effectiveEnabled;
-    if (effectiveEnabled) {
+    const modalOpen = Boolean(document.querySelector(
+        '.modal[aria-modal="true"]:not(.hidden)',
+    ));
+    if (RoomReply.shouldFocusComposer(effectiveEnabled, modalOpen)) {
         $input.focus();
     }
 }
 
 function updateSendButton() {
+    const roomOperationPending = Boolean(roomSnapshot && pendingRoomOperation);
+    $sendBtn.disabled = roomOperationPending;
     if (isGenerating && !roomSnapshot) {
         $sendBtn.classList.add('stop-mode');
         $sendBtn.innerHTML = '<i data-lucide="square"></i>';
@@ -1655,8 +1978,11 @@ function updateSendButton() {
     } else {
         $sendBtn.classList.remove('stop-mode');
         $sendBtn.innerHTML = '<i data-lucide="send-horizontal"></i>';
-        $sendBtn.title = '发送';
-        $sendBtn.setAttribute('aria-label', '发送');
+        const roomOperationLabel = pendingRoomOperation?.type === 'post'
+            ? '消息发送中'
+            : '房间操作处理中';
+        $sendBtn.title = roomOperationPending ? roomOperationLabel : '发送';
+        $sendBtn.setAttribute('aria-label', roomOperationPending ? roomOperationLabel : '发送');
     }
     refreshIcons();
 }
@@ -2915,6 +3241,31 @@ $roomMode.querySelectorAll('[data-mode]').forEach((button) => {
 
 $addMemberBtn.addEventListener('click', () => openMemberModal());
 $roomRefreshBtn.addEventListener('click', () => send('request_room_snapshot'));
+$roomDirectoryBtn.addEventListener('click', openRoomDirectoryModal);
+$loadEarlierEvents.addEventListener('click', () => {
+    if (!roomSnapshot || !hasEarlierRoomEvents) return;
+    const beforeSequence = Number(roomSnapshot.events[0]?.sequence || 1);
+    if (!beginPendingRoomOperation({
+        type: 'pagination',
+        roomId: roomSnapshot.room.room_id,
+        beforeSequence,
+    })) {
+        showToast('请等待当前房间操作完成');
+        return;
+    }
+    const sent = send('load_room_events_before', {
+        before_sequence: beforeSequence,
+        limit: 100,
+    });
+    if (!sent) {
+        failPendingRoomOperation();
+        showToast('连接不可用，无法加载较早消息');
+    }
+});
+$replyCancel.addEventListener('click', () => {
+    replyState = null;
+    renderReplyPreview();
+});
 $memberModalClose.addEventListener('click', closeMemberModal);
 $memberModalCancel.addEventListener('click', closeMemberModal);
 $memberModal.addEventListener('click', (event) => {
@@ -2923,6 +3274,15 @@ $memberModal.addEventListener('click', (event) => {
 $memberForm.addEventListener('submit', (event) => {
     event.preventDefault();
     submitMemberForm();
+});
+$roomDirectoryModalClose.addEventListener('click', closeRoomDirectoryModal);
+$roomDirectoryModalCancel.addEventListener('click', closeRoomDirectoryModal);
+$roomDirectoryModal.addEventListener('click', (event) => {
+    if (event.target === $roomDirectoryModal) closeRoomDirectoryModal();
+});
+$roomDirectoryForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    submitRoomDirectoryForm();
 });
 
 $personaSelect.addEventListener('change', () => {

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use brain_core::tool_executor::ToolExecutor;
+use brain_core::tool_executor::{ToolExecutionContext, ToolExecutor};
 use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
@@ -46,6 +46,10 @@ pub struct RealToolExecutor {
 impl RealToolExecutor {
     /// Create a new executor, registering all MVP tool specs from the tools crate.
     pub fn new() -> Self {
+        Self::new_with_graph_db_path(default_graph_db_path())
+    }
+
+    fn new_with_graph_db_path(graph_db_path: Option<PathBuf>) -> Self {
         let specs = tools::mvp_tool_specs();
         let tool_descriptors = specs
             .iter()
@@ -66,7 +70,7 @@ impl RealToolExecutor {
             dispatch: None,
             skill_catalog: None,
             mcp_pool: None,
-            graph_db_path: default_graph_db_path(),
+            graph_db_path,
             runtime_trace_tx: None,
             novel_application: None,
         }
@@ -75,6 +79,16 @@ impl RealToolExecutor {
     /// Create with an optional PyramidMemoryBrain for search_memory support.
     pub fn with_memory(memory_brain: Option<Arc<tokio::sync::Mutex<PyramidMemoryBrain>>>) -> Self {
         let mut exec = Self::new();
+        exec.memory_brain = memory_brain;
+        exec
+    }
+
+    /// 使用调用方解析好的图数据库路径创建执行器，不读取用户 HOME 默认值。
+    pub fn with_memory_and_graph_db_path(
+        memory_brain: Option<Arc<tokio::sync::Mutex<PyramidMemoryBrain>>>,
+        graph_db_path: Option<PathBuf>,
+    ) -> Self {
+        let mut exec = Self::new_with_graph_db_path(graph_db_path);
         exec.memory_brain = memory_brain;
         exec
     }
@@ -279,10 +293,11 @@ impl AgentTracePublisher {
     }
 }
 
-impl ToolExecutor for RealToolExecutor {
-    fn execute(
+impl RealToolExecutor {
+    fn execute_internal(
         &self,
         tool_call: &ToolCall,
+        working_directory: Option<PathBuf>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + '_>> {
         let name = tool_call.tool_name.clone();
         let mut input = tool_call.input.clone();
@@ -533,10 +548,12 @@ impl ToolExecutor for RealToolExecutor {
                 } else {
                     // 没有 SkillCatalog 时走旧的 tools::execute_tool 路径
                     let n_clone = n.clone();
-                    let result =
-                        tokio::task::spawn_blocking(move || tools::execute_tool(&n_clone, &inp))
-                            .await
-                            .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
+                    let result = tokio::task::spawn_blocking(move || match working_directory {
+                        Some(cwd) => tools::execute_tool_in_directory(&n_clone, &inp, &cwd),
+                        None => tools::execute_tool(&n_clone, &inp),
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
                     match result {
                         Ok(output) => ToolExecutionResult {
                             tool_name: n.clone(),
@@ -593,7 +610,12 @@ impl ToolExecutor for RealToolExecutor {
                 if let Some(trace) = &trace {
                     trace.publish_request();
                 }
-                let result = tools::execute_agent_tool_with_completion(&input).await;
+                let result = match working_directory {
+                    Some(cwd) => {
+                        tools::execute_agent_tool_with_completion_in_directory(&input, &cwd).await
+                    }
+                    None => tools::execute_agent_tool_with_completion(&input).await,
+                };
 
                 match result {
                     Ok(launch) => {
@@ -663,9 +685,12 @@ impl ToolExecutor for RealToolExecutor {
         Box::pin(async move {
             let start = std::time::Instant::now();
 
-            let result = tokio::task::spawn_blocking(move || tools::execute_tool(&name, &input))
-                .await
-                .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
+            let result = tokio::task::spawn_blocking(move || match working_directory {
+                Some(cwd) => tools::execute_tool_in_directory(&name, &input, &cwd),
+                None => tools::execute_tool(&name, &input),
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
 
             let (output, is_error) = match result {
                 Ok(output) => (output, false),
@@ -681,6 +706,23 @@ impl ToolExecutor for RealToolExecutor {
                 duration_ms,
             }
         })
+    }
+}
+
+impl ToolExecutor for RealToolExecutor {
+    fn execute(
+        &self,
+        tool_call: &ToolCall,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + '_>> {
+        self.execute_internal(tool_call, None)
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        tool_call: &'a ToolCall,
+        context: &'a ToolExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + 'a>> {
+        self.execute_internal(tool_call, Some(context.working_directory.clone()))
     }
 
     fn list_tools(&self) -> Vec<ToolDescriptor> {
@@ -1146,6 +1188,7 @@ pub fn mvp_tool_definitions() -> Vec<brain_llm::ToolDefinition> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use brain_core::tool_executor::ToolExecutionContext;
     use brain_graph::{
         id::gen_node_id,
         schema::{GraphType, Node, NodeKind},
@@ -2198,6 +2241,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_working_directory_scopes_real_tool_executor() {
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        std::fs::write(workspace_a.path().join("same.txt"), "from-a").unwrap();
+        std::fs::write(workspace_b.path().join("same.txt"), "from-b").unwrap();
+        let workspace_a = workspace_a.path().canonicalize().unwrap();
+        let workspace_b = workspace_b.path().canonicalize().unwrap();
+        let executor = RealToolExecutor::new();
+        let call = ToolCall {
+            tool_name: "read_file".into(),
+            input: json!({ "path": "same.txt" }),
+            validated: false,
+            validation_id: None,
+        };
+
+        let result_a = executor
+            .execute_with_context(&call, &ToolExecutionContext::new(&workspace_a))
+            .await;
+        let result_b = executor
+            .execute_with_context(&call, &ToolExecutionContext::new(&workspace_b))
+            .await;
+
+        assert!(!result_a.is_error, "目录 A 读取失败: {}", result_a.output);
+        assert!(result_a.output.contains("from-a"));
+        assert!(!result_a.output.contains("from-b"));
+        assert!(!result_b.is_error, "目录 B 读取失败: {}", result_b.output);
+        assert!(result_b.output.contains("from-b"));
+        assert!(!result_b.output.contains("from-a"));
+    }
+
+    #[tokio::test]
     async fn real_executor_unknown_tool_returns_error() {
         let exec = RealToolExecutor::new();
         let call = ToolCall {
@@ -2236,6 +2310,17 @@ mod tests {
         );
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output.as_array().unwrap()[0]["node_count"], 1);
+    }
+
+    #[test]
+    fn explicit_runtime_graph_path_never_falls_back_to_user_home() {
+        let explicit = PathBuf::from("isolated-runtime/graph.db");
+        let executor =
+            RealToolExecutor::with_memory_and_graph_db_path(None, Some(explicit.clone()));
+        assert_eq!(executor.graph_db_path.as_ref(), Some(&explicit));
+
+        let disabled = RealToolExecutor::with_memory_and_graph_db_path(None, None);
+        assert!(disabled.graph_db_path.is_none());
     }
 
     #[test]

@@ -25,6 +25,7 @@ static STYLE_CSS: &str = include_str!("web/static/style.css");
 static APP_JS: &str = include_str!("web/static/app.js");
 static MENTIONS_JS: &str = include_str!("web/static/mentions.js");
 static MODEL_CATALOG_JS: &str = include_str!("web/static/model_catalog.js");
+static ROOM_REPLY_JS: &str = include_str!("web/static/room_reply.js");
 
 // ─── 请求/响应类型 ───────────────────────────────────────────────
 
@@ -358,16 +359,39 @@ async fn handle_suggest(State(orch): State<SharedOrch>) -> impl IntoResponse {
 // ─── Web UI 服务 ──────────────────────────────────────────────────
 
 /// 启动 Web UI 服务（静态文件 + WebSocket）
-pub async fn serve_web(orch: Orchestrator, addr: &str) {
-    serve_web_with_policy(orch, addr, None).await;
+pub async fn serve_web(orch: Orchestrator, addr: &str) -> Result<(), String> {
+    serve_web_with_policy(orch, addr, None).await
 }
 
 /// 启动只接受 Tailscale Serve 请求的 Web UI。
-pub async fn serve_web_remote(orch: Orchestrator, addr: &str, expected_host: &str) {
-    serve_web_with_policy(orch, addr, Some(expected_host.to_string())).await;
+pub async fn serve_web_remote(
+    orch: Orchestrator,
+    addr: &str,
+    expected_host: &str,
+) -> Result<(), String> {
+    serve_web_with_policy(orch, addr, Some(expected_host.to_string())).await
 }
 
-async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: Option<String>) {
+fn capture_workspace_root<C, K>(
+    current_dir: C,
+    canonicalize: K,
+) -> Result<std::path::PathBuf, String>
+where
+    C: FnOnce() -> std::io::Result<std::path::PathBuf>,
+    K: FnOnce(&std::path::Path) -> std::io::Result<std::path::PathBuf>,
+{
+    current_dir()
+        .and_then(|path| canonicalize(&path))
+        .map_err(|error| format!("读取服务启动工作目录失败: {error}"))
+}
+
+async fn serve_web_with_policy(
+    orch: Orchestrator,
+    addr: &str,
+    tailscale_host: Option<String>,
+) -> Result<(), String> {
+    let workspace_root =
+        capture_workspace_root(std::env::current_dir, |path| std::fs::canonicalize(path))?;
     let base_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("ai-brain");
@@ -381,48 +405,35 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         }
     });
     let model_policy_details = llm_config.available_instance_model_policies();
-    let collaboration_config = match CollaborationConfig::load(&runtime_dir.join("config.toml")) {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::error!("加载协作配置失败: {error}");
-            return;
-        }
-    }
-    .with_available_model_policies(
-        model_policy_details
-            .iter()
-            .map(|policy| policy.policy_id.clone()),
+    let collaboration_config = CollaborationConfig::load(&runtime_dir.join("config.toml"))
+        .map_err(|error| format!("加载协作配置失败: {error}"))?
+        .with_available_model_policies(
+            model_policy_details
+                .iter()
+                .map(|policy| policy.policy_id.clone()),
+        );
+    let collaboration_repository = Arc::new(
+        CollaborationRepository::new_with_startup_working_directory(
+            &runtime_dir,
+            collaboration_config,
+            &workspace_root,
+        )
+        .map_err(|error| format!("初始化协作存储失败: {error}"))?,
     );
-    let collaboration_repository =
-        match CollaborationRepository::new(&runtime_dir, collaboration_config) {
-            Ok(repository) => Arc::new(repository),
-            Err(error) => {
-                tracing::error!("初始化协作存储失败: {error}");
-                return;
-            }
-        };
     let orch = Arc::new(orch);
-    let collaboration = match CollaborationRuntime::start(
+    let collaboration = CollaborationRuntime::start(
         Arc::clone(&collaboration_repository),
         Arc::clone(&orch),
         Arc::clone(&llm_config),
         model_policy_details,
     )
     .await
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::error!("启动协作运行时失败: {error}");
-            return;
-        }
-    };
+    .map_err(|error| format!("启动协作运行时失败: {error}"))?;
     let state = Arc::new(AppState {
         orch,
         sessions,
         collaboration,
-        workspace_root: std::env::current_dir()
-            .and_then(std::fs::canonicalize)
-            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        workspace_root: workspace_root.clone(),
     });
 
     let app = Router::new()
@@ -431,6 +442,7 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         .route("/app.js", get(serve_js))
         .route("/mentions.js", get(serve_mentions_js))
         .route("/model_catalog.js", get(serve_model_catalog_js))
+        .route("/room_reply.js", get(serve_room_reply_js))
         .route(
             "/api/local-file",
             get(serve_local_file).post(save_local_file),
@@ -446,17 +458,13 @@ async fn serve_web_with_policy(orch: Orchestrator, addr: &str, tailscale_host: O
         app
     };
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("绑定 {addr} 失败: {e}");
-            return;
-        }
-    };
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| format!("绑定 {addr} 失败: {error}"))?;
     tracing::info!("Web UI 启动于 http://{addr}");
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!("Web 服务错误: {e}");
-    }
+    axum::serve(listener, app)
+        .await
+        .map_err(|error| format!("Web 服务错误: {error}"))
 }
 
 #[derive(Clone)]
@@ -553,6 +561,16 @@ async fn serve_model_catalog_js() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         MODEL_CATALOG_JS,
+    )
+}
+
+async fn serve_room_reply_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        ROOM_REPLY_JS,
     )
 }
 
@@ -674,7 +692,23 @@ mod static_asset_tests {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
 
-    use super::serve_model_catalog_js;
+    use super::{serve_model_catalog_js, serve_room_reply_js};
+
+    #[tokio::test]
+    async fn collaboration_web_assets_serves_room_reply_script() {
+        let response = serve_room_reply_js().await.into_response();
+
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("RoomReply"));
+    }
 
     #[tokio::test]
     async fn model_catalog_script_returns_javascript_content_type_and_catalog_api() {
@@ -691,6 +725,38 @@ mod static_asset_tests {
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.contains("ModelCatalog"));
         assert!(body.contains("optionText"));
+    }
+}
+
+#[cfg(test)]
+mod startup_working_directory_tests {
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::capture_workspace_root;
+
+    #[test]
+    fn startup_working_directory_errors_are_returned_to_the_caller() {
+        let read_error = capture_workspace_root(
+            || Err(io::Error::new(io::ErrorKind::NotFound, "cwd missing")),
+            |_| Ok(PathBuf::from("unused")),
+        )
+        .unwrap_err();
+        assert!(read_error.contains("读取服务启动工作目录失败"));
+        assert!(read_error.contains("cwd missing"));
+
+        let canonicalize_error = capture_workspace_root(
+            || Ok(PathBuf::from("missing-workspace")),
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "canonicalize denied",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(canonicalize_error.contains("读取服务启动工作目录失败"));
+        assert!(canonicalize_error.contains("canonicalize denied"));
     }
 }
 

@@ -156,6 +156,23 @@ pub enum WebProgressEvent {
         through_sequence: u64,
         events: Vec<RoomEventView>,
     },
+    RoomEventsLoadedBefore {
+        room_id: String,
+        before_sequence: u64,
+        has_more: bool,
+        events: Vec<RoomEventView>,
+    },
+    RoomMessageAccepted {
+        room_id: String,
+        command_id: String,
+        event_id: String,
+        duplicate: bool,
+    },
+    RoomWorkingDirectoryAccepted {
+        room_id: String,
+        command_id: String,
+        snapshot: RoomSnapshot,
+    },
     MemberChanged {
         member: BrainMemberView,
     },

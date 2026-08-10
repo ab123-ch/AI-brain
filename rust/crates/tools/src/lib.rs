@@ -23,10 +23,10 @@ use brain_graph::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, read_file, write_file, ApiClient,
-    ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeError,
-    ToolError, ToolExecutor,
+    edit_file_in_dir, execute_bash_in_dir, glob_search_in_dir, grep_search_in_dir,
+    read_file_in_dir, write_file_in_dir, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    ContentBlock, ConversationMessage, GrepSearchInput, MessageRole, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, RuntimeError, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1052,30 +1052,152 @@ The sub-agent inherits your model and API credentials automatically — do NOT r
 }
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
+    if !is_workspace_tool(name) {
+        return execute_non_workspace_tool(name, input);
+    }
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    execute_tool_in_directory(name, input, &cwd)
+}
+
+/// 在显式目录下执行工具。
+///
+/// Workspace 工具要求目录为绝对路径、已存在且确实是目录；其他工具忽略该参数。
+pub fn execute_tool_in_directory(
+    name: &str,
+    input: &Value,
+    working_directory: &Path,
+) -> Result<String, String> {
+    if !is_workspace_tool(name) {
+        return execute_non_workspace_tool(name, input);
+    }
+    let working_directory = validate_working_directory(working_directory)?;
+    execute_workspace_tool_in_directory(name, input, &working_directory)
+}
+
+fn is_workspace_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "glob_search"
+            | "grep_search"
+            | "TodoWrite"
+            | "Agent"
+            | "NotebookEdit"
+            | "SendUserMessage"
+            | "Brief"
+            | "Config"
+            | "EnterPlanMode"
+            | "ExitPlanMode"
+            | "REPL"
+            | "PowerShell"
+            | "graph_search_catalog"
+            | "graph_get_node_detail"
+            | "graph_trace_memory"
+            | "graph_list_domains"
+            | "graph_add_memory"
+            | "graph_add_concept"
+            | "graph_add_code_node"
+            | "graph_index_code_workspace"
+            | "graph_link_nodes"
+    )
+}
+
+fn validate_working_directory(working_directory: &Path) -> Result<PathBuf, String> {
+    if !working_directory.is_absolute() {
+        return Err(format!(
+            "工作目录必须是绝对路径：{}",
+            working_directory.display()
+        ));
+    }
+    if !working_directory.exists() {
+        return Err(format!("工作目录不存在：{}", working_directory.display()));
+    }
+    let canonical = fs::canonicalize(working_directory).map_err(|error| {
+        format!(
+            "无法解析工作目录 `{}`：{error}",
+            working_directory.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!("工作目录不是目录：{}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+fn execute_workspace_tool_in_directory(
+    name: &str,
+    input: &Value,
+    working_directory: &Path,
+) -> Result<String, String> {
     match name {
-        "bash" => from_value::<BashCommandInput>(input).and_then(run_bash),
-        "read_file" => from_value::<ReadFileInput>(input).and_then(run_read_file),
-        "write_file" => from_value::<WriteFileInput>(input).and_then(run_write_file),
-        "edit_file" => from_value::<EditFileInput>(input).and_then(run_edit_file),
-        "glob_search" => from_value::<GlobSearchInputValue>(input).and_then(run_glob_search),
-        "grep_search" => from_value::<GrepSearchInput>(input).and_then(run_grep_search),
+        "bash" => from_value::<BashCommandInput>(input)
+            .and_then(|value| run_bash_in_directory(value, working_directory)),
+        "read_file" => from_value::<ReadFileInput>(input)
+            .and_then(|value| run_read_file_in_directory(value, working_directory)),
+        "write_file" => from_value::<WriteFileInput>(input)
+            .and_then(|value| run_write_file_in_directory(value, working_directory)),
+        "edit_file" => from_value::<EditFileInput>(input)
+            .and_then(|value| run_edit_file_in_directory(value, working_directory)),
+        "glob_search" => from_value::<GlobSearchInputValue>(input)
+            .and_then(|value| run_glob_search_in_directory(value, working_directory)),
+        "grep_search" => from_value::<GrepSearchInput>(input)
+            .and_then(|value| run_grep_search_in_directory(value, working_directory)),
+        "TodoWrite" => from_value::<TodoWriteInput>(input)
+            .and_then(|value| run_todo_write_in_directory(value, working_directory)),
+        "Agent" => from_value::<AgentInput>(input)
+            .and_then(|value| run_agent_in_directory(value, working_directory)),
+        "NotebookEdit" => from_value::<NotebookEditInput>(input)
+            .and_then(|value| run_notebook_edit_in_directory(value, working_directory)),
+        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input)
+            .and_then(|value| run_brief_in_directory(value, working_directory)),
+        "Config" => from_value::<ConfigInput>(input)
+            .and_then(|value| run_config_in_directory(value, working_directory)),
+        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input)
+            .and_then(|value| run_enter_plan_mode_in_directory(value, working_directory)),
+        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input)
+            .and_then(|value| run_exit_plan_mode_in_directory(value, working_directory)),
+        "REPL" => from_value::<ReplInput>(input)
+            .and_then(|value| run_repl_in_directory(value, working_directory)),
+        "PowerShell" => from_value::<PowerShellInput>(input)
+            .and_then(|value| run_powershell_in_directory(value, working_directory)),
+        "graph_search_catalog" => from_value::<GraphSearchCatalogInput>(input)
+            .and_then(|value| run_graph_search_catalog_in_directory(value, working_directory)),
+        "graph_get_node_detail" => from_value::<GraphGetNodeDetailInput>(input)
+            .and_then(|value| run_graph_get_node_detail_in_directory(value, working_directory)),
+        "graph_trace_memory" => from_value::<GraphTraceMemoryInput>(input)
+            .and_then(|value| run_graph_trace_memory_in_directory(value, working_directory)),
+        "graph_list_domains" => from_value::<GraphListDomainsInput>(input)
+            .and_then(|value| run_graph_list_domains_in_directory(value, working_directory)),
+        "graph_add_memory" => from_value::<GraphAddMemoryInput>(input)
+            .and_then(|value| run_graph_add_memory_in_directory(value, working_directory)),
+        "graph_add_concept" => from_value::<GraphAddConceptInput>(input)
+            .and_then(|value| run_graph_add_concept_in_directory(value, working_directory)),
+        "graph_add_code_node" => from_value::<GraphAddCodeNodeInput>(input)
+            .and_then(|value| run_graph_add_code_node_in_directory(value, working_directory)),
+        "graph_index_code_workspace" => {
+            from_value::<GraphIndexCodeWorkspaceInput>(input).and_then(|value| {
+                run_graph_index_code_workspace_in_directory(value, working_directory)
+            })
+        }
+        "graph_link_nodes" => from_value::<GraphLinkNodesInput>(input)
+            .and_then(|value| run_graph_link_nodes_in_directory(value, working_directory)),
+        _ => Err(format!("unsupported workspace tool: {name}")),
+    }
+}
+
+fn execute_non_workspace_tool(name: &str, input: &Value) -> Result<String, String> {
+    match name {
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
-        "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => Err("Skill tool is handled by RealToolExecutor directly".to_string()),
-        "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
-        "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
-        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
-        "Config" => from_value::<ConfigInput>(input).and_then(run_config),
-        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
-        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
-        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
-        "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
@@ -1092,32 +1214,6 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         }
         "novel_task" | "novel_project" => {
             Err(format!("{name} is handled by RealToolExecutor directly"))
-        }
-        "graph_search_catalog" => {
-            from_value::<GraphSearchCatalogInput>(input).and_then(run_graph_search_catalog)
-        }
-        "graph_get_node_detail" => {
-            from_value::<GraphGetNodeDetailInput>(input).and_then(run_graph_get_node_detail)
-        }
-        "graph_trace_memory" => {
-            from_value::<GraphTraceMemoryInput>(input).and_then(run_graph_trace_memory)
-        }
-        "graph_list_domains" => {
-            from_value::<GraphListDomainsInput>(input).and_then(run_graph_list_domains)
-        }
-        "graph_add_memory" => {
-            from_value::<GraphAddMemoryInput>(input).and_then(run_graph_add_memory)
-        }
-        "graph_add_concept" => {
-            from_value::<GraphAddConceptInput>(input).and_then(run_graph_add_concept)
-        }
-        "graph_add_code_node" => {
-            from_value::<GraphAddCodeNodeInput>(input).and_then(run_graph_add_code_node)
-        }
-        "graph_index_code_workspace" => from_value::<GraphIndexCodeWorkspaceInput>(input)
-            .and_then(run_graph_index_code_workspace),
-        "graph_link_nodes" => {
-            from_value::<GraphLinkNodesInput>(input).and_then(run_graph_link_nodes)
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -1209,8 +1305,11 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_search_catalog(input: GraphSearchCatalogInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_search_catalog_in_directory(
+    input: GraphSearchCatalogInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let mut query = CatalogQuery::new(split_keywords(&input.query));
     query.graph_type = input
@@ -1228,8 +1327,11 @@ fn run_graph_search_catalog(input: GraphSearchCatalogInput) -> Result<String, St
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_get_node_detail(input: GraphGetNodeDetailInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_get_node_detail_in_directory(
+    input: GraphGetNodeDetailInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     to_pretty_json(
         store
@@ -1239,8 +1341,11 @@ fn run_graph_get_node_detail(input: GraphGetNodeDetailInput) -> Result<String, S
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_trace_memory(input: GraphTraceMemoryInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_trace_memory_in_directory(
+    input: GraphTraceMemoryInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let mut query = TraceQuery::new(input.root_id);
     query.direction = input
@@ -1259,15 +1364,21 @@ fn run_graph_trace_memory(input: GraphTraceMemoryInput) -> Result<String, String
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_list_domains(input: GraphListDomainsInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_list_domains_in_directory(
+    input: GraphListDomainsInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     to_pretty_json(store.list_domains().map_err(|error| error.to_string())?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_add_memory(input: GraphAddMemoryInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_add_memory_in_directory(
+    input: GraphAddMemoryInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let title = required_non_empty("title", &input.title)?;
     let now = chrono::Utc::now().timestamp_millis();
@@ -1309,8 +1420,11 @@ fn run_graph_add_memory(input: GraphAddMemoryInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_add_concept(input: GraphAddConceptInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_add_concept_in_directory(
+    input: GraphAddConceptInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let name = required_non_empty("name", &input.name)?;
     let graph_type = input
@@ -1352,8 +1466,11 @@ fn run_graph_add_concept(input: GraphAddConceptInput) -> Result<String, String> 
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_add_code_node(input: GraphAddCodeNodeInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_add_code_node_in_directory(
+    input: GraphAddCodeNodeInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let path = required_non_empty("path", &input.path)?;
     let now = chrono::Utc::now().timestamp_millis();
@@ -1397,14 +1514,18 @@ fn run_graph_add_code_node(input: GraphAddCodeNodeInput) -> Result<String, Strin
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_index_code_workspace(input: GraphIndexCodeWorkspaceInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_index_code_workspace_in_directory(
+    input: GraphIndexCodeWorkspaceInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let root = input
         .root
         .as_deref()
         .filter(|root| !root.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .map(Path::new)
+        .map(|root| resolve_path_in_directory(working_directory, root))
+        .unwrap_or_else(|| working_directory.to_path_buf());
     let root = fs::canonicalize(&root).map_err(|error| {
         format!(
             "cannot resolve code workspace root `{}`: {error}",
@@ -1819,8 +1940,11 @@ fn stable_code_node_id(kind: &str, value: &str) -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_graph_link_nodes(input: GraphLinkNodesInput) -> Result<String, String> {
-    let db_path = resolve_graph_db_path(input.db_path.as_deref())?;
+fn run_graph_link_nodes_in_directory(
+    input: GraphLinkNodesInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    let db_path = resolve_graph_db_path_in_directory(input.db_path.as_deref(), working_directory)?;
     let store = GraphStore::open(&db_path).map_err(|error| error.to_string())?;
     let src = required_non_empty("src", &input.src)?;
     let dst = required_non_empty("dst", &input.dst)?;
@@ -1863,25 +1987,53 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
 
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+fn resolve_path_in_directory(working_directory: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
+    }
+}
+
+fn run_bash_in_directory(
+    input: BashCommandInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    serde_json::to_string_pretty(
+        &execute_bash_in_dir(input, working_directory).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+fn run_read_file_in_directory(
+    input: ReadFileInput,
+    working_directory: &Path,
+) -> Result<String, String> {
     to_pretty_json(
-        edit_file(
+        read_file_in_dir(working_directory, &input.path, input.offset, input.limit)
+            .map_err(io_to_string)?,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_write_file_in_directory(
+    input: WriteFileInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(
+        write_file_in_dir(working_directory, &input.path, &input.content).map_err(io_to_string)?,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_edit_file_in_directory(
+    input: EditFileInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(
+        edit_file_in_dir(
+            working_directory,
             &input.path,
             &input.old_string,
             &input.new_string,
@@ -1892,13 +2044,22 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
+fn run_glob_search_in_directory(
+    input: GlobSearchInputValue,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(
+        glob_search_in_dir(working_directory, &input.pattern, input.path.as_deref())
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
+fn run_grep_search_in_directory(
+    input: GrepSearchInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(grep_search_in_dir(working_directory, &input).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1911,12 +2072,15 @@ fn run_web_search(input: WebSearchInput) -> Result<String, String> {
     to_pretty_json(execute_web_search(&input)?)
 }
 
-fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
-    to_pretty_json(execute_todo_write(input)?)
+fn run_todo_write_in_directory(
+    input: TodoWriteInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(execute_todo_write(input, working_directory)?)
 }
 
-fn run_agent(input: AgentInput) -> Result<String, String> {
-    to_pretty_json(execute_agent(input)?)
+fn run_agent_in_directory(input: AgentInput, working_directory: &Path) -> Result<String, String> {
+    to_pretty_json(execute_agent_in_directory(input, working_directory)?)
 }
 
 pub struct AgentToolLaunch {
@@ -1936,9 +2100,17 @@ pub struct AgentCompletion {
 }
 
 pub async fn execute_agent_tool_with_completion(input: &Value) -> Result<AgentToolLaunch, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    execute_agent_tool_with_completion_in_directory(input, &cwd).await
+}
+
+pub async fn execute_agent_tool_with_completion_in_directory(
+    input: &Value,
+    working_directory: &Path,
+) -> Result<AgentToolLaunch, String> {
     let input = from_value::<AgentInput>(input)?;
     let run_in_background = input.run_in_background;
-    let launch = start_agent(input).await?;
+    let launch = start_agent_in_directory(input, working_directory).await?;
     if !run_in_background {
         let done = launch
             .completion_rx
@@ -1980,40 +2152,52 @@ fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
 
-fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
-    to_pretty_json(execute_notebook_edit(input)?)
+fn run_notebook_edit_in_directory(
+    input: NotebookEditInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(execute_notebook_edit(input, working_directory)?)
 }
 
 fn run_sleep(input: SleepInput) -> Result<String, String> {
     to_pretty_json(execute_sleep(input)?)
 }
 
-fn run_brief(input: BriefInput) -> Result<String, String> {
-    to_pretty_json(execute_brief(input)?)
+fn run_brief_in_directory(input: BriefInput, working_directory: &Path) -> Result<String, String> {
+    to_pretty_json(execute_brief(input, working_directory)?)
 }
 
-fn run_config(input: ConfigInput) -> Result<String, String> {
-    to_pretty_json(execute_config(input)?)
+fn run_config_in_directory(input: ConfigInput, working_directory: &Path) -> Result<String, String> {
+    to_pretty_json(execute_config(input, working_directory)?)
 }
 
-fn run_enter_plan_mode(input: EnterPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_enter_plan_mode(input)?)
+fn run_enter_plan_mode_in_directory(
+    input: EnterPlanModeInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(execute_enter_plan_mode(input, working_directory)?)
 }
 
-fn run_exit_plan_mode(input: ExitPlanModeInput) -> Result<String, String> {
-    to_pretty_json(execute_exit_plan_mode(input)?)
+fn run_exit_plan_mode_in_directory(
+    input: ExitPlanModeInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(execute_exit_plan_mode(input, working_directory)?)
 }
 
 fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
     to_pretty_json(execute_structured_output(input)?)
 }
 
-fn run_repl(input: ReplInput) -> Result<String, String> {
-    to_pretty_json(execute_repl(input)?)
+fn run_repl_in_directory(input: ReplInput, working_directory: &Path) -> Result<String, String> {
+    to_pretty_json(execute_repl(input, working_directory)?)
 }
 
-fn run_powershell(input: PowerShellInput) -> Result<String, String> {
-    to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
+fn run_powershell_in_directory(
+    input: PowerShellInput,
+    working_directory: &Path,
+) -> Result<String, String> {
+    to_pretty_json(execute_powershell(input, working_directory).map_err(|error| error.to_string())?)
 }
 
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
@@ -2320,12 +2504,15 @@ struct GraphLinkNodesInput {
     props: Option<Value>,
 }
 
-fn resolve_graph_db_path(input_path: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_graph_db_path_in_directory(
+    input_path: Option<&str>,
+    working_directory: &Path,
+) -> Result<PathBuf, String> {
     let path = if let Some(path) = input_path.filter(|path| !path.trim().is_empty()) {
-        PathBuf::from(path)
+        resolve_path_in_directory(working_directory, Path::new(path))
     } else if let Some(path) = std::env::var_os("AI_BRAIN_GRAPH_DB").filter(|path| !path.is_empty())
     {
-        PathBuf::from(path)
+        resolve_path_in_directory(working_directory, Path::new(&path))
     } else {
         default_graph_db_path()?
     };
@@ -3037,9 +3224,12 @@ fn dedupe_hits(hits: &mut Vec<SearchHit>) {
     hits.retain(|hit| seen.insert(hit.url.clone()));
 }
 
-fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
+fn execute_todo_write(
+    input: TodoWriteInput,
+    working_directory: &Path,
+) -> Result<TodoWriteOutput, String> {
     validate_todos(&input.todos)?;
-    let store_path = todo_store_path()?;
+    let store_path = todo_store_path(working_directory);
     let old_todos = if store_path.exists() {
         serde_json::from_str::<Vec<TodoItem>>(
             &std::fs::read_to_string(&store_path).map_err(|error| error.to_string())?,
@@ -3097,12 +3287,16 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
     Ok(())
 }
 
-fn todo_store_path() -> Result<std::path::PathBuf, String> {
+fn todo_store_path(working_directory: &Path) -> PathBuf {
     if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
-        return Ok(std::path::PathBuf::from(path));
+        let path = PathBuf::from(path);
+        return if path.is_absolute() {
+            path
+        } else {
+            working_directory.join(path)
+        };
     }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".clawd-todos.json"))
+    working_directory.join(".clawd-todos.json")
 }
 
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
@@ -3113,7 +3307,10 @@ fn current_date_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
+fn execute_agent_in_directory(
+    input: AgentInput,
+    working_directory: &Path,
+) -> Result<AgentOutput, String> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(String::from(
             "synchronous Agent compatibility entry cannot run inside a Tokio task; use execute_agent_tool_with_completion",
@@ -3121,7 +3318,7 @@ fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     }
     agent_compat_runtime()?.block_on(async move {
         let run_in_background = input.run_in_background;
-        let launch = start_agent(input).await?;
+        let launch = start_agent_in_directory(input, working_directory).await?;
         if run_in_background {
             return Ok(launch.manifest);
         }
@@ -3150,7 +3347,10 @@ fn agent_worker_pool() -> &'static AgentWorkerPool {
     })
 }
 
-fn prepare_agent(input: AgentInput) -> Result<PreparedAgent, String> {
+fn prepare_agent_in_directory(
+    input: AgentInput,
+    working_directory: &Path,
+) -> Result<PreparedAgent, String> {
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
@@ -3158,14 +3358,18 @@ fn prepare_agent(input: AgentInput) -> Result<PreparedAgent, String> {
         return Err(String::from("prompt must not be empty"));
     }
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let profile = build_agent_profile(&normalized_subagent_type)?;
+    let profile = build_agent_profile_in_directory(&normalized_subagent_type, working_directory)?;
 
     let agent_id = make_agent_id();
-    let output_dir = agent_store_dir()?;
+    let output_dir = agent_store_dir(working_directory);
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
-    let model = resolve_agent_model(input.model.as_deref(), &normalized_subagent_type);
+    let model = resolve_agent_model(
+        input.model.as_deref(),
+        &normalized_subagent_type,
+        working_directory,
+    );
     let agent_name = input
         .name
         .as_deref()
@@ -3226,17 +3430,21 @@ fn prepare_agent(input: AgentInput) -> Result<PreparedAgent, String> {
     })
 }
 
-async fn start_agent(input: AgentInput) -> Result<AgentLaunch, String> {
-    let mut prepared = prepare_agent(input)?;
+async fn start_agent_in_directory(
+    input: AgentInput,
+    working_directory: &Path,
+) -> Result<AgentLaunch, String> {
+    let mut prepared = prepare_agent_in_directory(input, working_directory)?;
     let allowed_tools = prepared
         .profile
         .tool_grant
         .iter()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    let client = ProviderRuntimeClient::new(
+    let client = ProviderRuntimeClient::new_in_directory(
         prepared.manifest.model.clone().unwrap_or_default(),
         allowed_tools.clone(),
+        working_directory,
     )
     .map_err(|error| {
         let message = format!("failed to initialize sub-agent provider: {error}");
@@ -3280,7 +3488,7 @@ async fn start_agent(input: AgentInput) -> Result<AgentLaunch, String> {
         .map_err(|error| error.to_string())?;
     let runtime = AgentRuntime::new(
         client,
-        SubagentToolExecutor::new(allowed_tools),
+        SubagentToolExecutor::new(allowed_tools, working_directory.to_path_buf()),
         agent_permission_policy(),
         FileAgentArtifactSink {
             manifest: prepared.manifest.clone(),
@@ -3308,7 +3516,10 @@ async fn start_agent(input: AgentInput) -> Result<AgentLaunch, String> {
     })
 }
 
-fn build_agent_profile(subagent_type: &str) -> Result<AgentProfileSnapshot, String> {
+fn build_agent_profile_in_directory(
+    subagent_type: &str,
+    working_directory: &Path,
+) -> Result<AgentProfileSnapshot, String> {
     if !matches!(
         subagent_type,
         "general-purpose" | "Explore" | "Plan" | "Verification" | "claw-guide" | "statusline-setup"
@@ -3327,18 +3538,20 @@ fn build_agent_profile(subagent_type: &str) -> Result<AgentProfileSnapshot, Stri
         ),
         1,
         subagent_type,
-        build_agent_system_prompt(subagent_type)?,
+        build_agent_system_prompt(subagent_type, working_directory)?,
         ToolGrant::new(allowed_tools_for_subagent(subagent_type)),
         OutputContract::Text,
-        load_subagent_config()
+        load_subagent_config(working_directory)
             .and_then(|config| config.max_iterations)
             .unwrap_or(DEFAULT_AGENT_MAX_ITERATIONS),
     )
     .map_err(|error| error.to_string())
 }
 
-fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+fn build_agent_system_prompt(
+    subagent_type: &str,
+    working_directory: &Path,
+) -> Result<Vec<String>, String> {
     // 子代理用轻量级系统提示词，不加载完整主脑 prompt（避免 60 万+ 字符撑爆弱模型上下文）
     let os = std::env::consts::OS;
     let today = current_date_str();
@@ -3352,18 +3565,22 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
          - Use only the tools available to you.\n\
          - Do not ask the user questions.\n\
          - Finish with a concise result.",
-        cwd.display()
+        working_directory.display()
     );
     Ok(vec![prompt])
 }
 
-fn resolve_agent_model(model: Option<&str>, _subagent_type: &str) -> String {
+fn resolve_agent_model(
+    model: Option<&str>,
+    _subagent_type: &str,
+    working_directory: &Path,
+) -> String {
     // 优先使用调用者指定的模型，否则从子代理配置或主脑配置中获取
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         return m.to_string();
     }
     // 尝试从子代理配置获取
-    if let Some(cfg) = load_subagent_config() {
+    if let Some(cfg) = load_subagent_config(working_directory) {
         if let Some(m) = cfg.model.filter(|m| !m.is_empty()) {
             return m;
         }
@@ -3582,9 +3799,8 @@ struct SubagentConfig {
 }
 
 /// 加载子代理配置文件
-fn load_subagent_config() -> Option<SubagentConfig> {
-    let cwd = std::env::current_dir().ok()?;
-    let config_path = cwd.join(".ai-brain").join("subagent.json");
+fn load_subagent_config(working_directory: &Path) -> Option<SubagentConfig> {
+    let config_path = working_directory.join(".ai-brain").join("subagent.json");
 
     let contents = fs::read_to_string(&config_path).ok()?;
     if contents.trim().is_empty() {
@@ -3608,7 +3824,11 @@ struct ProviderRuntimeClient {
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+    fn new_in_directory(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        working_directory: &Path,
+    ) -> Result<Self, String> {
         // 1. 加载主脑 LLM 配置（失败时使用默认配置，不阻断子代理启动）
         let llm_config = LlmConfig::load_default().unwrap_or_else(|e| {
             tracing::warn!("[子代理] 主脑配置加载失败，使用默认配置: {e}");
@@ -3618,7 +3838,7 @@ impl ProviderRuntimeClient {
         tracing::debug!("[子代理] 主脑配置: provider={default_provider}");
 
         // 2. 加载子代理配置（可选覆盖）
-        let subagent_config = load_subagent_config().unwrap_or_default();
+        let subagent_config = load_subagent_config(working_directory).unwrap_or_default();
 
         // 3. 模型优先级：subagent.json 配置 > brain_models.subagent > 主脑默认
         //    子代理需要 tool calling 支持，默认模型不一定兼容
@@ -3919,11 +4139,15 @@ impl ApiClient for ProviderRuntimeClient {
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
+    working_directory: PathBuf,
 }
 
 impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self { allowed_tools }
+    fn new(allowed_tools: BTreeSet<String>, working_directory: PathBuf) -> Self {
+        Self {
+            allowed_tools,
+            working_directory,
+        }
     }
 }
 
@@ -3936,7 +4160,8 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value: Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool(tool_name, &value).map_err(ToolError::new)
+        execute_tool_in_directory(tool_name, &value, &self.working_directory)
+            .map_err(ToolError::new)
     }
 }
 
@@ -4250,15 +4475,11 @@ fn canonical_tool_token(value: &str) -> String {
     canonical
 }
 
-fn agent_store_dir() -> Result<std::path::PathBuf, String> {
+fn agent_store_dir(working_directory: &Path) -> PathBuf {
     if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
-        return Ok(std::path::PathBuf::from(path));
+        return resolve_path_in_directory(working_directory, Path::new(&path));
     }
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".clawd-agents"));
-    }
-    Ok(cwd.join(".clawd-agents"))
+    working_directory.join(".clawd-agents")
 }
 
 fn make_agent_id() -> String {
@@ -4313,8 +4534,11 @@ fn iso8601_now() -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput, String> {
-    let path = std::path::PathBuf::from(&input.notebook_path);
+fn execute_notebook_edit(
+    input: NotebookEditInput,
+    working_directory: &Path,
+) -> Result<NotebookEditOutput, String> {
+    let path = resolve_path_in_directory(working_directory, Path::new(&input.notebook_path));
     if path.extension().and_then(|ext| ext.to_str()) != Some("ipynb") {
         return Err(String::from(
             "File must be a Jupyter notebook (.ipynb file).",
@@ -4497,7 +4721,7 @@ fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
     })
 }
 
-fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
+fn execute_brief(input: BriefInput, working_directory: &Path) -> Result<BriefOutput, String> {
     if input.message.trim().is_empty() {
         return Err(String::from("message must not be empty"));
     }
@@ -4508,7 +4732,7 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
         .map(|paths| {
             paths
                 .iter()
-                .map(|path| resolve_attachment(path))
+                .map(|path| resolve_attachment_in_directory(path, working_directory))
                 .collect::<Result<Vec<_>, String>>()
         })
         .transpose()?;
@@ -4524,9 +4748,28 @@ fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
     })
 }
 
-fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-    let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
+fn resolve_attachment_in_directory(
+    path: &str,
+    working_directory: &Path,
+) -> Result<ResolvedAttachment, String> {
+    let path = Path::new(path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
+    };
+    let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("附件不存在：{}", candidate.display())
+        } else {
+            format!("无法解析附件路径 `{}`：{error}", candidate.display())
+        }
+    })?;
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|error| format!("无法读取附件元数据 `{}`：{error}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("附件路径不是文件：{}", resolved.display()));
+    }
     Ok(ResolvedAttachment {
         path: resolved.display().to_string(),
         size: metadata.len(),
@@ -4544,7 +4787,7 @@ fn is_image_path(path: &Path) -> bool {
     )
 }
 
-fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
+fn execute_config(input: ConfigInput, working_directory: &Path) -> Result<ConfigOutput, String> {
     let setting = input.setting.trim();
     if setting.is_empty() {
         return Err(String::from("setting must not be empty"));
@@ -4561,7 +4804,7 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
         });
     };
 
-    let path = config_file_for_scope(spec.scope)?;
+    let path = config_file_for_scope(spec.scope, working_directory)?;
     let mut document = read_json_object(&path)?;
 
     if let Some(value) = input.value {
@@ -4593,9 +4836,12 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
 
 const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
 
-fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
+fn execute_enter_plan_mode(
+    _input: EnterPlanModeInput,
+    working_directory: &Path,
+) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings, working_directory)?;
+    let state_path = plan_mode_state_file(working_directory)?;
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
@@ -4662,9 +4908,12 @@ fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput,
     })
 }
 
-fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, String> {
-    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
-    let state_path = plan_mode_state_file()?;
+fn execute_exit_plan_mode(
+    _input: ExitPlanModeInput,
+    working_directory: &Path,
+) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings, working_directory)?;
+    let state_path = plan_mode_state_file(working_directory)?;
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
@@ -4745,16 +4994,19 @@ fn execute_structured_output(
     })
 }
 
-fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
+fn execute_repl(input: ReplInput, working_directory: &Path) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
-    let mut process = Command::new(runtime.program);
+    let mut process = build_repl_command(
+        runtime.program,
+        runtime.args,
+        &input.code,
+        working_directory,
+    );
     process
-        .args(runtime.args)
-        .arg(&input.code)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -4797,6 +5049,17 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
         exit_code: output.status.code().unwrap_or(1),
         duration_ms: started.elapsed().as_millis(),
     })
+}
+
+fn build_repl_command(
+    program: &str,
+    args: &[&str],
+    code: &str,
+    working_directory: &Path,
+) -> Command {
+    let mut process = Command::new(program);
+    process.args(args).arg(code).current_dir(working_directory);
+    process
 }
 
 struct ReplRuntime {
@@ -4987,20 +5250,22 @@ fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result
     Ok(normalized)
 }
 
-fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+fn config_file_for_scope(scope: ConfigScope, working_directory: &Path) -> Result<PathBuf, String> {
     Ok(match scope {
-        ConfigScope::Global => config_home_dir()?.join("settings.json"),
-        ConfigScope::Settings => cwd.join(".claw").join("settings.local.json"),
+        ConfigScope::Global => config_home_dir(working_directory)?.join("settings.json"),
+        ConfigScope::Settings => working_directory.join(".claw").join("settings.local.json"),
     })
 }
 
-fn config_home_dir() -> Result<PathBuf, String> {
+fn config_home_dir(working_directory: &Path) -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
+        return Ok(resolve_path_in_directory(
+            working_directory,
+            Path::new(&path),
+        ));
     }
     let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".claw"))
+    Ok(resolve_path_in_directory(working_directory, Path::new(&home)).join(".claw"))
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
@@ -5084,12 +5349,14 @@ fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str])
     removed
 }
 
-fn plan_mode_state_file() -> Result<PathBuf, String> {
-    Ok(config_file_for_scope(ConfigScope::Settings)?
-        .parent()
-        .ok_or_else(|| String::from("settings.local.json has no parent directory"))?
-        .join("tool-state")
-        .join("plan-mode.json"))
+fn plan_mode_state_file(working_directory: &Path) -> Result<PathBuf, String> {
+    Ok(
+        config_file_for_scope(ConfigScope::Settings, working_directory)?
+            .parent()
+            .ok_or_else(|| String::from("settings.local.json has no parent directory"))?
+            .join("tool-state")
+            .join("plan-mode.json"),
+    )
 }
 
 fn read_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
@@ -5139,7 +5406,10 @@ fn iso8601_timestamp() -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
+fn execute_powershell(
+    input: PowerShellInput,
+    working_directory: &Path,
+) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
     let shell = detect_powershell_shell()?;
     execute_shell_command(
@@ -5147,10 +5417,20 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
         &input.command,
         input.timeout,
         input.run_in_background,
+        working_directory,
     )
 }
 
 fn detect_powershell_shell() -> std::io::Result<&'static str> {
+    #[cfg(windows)]
+    {
+        if windows_command_exists("pwsh.exe") {
+            return Ok("pwsh.exe");
+        }
+        if windows_command_exists("powershell.exe") {
+            return Ok("powershell.exe");
+        }
+    }
     if command_exists("pwsh") {
         Ok("pwsh")
     } else if command_exists("powershell") {
@@ -5161,6 +5441,17 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
             "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
         ))
     }
+}
+
+#[cfg(windows)]
+fn windows_command_exists(command: &str) -> bool {
+    Command::new("where.exe")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn command_exists(command: &str) -> bool {
@@ -5178,13 +5469,11 @@ fn execute_shell_command(
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
+    working_directory: &Path,
 ) -> std::io::Result<runtime::BashCommandOutput> {
+    let mut process = build_powershell_command(shell, command, working_directory);
     if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(command)
+        let child = process
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -5208,12 +5497,6 @@ fn execute_shell_command(
         });
     }
 
-    let mut process = std::process::Command::new(shell);
-    process
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(command);
     process
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -5304,6 +5587,17 @@ Command exceeded timeout of {timeout_ms} ms",
     })
 }
 
+fn build_powershell_command(shell: &str, command: &str, working_directory: &Path) -> Command {
+    let mut process = Command::new(shell);
+    process
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(command)
+        .current_dir(working_directory);
+    process
+}
+
 fn resolve_cell_index(
     cells: &[serde_json::Value],
     cell_id: Option<&str>,
@@ -5362,10 +5656,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_profile, execute_tool,
-        final_assistant_text, mvp_tool_specs, permission_mode_from_plugin, persist_agent_artifact,
-        persist_agent_terminal_state, prepare_agent, push_output_block, AgentInput,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, build_agent_profile_in_directory,
+        execute_tool, final_assistant_text, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_artifact, persist_agent_terminal_state, prepare_agent_in_directory,
+        push_output_block, AgentInput, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use agent_runtime::{
         AgentRunSpec, AgentRunStatus, AgentRuntime, AgentRuntimeError, AgentWorkerPool,
@@ -5395,6 +5689,863 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn test_working_directory() -> PathBuf {
+        std::env::current_dir().expect("cwd")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct DirectoryCleanup(PathBuf);
+
+    impl DirectoryCleanup {
+        fn new(path: PathBuf) -> Self {
+            Self(path)
+        }
+    }
+
+    impl Drop for DirectoryCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(working_directory: &std::path::Path) -> std::io::Result<Self> {
+            let original = std::env::current_dir()?;
+            std::env::set_current_dir(working_directory)?;
+            Ok(Self { original })
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    fn current_dir_guard_restores_directory_after_scope() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = test_working_directory();
+        let temporary = temp_path("current-dir-guard");
+        let _temporary_cleanup = DirectoryCleanup::new(temporary.clone());
+        fs::create_dir_all(&temporary).expect("create temporary cwd");
+
+        {
+            let _cwd_guard = CurrentDirGuard::change_to(&temporary).expect("change cwd");
+            assert_eq!(
+                fs::canonicalize(test_working_directory()).expect("canonical current cwd"),
+                fs::canonicalize(&temporary).expect("canonical temporary cwd")
+            );
+        }
+
+        assert_eq!(test_working_directory(), original);
+    }
+
+    #[test]
+    fn explicit_working_directory_scopes_message_attachments() {
+        let root = temp_path("scoped-message-attachments");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create workspace A");
+        fs::create_dir_all(&workspace_b).expect("create workspace B");
+        fs::write(workspace_a.join("same.bin"), b"a").expect("write attachment A");
+        fs::write(workspace_b.join("same.bin"), b"workspace-b").expect("write attachment B");
+
+        let result_a = super::execute_tool_in_directory(
+            "SendUserMessage",
+            &json!({
+                "message": "workspace A",
+                "attachments": ["same.bin"],
+                "status": "normal"
+            }),
+            &workspace_a,
+        );
+        let result_b = super::execute_tool_in_directory(
+            "Brief",
+            &json!({
+                "message": "workspace B",
+                "attachments": ["same.bin"],
+                "status": "normal"
+            }),
+            &workspace_b,
+        );
+
+        assert!(
+            result_a.is_ok() && result_b.is_ok(),
+            "相同相对附件必须分别基于请求 cwd 解析：A={result_a:?}，B={result_b:?}"
+        );
+        for (result, workspace, expected_size) in [
+            (result_a, workspace_a, 1_u64),
+            (result_b, workspace_b, 11_u64),
+        ] {
+            let output: serde_json::Value =
+                serde_json::from_str(&result.expect("scoped message output"))
+                    .expect("message json");
+            let expected_path = fs::canonicalize(workspace.join("same.bin"))
+                .expect("canonical attachment path")
+                .display()
+                .to_string();
+            assert_eq!(output["attachments"][0]["path"], expected_path);
+            assert_eq!(output["attachments"][0]["size"], expected_size);
+        }
+    }
+
+    #[test]
+    fn message_attachments_reject_missing_and_non_file_paths() {
+        let workspace = temp_path("invalid-message-attachments");
+        let _workspace_cleanup = DirectoryCleanup::new(workspace.clone());
+        fs::create_dir_all(workspace.join("directory-attachment"))
+            .expect("create directory attachment");
+
+        let missing = super::execute_tool_in_directory(
+            "SendUserMessage",
+            &json!({
+                "message": "missing attachment",
+                "attachments": ["missing.bin"],
+                "status": "normal"
+            }),
+            &workspace,
+        )
+        .expect_err("missing attachment must fail");
+        let directory = super::execute_tool_in_directory(
+            "Brief",
+            &json!({
+                "message": "directory attachment",
+                "attachments": ["directory-attachment"],
+                "status": "normal"
+            }),
+            &workspace,
+        )
+        .expect_err("directory attachment must fail");
+
+        assert!(
+            missing.contains("附件不存在"),
+            "unexpected error: {missing}"
+        );
+        assert!(
+            directory.contains("附件路径不是文件"),
+            "unexpected error: {directory}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn explicit_working_directory_scopes_workspace_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _todo_store = EnvVarGuard::remove("CLAWD_TODO_STORE");
+        let root = temp_path("explicit-working-directory");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create workspace A");
+        fs::create_dir_all(&workspace_b).expect("create workspace B");
+        fs::write(workspace_a.join("same.txt"), "from-a\nneedle-a\n").expect("seed workspace A");
+        fs::write(workspace_b.join("same.txt"), "from-b\nneedle-b\n").expect("seed workspace B");
+
+        let read_a = super::execute_tool_in_directory(
+            "read_file",
+            &json!({"path": "same.txt"}),
+            &workspace_a,
+        )
+        .expect("read workspace A");
+        let read_b = super::execute_tool_in_directory(
+            "read_file",
+            &json!({"path": "same.txt"}),
+            &workspace_b,
+        )
+        .expect("read workspace B");
+        assert!(read_a.contains("from-a"));
+        assert!(read_b.contains("from-b"));
+
+        for (workspace, marker) in [(&workspace_a, "written-a"), (&workspace_b, "written-b")] {
+            super::execute_tool_in_directory(
+                "write_file",
+                &json!({"path": "written.txt", "content": marker}),
+                workspace,
+            )
+            .expect("write scoped file");
+            fs::write(workspace.join("editable.txt"), "before").expect("seed editable file");
+            super::execute_tool_in_directory(
+                "edit_file",
+                &json!({
+                    "path": "editable.txt",
+                    "old_string": "before",
+                    "new_string": marker
+                }),
+                workspace,
+            )
+            .expect("edit scoped file");
+            assert_eq!(
+                fs::read_to_string(workspace.join("written.txt")).expect("read written file"),
+                marker
+            );
+            assert_eq!(
+                fs::read_to_string(workspace.join("editable.txt")).expect("read edited file"),
+                marker
+            );
+        }
+
+        let glob_a = super::execute_tool_in_directory(
+            "glob_search",
+            &json!({"pattern": "*.txt"}),
+            &workspace_a,
+        )
+        .expect("glob workspace A");
+        let glob_b = super::execute_tool_in_directory(
+            "glob_search",
+            &json!({"pattern": "*.txt"}),
+            &workspace_b,
+        )
+        .expect("glob workspace B");
+        assert!(glob_a.contains("workspace-a"));
+        assert!(!glob_a.contains("workspace-b"));
+        assert!(glob_b.contains("workspace-b"));
+        assert!(!glob_b.contains("workspace-a"));
+
+        let grep_a = super::execute_tool_in_directory(
+            "grep_search",
+            &json!({"pattern": "needle-a", "path": ".", "output_mode": "content"}),
+            &workspace_a,
+        )
+        .expect("grep workspace A");
+        let grep_b = super::execute_tool_in_directory(
+            "grep_search",
+            &json!({"pattern": "needle-b", "path": ".", "output_mode": "content"}),
+            &workspace_b,
+        )
+        .expect("grep workspace B");
+        assert!(grep_a.contains("needle-a"));
+        assert!(!grep_a.contains("needle-b"));
+        assert!(grep_b.contains("needle-b"));
+        assert!(!grep_b.contains("needle-a"));
+
+        for (workspace, marker) in [(&workspace_a, "todo-a"), (&workspace_b, "todo-b")] {
+            super::execute_tool_in_directory(
+                "TodoWrite",
+                &json!({
+                    "todos": [{
+                        "content": marker,
+                        "status": "pending",
+                        "activeForm": marker
+                    }]
+                }),
+                workspace,
+            )
+            .expect("write scoped todo state");
+            let stored = fs::read_to_string(workspace.join(".clawd-todos.json"))
+                .expect("read scoped todo state");
+            assert!(stored.contains(marker));
+        }
+
+        for (workspace, language) in [(&workspace_a, "lang-a"), (&workspace_b, "lang-b")] {
+            let config_dir = workspace.join(".claw");
+            fs::create_dir_all(&config_dir).expect("create local config directory");
+            fs::write(
+                config_dir.join("settings.local.json"),
+                serde_json::to_vec(&json!({
+                    "language": language,
+                    "permissions": {"defaultMode": "acceptEdits"}
+                }))
+                .expect("serialize local config"),
+            )
+            .expect("write local config");
+            let config = super::execute_tool_in_directory(
+                "Config",
+                &json!({"setting": "language"}),
+                workspace,
+            )
+            .expect("read scoped config");
+            let config: serde_json::Value = serde_json::from_str(&config).expect("config json");
+            assert_eq!(config["value"], language);
+        }
+
+        super::execute_tool_in_directory("EnterPlanMode", &json!({}), &workspace_a)
+            .expect("enter plan mode in workspace A");
+        assert!(workspace_a.join(".claw/tool-state/plan-mode.json").exists());
+        assert!(!workspace_b.join(".claw/tool-state/plan-mode.json").exists());
+        super::execute_tool_in_directory("EnterPlanMode", &json!({}), &workspace_b)
+            .expect("enter plan mode in workspace B");
+        super::execute_tool_in_directory("ExitPlanMode", &json!({}), &workspace_a)
+            .expect("exit plan mode in workspace A");
+        assert!(!workspace_a.join(".claw/tool-state/plan-mode.json").exists());
+        assert!(workspace_b.join(".claw/tool-state/plan-mode.json").exists());
+        super::execute_tool_in_directory("ExitPlanMode", &json!({}), &workspace_b)
+            .expect("exit plan mode in workspace B");
+
+        for (workspace, marker) in [(&workspace_a, "notebook-a"), (&workspace_b, "notebook-b")] {
+            fs::write(
+                workspace.join("sample.ipynb"),
+                serde_json::to_vec(&json!({
+                    "cells": [{
+                        "cell_type": "code",
+                        "execution_count": null,
+                        "id": "cell-1",
+                        "metadata": {},
+                        "outputs": [],
+                        "source": ["before"]
+                    }],
+                    "metadata": {"kernelspec": {"language": "python"}},
+                    "nbformat": 4,
+                    "nbformat_minor": 5
+                }))
+                .expect("serialize notebook"),
+            )
+            .expect("write notebook");
+            super::execute_tool_in_directory(
+                "NotebookEdit",
+                &json!({
+                    "notebook_path": "sample.ipynb",
+                    "cell_id": "cell-1",
+                    "new_source": marker,
+                    "edit_mode": "replace"
+                }),
+                workspace,
+            )
+            .expect("edit scoped notebook");
+            assert!(fs::read_to_string(workspace.join("sample.ipynb"))
+                .expect("read edited notebook")
+                .contains(marker));
+        }
+
+        for (workspace, marker) in [(&workspace_a, "workspace-a"), (&workspace_b, "workspace-b")] {
+            let repl = super::execute_tool_in_directory(
+                "REPL",
+                &json!({
+                    "language": "python",
+                    "code": "import os; print(os.getcwd())",
+                    "timeout_ms": 1000
+                }),
+                workspace,
+            );
+            match repl {
+                Ok(repl) => {
+                    let repl: serde_json::Value = serde_json::from_str(&repl).expect("REPL json");
+                    assert!(repl["stdout"]
+                        .as_str()
+                        .expect("REPL stdout")
+                        .contains(marker));
+                }
+                Err(error) if error == "python runtime not found" => {
+                    let canonical_workspace =
+                        fs::canonicalize(workspace).expect("canonicalize REPL workspace");
+                    let command =
+                        super::build_repl_command("missing-runtime", &[], "", &canonical_workspace);
+                    assert_eq!(
+                        command.get_current_dir(),
+                        Some(canonical_workspace.as_path())
+                    );
+                }
+                Err(error) => panic!("run scoped REPL: {error}"),
+            }
+
+            let bash =
+                super::execute_tool_in_directory("bash", &json!({"command": "pwd"}), workspace);
+            match bash {
+                Ok(bash) => {
+                    let bash: serde_json::Value = serde_json::from_str(&bash).expect("bash json");
+                    assert!(bash["stdout"]
+                        .as_str()
+                        .expect("bash stdout")
+                        .contains(marker));
+                }
+                #[cfg(windows)]
+                Err(error) if error.contains("program not found") => {}
+                Err(error) => panic!("run scoped bash: {error}"),
+            }
+        }
+
+        fs::write(workspace_a.join("a.rs"), "pub fn from_a() {}\n").expect("write Rust A");
+        let relative_root_b = workspace_b.join("relative-root");
+        fs::create_dir_all(&relative_root_b).expect("create relative graph root");
+        fs::write(relative_root_b.join("b.rs"), "pub fn from_b() {}\n").expect("write Rust B");
+        let graph_a = super::execute_tool_in_directory(
+            "graph_index_code_workspace",
+            &json!({
+                "db_path": workspace_a.join("graph.db"),
+                "max_files": 10
+            }),
+            &workspace_a,
+        )
+        .expect("index default scoped graph root");
+        let graph_b = super::execute_tool_in_directory(
+            "graph_index_code_workspace",
+            &json!({
+                "db_path": workspace_b.join("graph.db"),
+                "root": "relative-root",
+                "max_files": 10
+            }),
+            &workspace_b,
+        )
+        .expect("index relative scoped graph root");
+        let graph_a: serde_json::Value = serde_json::from_str(&graph_a).expect("graph A json");
+        let graph_b: serde_json::Value = serde_json::from_str(&graph_b).expect("graph B json");
+        assert_eq!(graph_a["files_indexed"], 1);
+        assert_eq!(graph_b["files_indexed"], 1);
+        assert!(graph_a["root"]
+            .as_str()
+            .expect("graph A root")
+            .contains("workspace-a"));
+        assert!(graph_b["root"]
+            .as_str()
+            .expect("graph B root")
+            .contains("relative-root"));
+
+        #[cfg(windows)]
+        for (workspace, marker) in [(&workspace_a, "workspace-a"), (&workspace_b, "workspace-b")] {
+            let powershell = super::execute_tool_in_directory(
+                "PowerShell",
+                &json!({"command": "(Get-Location).Path", "timeout": 1000}),
+                workspace,
+            )
+            .expect("run scoped PowerShell");
+            let powershell: serde_json::Value =
+                serde_json::from_str(&powershell).expect("PowerShell json");
+            assert!(powershell["stdout"]
+                .as_str()
+                .expect("PowerShell stdout")
+                .contains(marker));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let command = super::build_powershell_command("pwsh", "Get-Location", &workspace_a);
+            assert_eq!(command.get_current_dir(), Some(workspace_a.as_path()));
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_inherits_working_directory() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _agent_store = EnvVarGuard::remove("CLAWD_AGENT_STORE");
+        let root = temp_path("explicit-agent-working-directory");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        for (workspace, model, max_iterations, marker) in [
+            (&workspace_a, "agent-model-a", 7, "from-agent-a"),
+            (&workspace_b, "agent-model-b", 9, "from-agent-b"),
+        ] {
+            fs::create_dir_all(workspace.join(".ai-brain")).expect("create agent config dir");
+            fs::write(
+                workspace.join(".ai-brain/subagent.json"),
+                serde_json::to_vec(&json!({
+                    "model": model,
+                    "max_iterations": max_iterations
+                }))
+                .expect("serialize agent config"),
+            )
+            .expect("write agent config");
+            fs::write(workspace.join("same.txt"), marker).expect("write agent fixture");
+
+            let prepared = super::prepare_agent_in_directory(
+                AgentInput {
+                    description: format!("agent in {marker}"),
+                    prompt: format!("inspect {marker}"),
+                    subagent_type: Some(String::from("Explore")),
+                    name: None,
+                    model: None,
+                    run_in_background: false,
+                },
+                workspace,
+            )
+            .expect("prepare scoped agent");
+            assert_eq!(prepared.manifest.model.as_deref(), Some(model));
+            assert_eq!(prepared.profile.max_iterations, max_iterations);
+            assert!(prepared
+                .profile
+                .system_prompt
+                .join("\n")
+                .contains(&workspace.display().to_string()));
+            assert!(PathBuf::from(&prepared.manifest.output_file)
+                .starts_with(workspace.join(".clawd-agents")));
+            assert!(PathBuf::from(&prepared.manifest.manifest_file)
+                .starts_with(workspace.join(".clawd-agents")));
+
+            let mut executor = SubagentToolExecutor::new(
+                BTreeSet::from([String::from("read_file")]),
+                workspace.to_path_buf(),
+            );
+            let read = runtime::ToolExecutor::execute(
+                &mut executor,
+                "read_file",
+                r#"{"path":"same.txt"}"#,
+            )
+            .expect("sub-agent executor reads scoped file");
+            assert!(read.contains(marker));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_working_directory_isolates_concurrent_requests() {
+        let root = temp_path("concurrent-working-directories");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create workspace A");
+        fs::create_dir_all(&workspace_b).expect("create workspace B");
+        fs::write(workspace_a.join("same.txt"), "from-a").expect("seed workspace A");
+        fs::write(workspace_b.join("same.txt"), "from-b").expect("seed workspace B");
+
+        thread::scope(|scope| {
+            for (workspace, marker) in [(&workspace_a, "from-a"), (&workspace_b, "from-b")] {
+                scope.spawn(move || {
+                    for iteration in 0..20 {
+                        let read = super::execute_tool_in_directory(
+                            "read_file",
+                            &json!({"path": "same.txt"}),
+                            workspace,
+                        )
+                        .expect("concurrent scoped read");
+                        assert!(read.contains(marker));
+                        super::execute_tool_in_directory(
+                            "write_file",
+                            &json!({
+                                "path": "concurrent.txt",
+                                "content": format!("{marker}-{iteration}")
+                            }),
+                            workspace,
+                        )
+                        .expect("concurrent scoped write");
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            fs::read_to_string(workspace_a.join("concurrent.txt"))
+                .expect("read concurrent output A"),
+            "from-a-19"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_b.join("concurrent.txt"))
+                .expect("read concurrent output B"),
+            "from-b-19"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_working_directory_resolves_relative_environment_overrides() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _todo_store = EnvVarGuard::set("CLAWD_TODO_STORE", "state/todos.json");
+        let _config_home = EnvVarGuard::set("CLAW_CONFIG_HOME", "config-home");
+        let _graph_db = EnvVarGuard::set("AI_BRAIN_GRAPH_DB", "graph/graph.db");
+        let _agent_store = EnvVarGuard::set("CLAWD_AGENT_STORE", "agent-output");
+        let workspace = temp_path("relative-environment-overrides");
+        fs::create_dir_all(&workspace).expect("create override workspace");
+        fs::write(workspace.join("lib.rs"), "pub fn scoped() {}\n").expect("write graph fixture");
+
+        super::execute_tool_in_directory(
+            "TodoWrite",
+            &json!({
+                "todos": [{
+                    "content": "relative todo",
+                    "status": "pending",
+                    "activeForm": "relative todo"
+                }]
+            }),
+            &workspace,
+        )
+        .expect("write relative todo override");
+        assert!(workspace.join("state/todos.json").exists());
+
+        super::execute_tool_in_directory(
+            "Config",
+            &json!({"setting": "verbose", "value": true}),
+            &workspace,
+        )
+        .expect("write relative config override");
+        assert!(workspace.join("config-home/settings.json").exists());
+
+        super::execute_tool_in_directory(
+            "graph_index_code_workspace",
+            &json!({"max_files": 10}),
+            &workspace,
+        )
+        .expect("write relative graph override");
+        assert!(workspace.join("graph/graph.db").exists());
+
+        let prepared = super::prepare_agent_in_directory(
+            AgentInput {
+                description: String::from("relative agent store"),
+                prompt: String::from("verify relative agent store"),
+                subagent_type: Some(String::from("Explore")),
+                name: None,
+                model: Some(String::from("explicit-test-model")),
+                run_in_background: false,
+            },
+            &workspace,
+        )
+        .expect("prepare relative agent override");
+        assert!(PathBuf::from(prepared.manifest.output_file)
+            .starts_with(workspace.join("agent-output")));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn explicit_working_directory_scopes_relative_graph_input_paths() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ignored_env_dir = PathBuf::from(
+            temp_path("ignored-graph-env")
+                .file_name()
+                .expect("relative env directory"),
+        );
+        let _graph_db = EnvVarGuard::set("AI_BRAIN_GRAPH_DB", ignored_env_dir.join("ignored.db"));
+        let relative_db_dir = PathBuf::from(
+            temp_path("relative-graph-input")
+                .file_name()
+                .expect("relative DB directory"),
+        );
+        let relative_db_path = relative_db_dir.join("graph.db");
+        let process_cwd = test_working_directory();
+        let _process_db_cleanup = DirectoryCleanup::new(process_cwd.join(&relative_db_dir));
+        let _process_env_cleanup = DirectoryCleanup::new(process_cwd.join(&ignored_env_dir));
+        let root = temp_path("relative-graph-input-workspaces");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create graph workspace A");
+        fs::create_dir_all(&workspace_b).expect("create graph workspace B");
+
+        for workspace in [&workspace_a, &workspace_b] {
+            super::execute_tool_in_directory(
+                "graph_list_domains",
+                &json!({"db_path": relative_db_path}),
+                workspace,
+            )
+            .expect("list domains in scoped relative graph DB");
+            assert!(workspace.join(&relative_db_path).exists());
+            assert!(!workspace.join(&ignored_env_dir).join("ignored.db").exists());
+        }
+        assert!(!process_cwd.join(relative_db_path).exists());
+    }
+
+    #[test]
+    fn explicit_working_directory_scopes_relative_graph_environment_paths() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let relative_db_dir = PathBuf::from(
+            temp_path("relative-graph-env")
+                .file_name()
+                .expect("relative env DB directory"),
+        );
+        let relative_db_path = relative_db_dir.join("graph.db");
+        let _graph_db = EnvVarGuard::set("AI_BRAIN_GRAPH_DB", &relative_db_path);
+        let process_cwd = test_working_directory();
+        let _process_db_cleanup = DirectoryCleanup::new(process_cwd.join(&relative_db_dir));
+        let root = temp_path("relative-graph-env-workspaces");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("create graph workspace A");
+        fs::create_dir_all(&workspace_b).expect("create graph workspace B");
+
+        for workspace in [&workspace_a, &workspace_b] {
+            super::execute_tool_in_directory("graph_list_domains", &json!({}), workspace)
+                .expect("list domains in scoped env graph DB");
+            assert!(workspace.join(&relative_db_path).exists());
+        }
+        assert!(!process_cwd.join(relative_db_path).exists());
+    }
+
+    #[test]
+    fn explicit_working_directory_rejects_missing_workspace_directories_without_side_effects() {
+        let root = temp_path("missing-explicit-working-directories");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        fs::create_dir_all(&root).expect("create missing cwd parent");
+        let missing_todo = root.join("missing-todo");
+        let missing_config = root.join("missing-config");
+        let missing_graph = root.join("missing-graph");
+
+        let todo = super::execute_tool_in_directory(
+            "TodoWrite",
+            &json!({
+                "todos": [{
+                    "content": "must not be stored",
+                    "status": "pending",
+                    "activeForm": "must not be stored"
+                }]
+            }),
+            &missing_todo,
+        );
+        let config = super::execute_tool_in_directory(
+            "Config",
+            &json!({"setting": "language", "value": "zh-CN"}),
+            &missing_config,
+        );
+        let graph = super::execute_tool_in_directory(
+            "graph_list_domains",
+            &json!({"db_path": "graph/graph.db"}),
+            &missing_graph,
+        );
+
+        assert!(
+            todo.is_err() && config.is_err() && graph.is_err(),
+            "缺失 cwd 必须全部拒绝且不得创建：TodoWrite={todo:?} created={}，Config={config:?} created={}，graph={graph:?} created={}",
+            missing_todo.exists(),
+            missing_config.exists(),
+            missing_graph.exists()
+        );
+        for error in [
+            todo.expect_err("TodoWrite must reject missing cwd"),
+            config.expect_err("Config must reject missing cwd"),
+            graph.expect_err("graph must reject missing cwd"),
+        ] {
+            assert!(
+                error.contains("工作目录不存在"),
+                "unexpected error: {error}"
+            );
+        }
+        assert!(!missing_todo.exists());
+        assert!(!missing_config.exists());
+        assert!(!missing_graph.exists());
+    }
+
+    #[test]
+    fn explicit_working_directory_validates_workspace_paths_only_for_workspace_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("invalid-explicit-working-directories");
+        let _root_cleanup = DirectoryCleanup::new(root.clone());
+        fs::create_dir_all(&root).expect("create invalid cwd fixtures");
+        let cwd_file = root.join("not-a-directory.txt");
+        fs::write(&cwd_file, "not a directory").expect("write cwd file fixture");
+        let relative_cwd = PathBuf::from(
+            temp_path("relative-explicit-working-directory")
+                .file_name()
+                .expect("relative cwd name"),
+        );
+        let absolute_relative_cwd = test_working_directory().join(&relative_cwd);
+        let _relative_cleanup = DirectoryCleanup::new(absolute_relative_cwd.clone());
+        fs::create_dir_all(&absolute_relative_cwd).expect("create relative cwd fixture");
+
+        let relative = super::execute_tool_in_directory(
+            "TodoWrite",
+            &json!({
+                "todos": [{
+                    "content": "relative cwd must fail",
+                    "status": "pending",
+                    "activeForm": "relative cwd must fail"
+                }]
+            }),
+            &relative_cwd,
+        );
+        let file =
+            super::execute_tool_in_directory("Config", &json!({"setting": "language"}), &cwd_file);
+        let missing_non_workspace = root.join("missing-non-workspace-cwd");
+        let sleep = super::execute_tool_in_directory(
+            "Sleep",
+            &json!({"duration_ms": 0}),
+            &missing_non_workspace,
+        );
+
+        let relative_error = relative.expect_err("relative workspace cwd must be rejected");
+        assert!(relative_error.contains("工作目录必须是绝对路径"));
+        let file_error = file.expect_err("file workspace cwd must be rejected");
+        assert!(file_error.contains("工作目录不是目录"));
+        assert!(sleep.is_ok(), "非 workspace 工具不应校验 cwd: {sleep:?}");
+        assert!(!absolute_relative_cwd.join(".clawd-todos.json").exists());
+        assert!(!missing_non_workspace.exists());
+    }
+
+    #[test]
+    fn legacy_execute_tool_keeps_current_directory_behavior() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cwd = std::env::current_dir().expect("current directory");
+        let relative_dir = PathBuf::from(format!(
+            ".clawd-tools-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let fixture_dir = cwd.join(&relative_dir);
+        let _fixture_cleanup = DirectoryCleanup::new(fixture_dir.clone());
+        fs::create_dir_all(&fixture_dir).expect("create legacy fixture dir");
+        fs::write(fixture_dir.join("same.txt"), "legacy-current-directory")
+            .expect("write legacy fixture");
+
+        let output = execute_tool("read_file", &json!({"path": relative_dir.join("same.txt")}))
+            .expect("legacy execute_tool reads from process cwd");
+        assert!(output.contains("legacy-current-directory"));
+
+        let attachment = execute_tool(
+            "Brief",
+            &json!({
+                "message": "legacy relative attachment",
+                "attachments": [relative_dir.join("same.txt")],
+                "status": "normal"
+            }),
+        )
+        .expect("legacy Brief resolves attachments from process cwd");
+        let attachment: serde_json::Value =
+            serde_json::from_str(&attachment).expect("legacy Brief json");
+        assert_eq!(
+            attachment["attachments"][0]["path"],
+            fs::canonicalize(fixture_dir.join("same.txt"))
+                .expect("canonical legacy attachment")
+                .display()
+                .to_string()
+        );
+
+        let without_attachment = execute_tool(
+            "Brief",
+            &json!({"message": "legacy without attachment", "status": "normal"}),
+        )
+        .expect("legacy Brief without attachment succeeds");
+        let without_attachment: serde_json::Value =
+            serde_json::from_str(&without_attachment).expect("legacy Brief json");
+        assert!(without_attachment["attachments"].is_null());
     }
 
     fn graph_node(title: &str, keywords: &[&str], importance: f64) -> Node {
@@ -6131,14 +7282,17 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
-        let prepared = prepare_agent(AgentInput {
-            description: "Audit the branch".to_string(),
-            prompt: "Check tests and outstanding work.".to_string(),
-            subagent_type: Some("Explore".to_string()),
-            name: Some("ship-audit".to_string()),
-            model: None,
-            run_in_background: false,
-        })
+        let prepared = prepare_agent_in_directory(
+            AgentInput {
+                description: "Audit the branch".to_string(),
+                prompt: "Check tests and outstanding work.".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("ship-audit".to_string()),
+                model: None,
+                run_in_background: false,
+            },
+            &test_working_directory(),
+        )
         .expect("Agent should be prepared");
         std::env::remove_var("CLAWD_AGENT_STORE");
 
@@ -6176,14 +7330,17 @@ mod tests {
         let dir = temp_path("agent-runner");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
 
-        let completed = prepare_agent(AgentInput {
-            description: "Complete the task".to_string(),
-            prompt: "Do the work".to_string(),
-            subagent_type: Some("Explore".to_string()),
-            name: Some("complete-task".to_string()),
-            model: Some("claude-sonnet-4-6".to_string()),
-            run_in_background: false,
-        })
+        let completed = prepare_agent_in_directory(
+            AgentInput {
+                description: "Complete the task".to_string(),
+                prompt: "Do the work".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("complete-task".to_string()),
+                model: Some("claude-sonnet-4-6".to_string()),
+                run_in_background: false,
+            },
+            &test_working_directory(),
+        )
         .expect("completed agent should prepare")
         .manifest;
         let artifact = ArtifactEnvelope {
@@ -6229,14 +7386,17 @@ mod tests {
         assert!(completed_manifest.contains("Finished successfully"));
         assert!(completed_output.contains("Finished successfully"));
 
-        let failed = prepare_agent(AgentInput {
-            description: "Fail the task".to_string(),
-            prompt: "Do the failing work".to_string(),
-            subagent_type: Some("Verification".to_string()),
-            name: Some("fail-task".to_string()),
-            model: None,
-            run_in_background: false,
-        })
+        let failed = prepare_agent_in_directory(
+            AgentInput {
+                description: "Fail the task".to_string(),
+                prompt: "Do the failing work".to_string(),
+                subagent_type: Some("Verification".to_string()),
+                name: Some("fail-task".to_string()),
+                model: None,
+                run_in_background: false,
+            },
+            &test_working_directory(),
+        )
         .expect("failed agent should prepare")
         .manifest;
         persist_agent_terminal_state(
@@ -6262,7 +7422,8 @@ mod tests {
     #[test]
     fn agent_profiles_own_prompt_tool_grant_and_output_contract() {
         for role in ["Explore", "Plan", "Verification"] {
-            let profile = build_agent_profile(role).expect("built-in profile");
+            let profile = build_agent_profile_in_directory(role, &test_working_directory())
+                .expect("built-in profile");
             assert_eq!(profile.role, role);
             assert!(profile.system_prompt.join("\n").contains(role));
             assert!(profile.tool_grant.contains("read_file"));
@@ -6491,14 +7652,17 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         std::env::set_var("CLAWD_AGENT_STORE", &agent_store);
 
-        let result = prepare_agent(AgentInput {
-            description: "续写第四章".into(),
-            prompt: "承接第三章并完成第四章正文。".into(),
-            subagent_type: Some("Novel".into()),
-            name: Some("chapter-four".into()),
-            model: None,
-            run_in_background: false,
-        });
+        let result = prepare_agent_in_directory(
+            AgentInput {
+                description: "续写第四章".into(),
+                prompt: "承接第三章并完成第四章正文。".into(),
+                subagent_type: Some("Novel".into()),
+                name: Some("chapter-four".into()),
+                model: None,
+                run_in_background: false,
+            },
+            &test_working_directory(),
+        );
         let Err(error) = result else {
             panic!("ephemeral Novel launch must be rejected");
         };
@@ -6575,14 +7739,18 @@ mod tests {
         for (index, role) in ["Explore", "Plan", "Verification"].into_iter().enumerate() {
             let cancellation = tokio_util::sync::CancellationToken::new();
             let lease = pool.acquire(&cancellation).await.expect("worker lease");
-            let profile = build_agent_profile(role).expect("built-in profile");
+            let profile = build_agent_profile_in_directory(role, &test_working_directory())
+                .expect("built-in profile");
             let sink = TestArtifactSink::default();
             let runtime = AgentRuntime::new(
                 MockSubagentApiClient {
                     calls: 0,
                     input_path: path.display().to_string(),
                 },
-                SubagentToolExecutor::new(profile.tool_grant.iter().map(str::to_string).collect()),
+                SubagentToolExecutor::new(
+                    profile.tool_grant.iter().map(str::to_string).collect(),
+                    std::env::current_dir().expect("cwd"),
+                ),
                 agent_permission_policy(),
                 sink.clone(),
             );
@@ -6824,8 +7992,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("fs-suite");
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&root).expect("set cwd");
 
         let write_create = execute_tool(
             "write_file",
@@ -6929,7 +8096,7 @@ mod tests {
         .expect_err("missing substring should fail");
         assert!(edit_missing.contains("old_string not found"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6940,8 +8107,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("search-suite");
         fs::create_dir_all(root.join("nested")).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&root).expect("set cwd");
 
         fs::write(
             root.join("nested/lib.rs"),
@@ -7001,7 +8167,7 @@ mod tests {
         .expect_err("invalid regex should fail");
         assert!(!grep_error.is_empty());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7060,6 +8226,13 @@ mod tests {
         assert_eq!(output["message"], "hello user");
         assert!(output["sentAt"].as_str().is_some());
         assert_eq!(output["attachments"][0]["isImage"], true);
+        assert_eq!(
+            output["attachments"][0]["path"],
+            fs::canonicalize(&attachment)
+                .expect("canonical absolute attachment")
+                .display()
+                .to_string()
+        );
         let _ = std::fs::remove_file(attachment);
     }
 
@@ -7087,10 +8260,9 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&cwd).expect("set cwd");
 
         let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
         let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
@@ -7117,7 +8289,7 @@ mod tests {
         let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
         assert_eq!(unknown_output["success"], false);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -7153,10 +8325,9 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&cwd).expect("set cwd");
 
         let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
@@ -7190,7 +8361,7 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -7221,10 +8392,9 @@ mod tests {
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
         std::env::remove_var("CLAW_CONFIG_HOME");
-        std::env::set_current_dir(&cwd).expect("set cwd");
+        let cwd_guard = CurrentDirGuard::change_to(&cwd).expect("set cwd");
 
         let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
@@ -7251,7 +8421,7 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        drop(cwd_guard);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -7512,9 +8682,10 @@ printf 'pwsh:%s' "$1"
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let client = ProviderRuntimeClient::new(
+        let client = ProviderRuntimeClient::new_in_directory(
             String::from("claude-opus-4-6"),
             BTreeSet::from([String::from("read_file")]),
+            &test_working_directory(),
         );
 
         match &client {
@@ -7543,7 +8714,7 @@ printf 'pwsh:%s' "$1"
         let default_model = config.llm.default_model.clone();
         let default_provider = &config.llm.default_provider;
 
-        // 直接构建 client，不走 ProviderRuntimeClient::new()（它会用 subagent 模型）
+        // 直接构建 client，不走目录化构造函数（它会用 subagent 模型）
         let api_key = config.resolve_api_key(default_provider).expect("api key");
         let provider_config = config
             .llm
@@ -7639,14 +8810,15 @@ printf 'pwsh:%s' "$1"
 
         eprintln!("[测试] 创建 AgentRuntime, model={}", api_client.model);
         let model = api_client.resolved_model_policy();
-        let profile = build_agent_profile("Explore").expect("profile");
+        let profile = build_agent_profile_in_directory("Explore", &test_working_directory())
+            .expect("profile");
         let sink = TestArtifactSink::default();
         let cancellation = tokio_util::sync::CancellationToken::new();
         let pool = AgentWorkerPool::new(1).expect("worker pool");
         let lease = pool.acquire(&cancellation).await.expect("worker lease");
         let runtime = AgentRuntime::new(
             api_client,
-            SubagentToolExecutor::new(BTreeSet::new()),
+            SubagentToolExecutor::new(BTreeSet::new(), std::env::current_dir().expect("cwd")),
             agent_permission_policy(),
             sink,
         );
@@ -7799,15 +8971,22 @@ printf 'pwsh:%s' "$1"
             String::from("grep_search"),
         ]);
 
-        let api_client = ProviderRuntimeClient::new(String::new(), allowed_tools.clone())
-            .expect("ProviderRuntimeClient 应该创建成功");
+        let api_client = ProviderRuntimeClient::new_in_directory(
+            String::new(),
+            allowed_tools.clone(),
+            &test_working_directory(),
+        )
+        .expect("ProviderRuntimeClient 应该创建成功");
 
         eprintln!("[测试] 创建带工具的 runtime, model={}", api_client.model);
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             api_client,
-            SubagentToolExecutor::new(allowed_tools),
+            SubagentToolExecutor::new(
+                allowed_tools,
+                std::env::current_dir().expect("cwd"),
+            ),
             agent_permission_policy(),
             vec![format!(
                 "You are a sub-agent. Read the file at {tmp_path_str} and report its contents. Use the read_file tool."

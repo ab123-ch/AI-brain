@@ -4,7 +4,7 @@
 //! tool execution happens in `collaboration_runtime` after a claim has been
 //! committed and every database handle has been released.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,7 +18,7 @@ use task_engine::SchedulerLimits;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 8;
 const DEFAULT_PROFILE_ID: &str = "general_member";
 pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
@@ -30,6 +30,62 @@ pub(crate) fn default_runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ai-brain");
     dirs::home_dir().unwrap_or(fallback).join(".ai-brain")
+}
+
+#[cfg(any(unix, test))]
+fn unix_directory_mode_has_search(mode: u32) -> bool {
+    mode & 0o111 != 0
+}
+
+#[cfg(any(unix, test))]
+fn validate_directory_search_with<F>(path: &Path, probe: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let candidate = path.join(".");
+    probe(&candidate).map_err(|error| {
+        CollaborationError::Config(format!(
+            "工作目录缺少目录搜索权限: {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+pub(crate) fn validate_working_directory_access(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        CollaborationError::Config(format!("工作目录不可访问: {}: {error}", path.display()))
+    })?;
+    if !metadata.is_dir() {
+        return Err(CollaborationError::Config(format!(
+            "工作目录不是目录: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if !unix_directory_mode_has_search(metadata.mode()) {
+            return Err(CollaborationError::Config(format!(
+                "工作目录缺少目录搜索权限: {}",
+                path.display()
+            )));
+        }
+        validate_directory_search_with(path, |candidate| fs::metadata(candidate).map(|_| ()))?;
+    }
+    fs::read_dir(path).map_err(|error| {
+        CollaborationError::Config(format!("工作目录无法读取: {}: {error}", path.display()))
+    })?;
+    Ok(())
+}
+
+fn path_to_storage_text(path: &Path) -> Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        CollaborationError::Config(format!(
+            "工作目录路径不是有效 UTF-8，无法无损保存: {}",
+            path.display()
+        ))
+    })
 }
 
 #[derive(Debug, Error)]
@@ -90,6 +146,22 @@ pub enum CollaborationError {
     EmptyThreadKey,
     #[error("成员模板不存在: {0}")]
     MemberTemplateNotFound(String),
+    #[error("回复目标不存在: {0}")]
+    ReplyTargetNotFound(String),
+    #[error("回复目标 {event_id} 属于房间 {target_room_id}，不能用于房间 {room_id}")]
+    ReplyTargetRoomMismatch {
+        event_id: String,
+        room_id: String,
+        target_room_id: String,
+    },
+    #[error("回复目标已经失效: {0}")]
+    ReplyTargetInvalidated(String),
+    #[error("回复目标 {event_id} 的类型不受支持: {sender_kind}/{kind}")]
+    ReplyTargetTypeUnsupported {
+        event_id: String,
+        sender_kind: String,
+        kind: String,
+    },
     #[error("协作配置错误: {0}")]
     Config(String),
 }
@@ -118,6 +190,7 @@ impl CollaborationActor {
 pub enum RoomCapability {
     RoomRead,
     RoomPost,
+    ConfigureRoom,
     MentionMember,
     SubmitTask,
     CreateMember,
@@ -136,6 +209,7 @@ impl RoomCapability {
         vec![
             Self::RoomRead,
             Self::RoomPost,
+            Self::ConfigureRoom,
             Self::MentionMember,
             Self::SubmitTask,
             Self::CreateMember,
@@ -570,6 +644,19 @@ pub enum ParticipationDisposition {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxFailureDisposition {
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimReleaseDisposition {
+    Released,
+    AlreadyPending,
+    AlreadyTerminal(InboxState),
+}
+
 impl InboxState {
     fn from_db(value: &str) -> Self {
         match value {
@@ -603,8 +690,11 @@ impl RoomInputMode {
 pub struct CollaborationRoomView {
     pub room_id: String,
     pub title: String,
+    pub working_directory: String,
     pub default_member_id: String,
     pub latest_event_seq: u64,
+    #[serde(default)]
+    pub state_revision: u64,
     pub version: u64,
     pub created_at: DateTime<Utc>,
 }
@@ -642,11 +732,31 @@ pub struct RoomEventView {
     pub content: String,
     pub run_id: Option<String>,
     pub parent_event_id: Option<String>,
+    #[serde(default)]
+    pub reply_reference: Option<RoomEventReferenceView>,
     pub conversation_root_event_id: String,
     pub debate_depth: u32,
     pub group_enabled: bool,
     pub conversation_mode: RoomInputMode,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomEventReferenceView {
+    pub event_id: String,
+    pub sequence: u64,
+    pub sender_kind: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub kind: String,
+    pub content: String,
+    pub content_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+struct ValidatedReplyTarget {
+    reference: RoomEventReferenceView,
+    conversation_root_event_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -686,6 +796,8 @@ pub struct RoomSnapshot {
     pub room: CollaborationRoomView,
     pub members: Vec<BrainMemberView>,
     pub events: Vec<RoomEventView>,
+    #[serde(default)]
+    pub has_earlier_events: bool,
     pub inbox: Vec<InboxItemView>,
     pub deliveries: Vec<RoomEventDeliveryView>,
     pub member_templates: Vec<MemberTemplateView>,
@@ -695,6 +807,12 @@ pub struct RoomSnapshot {
     pub reasoning_depths: Vec<String>,
     pub max_members: usize,
     pub max_workers: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomEventPage {
+    pub events: Vec<RoomEventView>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -736,11 +854,71 @@ pub struct ClaimedInboxItem {
     pub context_through_seq: u64,
     pub response_to_event_id: String,
     pub group_enabled: bool,
+    pub execution_working_directory: PathBuf,
+    pub reply_reference: Option<RoomEventReferenceView>,
     pub input: String,
     pub mode: RoomInputMode,
     pub run_id: String,
     pub task_run_id: String,
     pub version: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ClaimCandidate {
+    inbox_item_id: String,
+    room_id: Option<String>,
+    member_id: String,
+    member_name: String,
+    profile_id: String,
+    model_policy: String,
+    reasoning_depth: String,
+    source_event_id: String,
+    source_event_found: bool,
+    source_event_seq: Option<u64>,
+    input: Option<String>,
+    mode: String,
+    task_run_id: String,
+    version: u64,
+    thread_key: String,
+    purpose: String,
+    conversation_root_event_id: String,
+    context_through_seq: Option<u64>,
+    response_to_event_id: String,
+    group_enabled: Option<bool>,
+    execution_working_directory: Option<String>,
+    parent_event_id: Option<String>,
+    reply_event_id: Option<String>,
+    reply_room_id: Option<String>,
+    reply_sequence: Option<u64>,
+    reply_sender_kind: Option<String>,
+    reply_sender_id: Option<String>,
+    reply_sender_name: Option<String>,
+    reply_kind: Option<String>,
+    reply_content: Option<String>,
+    reply_created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemberReplyEventContext<'a> {
+    room_id: &'a str,
+    member_id: &'a str,
+    member_name: &'a str,
+    run_id: &'a str,
+    response_to_event_id: &'a str,
+    execution_working_directory: &'a Path,
+}
+
+impl<'a> From<&'a ClaimedInboxItem> for MemberReplyEventContext<'a> {
+    fn from(claim: &'a ClaimedInboxItem) -> Self {
+        Self {
+            room_id: &claim.room_id,
+            member_id: &claim.member_id,
+            member_name: &claim.member_name,
+            run_id: &claim.run_id,
+            response_to_event_id: &claim.response_to_event_id,
+            execution_working_directory: &claim.execution_working_directory,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,14 +938,28 @@ fn history_content_hash(content: &str) -> String {
 pub struct CollaborationRepository {
     database_path: PathBuf,
     config: CollaborationConfig,
+    startup_working_directory: PathBuf,
 }
 
 impl CollaborationRepository {
     pub fn new(runtime_dir: &Path, config: CollaborationConfig) -> Result<Self> {
+        let startup_working_directory = std::env::current_dir()?;
+        Self::new_with_startup_working_directory(runtime_dir, config, &startup_working_directory)
+    }
+
+    pub fn new_with_startup_working_directory(
+        runtime_dir: &Path,
+        config: CollaborationConfig,
+        startup_working_directory: &Path,
+    ) -> Result<Self> {
+        let startup_working_directory = startup_working_directory.canonicalize()?;
+        validate_working_directory_access(&startup_working_directory)?;
+        path_to_storage_text(&startup_working_directory)?;
         fs::create_dir_all(runtime_dir)?;
         let repository = Self {
             database_path: runtime_dir.join("runtime.db"),
             config,
+            startup_working_directory,
         };
         repository.initialize()?;
         Ok(repository)
@@ -790,7 +982,7 @@ impl CollaborationRepository {
 
     #[allow(clippy::too_many_lines)]
     fn initialize(&self) -> Result<()> {
-        let connection = self.connect()?;
+        let mut connection = self.connect()?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS collaboration_schema (
@@ -803,8 +995,10 @@ impl CollaborationRepository {
                  room_id TEXT PRIMARY KEY,
                  workspace_id TEXT NOT NULL DEFAULT 'local',
                  title TEXT NOT NULL,
+                 working_directory TEXT NOT NULL,
                  default_member_id TEXT NOT NULL,
                  latest_event_seq INTEGER NOT NULL DEFAULT 0,
+                 state_revision INTEGER NOT NULL DEFAULT 0,
                  room_summary_ref TEXT,
                  room_summary_through_seq INTEGER NOT NULL DEFAULT 0,
                  version INTEGER NOT NULL DEFAULT 1,
@@ -870,6 +1064,7 @@ impl CollaborationRepository {
                  idempotency_key TEXT NOT NULL,
                  created_at TEXT NOT NULL,
                  invalidated_at TEXT,
+                 execution_working_directory TEXT,
                  UNIQUE(room_id, sequence),
                  UNIQUE(room_id, idempotency_key)
              );
@@ -1143,6 +1338,71 @@ impl CollaborationRepository {
             )?;
             version = 6;
         }
+        if version == 6 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !table_has_column(&transaction, "collaboration_rooms", "working_directory")? {
+                transaction.execute(
+                    "ALTER TABLE collaboration_rooms
+                     ADD COLUMN working_directory TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            if !table_has_column(&transaction, "room_events", "execution_working_directory")? {
+                transaction.execute(
+                    "ALTER TABLE room_events ADD COLUMN execution_working_directory TEXT",
+                    [],
+                )?;
+            }
+            let startup_working_directory = path_to_storage_text(&self.startup_working_directory)?;
+            transaction.execute(
+                "UPDATE collaboration_rooms SET working_directory = ?1",
+                [&startup_working_directory],
+            )?;
+            transaction.execute(
+                "UPDATE room_events SET execution_working_directory = ?1",
+                [&startup_working_directory],
+            )?;
+            transaction.execute(
+                "UPDATE room_principal_memberships
+                 SET capabilities_json = ?1, capability_version = 2,
+                     version = version + 1, updated_at = ?2
+                 WHERE principal_id = ?3 AND role = 'owner'",
+                params![
+                    serialize_capabilities(&RoomCapability::owner_capabilities())?,
+                    Utc::now().to_rfc3339(),
+                    LOCAL_PRINCIPAL_ID,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE collaboration_schema SET version = 7 WHERE singleton = 1",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 7;
+        }
+        if version == 7 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !table_has_column(&transaction, "collaboration_rooms", "state_revision")? {
+                transaction.execute(
+                    "ALTER TABLE collaboration_rooms
+                     ADD COLUMN state_revision INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE collaboration_rooms SET state_revision = 1
+                 WHERE state_revision = 0",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE collaboration_schema SET version = 8 WHERE singleton = 1",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 8;
+        }
         if version != SCHEMA_VERSION {
             return Err(CollaborationError::Config(format!(
                 "不支持的协作存储版本 {version}"
@@ -1192,7 +1452,7 @@ impl CollaborationRepository {
                  room_id, principal_id, role, capabilities_json, capability_version,
                  version, created_at, updated_at
              )
-             SELECT room_id, ?1, 'owner', ?2, 1, 1, ?3, ?3
+             SELECT room_id, ?1, 'owner', ?2, 2, 1, ?3, ?3
              FROM collaboration_rooms
              WHERE 1
              ON CONFLICT(room_id, principal_id) DO NOTHING",
@@ -1239,14 +1499,23 @@ impl CollaborationRepository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let default_member_id = format!("member-{room_id}-main");
         let now = Utc::now();
-        transaction.execute(
+        let startup_working_directory = path_to_storage_text(&self.startup_working_directory)?;
+        let mut changed = transaction.execute(
             "INSERT INTO collaboration_rooms(
-                 room_id, title, default_member_id, latest_event_seq, version, created_at
-             ) VALUES (?1, ?2, ?3, 0, 1, ?4)
-             ON CONFLICT(room_id) DO UPDATE SET title = excluded.title",
-            params![room_id, title, default_member_id, now.to_rfc3339()],
-        )?;
-        transaction.execute(
+                 room_id, title, working_directory, default_member_id,
+                 latest_event_seq, version, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)
+             ON CONFLICT(room_id) DO UPDATE SET title = excluded.title
+             WHERE collaboration_rooms.title <> excluded.title",
+            params![
+                room_id,
+                title,
+                startup_working_directory,
+                default_member_id,
+                now.to_rfc3339(),
+            ],
+        )? > 0;
+        changed |= transaction.execute(
             "INSERT INTO brain_members(
                  member_id, room_id, display_name, template_id, profile_id, model_policy,
                  reasoning_depth, availability, version, created_at, last_woken_at
@@ -1261,8 +1530,15 @@ impl CollaborationRepository {
                 self.config.default_reasoning_depth,
                 now.to_rfc3339(),
             ],
-        )?;
+        )? > 0;
         ensure_local_owner_membership(&transaction, room_id, &now)?;
+        let execution_working_directory: String = transaction.query_row(
+            "SELECT working_directory FROM collaboration_rooms WHERE room_id = ?1",
+            [room_id],
+            |row| row.get(0),
+        )?;
+        let execution_working_directory =
+            required_execution_working_directory(execution_working_directory)?;
 
         for (index, message) in legacy_messages.iter().enumerate() {
             if message.hidden || !matches!(message.role.as_str(), "user" | "assistant") {
@@ -1291,9 +1567,10 @@ impl CollaborationRepository {
             };
             transaction.execute(
                 "INSERT INTO room_events(
-                     event_id, room_id, sequence, sender_kind, sender_id, sender_name,
-                     kind, content, run_id, idempotency_key, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
+                 event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                     kind, content, run_id, idempotency_key,
+                     execution_working_directory, created_at
+                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11)",
                 params![
                     event_id,
                     room_id,
@@ -1304,9 +1581,11 @@ impl CollaborationRepository {
                     kind,
                     message.content,
                     idempotency_key,
+                    execution_working_directory.display().to_string(),
                     message.timestamp.to_rfc3339(),
                 ],
             )?;
+            changed = true;
             if message.role == "user" {
                 transaction.execute(
                     "INSERT INTO room_event_recipients(event_id, member_id) VALUES (?1, ?2)",
@@ -1314,15 +1593,95 @@ impl CollaborationRepository {
                 )?;
             }
         }
+        if changed {
+            enqueue_room_changed(
+                &transaction,
+                room_id,
+                "room",
+                room_id,
+                &format!("room-ensured:{room_id}:{}", Uuid::new_v4()),
+            )?;
+        }
+        transaction.commit()?;
+        self.snapshot(room_id)
+    }
+
+    pub fn update_room_working_directory(
+        &self,
+        room_id: &str,
+        working_directory: &str,
+        expected_version: u64,
+    ) -> Result<CollaborationRoomView> {
+        self.update_room_working_directory_as(
+            &CollaborationActor::local(),
+            room_id,
+            working_directory,
+            expected_version,
+        )
+    }
+
+    pub fn update_room_working_directory_as(
+        &self,
+        actor: &CollaborationActor,
+        room_id: &str,
+        working_directory: &str,
+        expected_version: u64,
+    ) -> Result<CollaborationRoomView> {
+        {
+            let connection = self.connect()?;
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM collaboration_rooms WHERE room_id = ?1)",
+                [room_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(CollaborationError::RoomNotFound(room_id.into()));
+            }
+            require_capability(&connection, actor, room_id, RoomCapability::ConfigureRoom)?;
+        }
+
+        let working_directory = working_directory.trim();
+        if working_directory.is_empty() {
+            return Err(CollaborationError::Config("房间工作目录不能为空".into()));
+        }
+        let requested_path = Path::new(working_directory);
+        let candidate = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.startup_working_directory.join(requested_path)
+        };
+        let canonical = candidate.canonicalize()?;
+        validate_working_directory_access(&canonical)?;
+        let canonical = path_to_storage_text(&canonical)?;
+
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_capability(&transaction, actor, room_id, RoomCapability::ConfigureRoom)?;
+        let actual_version = transaction
+            .query_row(
+                "SELECT version FROM collaboration_rooms WHERE room_id = ?1",
+                [room_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| CollaborationError::RoomNotFound(room_id.into()))?;
+        ensure_version("room", room_id, expected_version, actual_version)?;
+        transaction.execute(
+            "UPDATE collaboration_rooms
+             SET working_directory = ?1, version = version + 1
+             WHERE room_id = ?2",
+            params![canonical, room_id],
+        )?;
         enqueue_room_changed(
             &transaction,
             room_id,
             "room",
             room_id,
-            &format!("room-ensured:{room_id}"),
+            &format!("room-working-directory:{room_id}:{}", Uuid::new_v4()),
         )?;
+        let room = room_from_connection(&transaction, room_id)?;
         transaction.commit()?;
-        self.snapshot(room_id)
+        Ok(room)
     }
 
     pub fn create_member(
@@ -1819,6 +2178,7 @@ impl CollaborationRepository {
             thread_key,
             expected_room_version,
             idempotency_key,
+            None,
             false,
         )
     }
@@ -1870,6 +2230,32 @@ impl CollaborationRepository {
         expected_room_version: u64,
         idempotency_key: &str,
     ) -> Result<PostMessageResult> {
+        self.post_group_message_checked_with_reply(
+            actor,
+            room_id,
+            recipients,
+            content,
+            mode,
+            thread_key,
+            expected_room_version,
+            idempotency_key,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_group_message_checked_with_reply(
+        &self,
+        actor: &CollaborationActor,
+        room_id: &str,
+        recipients: &[MemberAddress],
+        content: &str,
+        mode: RoomInputMode,
+        thread_key: &str,
+        expected_room_version: u64,
+        idempotency_key: &str,
+        reply_to_event_id: Option<&str>,
+    ) -> Result<PostMessageResult> {
         self.post_message_checked_internal(
             actor,
             room_id,
@@ -1879,6 +2265,7 @@ impl CollaborationRepository {
             thread_key,
             expected_room_version,
             idempotency_key,
+            reply_to_event_id,
             true,
         )
     }
@@ -1894,6 +2281,7 @@ impl CollaborationRepository {
         thread_key: &str,
         expected_room_version: u64,
         idempotency_key: &str,
+        reply_to_event_id: Option<&str>,
         group_enabled: bool,
     ) -> Result<PostMessageResult> {
         let content = content.trim();
@@ -1940,12 +2328,18 @@ impl CollaborationRepository {
                 duplicate: true,
             });
         }
-        let actual_room_version: u64 = transaction.query_row(
-            "SELECT version FROM collaboration_rooms WHERE room_id = ?1",
-            [room_id],
-            |row| row.get(0),
-        )?;
+        let (actual_room_version, execution_working_directory): (u64, String) = transaction
+            .query_row(
+                "SELECT version, working_directory FROM collaboration_rooms WHERE room_id = ?1",
+                [room_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
         ensure_version("room", room_id, expected_room_version, actual_room_version)?;
+        let execution_working_directory =
+            required_execution_working_directory(execution_working_directory)?;
+        let reply_target = reply_to_event_id
+            .map(|event_id| validated_reply_target(&transaction, room_id, event_id))
+            .transpose()?;
 
         let room_pending: usize = transaction.query_row(
             "SELECT COUNT(*)
@@ -2011,24 +2405,45 @@ impl CollaborationRepository {
 
         let event_id = format!("event-{}", Uuid::new_v4());
         let sequence = allocate_room_sequence(&transaction, room_id)?;
+        if reply_target
+            .as_ref()
+            .is_some_and(|target| target.reference.sequence >= sequence)
+        {
+            return Err(CollaborationError::Config(
+                "回复目标序号必须早于新消息".into(),
+            ));
+        }
+        let (parent_event_id, conversation_root_event_id, reply_reference) =
+            match reply_target.as_ref() {
+                Some(target) => (
+                    Some(target.reference.event_id.clone()),
+                    target.conversation_root_event_id.clone(),
+                    Some(target.reference.clone()),
+                ),
+                None => (None, event_id.clone(), None),
+            };
         let now = Utc::now();
         transaction.execute(
             "INSERT INTO room_events(
                  event_id, room_id, sequence, sender_kind, sender_id, sender_name,
                  kind, content, run_id, parent_event_id, conversation_root_event_id,
-                 debate_depth, group_enabled, conversation_mode, idempotency_key, created_at
-             ) VALUES (
-                 ?1, ?2, ?3, 'user', 'user', '用户', 'user_message', ?4, NULL,
-                 NULL, ?1, 0, ?5, ?6, ?7, ?8
-             )",
+                 debate_depth, group_enabled, conversation_mode, idempotency_key,
+                 execution_working_directory, created_at
+              ) VALUES (
+                  ?1, ?2, ?3, 'user', 'user', '用户', 'user_message', ?4, NULL,
+                  ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11
+              )",
             params![
                 event_id,
                 room_id,
                 sequence,
                 content,
+                parent_event_id.as_deref(),
+                conversation_root_event_id,
                 group_enabled,
                 mode.as_db(),
                 idempotency_key,
+                execution_working_directory.display().to_string(),
                 now.to_rfc3339(),
             ],
         )?;
@@ -2046,7 +2461,7 @@ impl CollaborationRepository {
                 thread_key,
                 mode,
                 InboxPurpose::Direct,
-                &event_id,
+                &conversation_root_event_id,
                 recipient.expected_version,
                 &format!("{idempotency_key}:{member_id}"),
                 &now,
@@ -2095,8 +2510,9 @@ impl CollaborationRepository {
             kind: "user_message".into(),
             content: content.into(),
             run_id: None,
-            parent_event_id: None,
-            conversation_root_event_id: event_id,
+            parent_event_id,
+            reply_reference,
+            conversation_root_event_id,
             debate_depth: 0,
             group_enabled,
             conversation_mode: mode,
@@ -2123,15 +2539,28 @@ impl CollaborationRepository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate = transaction
             .query_row(
-                "SELECT i.inbox_item_id, e.room_id, i.member_id, m.display_name,
-                        m.profile_id, m.model_policy, m.reasoning_depth,
-                        i.source_event_id, e.sequence, e.content, i.mode, i.task_run_id, i.version,
-                        i.thread_key, i.purpose,
-                        COALESCE(i.conversation_root_event_id, i.source_event_id),
+                "SELECT i.inbox_item_id AS inbox_item_id,
+                        e.room_id AS room_id,
+                        i.member_id AS member_id,
+                        m.display_name AS member_name,
+                        m.profile_id AS profile_id,
+                        m.model_policy AS model_policy,
+                        m.reasoning_depth AS reasoning_depth,
+                        i.source_event_id AS source_event_id,
+                        e.event_id IS NOT NULL AS source_event_found,
+                        e.sequence AS source_event_seq,
+                        e.content AS input,
+                        i.mode AS mode,
+                        i.task_run_id AS task_run_id,
+                        i.version AS version,
+                        i.thread_key AS thread_key,
+                        i.purpose AS purpose,
+                        COALESCE(i.conversation_root_event_id, i.source_event_id)
+                            AS conversation_root_event_id,
                         CASE WHEN i.purpose = 'participation'
                              THEN CASE WHEN i.context_through_seq > 0
                                        THEN i.context_through_seq ELSE room.latest_event_seq END
-                             ELSE e.sequence END,
+                             ELSE e.sequence END AS context_through_seq,
                         CASE WHEN i.purpose = 'participation' THEN COALESCE((
                             SELECT delivered.event_id
                             FROM room_event_deliveries delivery
@@ -2141,14 +2570,26 @@ impl CollaborationRepository {
                                   = COALESCE(i.conversation_root_event_id, i.source_event_id)
                               AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
                                   THEN i.context_through_seq ELSE room.latest_event_seq END
-                              AND delivered.invalidated_at IS NULL
-                            ORDER BY delivered.sequence DESC LIMIT 1
-                        ), i.source_event_id) ELSE i.source_event_id END,
-                        e.group_enabled
+                               AND delivered.invalidated_at IS NULL
+                             ORDER BY delivered.sequence DESC LIMIT 1
+                        ), i.source_event_id) ELSE i.source_event_id END AS response_to_event_id,
+                        e.group_enabled AS group_enabled,
+                        e.execution_working_directory AS execution_working_directory,
+                        e.parent_event_id AS parent_event_id,
+                        parent.event_id AS reply_event_id,
+                        parent.room_id AS reply_room_id,
+                        parent.sequence AS reply_sequence,
+                        parent.sender_kind AS reply_sender_kind,
+                        parent.sender_id AS reply_sender_id,
+                        parent.sender_name AS reply_sender_name,
+                        parent.kind AS reply_kind,
+                        parent.content AS reply_content,
+                        parent.created_at AS reply_created_at
                  FROM member_inbox_items i
                  JOIN brain_members m ON m.member_id = i.member_id
-                 JOIN room_events e ON e.event_id = i.source_event_id
-                 JOIN collaboration_rooms room ON room.room_id = e.room_id
+                 LEFT JOIN room_events e ON e.event_id = i.source_event_id
+                 LEFT JOIN collaboration_rooms room ON room.room_id = e.room_id
+                 LEFT JOIN room_events parent ON parent.event_id = e.parent_event_id
                  WHERE i.state = 'pending'
                    AND e.invalidated_at IS NULL
                    AND m.availability = 'active'
@@ -2162,57 +2603,28 @@ impl CollaborationRepository {
                           i.created_at, i.rowid
                  LIMIT 1",
                 [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, u64>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, String>(10)?,
-                        row.get::<_, String>(11)?,
-                        row.get::<_, u64>(12)?,
-                        row.get::<_, String>(13)?,
-                        row.get::<_, String>(14)?,
-                        row.get::<_, String>(15)?,
-                        row.get::<_, u64>(16)?,
-                        row.get::<_, String>(17)?,
-                        row.get::<_, bool>(18)?,
-                    ))
-                },
+                claimed_inbox_from_row,
             )
             .optional()?;
-        let Some((
-            inbox_item_id,
-            room_id,
-            member_id,
-            member_name,
-            profile_id,
-            model_policy,
-            reasoning_depth,
-            source_event_id,
-            source_event_seq,
-            input,
-            mode,
-            task_run_id,
-            version,
-            thread_key,
-            purpose,
-            conversation_root_event_id,
-            context_through_seq,
-            response_to_event_id,
-            group_enabled,
-        )) = candidate
-        else {
+        let Some(candidate) = candidate else {
             transaction.commit()?;
             return Ok(None);
         };
         let run_id = format!("run-{}", Uuid::new_v4());
+        let claim =
+            match claimed_inbox_from_candidate(&candidate, run_id.clone(), candidate.version + 1) {
+                Ok(claim) => claim,
+                Err(error @ CollaborationError::Config(_)) => {
+                    let quarantined =
+                        quarantine_corrupt_claim(&transaction, &candidate, &error.to_string())?;
+                    transaction.commit()?;
+                    if quarantined {
+                        return Err(error);
+                    }
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
         let lease_expires_at = Utc::now() + chrono::Duration::minutes(5);
         let updated = transaction.execute(
             "UPDATE member_inbox_items
@@ -2220,11 +2632,11 @@ impl CollaborationRepository {
                  context_through_seq = ?3, version = version + 1
              WHERE inbox_item_id = ?4 AND state = 'pending' AND version = ?5",
             params![
-                run_id,
+                &run_id,
                 lease_expires_at.to_rfc3339(),
-                context_through_seq,
-                inbox_item_id,
-                version
+                claim.context_through_seq,
+                &candidate.inbox_item_id,
+                candidate.version
             ],
         )?;
         if updated == 0 {
@@ -2235,42 +2647,17 @@ impl CollaborationRepository {
             "UPDATE room_event_deliveries
              SET state = 'running', updated_at = ?1
              WHERE inbox_item_id = ?2 AND state IN ('queued', 'deferred')",
-            params![Utc::now().to_rfc3339(), inbox_item_id],
+            params![Utc::now().to_rfc3339(), &candidate.inbox_item_id],
         )?;
         enqueue_room_changed(
             &transaction,
-            &room_id,
+            &claim.room_id,
             "inbox",
-            &inbox_item_id,
-            &format!("inbox-leased:{inbox_item_id}:{run_id}"),
+            &candidate.inbox_item_id,
+            &format!("inbox-leased:{}:{run_id}", candidate.inbox_item_id),
         )?;
         transaction.commit()?;
-        Ok(Some(ClaimedInboxItem {
-            inbox_item_id,
-            room_id,
-            member_id,
-            member_name,
-            profile_id,
-            model_policy,
-            reasoning_depth,
-            source_event_id,
-            source_event_seq,
-            thread_key,
-            purpose: InboxPurpose::from_db(&purpose),
-            conversation_root_event_id,
-            context_through_seq,
-            response_to_event_id,
-            group_enabled,
-            input,
-            mode: if mode == "task" {
-                RoomInputMode::Task
-            } else {
-                RoomInputMode::Chat
-            },
-            run_id,
-            task_run_id,
-            version: version + 1,
-        }))
+        Ok(Some(claim))
     }
 
     pub fn claim_for_reconciliation(
@@ -2280,15 +2667,28 @@ impl CollaborationRepository {
         durable_run_id: &str,
     ) -> Result<Option<ClaimedInboxItem>> {
         let connection = self.connect()?;
-        connection
+        let candidate = connection
             .query_row(
-                "SELECT i.inbox_item_id, e.room_id, i.member_id, m.display_name,
-                        m.profile_id, m.model_policy, m.reasoning_depth,
-                        i.source_event_id, e.sequence, e.content, i.mode, i.task_run_id, i.version,
-                        i.thread_key, i.purpose,
-                        COALESCE(i.conversation_root_event_id, i.source_event_id),
+                "SELECT i.inbox_item_id AS inbox_item_id,
+                        e.room_id AS room_id,
+                        i.member_id AS member_id,
+                        m.display_name AS member_name,
+                        m.profile_id AS profile_id,
+                        m.model_policy AS model_policy,
+                        m.reasoning_depth AS reasoning_depth,
+                        i.source_event_id AS source_event_id,
+                        e.event_id IS NOT NULL AS source_event_found,
+                        e.sequence AS source_event_seq,
+                        e.content AS input,
+                        i.mode AS mode,
+                        i.task_run_id AS task_run_id,
+                        i.version AS version,
+                        i.thread_key AS thread_key,
+                        i.purpose AS purpose,
+                        COALESCE(i.conversation_root_event_id, i.source_event_id)
+                            AS conversation_root_event_id,
                         CASE WHEN i.purpose = 'participation' AND i.context_through_seq > 0
-                             THEN i.context_through_seq ELSE e.sequence END,
+                             THEN i.context_through_seq ELSE e.sequence END AS context_through_seq,
                         CASE WHEN i.purpose = 'participation' THEN COALESCE((
                             SELECT delivered.event_id
                             FROM room_event_deliveries delivery
@@ -2298,49 +2698,36 @@ impl CollaborationRepository {
                                   = COALESCE(i.conversation_root_event_id, i.source_event_id)
                               AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
                                   THEN i.context_through_seq ELSE e.sequence END
-                              AND delivered.invalidated_at IS NULL
-                            ORDER BY delivered.sequence DESC LIMIT 1
-                        ), i.source_event_id) ELSE i.source_event_id END,
-                        e.group_enabled
+                               AND delivered.invalidated_at IS NULL
+                             ORDER BY delivered.sequence DESC LIMIT 1
+                        ), i.source_event_id) ELSE i.source_event_id END AS response_to_event_id,
+                        e.group_enabled AS group_enabled,
+                        e.execution_working_directory AS execution_working_directory,
+                        e.parent_event_id AS parent_event_id,
+                        parent.event_id AS reply_event_id,
+                        parent.room_id AS reply_room_id,
+                        parent.sequence AS reply_sequence,
+                        parent.sender_kind AS reply_sender_kind,
+                        parent.sender_id AS reply_sender_id,
+                        parent.sender_name AS reply_sender_name,
+                        parent.kind AS reply_kind,
+                        parent.content AS reply_content,
+                        parent.created_at AS reply_created_at
                  FROM member_inbox_items i
                  JOIN brain_members m ON m.member_id = i.member_id
-                 JOIN room_events e ON e.event_id = i.source_event_id
+                 LEFT JOIN room_events e ON e.event_id = i.source_event_id
+                 LEFT JOIN room_events parent ON parent.event_id = e.parent_event_id
                  WHERE i.inbox_item_id = ?1 AND i.task_run_id = ?2
                    AND i.state NOT IN ('completed', 'cancelled')
                    AND e.invalidated_at IS NULL",
                 params![inbox_item_id, task_run_id],
-                |row| {
-                    let mode: String = row.get(10)?;
-                    Ok(ClaimedInboxItem {
-                        inbox_item_id: row.get(0)?,
-                        room_id: row.get(1)?,
-                        member_id: row.get(2)?,
-                        member_name: row.get(3)?,
-                        profile_id: row.get(4)?,
-                        model_policy: row.get(5)?,
-                        reasoning_depth: row.get(6)?,
-                        source_event_id: row.get(7)?,
-                        source_event_seq: row.get(8)?,
-                        input: row.get(9)?,
-                        mode: if mode == "task" {
-                            RoomInputMode::Task
-                        } else {
-                            RoomInputMode::Chat
-                        },
-                        run_id: durable_run_id.into(),
-                        task_run_id: row.get(11)?,
-                        version: row.get(12)?,
-                        thread_key: row.get(13)?,
-                        purpose: InboxPurpose::from_db(&row.get::<_, String>(14)?),
-                        conversation_root_event_id: row.get(15)?,
-                        context_through_seq: row.get(16)?,
-                        response_to_event_id: row.get(17)?,
-                        group_enabled: row.get(18)?,
-                    })
-                },
+                claimed_inbox_from_row,
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        claimed_inbox_from_candidate(&candidate, durable_run_id.into(), candidate.version).map(Some)
     }
 
     pub fn activate_lease(&self, claim: &ClaimedInboxItem) -> Result<ClaimedInboxItem> {
@@ -2374,7 +2761,7 @@ impl CollaborationRepository {
         Ok(active)
     }
 
-    pub fn release_lease(&self, claim: &ClaimedInboxItem) -> Result<()> {
+    pub fn release_lease(&self, claim: &ClaimedInboxItem) -> Result<ClaimReleaseDisposition> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
@@ -2392,7 +2779,199 @@ impl CollaborationRepository {
                 &claim.inbox_item_id,
                 &format!("inbox-released:{}:{}", claim.inbox_item_id, claim.run_id),
             )?;
+            transaction.commit()?;
+            return Ok(ClaimReleaseDisposition::Released);
         }
+        let current = transaction
+            .query_row(
+                "SELECT state, run_id FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [claim.inbox_item_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((state, run_id)) = current else {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        };
+        let state = InboxState::from_db(&state);
+        let disposition = match state {
+            InboxState::Pending if run_id.is_none() => ClaimReleaseDisposition::AlreadyPending,
+            InboxState::Completed | InboxState::Failed | InboxState::Cancelled => {
+                ClaimReleaseDisposition::AlreadyTerminal(state)
+            }
+            _ => return Err(CollaborationError::RunNotActive(claim.run_id.clone())),
+        };
+        transaction.commit()?;
+        Ok(disposition)
+    }
+
+    /// 将尚未提交结果的运行中 Claim 精确回退为待重试状态。
+    ///
+    /// 仅匹配同一 run，并在同一事务中读取当前版本后执行 CAS；
+    /// 已经回退或已终结时按幂等成功处理。
+    pub fn release_active_for_retry(
+        &self,
+        claim: &ClaimedInboxItem,
+    ) -> Result<ClaimReleaseDisposition> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT state, run_id, version
+                 FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [claim.inbox_item_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((current_state, current_run_id, current_version)) = current else {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        };
+        if current_state == "pending" && current_run_id.is_none() {
+            transaction.commit()?;
+            return Ok(ClaimReleaseDisposition::AlreadyPending);
+        }
+        if matches!(current_state.as_str(), "completed" | "failed" | "cancelled") {
+            let state = InboxState::from_db(&current_state);
+            transaction.commit()?;
+            return Ok(ClaimReleaseDisposition::AlreadyTerminal(state));
+        }
+        if current_state != "running" || current_run_id.as_deref() != Some(claim.run_id.as_str()) {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let updated = transaction.execute(
+            "UPDATE member_inbox_items
+             SET state = 'pending', run_id = NULL, started_at = NULL,
+                 lease_expires_at = NULL, error = NULL, version = version + 1
+             WHERE inbox_item_id = ?1 AND run_id = ?2
+               AND state = 'running' AND version = ?3",
+            params![claim.inbox_item_id, claim.run_id, current_version],
+        )?;
+        if updated == 1 {
+            transaction.execute(
+                "UPDATE room_event_deliveries
+                 SET state = 'queued', decision_reason = NULL, updated_at = ?1
+                 WHERE inbox_item_id = ?2 AND state = 'running'",
+                params![now, claim.inbox_item_id],
+            )?;
+            enqueue_room_changed(
+                &transaction,
+                &claim.room_id,
+                "inbox",
+                &claim.inbox_item_id,
+                &format!(
+                    "inbox-active-released:{}:{}",
+                    claim.inbox_item_id, claim.run_id
+                ),
+            )?;
+            transaction.commit()?;
+            return Ok(ClaimReleaseDisposition::Released);
+        }
+
+        let actual_version = transaction
+            .query_row(
+                "SELECT version FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [claim.inbox_item_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Err(CollaborationError::VersionConflict {
+            entity: "member inbox run",
+            id: claim.run_id.clone(),
+            expected: current_version,
+            actual: actual_version,
+        })
+    }
+
+    /// 持久结果投影失败时，将受控打开的历史 Failed Inbox 恢复原状。
+    fn restore_failed_reconciliation(
+        &self,
+        claim: &ClaimedInboxItem,
+        original_run_id: Option<&str>,
+    ) -> Result<()> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT state, run_id, version
+                 FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [claim.inbox_item_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((current_state, current_run_id, current_version)) = current else {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        };
+        if current_state == "failed" {
+            if current_run_id.as_deref() == original_run_id {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        }
+        if current_state != "running" || current_run_id.as_deref() != Some(claim.run_id.as_str()) {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        }
+        if current_version != claim.version {
+            return Err(CollaborationError::VersionConflict {
+                entity: "member inbox run",
+                id: claim.run_id.clone(),
+                expected: claim.version,
+                actual: current_version,
+            });
+        }
+
+        let updated = transaction.execute(
+            "UPDATE member_inbox_items
+             SET state = 'failed', run_id = ?1, lease_expires_at = NULL,
+                 version = version + 1
+             WHERE inbox_item_id = ?2 AND run_id = ?3
+               AND state = 'running' AND version = ?4",
+            params![
+                original_run_id,
+                claim.inbox_item_id,
+                claim.run_id,
+                claim.version
+            ],
+        )?;
+        if updated != 1 {
+            return Err(CollaborationError::VersionConflict {
+                entity: "member inbox run",
+                id: claim.run_id.clone(),
+                expected: claim.version,
+                actual: transaction
+                    .query_row(
+                        "SELECT version FROM member_inbox_items WHERE inbox_item_id = ?1",
+                        [claim.inbox_item_id.as_str()],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0),
+            });
+        }
+        enqueue_room_changed(
+            &transaction,
+            &claim.room_id,
+            "inbox",
+            &claim.inbox_item_id,
+            &format!(
+                "inbox-reconciliation-restored:{}:{}",
+                claim.inbox_item_id, claim.run_id
+            ),
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -2568,7 +3147,7 @@ impl CollaborationRepository {
     fn append_member_reply_event(
         &self,
         transaction: &Transaction<'_>,
-        claim: &ClaimedInboxItem,
+        context: MemberReplyEventContext<'_>,
         answer: &str,
         idempotency_key: &str,
         now: &DateTime<Utc>,
@@ -2579,7 +3158,7 @@ impl CollaborationRepository {
                         debate_depth, group_enabled, conversation_mode
                  FROM room_events
                  WHERE room_id = ?1 AND event_id = ?2",
-                params![claim.room_id, claim.response_to_event_id],
+                params![context.room_id, context.response_to_event_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2605,53 +3184,58 @@ impl CollaborationRepository {
             0
         };
         let event_id = format!("event-{}", Uuid::new_v4());
-        let sequence = allocate_room_sequence(transaction, &claim.room_id)?;
+        let sequence = allocate_room_sequence(transaction, context.room_id)?;
         transaction.execute(
             "INSERT INTO room_events(
                  event_id, room_id, sequence, sender_kind, sender_id, sender_name,
                  kind, content, run_id, parent_event_id, conversation_root_event_id,
-                 debate_depth, group_enabled, conversation_mode, idempotency_key, created_at
-             ) VALUES (
-                 ?1, ?2, ?3, 'member', ?4, ?5, 'member_message', ?6, ?7, ?8,
-                 ?9, ?10, ?11, ?12, ?13, ?14
-             )",
+                 debate_depth, group_enabled, conversation_mode, idempotency_key,
+                 execution_working_directory, created_at
+              ) VALUES (
+                  ?1, ?2, ?3, 'member', ?4, ?5, 'member_message', ?6, ?7, ?8,
+                  ?9, ?10, ?11, ?12, ?13, ?14, ?15
+              )",
             params![
                 event_id,
-                claim.room_id,
+                context.room_id,
                 sequence,
-                claim.member_id,
-                claim.member_name,
+                context.member_id,
+                context.member_name,
                 answer,
-                claim.run_id,
+                context.run_id,
                 parent_event_id,
                 conversation_root_event_id,
                 debate_depth,
                 group_enabled,
                 conversation_mode.as_db(),
                 idempotency_key,
+                context.execution_working_directory.display().to_string(),
                 now.to_rfc3339(),
             ],
         )?;
         let event = RoomEventView {
             event_id: event_id.clone(),
-            room_id: claim.room_id.clone(),
+            room_id: context.room_id.into(),
             sequence,
             sender_kind: "member".into(),
-            sender_id: claim.member_id.clone(),
-            sender_name: claim.member_name.clone(),
+            sender_id: context.member_id.into(),
+            sender_name: context.member_name.into(),
             recipients: Vec::new(),
             audience: Vec::new(),
             kind: "member_message".into(),
             content: answer.into(),
-            run_id: Some(claim.run_id.clone()),
+            run_id: Some(context.run_id.into()),
             parent_event_id: Some(parent_event_id),
+            reply_reference: None,
             conversation_root_event_id,
             debate_depth,
             group_enabled,
             conversation_mode,
             created_at: *now,
         };
-        Ok(event)
+        hydrate_events(transaction, vec![event])?
+            .pop()
+            .ok_or_else(|| CollaborationError::Config("成员回复事件水合失败".into()))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2801,7 +3385,8 @@ impl CollaborationRepository {
         let event = if cancel_requested {
             transaction.execute(
                 "UPDATE member_inbox_items
-                 SET state = 'cancelled', completed_at = ?1, version = version + 1
+                 SET state = 'cancelled', completed_at = ?1, error = NULL,
+                     version = version + 1
                  WHERE inbox_item_id = ?2 AND run_id = ?3",
                 params![now.to_rfc3339(), claim.inbox_item_id, claim.run_id],
             )?;
@@ -2809,7 +3394,7 @@ impl CollaborationRepository {
         } else {
             let event = self.append_member_reply_event(
                 &transaction,
-                claim,
+                claim.into(),
                 answer,
                 &format!("run-result:{}", claim.run_id),
                 &now,
@@ -2817,7 +3402,7 @@ impl CollaborationRepository {
             transaction.execute(
                 "UPDATE member_inbox_items
                  SET state = 'completed', reply_event_id = ?1, completed_at = ?2,
-                     version = version + 1
+                     error = NULL, version = version + 1
                  WHERE inbox_item_id = ?3 AND run_id = ?4 AND state = 'running'",
                 params![
                     event.event_id,
@@ -2904,7 +3489,7 @@ impl CollaborationRepository {
             if within_limits {
                 let event = self.append_member_reply_event(
                     &transaction,
-                    claim,
+                    claim.into(),
                     answer,
                     &format!("run-result:{}", claim.run_id),
                     &now,
@@ -2924,7 +3509,7 @@ impl CollaborationRepository {
         transaction.execute(
             "UPDATE member_inbox_items
              SET state = ?1, reply_event_id = ?2, completed_at = ?3,
-                 lease_expires_at = NULL, version = version + 1
+                 lease_expires_at = NULL, error = NULL, version = version + 1
              WHERE inbox_item_id = ?4 AND run_id = ?5 AND state = 'running'",
             params![
                 state,
@@ -2987,11 +3572,19 @@ impl CollaborationRepository {
         }
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_state = transaction
+        let (current_state, current_run_id, current_version, cancel_requested) = transaction
             .query_row(
-                "SELECT state FROM member_inbox_items WHERE inbox_item_id = ?1",
+                "SELECT state, run_id, version, cancel_requested
+                 FROM member_inbox_items WHERE inbox_item_id = ?1",
                 [claim.inbox_item_id.as_str()],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| CollaborationError::RunNotActive(durable_run_id.into()))?;
@@ -3008,15 +3601,58 @@ impl CollaborationRepository {
                 event: None,
             });
         }
+        if !matches!(
+            current_state.as_str(),
+            "pending" | "leased" | "running" | "failed"
+        ) {
+            return Err(CollaborationError::RunNotActive(durable_run_id.into()));
+        }
+        if current_state == "running" && current_run_id.as_deref() != Some(durable_run_id) {
+            return Err(CollaborationError::RunNotActive(durable_run_id.into()));
+        }
+        let transition_version = if current_version == claim.version {
+            current_version
+        } else if current_state == "running"
+            && current_run_id.as_deref() == Some(durable_run_id)
+            && claim.run_id == durable_run_id
+            && cancel_requested
+        {
+            // interrupt 只会提升同一运行的版本；投影仍以事务内当前版本做 CAS。
+            current_version
+        } else {
+            return Err(CollaborationError::VersionConflict {
+                entity: "member inbox run",
+                id: durable_run_id.into(),
+                expected: claim.version,
+                actual: current_version,
+            });
+        };
         let updated = transaction.execute(
             "UPDATE member_inbox_items
              SET state = 'running', run_id = ?1, lease_expires_at = NULL,
                  version = version + 1
-             WHERE inbox_item_id = ?2 AND state IN ('pending', 'leased', 'running')",
-            params![durable_run_id, claim.inbox_item_id],
+             WHERE inbox_item_id = ?2 AND state = ?3 AND version = ?4",
+            params![
+                durable_run_id,
+                claim.inbox_item_id,
+                current_state,
+                transition_version
+            ],
         )?;
         if updated != 1 {
-            return Err(CollaborationError::RunNotActive(durable_run_id.into()));
+            return Err(CollaborationError::VersionConflict {
+                entity: "member inbox run",
+                id: durable_run_id.into(),
+                expected: transition_version,
+                actual: transaction
+                    .query_row(
+                        "SELECT version FROM member_inbox_items WHERE inbox_item_id = ?1",
+                        [claim.inbox_item_id.as_str()],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0),
+            });
         }
         transaction.execute(
             "UPDATE room_event_deliveries
@@ -3028,7 +3664,8 @@ impl CollaborationRepository {
 
         let mut durable_claim = claim.clone();
         durable_claim.run_id = durable_run_id.into();
-        if durable_claim.purpose == InboxPurpose::Participation {
+        durable_claim.version = transition_version + 1;
+        let completion = if durable_claim.purpose == InboxPurpose::Participation {
             self.complete_participation_item(&durable_claim, answer)
         } else {
             self.complete_item(
@@ -3043,6 +3680,22 @@ impl CollaborationRepository {
                 },
                 event,
             })
+        };
+        match completion {
+            Ok(completion) => Ok(completion),
+            Err(error) => {
+                let rollback = if current_state == "failed" {
+                    self.restore_failed_reconciliation(&durable_claim, current_run_id.as_deref())
+                } else {
+                    self.release_active_for_retry(&durable_claim).map(|_| ())
+                };
+                if let Err(release_error) = rollback {
+                    return Err(CollaborationError::Config(format!(
+                        "投影持久结果失败且无法释放运行中 Claim: {error}; {release_error}"
+                    )));
+                }
+                Err(error)
+            }
         }
     }
 
@@ -3061,10 +3714,23 @@ impl CollaborationRepository {
         let item = transaction
             .query_row(
                 "SELECT e.room_id, i.member_id, m.display_name, i.cancel_requested,
-                        i.reply_event_id, i.state
+                        i.reply_event_id, i.state, e.execution_working_directory,
+                        CASE WHEN i.purpose = 'participation' THEN COALESCE((
+                            SELECT delivered.event_id
+                            FROM room_event_deliveries delivery
+                            JOIN room_events delivered ON delivered.event_id = delivery.event_id
+                            WHERE delivery.member_id = i.member_id
+                              AND COALESCE(delivered.conversation_root_event_id, delivered.event_id)
+                                  = COALESCE(i.conversation_root_event_id, i.source_event_id)
+                              AND delivered.sequence <= CASE WHEN i.context_through_seq > 0
+                                  THEN i.context_through_seq ELSE room.latest_event_seq END
+                              AND delivered.invalidated_at IS NULL
+                            ORDER BY delivered.sequence DESC LIMIT 1
+                        ), i.source_event_id) ELSE i.source_event_id END
                  FROM member_inbox_items i
                  JOIN room_events e ON e.event_id = i.source_event_id
                  JOIN brain_members m ON m.member_id = i.member_id
+                 JOIN collaboration_rooms room ON room.room_id = e.room_id
                  WHERE i.inbox_item_id = ?1 AND i.run_id = ?2
                    AND e.invalidated_at IS NULL",
                 params![inbox_item_id, run_id],
@@ -3076,14 +3742,27 @@ impl CollaborationRepository {
                         row.get::<_, bool>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((room_id, member_id, member_name, cancel_requested, reply_event_id, state)) = item
+        let Some((
+            room_id,
+            member_id,
+            member_name,
+            cancel_requested,
+            reply_event_id,
+            state,
+            execution_working_directory,
+            response_to_event_id,
+        )) = item
         else {
             return Err(CollaborationError::RunNotActive(run_id.into()));
         };
+        let execution_working_directory =
+            required_execution_working_directory(execution_working_directory.unwrap_or_default())?;
         if reply_event_id.is_some() || state == "completed" {
             transaction.commit()?;
             return Ok(None);
@@ -3119,45 +3798,21 @@ impl CollaborationRepository {
             if let Some(event) = event_by_idempotency(&transaction, &room_id, &idempotency_key)? {
                 event
             } else {
-                let event_id = format!("event-{}", Uuid::new_v4());
-                let sequence = allocate_room_sequence(&transaction, &room_id)?;
                 let now = Utc::now();
-                transaction.execute(
-                    "INSERT INTO room_events(
-                     event_id, room_id, sequence, sender_kind, sender_id, sender_name,
-                     kind, content, run_id, idempotency_key, created_at
-                 ) VALUES (?1, ?2, ?3, 'member', ?4, ?5, 'member_message', ?6, ?7, ?8, ?9)",
-                    params![
-                        event_id,
-                        room_id,
-                        sequence,
-                        member_id,
-                        member_name,
-                        answer,
+                self.append_member_reply_event(
+                    &transaction,
+                    MemberReplyEventContext {
+                        room_id: &room_id,
+                        member_id: &member_id,
+                        member_name: &member_name,
                         run_id,
-                        idempotency_key,
-                        now.to_rfc3339(),
-                    ],
-                )?;
-                RoomEventView {
-                    event_id: event_id.clone(),
-                    room_id: room_id.clone(),
-                    sequence,
-                    sender_kind: "member".into(),
-                    sender_id: member_id.clone(),
-                    sender_name: member_name.clone(),
-                    recipients: Vec::new(),
-                    audience: Vec::new(),
-                    kind: "member_message".into(),
-                    content: answer.into(),
-                    run_id: Some(run_id.into()),
-                    parent_event_id: None,
-                    conversation_root_event_id: event_id,
-                    debate_depth: 0,
-                    group_enabled: false,
-                    conversation_mode: RoomInputMode::Chat,
-                    created_at: now,
-                }
+                        response_to_event_id: &response_to_event_id,
+                        execution_working_directory: &execution_working_directory,
+                    },
+                    answer,
+                    &idempotency_key,
+                    &now,
+                )?
             };
         transaction.execute(
             "UPDATE member_inbox_items
@@ -3184,7 +3839,33 @@ impl CollaborationRepository {
         Ok(Some(event))
     }
 
-    pub fn fail_item(&self, claim: &ClaimedInboxItem, error: &str) -> Result<()> {
+    pub fn fail_item(
+        &self,
+        claim: &ClaimedInboxItem,
+        error: &str,
+    ) -> Result<InboxFailureDisposition> {
+        self.fail_item_with_expected_disposition(claim, error, None)
+    }
+
+    /// 按已经在线性化的 Task 终态提交 Inbox 失败结果。
+    ///
+    /// 失败结算先于迟到的取消请求完成时，调用方必须保持 Task 与 Inbox
+    /// 的终态一致；返回值仍是本事务实际提交的终态。
+    pub fn fail_item_with_disposition(
+        &self,
+        claim: &ClaimedInboxItem,
+        error: &str,
+        disposition: InboxFailureDisposition,
+    ) -> Result<InboxFailureDisposition> {
+        self.fail_item_with_expected_disposition(claim, error, Some(disposition))
+    }
+
+    fn fail_item_with_expected_disposition(
+        &self,
+        claim: &ClaimedInboxItem,
+        error: &str,
+        expected_disposition: Option<InboxFailureDisposition>,
+    ) -> Result<InboxFailureDisposition> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cancel_requested: bool = transaction
@@ -3196,12 +3877,16 @@ impl CollaborationRepository {
             )
             .optional()?
             .unwrap_or(false);
-        let state = if cancel_requested {
-            "cancelled"
+        let disposition = expected_disposition.unwrap_or(if cancel_requested {
+            InboxFailureDisposition::Cancelled
         } else {
-            "failed"
+            InboxFailureDisposition::Failed
+        });
+        let state = match disposition {
+            InboxFailureDisposition::Failed => "failed",
+            InboxFailureDisposition::Cancelled => "cancelled",
         };
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE member_inbox_items
              SET state = ?1, error = ?2, completed_at = ?3, version = version + 1
              WHERE inbox_item_id = ?4 AND run_id = ?5 AND state = 'running'",
@@ -3213,6 +3898,9 @@ impl CollaborationRepository {
                 claim.run_id,
             ],
         )?;
+        if updated != 1 {
+            return Err(CollaborationError::RunNotActive(claim.run_id.clone()));
+        }
         settle_sleep_after_current(&transaction, &claim.member_id)?;
         enqueue_room_changed(
             &transaction,
@@ -3222,7 +3910,7 @@ impl CollaborationRepository {
             &format!("inbox-failed:{}:{}", claim.inbox_item_id, claim.run_id),
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(disposition)
     }
 
     pub fn request_interrupt(&self, room_id: &str, member_id: &str, run_id: &str) -> Result<()> {
@@ -3470,6 +4158,23 @@ impl CollaborationRepository {
             RoomCapability::RoomRead,
         )?;
         events_after_from_connection(&connection, room_id, after_sequence, limit)
+    }
+
+    pub fn events_before(
+        &self,
+        room_id: &str,
+        before_sequence: u64,
+        limit: usize,
+    ) -> Result<RoomEventPage> {
+        let connection = self.connect()?;
+        room_from_connection(&connection, room_id)?;
+        require_capability(
+            &connection,
+            &CollaborationActor::local(),
+            room_id,
+            RoomCapability::RoomRead,
+        )?;
+        events_before_from_connection(&connection, room_id, before_sequence, limit)
     }
 
     /// 返回不晚于指定上下文边界的公共群消息，按发送顺序排列。
@@ -3758,7 +4463,11 @@ impl CollaborationRepository {
         require_capability(&transaction, actor, room_id, RoomCapability::RoomRead)?;
         let room = room_from_connection(&transaction, room_id)?;
         let members = members_from_connection(&transaction, room_id)?;
-        let events = events_from_connection(&transaction, room_id, 300)?;
+        let mut events = events_from_connection(&transaction, room_id, 301)?;
+        let has_earlier_events = events.len() > 300;
+        if has_earlier_events {
+            events.remove(0);
+        }
         let inbox = inbox_from_connection(&transaction, room_id, 200)?;
         let deliveries = deliveries_from_connection(&transaction, room_id, 1_000)?;
         let member_templates = member_templates_from_connection(&transaction)?;
@@ -3766,6 +4475,7 @@ impl CollaborationRepository {
             room,
             members,
             events,
+            has_earlier_events,
             inbox,
             deliveries,
             member_templates,
@@ -3814,7 +4524,7 @@ fn ensure_local_owner_membership(
         "INSERT INTO room_principal_memberships(
              room_id, principal_id, role, capabilities_json, capability_version,
              version, created_at, updated_at
-         ) VALUES (?1, ?2, 'owner', ?3, 1, 1, ?4, ?4)
+         ) VALUES (?1, ?2, 'owner', ?3, 2, 1, ?4, ?4)
          ON CONFLICT(room_id, principal_id) DO NOTHING",
         params![
             room_id,
@@ -4072,7 +4782,7 @@ fn enqueue_room_changed(
     aggregate_id: &str,
     idempotency_key: &str,
 ) -> Result<()> {
-    transaction.execute(
+    let inserted = transaction.execute(
         "INSERT INTO runtime_outbox_events(
              outbox_event_id, room_id, event_kind, aggregate_kind,
              aggregate_id, idempotency_key, state, version, created_at
@@ -4087,6 +4797,19 @@ fn enqueue_room_changed(
             Utc::now().to_rfc3339(),
         ],
     )?;
+    if inserted == 1 {
+        let updated = transaction.execute(
+            "UPDATE collaboration_rooms
+             SET state_revision = state_revision + 1
+             WHERE room_id = ?1",
+            [room_id],
+        )?;
+        if updated != 1 {
+            return Err(CollaborationError::RoomNotFound(room_id.into()));
+        }
+    } else {
+        ensure_room_exists(transaction, room_id)?;
+    }
     Ok(())
 }
 
@@ -4101,6 +4824,329 @@ fn ensure_room_exists(transaction: &Transaction<'_>, room_id: &str) -> Result<()
     } else {
         Err(CollaborationError::RoomNotFound(room_id.into()))
     }
+}
+
+fn claimed_inbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimCandidate> {
+    Ok(ClaimCandidate {
+        inbox_item_id: row.get("inbox_item_id")?,
+        room_id: row.get("room_id")?,
+        member_id: row.get("member_id")?,
+        member_name: row.get("member_name")?,
+        profile_id: row.get("profile_id")?,
+        model_policy: row.get("model_policy")?,
+        reasoning_depth: row.get("reasoning_depth")?,
+        source_event_id: row.get("source_event_id")?,
+        source_event_found: row.get("source_event_found")?,
+        source_event_seq: row.get("source_event_seq")?,
+        input: row.get("input")?,
+        mode: row.get("mode")?,
+        task_run_id: row.get("task_run_id")?,
+        version: row.get("version")?,
+        thread_key: row.get("thread_key")?,
+        purpose: row.get("purpose")?,
+        conversation_root_event_id: row.get("conversation_root_event_id")?,
+        context_through_seq: row.get("context_through_seq")?,
+        response_to_event_id: row.get("response_to_event_id")?,
+        group_enabled: row.get("group_enabled")?,
+        execution_working_directory: row.get("execution_working_directory")?,
+        parent_event_id: row.get("parent_event_id")?,
+        reply_event_id: row.get("reply_event_id")?,
+        reply_room_id: row.get("reply_room_id")?,
+        reply_sequence: row.get("reply_sequence")?,
+        reply_sender_kind: row.get("reply_sender_kind")?,
+        reply_sender_id: row.get("reply_sender_id")?,
+        reply_sender_name: row.get("reply_sender_name")?,
+        reply_kind: row.get("reply_kind")?,
+        reply_content: row.get("reply_content")?,
+        reply_created_at: row.get("reply_created_at")?,
+    })
+}
+
+fn claimed_inbox_from_candidate(
+    candidate: &ClaimCandidate,
+    run_id: String,
+    version: u64,
+) -> Result<ClaimedInboxItem> {
+    if !candidate.source_event_found {
+        return Err(CollaborationError::Config(format!(
+            "Inbox 来源用户事件 {} 不存在",
+            candidate.source_event_id
+        )));
+    }
+    let missing_source_field = |field: &str| {
+        CollaborationError::Config(format!(
+            "Inbox 来源用户事件 {} 缺少{field}",
+            candidate.source_event_id
+        ))
+    };
+    let room_id = candidate
+        .room_id
+        .clone()
+        .ok_or_else(|| missing_source_field("房间"))?;
+    let source_event_seq = candidate
+        .source_event_seq
+        .ok_or_else(|| missing_source_field("事件序号"))?;
+    let input = candidate
+        .input
+        .clone()
+        .ok_or_else(|| missing_source_field("正文"))?;
+    let context_through_seq = candidate
+        .context_through_seq
+        .ok_or_else(|| missing_source_field("上下文截止序号"))?;
+    let group_enabled = candidate
+        .group_enabled
+        .ok_or_else(|| missing_source_field("群聊标记"))?;
+    let execution_working_directory = required_execution_working_directory(
+        candidate
+            .execution_working_directory
+            .clone()
+            .unwrap_or_default(),
+    )?;
+    let reply_reference = reply_reference_from_candidate(candidate, &room_id)?;
+    Ok(ClaimedInboxItem {
+        inbox_item_id: candidate.inbox_item_id.clone(),
+        room_id,
+        member_id: candidate.member_id.clone(),
+        member_name: candidate.member_name.clone(),
+        profile_id: candidate.profile_id.clone(),
+        model_policy: candidate.model_policy.clone(),
+        reasoning_depth: candidate.reasoning_depth.clone(),
+        source_event_id: candidate.source_event_id.clone(),
+        source_event_seq,
+        thread_key: candidate.thread_key.clone(),
+        purpose: InboxPurpose::from_db(&candidate.purpose),
+        conversation_root_event_id: candidate.conversation_root_event_id.clone(),
+        context_through_seq,
+        response_to_event_id: candidate.response_to_event_id.clone(),
+        group_enabled,
+        execution_working_directory,
+        reply_reference,
+        input,
+        mode: if candidate.mode == "task" {
+            RoomInputMode::Task
+        } else {
+            RoomInputMode::Chat
+        },
+        run_id,
+        task_run_id: candidate.task_run_id.clone(),
+        version,
+    })
+}
+
+fn quarantine_corrupt_claim(
+    transaction: &Transaction<'_>,
+    candidate: &ClaimCandidate,
+    error: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let updated = transaction.execute(
+        "UPDATE member_inbox_items
+         SET state = 'failed', run_id = NULL, lease_expires_at = NULL,
+             error = ?1, completed_at = ?2, version = version + 1
+         WHERE inbox_item_id = ?3 AND state = 'pending' AND version = ?4",
+        params![error, &now, &candidate.inbox_item_id, candidate.version],
+    )?;
+    if updated != 1 {
+        return Ok(false);
+    }
+    transaction.execute(
+        "UPDATE room_event_deliveries
+         SET state = 'suppressed', decision_reason = ?1, updated_at = ?2
+         WHERE inbox_item_id = ?3 AND state IN ('queued', 'deferred', 'running')",
+        params![error, &now, &candidate.inbox_item_id],
+    )?;
+    if let Some(room_id) = candidate.room_id.as_deref() {
+        let room_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM collaboration_rooms WHERE room_id = ?1)",
+            [room_id],
+            |row| row.get(0),
+        )?;
+        if room_exists {
+            enqueue_room_changed(
+                transaction,
+                room_id,
+                "inbox",
+                &candidate.inbox_item_id,
+                &format!(
+                    "inbox-corrupt:{}:{}",
+                    candidate.inbox_item_id,
+                    candidate.version + 1
+                ),
+            )?;
+        }
+    }
+    Ok(true)
+}
+
+fn reply_reference_from_candidate(
+    candidate: &ClaimCandidate,
+    room_id: &str,
+) -> Result<Option<RoomEventReferenceView>> {
+    let Some(parent_event_id) = candidate.parent_event_id.as_deref() else {
+        if candidate.reply_event_id.is_some() {
+            return Err(CollaborationError::Config(format!(
+                "Inbox 来源事件 {} 的回复目标关联异常",
+                candidate.source_event_id
+            )));
+        }
+        return Ok(None);
+    };
+    let reply_event_id = candidate.reply_event_id.as_deref().ok_or_else(|| {
+        CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 不存在",
+            candidate.source_event_id, parent_event_id
+        ))
+    })?;
+    if reply_event_id != parent_event_id {
+        return Err(CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标关联异常",
+            candidate.source_event_id
+        )));
+    }
+    let reply_room_id = candidate.reply_room_id.as_deref().ok_or_else(|| {
+        CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 缺少房间",
+            candidate.source_event_id, parent_event_id
+        ))
+    })?;
+    if reply_room_id != room_id {
+        return Err(CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 不属于同一房间",
+            candidate.source_event_id, parent_event_id
+        )));
+    }
+    let missing_column = |column: &str| {
+        CollaborationError::Config(format!(
+            "Inbox 来源事件 {} 的回复目标 {} 缺少{column}",
+            candidate.source_event_id, parent_event_id
+        ))
+    };
+    let content = candidate
+        .reply_content
+        .clone()
+        .ok_or_else(|| missing_column("正文"))?;
+    let created_at = candidate
+        .reply_created_at
+        .as_deref()
+        .ok_or_else(|| missing_column("创建时间"))?;
+    let created_at = DateTime::parse_from_rfc3339(created_at)
+        .map_err(|_| missing_column("有效创建时间"))?
+        .with_timezone(&Utc);
+    Ok(Some(RoomEventReferenceView {
+        event_id: reply_event_id.into(),
+        sequence: candidate
+            .reply_sequence
+            .ok_or_else(|| missing_column("事件序号"))?,
+        sender_kind: candidate
+            .reply_sender_kind
+            .clone()
+            .ok_or_else(|| missing_column("发送者类型"))?,
+        sender_id: candidate
+            .reply_sender_id
+            .clone()
+            .ok_or_else(|| missing_column("发送者 ID"))?,
+        sender_name: candidate
+            .reply_sender_name
+            .clone()
+            .ok_or_else(|| missing_column("发送者名称"))?,
+        kind: candidate
+            .reply_kind
+            .clone()
+            .ok_or_else(|| missing_column("事件类型"))?,
+        content_hash: history_content_hash(&content),
+        content,
+        created_at,
+    }))
+}
+
+fn required_execution_working_directory(value: String) -> Result<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CollaborationError::Config(
+            "房间事件缺少冻结的执行工作目录".into(),
+        ));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn validated_reply_target(
+    connection: &Connection,
+    room_id: &str,
+    event_id: &str,
+) -> Result<ValidatedReplyTarget> {
+    let target = connection
+        .query_row(
+            "SELECT event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                    kind, content, COALESCE(conversation_root_event_id, event_id),
+                    invalidated_at, created_at
+             FROM room_events WHERE event_id = ?1",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| CollaborationError::ReplyTargetNotFound(event_id.into()))?;
+    let (
+        event_id,
+        target_room_id,
+        sequence,
+        sender_kind,
+        sender_id,
+        sender_name,
+        kind,
+        content,
+        conversation_root_event_id,
+        invalidated_at,
+        created_at,
+    ) = target;
+    if target_room_id != room_id {
+        return Err(CollaborationError::ReplyTargetRoomMismatch {
+            event_id,
+            room_id: room_id.into(),
+            target_room_id,
+        });
+    }
+    if invalidated_at.is_some() {
+        return Err(CollaborationError::ReplyTargetInvalidated(event_id));
+    }
+    let supported = matches!(
+        (sender_kind.as_str(), kind.as_str()),
+        ("user", "user_message") | ("member", "member_message")
+    );
+    if !supported {
+        return Err(CollaborationError::ReplyTargetTypeUnsupported {
+            event_id,
+            sender_kind,
+            kind,
+        });
+    }
+    Ok(ValidatedReplyTarget {
+        reference: RoomEventReferenceView {
+            event_id,
+            sequence,
+            sender_kind,
+            sender_id,
+            sender_name,
+            kind,
+            content_hash: history_content_hash(&content),
+            content,
+            created_at: parse_datetime(&created_at),
+        },
+        conversation_root_event_id,
+    })
 }
 
 fn allocate_room_sequence(transaction: &Transaction<'_>, room_id: &str) -> Result<u64> {
@@ -4217,14 +5263,25 @@ fn append_service_event(
     if let Some(event) = event_by_idempotency(transaction, room_id, idempotency_key)? {
         return Ok(event);
     }
+    let execution_working_directory: String = transaction
+        .query_row(
+            "SELECT working_directory FROM collaboration_rooms WHERE room_id = ?1",
+            [room_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| CollaborationError::RoomNotFound(room_id.into()))?;
+    let execution_working_directory =
+        required_execution_working_directory(execution_working_directory)?;
     let event_id = format!("event-{}", Uuid::new_v4());
     let sequence = allocate_room_sequence(transaction, room_id)?;
     let now = Utc::now();
     transaction.execute(
         "INSERT INTO room_events(
              event_id, room_id, sequence, sender_kind, sender_id, sender_name,
-             kind, content, run_id, idempotency_key, created_at
-         ) VALUES (?1, ?2, ?3, 'service', 'service', '系统', ?4, ?5, NULL, ?6, ?7)",
+             kind, content, run_id, idempotency_key,
+             execution_working_directory, created_at
+          ) VALUES (?1, ?2, ?3, 'service', 'service', '系统', ?4, ?5, NULL, ?6, ?7, ?8)",
         params![
             event_id,
             room_id,
@@ -4232,6 +5289,7 @@ fn append_service_event(
             kind,
             content,
             idempotency_key,
+            execution_working_directory.display().to_string(),
             now.to_rfc3339(),
         ],
     )?;
@@ -4248,6 +5306,7 @@ fn append_service_event(
         content: content.into(),
         run_id: None,
         parent_event_id: None,
+        reply_reference: None,
         conversation_root_event_id: event_id.clone(),
         debate_depth: 0,
         group_enabled: false,
@@ -4272,33 +5331,144 @@ fn event_by_idempotency(
             event_from_row_without_recipients,
         )
         .optional()?;
-    event
-        .map(|mut event| {
-            event.recipients = recipients_for_event(connection, &event.event_id)?;
-            event.audience = audience_for_event(connection, &event.event_id)?;
-            Ok(event)
-        })
-        .transpose()
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    Ok(hydrate_events(connection, vec![event])?.pop())
 }
 
-fn recipients_for_event(connection: &Connection, event_id: &str) -> Result<Vec<String>> {
-    let mut statement = connection.prepare(
-        "SELECT member_id FROM room_event_recipients WHERE event_id = ?1 ORDER BY member_id",
-    )?;
-    let recipients = statement
-        .query_map([event_id], |row| row.get(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(recipients)
+fn event_by_id(connection: &Connection, event_id: &str) -> Result<Option<RoomEventView>> {
+    let event = connection
+        .query_row(
+            "SELECT event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                    kind, content, run_id, parent_event_id,
+                    COALESCE(conversation_root_event_id, event_id), debate_depth,
+                    group_enabled, conversation_mode, created_at
+             FROM room_events WHERE event_id = ?1",
+            [event_id],
+            event_from_row_without_recipients,
+        )
+        .optional()?;
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    Ok(hydrate_events(connection, vec![event])?.pop())
 }
 
-fn audience_for_event(connection: &Connection, event_id: &str) -> Result<Vec<String>> {
-    let mut statement = connection.prepare(
-        "SELECT member_id FROM room_event_deliveries WHERE event_id = ?1 ORDER BY member_id",
-    )?;
-    let audience = statement
-        .query_map([event_id], |row| row.get(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(audience)
+fn hydrate_events(
+    connection: &Connection,
+    mut events: Vec<RoomEventView>,
+) -> Result<Vec<RoomEventView>> {
+    if events.is_empty() {
+        return Ok(events);
+    }
+    let event_ids = events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let event_placeholders = vec!["?"; event_ids.len()].join(", ");
+
+    let mut recipients_by_event = HashMap::<String, Vec<String>>::new();
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT event_id, member_id FROM room_event_recipients
+             WHERE event_id IN ({event_placeholders}) ORDER BY event_id, member_id"
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(event_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (event_id, member_id) in rows {
+            recipients_by_event
+                .entry(event_id)
+                .or_default()
+                .push(member_id);
+        }
+    }
+
+    let mut audience_by_event = HashMap::<String, Vec<String>>::new();
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT event_id, member_id FROM room_event_deliveries
+             WHERE event_id IN ({event_placeholders}) ORDER BY event_id, member_id"
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(event_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (event_id, member_id) in rows {
+            audience_by_event
+                .entry(event_id)
+                .or_default()
+                .push(member_id);
+        }
+    }
+
+    let mut parent_ids = events
+        .iter()
+        .filter_map(|event| event.parent_event_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    parent_ids.sort();
+    let mut parents = HashMap::<String, (String, RoomEventReferenceView)>::new();
+    if !parent_ids.is_empty() {
+        let parent_placeholders = vec!["?"; parent_ids.len()].join(", ");
+        let mut statement = connection.prepare(&format!(
+            "SELECT event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                    kind, content, created_at
+             FROM room_events WHERE event_id IN ({parent_placeholders})"
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(parent_ids.iter()), |row| {
+                let content = row.get::<_, String>(7)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    RoomEventReferenceView {
+                        event_id: row.get(0)?,
+                        sequence: row.get(2)?,
+                        sender_kind: row.get(3)?,
+                        sender_id: row.get(4)?,
+                        sender_name: row.get(5)?,
+                        kind: row.get(6)?,
+                        content_hash: history_content_hash(&content),
+                        content,
+                        created_at: parse_datetime(&row.get::<_, String>(8)?),
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (event_id, room_id, reference) in rows {
+            parents.insert(event_id, (room_id, reference));
+        }
+    }
+
+    for event in &mut events {
+        event.recipients = recipients_by_event
+            .remove(&event.event_id)
+            .unwrap_or_default();
+        event.audience = audience_by_event
+            .remove(&event.event_id)
+            .unwrap_or_default();
+        let Some(parent_event_id) = event.parent_event_id.as_ref() else {
+            event.reply_reference = None;
+            continue;
+        };
+        let (parent_room_id, reference) = parents.get(parent_event_id).ok_or_else(|| {
+            CollaborationError::Config(format!("事件 {parent_event_id} 的回复目标不存在"))
+        })?;
+        if parent_room_id != &event.room_id {
+            return Err(CollaborationError::Config(format!(
+                "事件 {} 的回复目标 {} 不属于同一房间",
+                event.event_id, parent_event_id
+            )));
+        }
+        event.reply_reference = Some(reference.clone());
+    }
+    Ok(events)
 }
 
 fn inbox_for_event(connection: &Connection, event_id: &str) -> Result<Vec<InboxItemView>> {
@@ -4318,17 +5488,20 @@ fn inbox_for_event(connection: &Connection, event_id: &str) -> Result<Vec<InboxI
 fn room_from_connection(connection: &Connection, room_id: &str) -> Result<CollaborationRoomView> {
     connection
         .query_row(
-            "SELECT room_id, title, default_member_id, latest_event_seq, version, created_at
+            "SELECT room_id, title, working_directory, default_member_id,
+                    latest_event_seq, state_revision, version, created_at
              FROM collaboration_rooms WHERE room_id = ?1",
             [room_id],
             |row| {
                 Ok(CollaborationRoomView {
                     room_id: row.get(0)?,
                     title: row.get(1)?,
-                    default_member_id: row.get(2)?,
-                    latest_event_seq: row.get(3)?,
-                    version: row.get(4)?,
-                    created_at: parse_datetime(&row.get::<_, String>(5)?),
+                    working_directory: row.get(2)?,
+                    default_member_id: row.get(3)?,
+                    latest_event_seq: row.get(4)?,
+                    state_revision: row.get(5)?,
+                    version: row.get(6)?,
+                    created_at: parse_datetime(&row.get::<_, String>(7)?),
                 })
             },
         )
@@ -4407,14 +5580,7 @@ fn events_from_connection(
     let rows = statement
         .query_map(params![room_id, limit], event_from_row_without_recipients)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut events = rows
-        .into_iter()
-        .map(|mut event| {
-            event.recipients = recipients_for_event(connection, &event.event_id)?;
-            event.audience = audience_for_event(connection, &event.event_id)?;
-            Ok(event)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut events = hydrate_events(connection, rows)?;
     events.reverse();
     Ok(events)
 }
@@ -4440,14 +5606,36 @@ fn events_after_from_connection(
             event_from_row_without_recipients,
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    events
-        .into_iter()
-        .map(|mut event| {
-            event.recipients = recipients_for_event(connection, &event.event_id)?;
-            event.audience = audience_for_event(connection, &event.event_id)?;
-            Ok(event)
-        })
-        .collect()
+    hydrate_events(connection, events)
+}
+
+fn events_before_from_connection(
+    connection: &Connection,
+    room_id: &str,
+    before_sequence: u64,
+    limit: usize,
+) -> Result<RoomEventPage> {
+    let requested = limit.clamp(1, 100);
+    let mut statement = connection.prepare(
+        "SELECT event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                kind, content, run_id, parent_event_id,
+                COALESCE(conversation_root_event_id, event_id), debate_depth,
+                group_enabled, conversation_mode, created_at
+         FROM room_events
+         WHERE room_id = ?1 AND sequence < ?2 AND invalidated_at IS NULL
+         ORDER BY sequence DESC LIMIT ?3",
+    )?;
+    let mut events = statement
+        .query_map(
+            params![room_id, before_sequence, requested + 1],
+            event_from_row_without_recipients,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = events.len() > requested;
+    events.truncate(requested);
+    let mut events = hydrate_events(connection, events)?;
+    events.reverse();
+    Ok(RoomEventPage { events, has_more })
 }
 
 fn events_through_from_connection(
@@ -4471,14 +5659,7 @@ fn events_through_from_connection(
             event_from_row_without_recipients,
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut events = rows
-        .into_iter()
-        .map(|mut event| {
-            event.recipients = recipients_for_event(connection, &event.event_id)?;
-            event.audience = audience_for_event(connection, &event.event_id)?;
-            Ok(event)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut events = hydrate_events(connection, rows)?;
     events.reverse();
     Ok(events)
 }
@@ -4520,6 +5701,7 @@ fn event_from_row_without_recipients(row: &rusqlite::Row<'_>) -> rusqlite::Resul
         content: row.get(7)?,
         run_id: row.get(8)?,
         parent_event_id: row.get(9)?,
+        reply_reference: None,
         conversation_root_event_id: row.get(10)?,
         debate_depth: row.get(11)?,
         group_enabled: row.get(12)?,
@@ -4684,6 +5866,24 @@ fn truncate_title(content: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unix_directory_search_mode_requires_execute_bit() {
+        assert!(!unix_directory_mode_has_search(0o600));
+        assert!(unix_directory_mode_has_search(0o700));
+
+        let path = Path::new("workspace");
+        let error = validate_directory_search_with(path, |candidate| {
+            assert_eq!(candidate, path.join("."));
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, CollaborationError::Config(message) if
+                message.contains("目录搜索权限") && message.contains("workspace")),
+            "内核拒绝 search 时应返回明确的目录搜索权限配置错误"
+        );
+    }
+
     fn repository() -> (tempfile::TempDir, CollaborationRepository) {
         let directory = tempfile::tempdir().unwrap();
         let repository = CollaborationRepository::new(
@@ -4704,6 +5904,1487 @@ mod tests {
 
     fn ensure(repository: &CollaborationRepository) -> RoomSnapshot {
         repository.ensure_room("room-1", "Test Room", &[]).unwrap()
+    }
+
+    #[test]
+    fn room_working_directory_defaults_to_startup_and_survives_reopen() {
+        let runtime = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let canonical_a = workspace_a.path().canonicalize().unwrap();
+
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        let created = repository.ensure_room("room-1", "Room", &[]).unwrap();
+        assert_eq!(Path::new(&created.room.working_directory), canonical_a);
+        drop(repository);
+
+        let reopened = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_b.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&reopened.snapshot("room-1").unwrap().room.working_directory),
+            canonical_a
+        );
+    }
+
+    #[test]
+    fn room_working_directory_update_is_versioned_persisted_and_not_reset_by_ensure() {
+        let runtime = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let canonical_b = workspace_b.path().canonicalize().unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        let created = repository.ensure_room("room-1", "Room", &[]).unwrap();
+
+        let updated = repository
+            .update_room_working_directory(
+                "room-1",
+                &workspace_b.path().to_string_lossy(),
+                created.room.version,
+            )
+            .unwrap();
+        assert_eq!(updated.version, created.room.version + 1);
+        assert_eq!(Path::new(&updated.working_directory), canonical_b);
+
+        let ensured = repository
+            .ensure_room("room-1", "Renamed Room", &[])
+            .unwrap();
+        assert_eq!(ensured.room.title, "Renamed Room");
+        assert_eq!(Path::new(&ensured.room.working_directory), canonical_b);
+        assert_eq!(ensured.room.version, updated.version);
+        drop(repository);
+
+        let reopened = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&reopened.snapshot("room-1").unwrap().room.working_directory),
+            canonical_b
+        );
+    }
+
+    #[test]
+    fn message_freezes_room_working_directory_for_claim_release_retry_and_new_messages() {
+        let runtime = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let canonical_a = workspace_a.path().canonicalize().unwrap();
+        let canonical_b = workspace_b.path().canonicalize().unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+        let member_id = snapshot.room.default_member_id;
+        let first = repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "U1",
+                RoomInputMode::Chat,
+                "freeze-u1",
+            )
+            .unwrap();
+
+        repository
+            .update_room_working_directory(
+                "room-1",
+                &workspace_b.path().to_string_lossy(),
+                repository.snapshot("room-1").unwrap().room.version,
+            )
+            .unwrap();
+
+        let first_lease = repository.lease_next().unwrap().unwrap();
+        assert_eq!(first_lease.source_event_id, first.event.event_id);
+        assert_eq!(first_lease.execution_working_directory, canonical_a);
+        repository.release_lease(&first_lease).unwrap();
+
+        let released_lease = repository.lease_next().unwrap().unwrap();
+        assert_eq!(released_lease.source_event_id, first.event.event_id);
+        assert_eq!(released_lease.execution_working_directory, canonical_a);
+
+        repository
+            .retry_last_user_event("room-1", &first.event.event_id)
+            .unwrap();
+        let retry_lease = repository.lease_next().unwrap().unwrap();
+        assert_eq!(retry_lease.source_event_id, first.event.event_id);
+        assert_eq!(retry_lease.execution_working_directory, canonical_a);
+        let retry_claim = repository.activate_lease(&retry_lease).unwrap();
+        let reply = repository
+            .reconcile_completed_item(&retry_claim.inbox_item_id, &retry_claim.run_id, "U1 reply")
+            .unwrap()
+            .unwrap();
+
+        let second = repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "U2",
+                RoomInputMode::Chat,
+                "freeze-u2",
+            )
+            .unwrap();
+        let second_claim = repository.claim_next().unwrap().unwrap();
+        assert_eq!(second_claim.source_event_id, second.event.event_id);
+        assert_eq!(second_claim.execution_working_directory, canonical_b);
+
+        repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap();
+        let ensured = repository
+            .ensure_room(
+                "room-1",
+                "Room",
+                &[LegacyMessageSeed {
+                    id: "frozen-legacy".into(),
+                    role: "assistant".into(),
+                    content: "legacy reply".into(),
+                    timestamp: Utc::now(),
+                    hidden: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(Path::new(&ensured.room.working_directory), canonical_b);
+
+        let connection = repository.connect().unwrap();
+        let frozen_directory = |event_id: &str| {
+            connection
+                .query_row(
+                    "SELECT execution_working_directory FROM room_events WHERE event_id = ?1",
+                    [event_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .map(PathBuf::from)
+        };
+        assert_eq!(
+            frozen_directory(&first.event.event_id),
+            Some(canonical_a.clone())
+        );
+        assert_eq!(frozen_directory(&reply.event_id), Some(canonical_a));
+        assert_eq!(
+            frozen_directory(&second.event.event_id),
+            Some(canonical_b.clone())
+        );
+        assert_eq!(
+            frozen_directory("legacy-room-1-frozen-legacy"),
+            Some(canonical_b.clone())
+        );
+        let service_directory: Option<String> = connection
+            .query_row(
+                "SELECT execution_working_directory FROM room_events
+                 WHERE room_id = 'room-1' AND kind = 'member_created'
+                 ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(service_directory.map(PathBuf::from), Some(canonical_b));
+    }
+
+    #[test]
+    fn message_freezes_room_working_directory_for_deferred_participation_reply() {
+        let runtime = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let canonical_a = workspace_a.path().canonicalize().unwrap();
+        let canonical_b = workspace_b.path().canonicalize().unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            workspace_a.path(),
+        )
+        .unwrap();
+        let created = repository.ensure_room("room-1", "Room", &[]).unwrap();
+        let member_id = created.room.default_member_id;
+        let member_version = created
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .unwrap()
+            .version;
+        repository
+            .update_room_working_directory(
+                "room-1",
+                &workspace_b.path().to_string_lossy(),
+                created.room.version,
+            )
+            .unwrap();
+
+        let now = Utc::now();
+        let mut connection = repository.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO room_events(
+                     event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                     kind, content, parent_event_id, conversation_root_event_id,
+                     debate_depth, group_enabled, conversation_mode, idempotency_key,
+                     execution_working_directory, created_at
+                 ) VALUES (
+                     'participation-source', 'room-1', 1, 'user', 'user', '用户',
+                     'user_message', '来源事件', NULL, 'participation-source',
+                     0, 1, 'chat', 'participation-source', ?1, ?2
+                 )",
+                params![canonical_a.display().to_string(), now.to_rfc3339(),],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO room_events(
+                     event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                     kind, content, parent_event_id, conversation_root_event_id,
+                     debate_depth, group_enabled, conversation_mode, idempotency_key,
+                     execution_working_directory, created_at
+                 ) VALUES (
+                     'participation-target', 'room-1', 2, 'member', 'other-member', '智脑 B',
+                     'member_message', '延迟投递的回复目标', 'participation-source',
+                     'participation-source', 1, 1, 'chat', 'participation-target', ?1, ?2
+                 )",
+                params![canonical_b.display().to_string(), now.to_rfc3339(),],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE collaboration_rooms SET latest_event_seq = 2 WHERE room_id = 'room-1'",
+                [],
+            )
+            .unwrap();
+        let item = insert_inbox_item(
+            &transaction,
+            &member_id,
+            "participation-source",
+            "room:room-1",
+            RoomInputMode::Chat,
+            InboxPurpose::Participation,
+            "participation-source",
+            member_version,
+            "participation-directory-freeze",
+            &now,
+        )
+        .unwrap();
+        insert_delivery(
+            &transaction,
+            "participation-target",
+            &member_id,
+            DeliveryKind::Ambient,
+            DeliveryState::Deferred,
+            None,
+            Some("等待当前任务完成"),
+            &now,
+        )
+        .unwrap();
+        transaction
+            .execute(
+                "UPDATE room_event_deliveries
+                 SET state = 'queued', inbox_item_id = ?1, decision_reason = NULL
+                 WHERE event_id = 'participation-target' AND member_id = ?2",
+                params![item.inbox_item_id, member_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let claim = repository.claim_next().unwrap().unwrap();
+        assert_eq!(claim.purpose, InboxPurpose::Participation);
+        assert_eq!(claim.source_event_id, "participation-source");
+        assert_eq!(claim.response_to_event_id, "participation-target");
+        assert_eq!(claim.execution_working_directory, canonical_a);
+
+        let completion = repository
+            .complete_participation_item(&claim, Some("参与回复"))
+            .unwrap();
+        assert_eq!(completion.disposition, ParticipationDisposition::Replied);
+        let reply = completion.event.unwrap();
+        assert_eq!(
+            reply.parent_event_id.as_deref(),
+            Some("participation-target")
+        );
+        let persisted_directory: String = repository
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT execution_working_directory FROM room_events WHERE event_id = ?1",
+                [reply.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(persisted_directory), canonical_a);
+    }
+
+    #[test]
+    fn message_freezes_room_working_directory_rejects_missing_or_empty_event_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        for (index, invalid) in [None, Some("")].into_iter().enumerate() {
+            let runtime = tempfile::tempdir().unwrap();
+            let repository = CollaborationRepository::new_with_startup_working_directory(
+                runtime.path(),
+                CollaborationConfig::default(),
+                workspace.path(),
+            )
+            .unwrap();
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let posted = repository
+                .post_message(
+                    "room-1",
+                    &[snapshot.room.default_member_id],
+                    "U1",
+                    RoomInputMode::Chat,
+                    &format!("freeze-invalid-directory-{index}"),
+                )
+                .unwrap();
+            repository
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE room_events SET execution_working_directory = ?1 WHERE event_id = ?2",
+                    params![invalid, posted.event.event_id],
+                )
+                .unwrap();
+            let error = repository.lease_next().unwrap_err();
+            assert!(matches!(
+                error,
+                CollaborationError::Config(message)
+                    if message == "房间事件缺少冻结的执行工作目录"
+            ));
+            let error = repository
+                .claim_for_reconciliation(
+                    &posted.inbox_items[0].inbox_item_id,
+                    posted.inbox_items[0].task_run_id.as_deref().unwrap(),
+                    "invalid-directory-reconciliation",
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CollaborationError::Config(message)
+                    if message == "房间事件缺少冻结的执行工作目录"
+            ));
+        }
+    }
+
+    #[test]
+    fn claim_preserves_reply_and_directory_rejects_missing_source_event() {
+        let lease_runtime = tempfile::tempdir().unwrap();
+        let lease_repository =
+            CollaborationRepository::new(lease_runtime.path(), CollaborationConfig::default())
+                .unwrap();
+        let lease_room = lease_repository
+            .ensure_room("lease-room", "Lease Room", &[])
+            .unwrap();
+        let lease_post = lease_repository
+            .post_group_message(
+                "lease-room",
+                &[lease_room.room.default_member_id],
+                "missing lease source",
+                RoomInputMode::Chat,
+                "missing-lease-source",
+            )
+            .unwrap();
+        let lease_connection = lease_repository.connect().unwrap();
+        lease_connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        lease_connection
+            .execute(
+                "UPDATE member_inbox_items SET source_event_id = 'missing-lease-event'",
+                [],
+            )
+            .unwrap();
+        drop(lease_connection);
+
+        let error = lease_repository.lease_next().unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::Config(message)
+                if message == "Inbox 来源用户事件 missing-lease-event 不存在"
+        ));
+        let missing_inbox_id = &lease_post.inbox_items[0].inbox_item_id;
+        let connection = lease_repository.connect().unwrap();
+        let (state, stored_error, completed_at): (String, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT state, error, completed_at FROM member_inbox_items
+                     WHERE inbox_item_id = ?1",
+                    [missing_inbox_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(state, "failed");
+        assert!(stored_error
+            .as_deref()
+            .is_some_and(|message| message.contains("missing-lease-event")));
+        assert!(completed_at.is_some());
+        let (delivery_state, delivery_reason): (String, Option<String>) = connection
+            .query_row(
+                "SELECT state, decision_reason FROM room_event_deliveries
+                 WHERE inbox_item_id = ?1",
+                [missing_inbox_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delivery_state, "suppressed");
+        assert!(delivery_reason
+            .as_deref()
+            .is_some_and(|message| message.contains("missing-lease-event")));
+        let fabricated_outbox: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_outbox_events
+                 WHERE aggregate_kind = 'inbox' AND aggregate_id = ?1
+                   AND idempotency_key LIKE 'inbox-corrupt:%'",
+                [missing_inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fabricated_outbox, 0);
+        drop(connection);
+
+        let reconcile_runtime = tempfile::tempdir().unwrap();
+        let reconcile_repository =
+            CollaborationRepository::new(reconcile_runtime.path(), CollaborationConfig::default())
+                .unwrap();
+        let reconcile_room = reconcile_repository
+            .ensure_room("reconcile-room", "Reconcile Room", &[])
+            .unwrap();
+        reconcile_repository
+            .post_message(
+                "reconcile-room",
+                &[reconcile_room.room.default_member_id],
+                "missing reconciliation source",
+                RoomInputMode::Chat,
+                "missing-reconciliation-source",
+            )
+            .unwrap();
+        let lease = reconcile_repository.lease_next().unwrap().unwrap();
+        let reconcile_connection = reconcile_repository.connect().unwrap();
+        reconcile_connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        reconcile_connection
+            .execute(
+                "UPDATE member_inbox_items SET source_event_id = 'missing-reconciliation-event'
+                 WHERE inbox_item_id = ?1",
+                [&lease.inbox_item_id],
+            )
+            .unwrap();
+        drop(reconcile_connection);
+
+        let error = reconcile_repository
+            .claim_for_reconciliation(
+                &lease.inbox_item_id,
+                &lease.task_run_id,
+                "missing-source-durable-run",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::Config(message)
+                if message == "Inbox 来源用户事件 missing-reconciliation-event 不存在"
+        ));
+    }
+
+    #[test]
+    fn claim_preserves_reply_and_directory_quarantines_corrupt_head() {
+        let (_directory, repository) = repository();
+        let room = ensure(&repository);
+        let member_id = room.room.default_member_id;
+        let first = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "损坏的队首消息",
+                RoomInputMode::Chat,
+                "corrupt-head-first",
+            )
+            .unwrap();
+        let second = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "健康的后续消息",
+                RoomInputMode::Chat,
+                "corrupt-head-second",
+            )
+            .unwrap();
+        let first_inbox_id = &first.inbox_items[0].inbox_item_id;
+        repository
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE room_events SET execution_working_directory = '' WHERE event_id = ?1",
+                [&first.event.event_id],
+            )
+            .unwrap();
+
+        let error = repository.lease_next().unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::Config(message)
+                if message == "房间事件缺少冻结的执行工作目录"
+        ));
+
+        let snapshot = repository.snapshot("room-1").unwrap();
+        let quarantined = snapshot
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == *first_inbox_id)
+            .unwrap();
+        assert_eq!(quarantined.state, InboxState::Failed);
+        assert!(quarantined
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("冻结的执行工作目录")));
+        assert!(quarantined.completed_at.is_some());
+        let delivery = snapshot
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.inbox_item_id.as_deref() == Some(first_inbox_id))
+            .unwrap();
+        assert_eq!(delivery.state, DeliveryState::Suppressed);
+        assert!(delivery
+            .decision_reason
+            .as_deref()
+            .is_some_and(|message| message.contains("冻结的执行工作目录")));
+        let outbox_count: usize = repository
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_outbox_events
+                 WHERE aggregate_kind = 'inbox' AND aggregate_id = ?1
+                   AND idempotency_key LIKE 'inbox-corrupt:%'",
+                [first_inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 1);
+
+        let healthy = repository.lease_next().unwrap().unwrap();
+        assert_eq!(healthy.source_event_id, second.event.event_id);
+    }
+
+    mod reply_target {
+        use super::*;
+
+        fn repository_with_workspace(
+            workspace: &Path,
+        ) -> (tempfile::TempDir, CollaborationRepository) {
+            let runtime = tempfile::tempdir().unwrap();
+            let repository = CollaborationRepository::new_with_startup_working_directory(
+                runtime.path(),
+                CollaborationConfig {
+                    max_members_per_room: 6,
+                    max_pending_items_per_member: 1_000,
+                    max_pending_items_per_room: 2_000,
+                    max_recipients_per_message: 6,
+                    max_workers: 6,
+                    ..CollaborationConfig::default()
+                },
+                workspace,
+            )
+            .unwrap();
+            (runtime, repository)
+        }
+
+        fn post_reply(
+            repository: &CollaborationRepository,
+            room_id: &str,
+            recipient_ids: &[String],
+            content: &str,
+            idempotency_key: &str,
+            reply_to_event_id: Option<&str>,
+        ) -> PostMessageResult {
+            let snapshot = repository.snapshot(room_id).unwrap();
+            let recipients = recipient_ids
+                .iter()
+                .map(|member_id| MemberAddress {
+                    member_id: member_id.clone(),
+                    expected_version: snapshot
+                        .members
+                        .iter()
+                        .find(|member| member.member_id == *member_id)
+                        .unwrap()
+                        .version,
+                })
+                .collect::<Vec<_>>();
+            repository
+                .post_group_message_checked_with_reply(
+                    &CollaborationActor::local(),
+                    room_id,
+                    &recipients,
+                    content,
+                    RoomInputMode::Chat,
+                    DEFAULT_THREAD_KEY,
+                    snapshot.room.version,
+                    idempotency_key,
+                    reply_to_event_id,
+                )
+                .unwrap()
+        }
+
+        fn assert_reference_matches(reference: &RoomEventReferenceView, target: &RoomEventView) {
+            assert_eq!(reference.event_id, target.event_id);
+            assert_eq!(reference.sequence, target.sequence);
+            assert_eq!(reference.sender_kind, target.sender_kind);
+            assert_eq!(reference.sender_id, target.sender_id);
+            assert_eq!(reference.sender_name, target.sender_name);
+            assert_eq!(reference.kind, target.kind);
+            assert_eq!(reference.content, target.content);
+            assert_eq!(
+                reference.content_hash,
+                history_content_hash(&target.content)
+            );
+            assert_eq!(reference.created_at, target.created_at);
+        }
+
+        #[test]
+        fn reply_to_member_event_preserves_parent_root_and_reference() {
+            let workspace = tempfile::tempdir().unwrap();
+            let (_runtime, repository) = repository_with_workspace(workspace.path());
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let member_id = snapshot.room.default_member_id;
+            let root = repository
+                .post_message(
+                    "room-1",
+                    std::slice::from_ref(&member_id),
+                    "root",
+                    RoomInputMode::Chat,
+                    "reply-root",
+                )
+                .unwrap();
+            let root_claim = repository.claim_next().unwrap().unwrap();
+            let target = repository
+                .complete_item(&root_claim, "member target")
+                .unwrap()
+                .unwrap();
+
+            let posted = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "reply to member",
+                "reply-to-member",
+                Some(&target.event_id),
+            );
+
+            assert_eq!(
+                posted.event.parent_event_id.as_deref(),
+                Some(target.event_id.as_str())
+            );
+            assert_eq!(posted.event.conversation_root_event_id, root.event.event_id);
+            let reference = posted.event.reply_reference.as_ref().unwrap();
+            assert_reference_matches(reference, &target);
+            assert!(target.sequence < posted.event.sequence);
+            let claim = repository.claim_next().unwrap().unwrap();
+            assert_eq!(claim.reply_reference, Some(reference.clone()));
+            let recovered = repository
+                .claim_for_reconciliation(
+                    &claim.inbox_item_id,
+                    &claim.task_run_id,
+                    "durable-reply-run",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recovered.execution_working_directory,
+                claim.execution_working_directory
+            );
+            assert_eq!(recovered.reply_reference, claim.reply_reference);
+        }
+
+        #[test]
+        fn claim_preserves_reply_and_directory() {
+            let workspace = tempfile::tempdir().unwrap();
+            let canonical_workspace = workspace.path().canonicalize().unwrap();
+            let (_runtime, repository) = repository_with_workspace(workspace.path());
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let member_id = snapshot.room.default_member_id;
+            let _root = repository
+                .post_message(
+                    "room-1",
+                    std::slice::from_ref(&member_id),
+                    "root",
+                    RoomInputMode::Chat,
+                    "claim-reply-root",
+                )
+                .unwrap();
+            let root_claim = repository.claim_next().unwrap().unwrap();
+            let target = repository
+                .complete_item(&root_claim, "member target")
+                .unwrap()
+                .unwrap();
+            let posted = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "reply to target",
+                "claim-reply-source",
+                Some(&target.event_id),
+            );
+
+            let lease = repository.lease_next().unwrap().unwrap();
+            assert_eq!(lease.source_event_id, posted.event.event_id);
+            assert_eq!(lease.execution_working_directory, canonical_workspace);
+            let reference = lease.reply_reference.as_ref().unwrap();
+            assert_eq!(reference.event_id, target.event_id);
+            assert_eq!(reference.sequence, target.sequence);
+            assert_eq!(
+                reference.content_hash,
+                history_content_hash(&target.content)
+            );
+
+            repository
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE room_events SET invalidated_at = ?1 WHERE event_id = ?2",
+                    params![Utc::now().to_rfc3339(), target.event_id],
+                )
+                .unwrap();
+
+            let recovered = repository
+                .claim_for_reconciliation(
+                    &lease.inbox_item_id,
+                    &lease.task_run_id,
+                    "durable-claim-reply-run",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.source_event_id, posted.event.event_id);
+            assert_eq!(recovered.execution_working_directory, canonical_workspace);
+            assert_eq!(recovered.reply_reference, lease.reply_reference);
+        }
+
+        #[test]
+        fn reply_to_old_user_event_is_projected_outside_snapshot_window() {
+            let workspace = tempfile::tempdir().unwrap();
+            let canonical_workspace = workspace.path().canonicalize().unwrap();
+            let (_runtime, repository) = repository_with_workspace(workspace.path());
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let member_id = snapshot.room.default_member_id;
+            let target = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "old target",
+                "old-target",
+                None,
+            );
+            let mut connection = repository.connect().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for sequence in 2_u64..=301 {
+                let event_id = format!("window-filler-{sequence}");
+                transaction
+                    .execute(
+                        "INSERT INTO room_events(
+                             event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                             kind, content, conversation_root_event_id, group_enabled,
+                             conversation_mode, idempotency_key, execution_working_directory,
+                             created_at
+                         ) VALUES (
+                             ?1, 'room-1', ?2, 'service', 'service', '系统',
+                             'window_filler', ?1, ?1, 0, 'chat', ?1, ?3, ?4
+                         )",
+                        params![
+                            event_id,
+                            sequence,
+                            canonical_workspace.display().to_string(),
+                            Utc::now().to_rfc3339()
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction
+                .execute(
+                    "UPDATE collaboration_rooms SET latest_event_seq = 301 WHERE room_id = 'room-1'",
+                    [],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+
+            let posted = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "reply outside window",
+                "reply-outside-window",
+                Some(&target.event.event_id),
+            );
+            let snapshot = repository.snapshot("room-1").unwrap();
+            assert_eq!(snapshot.events.len(), 300);
+            assert!(snapshot
+                .events
+                .iter()
+                .all(|event| event.event_id != target.event.event_id));
+            let projected = snapshot
+                .events
+                .iter()
+                .find(|event| event.event_id == posted.event.event_id)
+                .unwrap();
+            assert_reference_matches(projected.reply_reference.as_ref().unwrap(), &target.event);
+        }
+
+        #[test]
+        fn all_explicit_recipients_share_the_same_reply_reference() {
+            let workspace = tempfile::tempdir().unwrap();
+            let (_runtime, repository) = repository_with_workspace(workspace.path());
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let member_a = snapshot.room.default_member_id;
+            let member_b = repository
+                .create_member("room-1", "智脑 B", None, None)
+                .unwrap()
+                .member_id;
+            let member_c = repository
+                .create_member("room-1", "智脑 C", None, None)
+                .unwrap()
+                .member_id;
+            let target = repository
+                .post_message(
+                    "room-1",
+                    std::slice::from_ref(&member_c),
+                    "shared target",
+                    RoomInputMode::Chat,
+                    "shared-target",
+                )
+                .unwrap();
+            let target_claim = repository.claim_next().unwrap().unwrap();
+            repository
+                .complete_item(&target_claim, "target handled")
+                .unwrap();
+
+            let posted = post_reply(
+                &repository,
+                "room-1",
+                &[member_a.clone(), member_b.clone()],
+                "shared reply",
+                "shared-reply",
+                Some(&target.event.event_id),
+            );
+            assert_eq!(posted.inbox_items.len(), 2);
+            assert!(posted
+                .inbox_items
+                .iter()
+                .all(|item| item.member_id == member_a || item.member_id == member_b));
+            assert!(posted
+                .inbox_items
+                .iter()
+                .all(|item| item.member_id != member_c));
+            let reference = posted.event.reply_reference.clone().unwrap();
+            let first = repository.claim_next().unwrap().unwrap();
+            let second = repository.claim_next().unwrap().unwrap();
+            assert_ne!(first.member_id, second.member_id);
+            assert_eq!(first.reply_reference, Some(reference.clone()));
+            assert_eq!(second.reply_reference, Some(reference));
+        }
+
+        #[test]
+        fn cross_room_invalidated_and_service_reply_targets_are_rejected() {
+            let workspace = tempfile::tempdir().unwrap();
+            let (_runtime, repository) = repository_with_workspace(workspace.path());
+            let room_one = repository.ensure_room("room-1", "Room 1", &[]).unwrap();
+            let room_two = repository.ensure_room("room-2", "Room 2", &[]).unwrap();
+            let recipient = room_one.room.default_member_id;
+
+            let missing =
+                post_reply_error(&repository, &recipient, "missing-target", "reply-missing");
+            assert!(matches!(
+                missing,
+                CollaborationError::ReplyTargetNotFound(event_id)
+                    if event_id == "missing-target"
+            ));
+
+            let cross_room = post_reply(
+                &repository,
+                "room-2",
+                &[room_two.room.default_member_id],
+                "cross-room target",
+                "cross-room-target",
+                None,
+            );
+            let cross_room_error = post_reply_error(
+                &repository,
+                &recipient,
+                &cross_room.event.event_id,
+                "reply-cross-room",
+            );
+            assert!(matches!(
+                cross_room_error,
+                CollaborationError::ReplyTargetRoomMismatch {
+                    event_id,
+                    room_id,
+                    target_room_id,
+                } if event_id == cross_room.event.event_id
+                    && room_id == "room-1"
+                    && target_room_id == "room-2"
+            ));
+
+            let invalidated = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&recipient),
+                "invalidated target",
+                "invalidated-target",
+                None,
+            );
+            repository
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE room_events SET invalidated_at = ?1 WHERE event_id = ?2",
+                    params![Utc::now().to_rfc3339(), invalidated.event.event_id],
+                )
+                .unwrap();
+            let invalidated_error = post_reply_error(
+                &repository,
+                &recipient,
+                &invalidated.event.event_id,
+                "reply-invalidated",
+            );
+            assert!(matches!(
+                invalidated_error,
+                CollaborationError::ReplyTargetInvalidated(event_id)
+                    if event_id == invalidated.event.event_id
+            ));
+
+            repository
+                .create_member("room-1", "service target member", None, None)
+                .unwrap();
+            let service_event_id: String = repository
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT event_id FROM room_events
+                     WHERE room_id = 'room-1' AND sender_kind = 'service'
+                     ORDER BY sequence DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let service_error =
+                post_reply_error(&repository, &recipient, &service_event_id, "reply-service");
+            assert!(matches!(
+                service_error,
+                CollaborationError::ReplyTargetTypeUnsupported {
+                    event_id,
+                    sender_kind,
+                    kind,
+                } if event_id == service_event_id
+                    && sender_kind == "service"
+                    && kind == "member_created"
+            ));
+        }
+
+        fn post_reply_error(
+            repository: &CollaborationRepository,
+            recipient: &str,
+            target: &str,
+            idempotency_key: &str,
+        ) -> CollaborationError {
+            let snapshot = repository.snapshot("room-1").unwrap();
+            let member = snapshot
+                .members
+                .iter()
+                .find(|member| member.member_id == recipient)
+                .unwrap();
+            repository
+                .post_group_message_checked_with_reply(
+                    &CollaborationActor::local(),
+                    "room-1",
+                    &[MemberAddress {
+                        member_id: recipient.into(),
+                        expected_version: member.version,
+                    }],
+                    "invalid reply",
+                    RoomInputMode::Chat,
+                    DEFAULT_THREAD_KEY,
+                    snapshot.room.version,
+                    idempotency_key,
+                    Some(target),
+                )
+                .unwrap_err()
+        }
+
+        #[test]
+        fn idempotent_replay_keeps_original_directory_and_reply_target() {
+            let workspace_a = tempfile::tempdir().unwrap();
+            let workspace_b = tempfile::tempdir().unwrap();
+            let canonical_a = workspace_a.path().canonicalize().unwrap();
+            let (_runtime, repository) = repository_with_workspace(workspace_a.path());
+            let snapshot = repository.ensure_room("room-1", "Room", &[]).unwrap();
+            let member_id = snapshot.room.default_member_id;
+            let original_target = repository
+                .post_message(
+                    "room-1",
+                    std::slice::from_ref(&member_id),
+                    "original target",
+                    RoomInputMode::Chat,
+                    "idempotent-original-target",
+                )
+                .unwrap();
+            let target_claim = repository.claim_next().unwrap().unwrap();
+            repository
+                .complete_item(&target_claim, "target handled")
+                .unwrap();
+            let first = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "first reply",
+                "idempotent-reply",
+                Some(&original_target.event.event_id),
+            );
+            repository
+                .update_room_working_directory(
+                    "room-1",
+                    &workspace_b.path().to_string_lossy(),
+                    repository.snapshot("room-1").unwrap().room.version,
+                )
+                .unwrap();
+            let changed_target = post_reply(
+                &repository,
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "changed target",
+                "idempotent-changed-target",
+                None,
+            );
+            let duplicate = repository
+                .post_group_message_checked_with_reply(
+                    &CollaborationActor::local(),
+                    "room-1",
+                    &[MemberAddress {
+                        member_id: member_id.clone(),
+                        expected_version: u64::MAX,
+                    }],
+                    "different replay content",
+                    RoomInputMode::Task,
+                    "different-thread",
+                    0,
+                    "idempotent-reply",
+                    Some(&changed_target.event.event_id),
+                )
+                .unwrap();
+
+            assert!(duplicate.duplicate);
+            assert_eq!(duplicate.event.event_id, first.event.event_id);
+            assert_eq!(duplicate.event.parent_event_id, first.event.parent_event_id);
+            assert_eq!(duplicate.event.reply_reference, first.event.reply_reference);
+            assert_eq!(
+                duplicate
+                    .inbox_items
+                    .iter()
+                    .map(|item| &item.inbox_item_id)
+                    .collect::<Vec<_>>(),
+                first
+                    .inbox_items
+                    .iter()
+                    .map(|item| &item.inbox_item_id)
+                    .collect::<Vec<_>>()
+            );
+            let stored_directory: String = repository
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT execution_working_directory FROM room_events WHERE event_id = ?1",
+                    [&first.event.event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(PathBuf::from(stored_directory), canonical_a);
+            let claim = repository.claim_next().unwrap().unwrap();
+            assert_eq!(claim.source_event_id, first.event.event_id);
+            assert_eq!(claim.execution_working_directory, canonical_a);
+            assert_eq!(claim.reply_reference, first.event.reply_reference);
+        }
+    }
+
+    mod events_before {
+        use super::*;
+
+        fn paged_repository() -> (tempfile::TempDir, CollaborationRepository) {
+            let runtime = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let repository = CollaborationRepository::new_with_startup_working_directory(
+                runtime.path(),
+                CollaborationConfig::default(),
+                workspace.path(),
+            )
+            .unwrap();
+            // 仓储只保存规范路径，测试无需继续持有工作目录句柄。
+            drop(workspace);
+            (runtime, repository)
+        }
+
+        fn seed_service_events(
+            repository: &CollaborationRepository,
+            room_id: &str,
+            count: u64,
+            invalidated_sequences: &[u64],
+        ) {
+            let room = repository.snapshot(room_id).unwrap().room;
+            let mut connection = repository.connect().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for sequence in 1..=count {
+                let event_id = format!("page-event-{sequence}");
+                let invalidated_at = invalidated_sequences
+                    .contains(&sequence)
+                    .then(|| Utc::now().to_rfc3339());
+                transaction
+                    .execute(
+                        "INSERT INTO room_events(
+                             event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                             kind, content, conversation_root_event_id, group_enabled,
+                             conversation_mode, idempotency_key, execution_working_directory,
+                             created_at, invalidated_at
+                         ) VALUES (
+                             ?1, ?2, ?3, 'service', 'service', '系统', 'page_event',
+                             ?1, ?1, 0, 'chat', ?1, ?4, ?5, ?6
+                         )",
+                        params![
+                            event_id,
+                            room_id,
+                            sequence,
+                            room.working_directory,
+                            Utc::now().to_rfc3339(),
+                            invalidated_at
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction
+                .execute(
+                    "UPDATE collaboration_rooms SET latest_event_seq = ?1 WHERE room_id = ?2",
+                    params![count, room_id],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        #[test]
+        fn events_before_clamps_limit_orders_ascending_and_reports_more() {
+            let (_runtime, repository) = paged_repository();
+            repository.ensure_room("room-1", "Room", &[]).unwrap();
+            seed_service_events(&repository, "room-1", 150, &[120, 140]);
+
+            let newest = repository.events_before("room-1", 151, 200).unwrap();
+            assert_eq!(newest.events.len(), 100);
+            assert!(newest.has_more);
+            assert!(newest
+                .events
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence));
+            assert!(newest.events.iter().all(|event| event.sequence < 151));
+            assert!(newest
+                .events
+                .iter()
+                .all(|event| !matches!(event.sequence, 120 | 140)));
+
+            let older = repository
+                .events_before("room-1", newest.events[0].sequence, 100)
+                .unwrap();
+            assert!(!older.has_more);
+            let sequences = older
+                .events
+                .iter()
+                .chain(newest.events.iter())
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>();
+            assert_eq!(sequences.len(), 148);
+            assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+
+            let minimum = repository.events_before("room-1", 151, 0).unwrap();
+            assert_eq!(minimum.events.len(), 1);
+            assert_eq!(minimum.events[0].sequence, 150);
+            assert!(minimum.has_more);
+            let empty = repository.events_before("room-1", 0, 10).unwrap();
+            assert!(empty.events.is_empty());
+            assert!(!empty.has_more);
+        }
+
+        #[test]
+        fn events_before_hydrates_invalidated_parent_reference_outside_page() {
+            let (_runtime, repository) = paged_repository();
+            let room = repository.ensure_room("room-1", "Room", &[]).unwrap().room;
+            let mut connection = repository.connect().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let created_at = Utc::now();
+            transaction
+                .execute(
+                    "INSERT INTO room_events(
+                         event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                         kind, content, conversation_root_event_id, group_enabled,
+                         conversation_mode, idempotency_key, execution_working_directory,
+                         created_at, invalidated_at
+                     ) VALUES (
+                         'page-parent', 'room-1', 1, 'user', 'user', '用户',
+                         'user_message', 'historical parent', 'page-parent', 1, 'chat',
+                         'page-parent', ?1, ?2, ?3
+                     )",
+                    params![
+                        room.working_directory,
+                        created_at.to_rfc3339(),
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .unwrap();
+            for sequence in 2_u64..=10 {
+                let event_id = format!("parent-filler-{sequence}");
+                transaction
+                    .execute(
+                        "INSERT INTO room_events(
+                             event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                             kind, content, conversation_root_event_id, group_enabled,
+                             conversation_mode, idempotency_key, execution_working_directory,
+                             created_at
+                         ) VALUES (
+                             ?1, 'room-1', ?2, 'service', 'service', '系统', 'page_filler',
+                             ?1, ?1, 0, 'chat', ?1, ?3, ?4
+                         )",
+                        params![
+                            event_id,
+                            sequence,
+                            room.working_directory,
+                            Utc::now().to_rfc3339()
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction
+                .execute(
+                    "INSERT INTO room_events(
+                         event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                         kind, content, parent_event_id, conversation_root_event_id,
+                         group_enabled, conversation_mode, idempotency_key,
+                         execution_working_directory, created_at
+                     ) VALUES (
+                         'page-child', 'room-1', 11, 'user', 'user', '用户',
+                         'user_message', 'historical child', 'page-parent', 'page-parent',
+                         1, 'chat', 'page-child', ?1, ?2
+                     )",
+                    params![room.working_directory, Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE collaboration_rooms SET latest_event_seq = 11 WHERE room_id = 'room-1'",
+                    [],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+
+            let page = repository.events_before("room-1", 12, 1).unwrap();
+            assert_eq!(page.events.len(), 1);
+            assert_eq!(page.events[0].event_id, "page-child");
+            let reference = page.events[0].reply_reference.as_ref().unwrap();
+            assert_eq!(reference.event_id, "page-parent");
+            assert_eq!(reference.content, "historical parent");
+            assert_eq!(
+                reference.content_hash,
+                history_content_hash("historical parent")
+            );
+            assert!(page.has_more);
+        }
+
+        #[test]
+        fn events_before_snapshot_reports_earlier_and_missing_room_is_explicit() {
+            let (_runtime, repository) = paged_repository();
+            repository.ensure_room("room-1", "Room", &[]).unwrap();
+            seed_service_events(&repository, "room-1", 305, &[]);
+
+            let snapshot = repository.snapshot("room-1").unwrap();
+            assert_eq!(snapshot.events.len(), 300);
+            assert_eq!(snapshot.events[0].sequence, 6);
+            assert!(snapshot.has_earlier_events);
+            let mut serialized = serde_json::to_value(&snapshot).unwrap();
+            serialized
+                .as_object_mut()
+                .unwrap()
+                .remove("has_earlier_events");
+            let old_snapshot: RoomSnapshot = serde_json::from_value(serialized).unwrap();
+            assert!(!old_snapshot.has_earlier_events);
+
+            let error = repository
+                .events_before("missing-room", 10, 10)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CollaborationError::RoomNotFound(room_id) if room_id == "missing-room"
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_room_working_directory_errors_leave_path_and_version_unchanged() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let absolute_workspace = tempfile::tempdir().unwrap();
+        let relative_workspace = startup.path().join("relative-workspace");
+        fs::create_dir(&relative_workspace).unwrap();
+        let file_path = startup.path().join("not-a-directory.txt");
+        fs::write(&file_path, "file").unwrap();
+        let missing_path = startup.path().join("missing-workspace");
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        let created = repository.ensure_room("room-1", "Room", &[]).unwrap();
+        let original_path = created.room.working_directory.clone();
+        let original_version = created.room.version;
+
+        for invalid_path in [
+            "",
+            "   ",
+            missing_path.to_str().unwrap(),
+            file_path.to_str().unwrap(),
+        ] {
+            assert!(repository
+                .update_room_working_directory("room-1", invalid_path, original_version)
+                .is_err());
+            let unchanged = repository.snapshot("room-1").unwrap().room;
+            assert_eq!(unchanged.working_directory, original_path);
+            assert_eq!(unchanged.version, original_version);
+        }
+
+        let relative = repository
+            .update_room_working_directory("room-1", "  relative-workspace  ", original_version)
+            .unwrap();
+        assert_eq!(
+            Path::new(&relative.working_directory),
+            relative_workspace.canonicalize().unwrap()
+        );
+        assert_eq!(relative.version, original_version + 1);
+
+        let stale_error = repository
+            .update_room_working_directory(
+                "room-1",
+                &absolute_workspace.path().to_string_lossy(),
+                original_version,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale_error,
+            CollaborationError::VersionConflict {
+                entity: "room",
+                expected,
+                actual,
+                ..
+            } if expected == original_version && actual == relative.version
+        ));
+        let unchanged = repository.snapshot("room-1").unwrap().room;
+        assert_eq!(unchanged.working_directory, relative.working_directory);
+        assert_eq!(unchanged.version, relative.version);
+
+        let absolute = repository
+            .update_room_working_directory(
+                "room-1",
+                &absolute_workspace.path().to_string_lossy(),
+                relative.version,
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(&absolute.working_directory),
+            absolute_workspace.path().canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_canonical_room_directory_is_rejected_without_mutation() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let non_utf8_directory = startup
+            .path()
+            .join(OsString::from_vec(b"non-utf8-\x80".to_vec()));
+        fs::create_dir(&non_utf8_directory).unwrap();
+        let utf8_link = startup.path().join("utf8-link");
+        std::os::unix::fs::symlink(&non_utf8_directory, &utf8_link).unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        let before = repository.ensure_room("room-1", "Room", &[]).unwrap().room;
+
+        let error = repository
+            .update_room_working_directory("room-1", utf8_link.to_str().unwrap(), before.version)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CollaborationError::Config(message) if message.contains("UTF-8")),
+            "应明确报告无法无损存储路径"
+        );
+        let after = repository.snapshot("room-1").unwrap().room;
+        assert_eq!(after.working_directory, before.working_directory);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.state_revision, before.state_revision);
+    }
+
+    #[test]
+    fn invalid_room_working_directory_is_hidden_from_actor_without_configure_room() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        repository.ensure_room("room-1", "Room", &[]).unwrap();
+        repository
+            .upsert_membership(
+                &CollaborationActor::local(),
+                "room-1",
+                "viewer-1",
+                RoomRole::Viewer,
+                &[RoomCapability::RoomRead],
+                None,
+            )
+            .unwrap();
+        let before = repository.snapshot("room-1").unwrap().room;
+        let missing_path = startup.path().join("secret-does-not-exist");
+
+        let error = repository
+            .update_room_working_directory_as(
+                &CollaborationActor::new("viewer-1"),
+                "room-1",
+                &missing_path.to_string_lossy(),
+                before.version,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::CapabilityDenied {
+                capability: RoomCapability::ConfigureRoom,
+                ..
+            }
+        ));
+        let after = repository.snapshot("room-1").unwrap().room;
+        assert_eq!(after.working_directory, before.working_directory);
+        assert_eq!(after.version, before.version);
     }
 
     #[test]
@@ -4850,6 +7531,67 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_snapshot_state_revision_tracks_inbox_only_mutations() {
+        let (_directory, repository) = repository();
+        let initial = ensure(&repository);
+        let member_id = initial.room.default_member_id.clone();
+        let renamed = repository
+            .ensure_room("room-1", "Renamed Room", &[])
+            .unwrap();
+        assert_eq!(renamed.room.title, "Renamed Room");
+        assert_eq!(renamed.room.version, initial.room.version);
+        assert_eq!(renamed.room.latest_event_seq, initial.room.latest_event_seq);
+        assert!(renamed.room.state_revision > initial.room.state_revision);
+
+        let unchanged = repository
+            .ensure_room("room-1", "Renamed Room", &[])
+            .unwrap();
+        assert_eq!(unchanged.room.state_revision, renamed.room.state_revision);
+        repository
+            .post_message(
+                "room-1",
+                &[member_id],
+                "等待租约",
+                RoomInputMode::Task,
+                "state-revision-command",
+            )
+            .unwrap();
+        let before = repository.snapshot("room-1").unwrap();
+
+        repository.lease_next().unwrap().unwrap();
+        let after_lease = repository.snapshot("room-1").unwrap();
+
+        assert_eq!(after_lease.room.version, before.room.version);
+        assert_eq!(
+            after_lease.room.latest_event_seq,
+            before.room.latest_event_seq
+        );
+        assert!(after_lease.room.state_revision > before.room.state_revision);
+        assert_eq!(after_lease.inbox[0].state, InboxState::Leased);
+        assert!(after_lease.inbox[0].version > before.inbox[0].version);
+
+        let mut connection = repository.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let duplicate_key = "duplicate-missing-room-invariant";
+        enqueue_room_changed(&transaction, "room-1", "room", "room-1", duplicate_key).unwrap();
+        let error = enqueue_room_changed(
+            &transaction,
+            "missing-room",
+            "room",
+            "missing-room",
+            duplicate_key,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::RoomNotFound(room_id) if room_id == "missing-room"
+        ));
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
     fn one_member_serializes_while_different_members_can_claim() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
@@ -4927,7 +7669,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_lease_release_does_not_emit_room_change() {
+    fn stale_lease_release_reports_that_running_claim_was_not_released() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         acknowledge_pending_outbox(&repository);
@@ -4944,12 +7686,46 @@ mod tests {
         let active = repository.activate_lease(&lease).unwrap();
         acknowledge_pending_outbox(&repository);
 
-        repository.release_lease(&lease).unwrap();
+        let error = repository.release_lease(&lease).unwrap_err();
 
+        assert!(matches!(error, CollaborationError::RunNotActive(_)));
         assert!(repository.pending_outbox_events(100).unwrap().is_empty());
         let item = &repository.snapshot("room-1").unwrap().inbox[0];
         assert_eq!(item.state, InboxState::Running);
         assert_eq!(item.version, active.version);
+    }
+
+    #[test]
+    fn active_retry_release_tolerates_interrupt_version_bump() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "中断与失败结算并发",
+                RoomInputMode::Task,
+                "interrupt-before-retry-release",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+        let active = repository.activate_lease(&leased).unwrap();
+        repository
+            .request_interrupt("room-1", &member_id, &active.run_id)
+            .unwrap();
+
+        repository.release_active_for_retry(&active).unwrap();
+
+        let item = repository
+            .snapshot("room-1")
+            .unwrap()
+            .inbox
+            .into_iter()
+            .find(|item| item.inbox_item_id == active.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Pending);
+        assert!(item.run_id.is_none());
     }
 
     #[test]
@@ -4989,6 +7765,92 @@ mod tests {
         assert_eq!(snapshot.inbox[0].state, InboxState::Completed);
         assert_eq!(
             snapshot
+                .events
+                .iter()
+                .filter(|event| event.kind == "member_message")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_task_result_reconciliation_preserves_reply_metadata() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        let posted = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "需要恢复完整回复上下文的任务",
+                RoomInputMode::Task,
+                "reconcile-metadata-command",
+            )
+            .unwrap();
+        let claim = repository.claim_next().unwrap().unwrap();
+        assert_eq!(claim.response_to_event_id, posted.event.event_id);
+        assert_eq!(claim.mode, RoomInputMode::Task);
+        assert!(claim.group_enabled);
+
+        let event = repository
+            .reconcile_completed_item(
+                &posted.inbox_items[0].inbox_item_id,
+                &claim.run_id,
+                "恢复后仍属于原任务线程的回复",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event.parent_event_id.as_deref(),
+            Some(claim.response_to_event_id.as_str())
+        );
+        assert_eq!(
+            event.conversation_root_event_id,
+            posted.event.conversation_root_event_id
+        );
+        assert_eq!(event.debate_depth, posted.event.debate_depth + 1);
+        assert!(event.group_enabled);
+        assert_eq!(event.conversation_mode, RoomInputMode::Task);
+        assert_eq!(
+            event.reply_reference,
+            Some(RoomEventReferenceView {
+                event_id: posted.event.event_id.clone(),
+                sequence: posted.event.sequence,
+                sender_kind: posted.event.sender_kind.clone(),
+                sender_id: posted.event.sender_id.clone(),
+                sender_name: posted.event.sender_name.clone(),
+                kind: posted.event.kind.clone(),
+                content: posted.event.content.clone(),
+                content_hash: history_content_hash(&posted.event.content),
+                created_at: posted.event.created_at,
+            })
+        );
+        let persisted_directory: String = repository
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT execution_working_directory FROM room_events WHERE event_id = ?1",
+                [event.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(persisted_directory),
+            claim.execution_working_directory
+        );
+
+        assert!(repository
+            .reconcile_completed_item(
+                &posted.inbox_items[0].inbox_item_id,
+                &claim.run_id,
+                "重复恢复不应新增回复",
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repository
+                .snapshot("room-1")
+                .unwrap()
                 .events
                 .iter()
                 .filter(|event| event.kind == "member_message")
@@ -5848,6 +8710,224 @@ mod tests {
     }
 
     #[test]
+    fn failed_durable_projection_releases_the_running_transition_for_retry() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "恢复一个无效的持久结果",
+                RoomInputMode::Task,
+                "invalid-durable-projection",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+
+        let error = repository
+            .reconcile_claim_result(&leased, "invalid-durable-run", Some("   "))
+            .unwrap_err();
+
+        assert!(matches!(error, CollaborationError::EmptyMemberReply));
+        let persisted = repository.snapshot("room-1").unwrap();
+        let item = persisted
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == leased.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Pending);
+        assert!(item.run_id.is_none());
+        let retried = repository.lease_next().unwrap().unwrap();
+        assert_eq!(retried.inbox_item_id, leased.inbox_item_id);
+        assert_ne!(retried.run_id, "invalid-durable-run");
+    }
+
+    #[test]
+    fn failed_inbox_accepts_valid_authoritative_durable_result() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "恢复历史失败任务的权威结果",
+                RoomInputMode::Task,
+                "failed-authoritative-result",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+        let active = repository.activate_lease(&leased).unwrap();
+        repository.fail_item(&active, "历史执行失败").unwrap();
+        let durable_run_id = "durable-failed-authoritative-run";
+        let recovered = repository
+            .claim_for_reconciliation(&active.inbox_item_id, &active.task_run_id, durable_run_id)
+            .unwrap()
+            .unwrap();
+
+        let completion = repository
+            .reconcile_claim_result(&recovered, durable_run_id, Some("权威持久回复"))
+            .unwrap();
+
+        assert_eq!(completion.disposition, ParticipationDisposition::Replied);
+        assert_eq!(completion.event.unwrap().content, "权威持久回复");
+        let item = repository
+            .snapshot("room-1")
+            .unwrap()
+            .inbox
+            .into_iter()
+            .find(|item| item.inbox_item_id == active.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Completed);
+        assert_eq!(item.run_id.as_deref(), Some(durable_run_id));
+        assert!(item.error.is_none());
+    }
+
+    #[test]
+    fn failed_inbox_projection_error_restores_failed_state_and_run() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "无效权威结果不得覆盖历史失败态",
+                RoomInputMode::Task,
+                "failed-invalid-authoritative-result",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+        let active = repository.activate_lease(&leased).unwrap();
+        repository.fail_item(&active, "需要保留的历史错误").unwrap();
+        let durable_run_id = "durable-failed-invalid-run";
+        let recovered = repository
+            .claim_for_reconciliation(&active.inbox_item_id, &active.task_run_id, durable_run_id)
+            .unwrap()
+            .unwrap();
+
+        let error = repository
+            .reconcile_claim_result(&recovered, durable_run_id, Some("   "))
+            .unwrap_err();
+
+        assert!(matches!(error, CollaborationError::EmptyMemberReply));
+        let snapshot = repository.snapshot("room-1").unwrap();
+        let item = snapshot
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == active.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Failed);
+        assert_eq!(item.run_id.as_deref(), Some(active.run_id.as_str()));
+        assert_eq!(item.error.as_deref(), Some("需要保留的历史错误"));
+        assert!(snapshot
+            .events
+            .iter()
+            .all(|event| event.kind != "member_message"));
+    }
+
+    #[test]
+    fn failed_reconciliation_rollback_never_overwrites_a_newer_transition() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "旧回滚不得覆盖更新转换",
+                RoomInputMode::Task,
+                "failed-rollback-cas",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+        let active = repository.activate_lease(&leased).unwrap();
+        repository.fail_item(&active, "需要保留的原始失败").unwrap();
+        let durable_run_id = "durable-rollback-cas";
+        let recovered = repository
+            .claim_for_reconciliation(&active.inbox_item_id, &active.task_run_id, durable_run_id)
+            .unwrap()
+            .unwrap();
+        let connection = Connection::open(repository.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE member_inbox_items
+                 SET state = 'running', run_id = ?1, version = version + 1
+                 WHERE inbox_item_id = ?2 AND state = 'failed' AND version = ?3",
+                params![durable_run_id, active.inbox_item_id, recovered.version],
+            )
+            .unwrap();
+        let mut durable_claim = recovered;
+        durable_claim.version += 1;
+        connection
+            .execute(
+                "UPDATE member_inbox_items SET version = version + 1
+                 WHERE inbox_item_id = ?1 AND state = 'running' AND run_id = ?2",
+                params![active.inbox_item_id, durable_run_id],
+            )
+            .unwrap();
+
+        let error = repository
+            .restore_failed_reconciliation(&durable_claim, Some(&active.run_id))
+            .unwrap_err();
+
+        assert!(matches!(error, CollaborationError::VersionConflict { .. }));
+        let (state, run_id, version): (String, String, u64) = connection
+            .query_row(
+                "SELECT state, run_id, version FROM member_inbox_items
+                 WHERE inbox_item_id = ?1",
+                [&active.inbox_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        assert_eq!(run_id, durable_run_id);
+        assert_eq!(version, durable_claim.version + 1);
+    }
+
+    #[test]
+    fn durable_reconciliation_never_replaces_a_different_active_run() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "活动运行不得被旧持久结果覆盖",
+                RoomInputMode::Task,
+                "different-active-run",
+            )
+            .unwrap();
+        let leased = repository.lease_next().unwrap().unwrap();
+        let active = repository.activate_lease(&leased).unwrap();
+        let stale_durable_run = "stale-durable-run";
+        let recovered = repository
+            .claim_for_reconciliation(
+                &active.inbox_item_id,
+                &active.task_run_id,
+                stale_durable_run,
+            )
+            .unwrap()
+            .unwrap();
+
+        let error = repository
+            .reconcile_claim_result(&recovered, stale_durable_run, Some("迟到回复"))
+            .unwrap_err();
+
+        assert!(matches!(error, CollaborationError::RunNotActive(_)));
+        let snapshot = repository.snapshot("room-1").unwrap();
+        let item = snapshot
+            .inbox
+            .iter()
+            .find(|item| item.inbox_item_id == active.inbox_item_id)
+            .unwrap();
+        assert_eq!(item.state, InboxState::Running);
+        assert_eq!(item.run_id.as_deref(), Some(active.run_id.as_str()));
+        assert!(snapshot
+            .events
+            .iter()
+            .all(|event| event.kind != "member_message"));
+    }
+
+    #[test]
     fn explicitly_mentioned_busy_member_receives_one_pending_direct_item() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
@@ -5957,6 +9037,253 @@ mod tests {
             .all(|delivery| delivery.kind == DeliveryKind::Direct));
     }
 
+    fn create_schema_six_working_directory_fixture(database_path: &Path) {
+        let connection = Connection::open(database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE collaboration_schema (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO collaboration_schema(singleton, version) VALUES (1, 6);
+                 CREATE TABLE collaboration_rooms (
+                     room_id TEXT PRIMARY KEY,
+                     workspace_id TEXT NOT NULL DEFAULT 'local',
+                     title TEXT NOT NULL,
+                     default_member_id TEXT NOT NULL,
+                     latest_event_seq INTEGER NOT NULL DEFAULT 0,
+                     room_summary_ref TEXT,
+                     room_summary_through_seq INTEGER NOT NULL DEFAULT 0,
+                     version INTEGER NOT NULL DEFAULT 1,
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE room_events (
+                     event_id TEXT PRIMARY KEY,
+                     room_id TEXT NOT NULL REFERENCES collaboration_rooms(room_id),
+                     sequence INTEGER NOT NULL,
+                     sender_kind TEXT NOT NULL,
+                     sender_id TEXT NOT NULL,
+                     sender_name TEXT NOT NULL,
+                     visibility TEXT NOT NULL DEFAULT 'room',
+                     kind TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     run_id TEXT,
+                     parent_event_id TEXT,
+                     conversation_root_event_id TEXT,
+                     debate_depth INTEGER NOT NULL DEFAULT 0,
+                     group_enabled INTEGER NOT NULL DEFAULT 0,
+                     conversation_mode TEXT NOT NULL DEFAULT 'chat',
+                     idempotency_key TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     invalidated_at TEXT,
+                     UNIQUE(room_id, sequence),
+                     UNIQUE(room_id, idempotency_key)
+                 );
+                 CREATE TABLE room_principal_memberships (
+                     room_id TEXT NOT NULL REFERENCES collaboration_rooms(room_id) ON DELETE CASCADE,
+                     principal_id TEXT NOT NULL,
+                     role TEXT NOT NULL,
+                     capabilities_json TEXT NOT NULL,
+                     capability_version INTEGER NOT NULL DEFAULT 1,
+                     version INTEGER NOT NULL DEFAULT 1,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL,
+                     PRIMARY KEY(room_id, principal_id)
+                 );",
+            )
+            .unwrap();
+        let legacy_time = "2026-08-08T00:00:00Z";
+        connection
+            .execute(
+                "INSERT INTO collaboration_rooms(
+                     room_id, workspace_id, title, default_member_id, latest_event_seq,
+                     room_summary_ref, room_summary_through_seq, version, created_at
+                 ) VALUES ('legacy-room', 'local', '旧房间', 'legacy-member', 2, NULL, 0, 11, ?1)",
+                [legacy_time],
+            )
+            .unwrap();
+        for (event_id, sequence, sender_kind, sender_id, kind, content) in [
+            (
+                "legacy-user",
+                1_u64,
+                "user",
+                "user",
+                "user_message",
+                "旧用户消息",
+            ),
+            (
+                "legacy-member-event",
+                2_u64,
+                "member",
+                "legacy-member",
+                "member_message",
+                "旧成员消息",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO room_events(
+                         event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                         visibility, kind, content, run_id, parent_event_id,
+                         conversation_root_event_id, debate_depth, group_enabled,
+                         conversation_mode, idempotency_key, created_at, invalidated_at
+                     ) VALUES (
+                         ?1, 'legacy-room', ?2, ?3, ?4, ?4, 'room', ?5, ?6, NULL,
+                         NULL, ?1, 0, 0, 'chat', ?1, ?7, NULL
+                     )",
+                    params![
+                        event_id,
+                        sequence,
+                        sender_kind,
+                        sender_id,
+                        kind,
+                        content,
+                        legacy_time,
+                    ],
+                )
+                .unwrap();
+        }
+        let legacy_capabilities = serialize_capabilities(&[
+            RoomCapability::RoomRead,
+            RoomCapability::RoomPost,
+            RoomCapability::MentionMember,
+            RoomCapability::SubmitTask,
+            RoomCapability::CreateMember,
+            RoomCapability::ConfigureMember,
+            RoomCapability::WakeSleepMember,
+            RoomCapability::ArchiveRestoreMember,
+            RoomCapability::InterruptOwnRun,
+            RoomCapability::InterruptAnyRun,
+            RoomCapability::OverrideMemberModel,
+            RoomCapability::OverrideMemberReasoning,
+            RoomCapability::ManageMembership,
+        ])
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO room_principal_memberships(
+                     room_id, principal_id, role, capabilities_json, capability_version,
+                     version, created_at, updated_at
+                 ) VALUES ('legacy-room', ?1, 'owner', ?2, 1, 4, ?3, ?3)",
+                params![LOCAL_PRINCIPAL_ID, legacy_capabilities, legacy_time],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn migrates_working_directory_and_owner_capability_from_schema_six() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let canonical_startup = startup.path().canonicalize().unwrap().display().to_string();
+        create_schema_six_working_directory_fixture(&runtime.path().join("runtime.db"));
+
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        let room = repository.snapshot("legacy-room").unwrap().room;
+        assert_eq!(room.working_directory, canonical_startup);
+        assert_eq!(room.version, 11);
+
+        let connection = repository.connect().unwrap();
+        let schema_version: u32 = connection
+            .query_row(
+                "SELECT version FROM collaboration_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, SCHEMA_VERSION);
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id, execution_working_directory
+                 FROM room_events ORDER BY sequence",
+            )
+            .unwrap();
+        let event_directories = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            event_directories,
+            vec![
+                ("legacy-user".into(), canonical_startup.clone()),
+                ("legacy-member-event".into(), canonical_startup.clone()),
+            ]
+        );
+        let owner =
+            membership_from_connection(&connection, "legacy-room", LOCAL_PRINCIPAL_ID).unwrap();
+        assert!(owner.capabilities.contains(&RoomCapability::ConfigureRoom));
+        assert_eq!(owner.capability_version, 2);
+        assert_eq!(owner.version, 5);
+        let updated_at: String = connection
+            .query_row(
+                "SELECT updated_at FROM room_principal_memberships
+                 WHERE room_id = 'legacy-room' AND principal_id = ?1",
+                [LOCAL_PRINCIPAL_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(updated_at, "2026-08-08T00:00:00Z");
+    }
+
+    #[test]
+    fn migrates_working_directory_atomically_when_owner_update_fails() {
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let database_path = runtime.path().join("runtime.db");
+        create_schema_six_working_directory_fixture(&database_path);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_owner_capability_migration
+                 BEFORE UPDATE OF capabilities_json ON room_principal_memberships
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced owner migration failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .is_err());
+
+        let connection = Connection::open(&database_path).unwrap();
+        let schema_version: u32 = connection
+            .query_row(
+                "SELECT version FROM collaboration_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 6);
+        assert!(
+            !table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap()
+        );
+        assert!(
+            !table_has_column(&connection, "room_events", "execution_working_directory").unwrap()
+        );
+        let owner_versions: (u64, u64) = connection
+            .query_row(
+                "SELECT capability_version, version FROM room_principal_memberships
+                 WHERE room_id = 'legacy-room' AND principal_id = ?1",
+                [LOCAL_PRINCIPAL_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_versions, (1, 4));
+    }
+
     #[test]
     fn retry_invalidation_schema_extends_phase_five_without_replacing_it() {
         let (_directory, repository) = repository();
@@ -5969,8 +9296,15 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(table_has_column(&connection, "room_events", "invalidated_at").unwrap());
+        assert!(table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap());
+        assert!(
+            table_has_column(&connection, "room_events", "execution_working_directory").unwrap()
+        );
+        let owner = membership_from_connection(&connection, "room-1", LOCAL_PRINCIPAL_ID).unwrap();
+        assert!(owner.capabilities.contains(&RoomCapability::ConfigureRoom));
+        assert_eq!(owner.capability_version, 2);
         let member_name_index: bool = connection
             .query_row(
                 "SELECT EXISTS(
@@ -6009,6 +9343,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn version_two_database_migrates_in_place_without_losing_room_history() {
         let directory = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("runtime.db");
         let connection = Connection::open(&database_path).unwrap();
         connection
@@ -6119,10 +9454,16 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let repository =
-            CollaborationRepository::new(directory.path(), CollaborationConfig::default()).unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            directory.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
         let snapshot = repository.snapshot("legacy-room").unwrap();
         assert_eq!(snapshot.room.version, 7);
+        let canonical_startup = startup.path().canonicalize().unwrap().display().to_string();
+        assert_eq!(snapshot.room.working_directory, canonical_startup);
         assert_eq!(snapshot.members[0].display_name, "旧智脑");
         assert_eq!(
             snapshot.members[0].availability,
@@ -6135,9 +9476,33 @@ mod tests {
             snapshot.inbox[0].task_run_id.as_deref(),
             Some("legacy-task")
         );
-        let migrated_idempotency_key: String = repository
-            .connect()
-            .unwrap()
+        let connection = repository.connect().unwrap();
+        let schema_version: u32 = connection
+            .query_row(
+                "SELECT version FROM collaboration_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, SCHEMA_VERSION);
+        assert!(table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap());
+        assert!(
+            table_has_column(&connection, "room_events", "execution_working_directory").unwrap()
+        );
+        let execution_working_directory: String = connection
+            .query_row(
+                "SELECT execution_working_directory FROM room_events
+                 WHERE event_id = 'legacy-event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(execution_working_directory, canonical_startup);
+        let owner =
+            membership_from_connection(&connection, "legacy-room", LOCAL_PRINCIPAL_ID).unwrap();
+        assert!(owner.capabilities.contains(&RoomCapability::ConfigureRoom));
+        assert_eq!(owner.capability_version, 2);
+        let migrated_idempotency_key: String = connection
             .query_row(
                 "SELECT idempotency_key FROM member_inbox_items WHERE inbox_item_id = 'legacy-inbox'",
                 [],

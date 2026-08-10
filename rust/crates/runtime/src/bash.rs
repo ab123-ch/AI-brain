@@ -1,5 +1,6 @@
 use std::env;
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -66,10 +67,26 @@ pub struct BashCommandOutput {
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
+    execute_bash_in_dir(input, &cwd)
+}
+
+/// 在显式工作目录中执行 shell 命令。
+///
+/// `cwd` 必须可规范化为已存在目录；缺失目录不会被创建。规范化后的同一路径同时用于
+/// sandbox 解析和前后台进程，且 `.sandbox-*` 辅助目录创建失败会直接返回错误。
+pub fn execute_bash_in_dir(input: BashCommandInput, cwd: &Path) -> io::Result<BashCommandOutput> {
+    let cwd = cwd.canonicalize()?;
+    if !cwd.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("工作路径不是目录: {}", cwd.display()),
+        ));
+    }
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    prepare_sandbox_dirs(&cwd)?;
 
     if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let mut child = prepare_command(&input.command, &cwd, &sandbox_status);
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -104,7 +121,7 @@ async fn execute_bash_async(
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status);
 
     // 默认超时 120 秒，防止命令无限挂起
     const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -184,12 +201,7 @@ fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
-    create_dirs: bool,
 ) -> Command {
-    if create_dirs {
-        prepare_sandbox_dirs(cwd);
-    }
-
     if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
         let mut prepared = Command::new(launcher.program);
         prepared.args(launcher.args);
@@ -213,12 +225,7 @@ fn prepare_tokio_command(
     command: &str,
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
-    create_dirs: bool,
 ) -> TokioCommand {
-    if create_dirs {
-        prepare_sandbox_dirs(cwd);
-    }
-
     if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
         let mut prepared = TokioCommand::new(launcher.program);
         prepared.args(launcher.args);
@@ -238,18 +245,87 @@ fn prepare_tokio_command(
     prepared
 }
 
-fn prepare_sandbox_dirs(cwd: &std::path::Path) {
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+fn prepare_sandbox_dirs(cwd: &std::path::Path) -> io::Result<()> {
+    std::fs::create_dir_all(cwd.join(".sandbox-home"))?;
+    std::fs::create_dir_all(cwd.join(".sandbox-tmp"))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use super::{execute_bash, execute_bash_in_dir, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+
+    static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = unique_temp_path(name);
+            std::fs::create_dir_all(&path).expect("test directory should be created");
+            Self { path }
+        }
+
+        fn missing(name: &str) -> Self {
+            let path = unique_temp_path(name);
+            assert!(!path.exists(), "test path should start missing");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let counter = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "clawd-native-{name}-{}-{counter}-{timestamp}",
+            std::process::id()
+        ))
+    }
+
+    fn shell_is_available() -> bool {
+        match Command::new("sh")
+            .arg("-lc")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) => {
+                assert!(status.success(), "shell capability check should succeed");
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("shell capability check failed: {error}"),
+        }
+    }
 
     #[test]
     fn executes_simple_command() {
+        if !shell_is_available() {
+            return;
+        }
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
@@ -270,6 +346,9 @@ mod tests {
 
     #[test]
     fn disables_sandbox_when_requested() {
+        if !shell_is_available() {
+            return;
+        }
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
@@ -284,5 +363,142 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn explicit_directory_controls_shell_working_directory() {
+        if !shell_is_available() {
+            return;
+        }
+        let original_cwd = std::env::current_dir().expect("current directory should be readable");
+        let workspace = TestDir::new("explicit-directory-shell");
+        let outside_marker = original_cwd.join("shell-cwd.txt");
+        let outside_marker_before = std::fs::read(&outside_marker).ok();
+
+        let output = execute_bash_in_dir(
+            BashCommandInput {
+                command: String::from("printf 'from-shell' > shell-cwd.txt"),
+                timeout: Some(1_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(true),
+                namespace_restrictions: None,
+                isolate_network: None,
+                filesystem_mode: None,
+                allowed_mounts: None,
+            },
+            workspace.path(),
+        )
+        .expect("shell command should execute");
+
+        assert!(!output.interrupted, "shell command should not time out");
+        assert_eq!(
+            output.return_code_interpretation, None,
+            "shell command failed: {}",
+            output.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("shell-cwd.txt"))
+                .expect("marker should be written in the explicit directory"),
+            "from-shell"
+        );
+        assert_eq!(std::fs::read(&outside_marker).ok(), outside_marker_before);
+        assert_eq!(
+            std::env::current_dir().expect("current directory should remain readable"),
+            original_cwd
+        );
+    }
+
+    #[test]
+    fn explicit_directory_rejects_missing_cwd_without_creating_it() {
+        let missing_cwd = TestDir::missing("explicit-directory-missing-cwd");
+
+        let error = execute_bash_in_dir(
+            BashCommandInput {
+                command: String::from("printf 'should-not-run'"),
+                timeout: Some(1_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(true),
+                namespace_restrictions: None,
+                isolate_network: None,
+                filesystem_mode: None,
+                allowed_mounts: None,
+            },
+            missing_cwd.path(),
+        )
+        .expect_err("missing cwd should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !missing_cwd.path().exists(),
+            "missing cwd must stay missing"
+        );
+    }
+
+    #[test]
+    fn explicit_directory_propagates_sandbox_directory_errors() {
+        let workspace = TestDir::new("explicit-directory-sandbox-error");
+        std::fs::write(workspace.path().join(".sandbox-home"), "blocking-file")
+            .expect("blocking file should be written");
+
+        let error = execute_bash_in_dir(
+            BashCommandInput {
+                command: String::from("printf 'should-not-run'"),
+                timeout: Some(1_000),
+                description: None,
+                run_in_background: Some(false),
+                dangerously_disable_sandbox: Some(true),
+                namespace_restrictions: None,
+                isolate_network: None,
+                filesystem_mode: None,
+                allowed_mounts: None,
+            },
+            workspace.path(),
+        )
+        .expect_err("sandbox directory creation error should propagate");
+
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "unexpected error source: {error:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_directory_background_uses_cwd_and_prepares_sandbox_dirs() {
+        if !shell_is_available() {
+            return;
+        }
+        let workspace = TestDir::new("explicit-directory-background");
+        let marker = workspace.path().join("background-cwd.txt");
+
+        let output = execute_bash_in_dir(
+            BashCommandInput {
+                command: String::from("printf 'from-background' > background-cwd.txt"),
+                timeout: Some(1_000),
+                description: None,
+                run_in_background: Some(true),
+                dangerously_disable_sandbox: Some(true),
+                namespace_restrictions: None,
+                isolate_network: None,
+                filesystem_mode: None,
+                allowed_mounts: None,
+            },
+            workspace.path(),
+        )
+        .expect("background shell command should start");
+
+        assert!(output.background_task_id.is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("background marker should be written"),
+            "from-background"
+        );
+        assert!(workspace.path().join(".sandbox-home").is_dir());
+        assert!(workspace.path().join(".sandbox-tmp").is_dir());
     }
 }

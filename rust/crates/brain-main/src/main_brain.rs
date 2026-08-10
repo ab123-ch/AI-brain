@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use brain_core::config::BrainConfig;
-use brain_core::tool_executor::ToolExecutor;
+use brain_core::tool_executor::{ToolExecutionContext, ToolExecutor};
 use brain_core::types::{MainBrainOutput, ProgressEvent, TurnRecord, TurnRole, TurnUsage};
 use brain_llm::{ChatMessage, LlmProvider, ToolDefinition};
 
@@ -22,6 +22,7 @@ use brain_memory::threshold_compression::{ThresholdCompactionConfig, ThresholdCo
 pub struct MainBrain {
     llm: Arc<dyn LlmProvider>,
     tool_executor: Arc<dyn ToolExecutor>,
+    tool_execution_context: ToolExecutionContext,
     history: ConversationHistory,
     tools: Vec<ToolDefinition>,
     config: BrainConfig,
@@ -53,6 +54,25 @@ impl MainBrain {
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
+        Self::new_in_context(
+            llm,
+            tool_executor,
+            config,
+            llm_max_tokens,
+            llm_temperature,
+            ToolExecutionContext::default(),
+        )
+    }
+
+    /// 使用调用方冻结的工具工作目录创建主脑模板。
+    pub fn new_in_context(
+        llm: Arc<dyn LlmProvider>,
+        tool_executor: Arc<dyn ToolExecutor>,
+        config: BrainConfig,
+        llm_max_tokens: u32,
+        llm_temperature: f64,
+        tool_execution_context: ToolExecutionContext,
+    ) -> Self {
         // 从 ThresholdConfig 取 max_context_tokens，默认 1M
         let max_context_tokens = config.brain.thresholds.max_context_tokens as usize;
 
@@ -63,6 +83,7 @@ impl MainBrain {
         Self {
             llm,
             tool_executor,
+            tool_execution_context,
             history: ConversationHistory::new(max_context_tokens),
             tools: Vec::new(),
             config,
@@ -91,9 +112,10 @@ impl MainBrain {
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
-        self.fork_isolated_with_llm_and_executor(
+        self.fork_isolated_with_llm_and_executor_in_context(
             llm,
             Arc::clone(&self.tool_executor),
+            self.tool_execution_context.clone(),
             Vec::new(),
             llm_max_tokens,
             llm_temperature,
@@ -113,12 +135,34 @@ impl MainBrain {
         llm_max_tokens: u32,
         llm_temperature: f64,
     ) -> Self {
-        let mut fork = Self::new(
+        self.fork_isolated_with_llm_and_executor_in_context(
+            llm,
+            tool_executor,
+            self.tool_execution_context.clone(),
+            additional_tools,
+            llm_max_tokens,
+            llm_temperature,
+        )
+    }
+
+    /// 使用显式工具执行上下文创建隔离运行时。
+    #[must_use]
+    pub fn fork_isolated_with_llm_and_executor_in_context(
+        &self,
+        llm: Arc<dyn LlmProvider>,
+        tool_executor: Arc<dyn ToolExecutor>,
+        tool_execution_context: ToolExecutionContext,
+        additional_tools: Vec<ToolDefinition>,
+        llm_max_tokens: u32,
+        llm_temperature: f64,
+    ) -> Self {
+        let mut fork = Self::new_in_context(
             llm,
             tool_executor,
             self.config.clone(),
             llm_max_tokens,
             llm_temperature,
+            tool_execution_context,
         );
         fork.tools.clone_from(&self.tools);
         fork.tools.extend(additional_tools);
@@ -240,9 +284,10 @@ impl MainBrain {
         let mut prior_llm_calls = 0u32;
 
         loop {
-            let result = tool_loop::run_tool_loop_with_config(
+            let result = tool_loop::run_tool_loop_with_config_and_context(
                 self.llm.as_ref(),
                 self.tool_executor.as_ref(),
+                &self.tool_execution_context,
                 &mut messages,
                 &self.tools,
                 progress_tx,
@@ -507,6 +552,7 @@ impl MainBrain {
 
         let llm = self.llm.clone();
         let executor = self.tool_executor.clone();
+        let tool_execution_context = self.tool_execution_context.clone();
         let tools = self.tools.clone();
         let max_tokens = self.llm_max_tokens;
         let temperature = self.llm_temperature;
@@ -531,9 +577,10 @@ impl MainBrain {
                 })
                 .await;
 
-            let result = tool_loop::run_tool_loop_with_config(
+            let result = tool_loop::run_tool_loop_with_config_and_context(
                 llm.as_ref(),
                 executor.as_ref(),
+                &tool_execution_context,
                 &mut messages,
                 &tools,
                 Some(&tx),
@@ -682,7 +729,8 @@ impl MainBrain {
             prompts::build_system_prompt_with_tools()
         };
         // 注入运行环境信息（OS、工作目录、日期）
-        let env_info = prompts::build_environment_info();
+        let env_info =
+            prompts::build_environment_info_for(&self.tool_execution_context.working_directory);
         // 将记忆上下文追加到 system prompt
         // Prompt cache 排序：越稳定的越靠前
         // 1. Bootstrap 技能（插件注入，会话级稳定）
@@ -738,6 +786,24 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[test]
+    fn explicit_constructor_keeps_the_injected_tool_execution_context() {
+        let context = ToolExecutionContext::new("isolated-template-workspace");
+        let brain = MainBrain::new_in_context(
+            Arc::new(StubLlm),
+            Arc::new(StubToolExecutor::new()),
+            BrainConfig::default(),
+            32_768,
+            0.7,
+            context.clone(),
+        );
+
+        assert_eq!(brain.tool_execution_context, context);
+        assert!(brain.build_messages()[0]
+            .text_content()
+            .contains("isolated-template-workspace"));
     }
 
     #[tokio::test]

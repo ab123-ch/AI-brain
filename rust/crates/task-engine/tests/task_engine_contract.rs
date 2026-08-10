@@ -4,8 +4,8 @@ use std::time::Duration;
 use serde_json::json;
 use task_engine::{
     ActualUsage, AdmissionRequest, BudgetLimits, BudgetRequest, BudgetReservationState,
-    NewBudgetAccount, NewTaskNode, NewTaskRun, NodeKind, NodeState, Scheduler, SchedulerLimits,
-    TaskCoordinator, TaskEngineError, TaskEventKind, TaskRepository, TaskRunState,
+    InstanceRunState, NewBudgetAccount, NewTaskNode, NewTaskRun, NodeKind, NodeState, Scheduler,
+    SchedulerLimits, TaskCoordinator, TaskEngineError, TaskEventKind, TaskRepository, TaskRunState,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -347,6 +347,214 @@ fn recovery_requeues_only_retryable_side_effect_free_nodes() {
         .unwrap()
         .iter()
         .any(|node| node.node_id == "publish"));
+}
+
+#[test]
+fn pre_execution_failure_atomically_fails_queued_task_and_unstarted_nodes() {
+    let (_directory, repository) = repository();
+    let created = repository.create_task(task("task-pre-execution")).unwrap();
+
+    let failed = repository
+        .fail_task_before_execution("task-pre-execution", created.version, "冻结工作目录不可用")
+        .unwrap();
+
+    assert_eq!(failed.state, TaskRunState::Failed);
+    assert!(repository
+        .nodes("task-pre-execution")
+        .unwrap()
+        .iter()
+        .all(|node| node.state == NodeState::Failed));
+    assert!(repository.ready_nodes(10).unwrap().is_empty());
+    let events = repository.events("task-pre-execution", 0).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == TaskEventKind::NodeFailed)
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == TaskEventKind::TaskFailed)
+            .count(),
+        1
+    );
+
+    let event_count = events.len();
+    let repeated = repository
+        .fail_task_before_execution(
+            "task-pre-execution",
+            created.version,
+            "重复结算不应覆盖原状态",
+        )
+        .unwrap();
+    assert_eq!(repeated.state, TaskRunState::Failed);
+    assert_eq!(
+        repository.events("task-pre-execution", 0).unwrap().len(),
+        event_count
+    );
+}
+
+#[test]
+fn pre_execution_failure_fails_recovered_task_and_preserves_interrupted_instance() {
+    let (directory, repository) = repository();
+    repository
+        .create_task(task("task-recovered-failure"))
+        .unwrap();
+    let draft = repository.node("draft").unwrap();
+    let started = repository
+        .start_node("draft", draft.version, "instance-recovered-pre-execution")
+        .unwrap();
+    drop(repository);
+
+    let reopened = TaskRepository::open(directory.path().join("runtime.db")).unwrap();
+    let recovery = reopened.recover_inflight().unwrap();
+    assert_eq!(recovery.requeued, 1);
+    let recovered_task = reopened.task("task-recovered-failure").unwrap();
+    assert_eq!(recovered_task.state, TaskRunState::Queued);
+    assert_eq!(reopened.node("draft").unwrap().state, NodeState::Ready);
+
+    reopened
+        .fail_task_before_execution(
+            "task-recovered-failure",
+            recovered_task.version,
+            "冻结工作目录已删除",
+        )
+        .unwrap();
+
+    assert_eq!(
+        reopened.task("task-recovered-failure").unwrap().state,
+        TaskRunState::Failed
+    );
+    assert!(reopened
+        .nodes("task-recovered-failure")
+        .unwrap()
+        .iter()
+        .all(|node| node.state == NodeState::Failed));
+    assert_eq!(
+        reopened
+            .instance(&started.instance.instance_run_id)
+            .unwrap()
+            .state,
+        InstanceRunState::Interrupted
+    );
+}
+
+#[test]
+fn pre_execution_failure_closes_unstarted_nodes_after_running_failure() {
+    let (_directory, repository) = repository();
+    repository
+        .create_task(task("task-partially-running-pre-execution"))
+        .unwrap();
+    let draft = repository.node("draft").unwrap();
+    let started = repository
+        .start_node("draft", draft.version, "instance-partially-running")
+        .unwrap();
+
+    repository
+        .fail_node(
+            &started.instance.instance_run_id,
+            started.instance.version,
+            "运行节点预执行失败",
+            false,
+        )
+        .unwrap();
+    let failed_task = repository
+        .task("task-partially-running-pre-execution")
+        .unwrap();
+    assert_eq!(failed_task.state, TaskRunState::Failed);
+    assert_eq!(
+        repository
+            .budget_reservation(&started.reservation.reservation_id)
+            .unwrap()
+            .state,
+        BudgetReservationState::Released
+    );
+
+    repository
+        .fail_task_before_execution(
+            &failed_task.task_run_id,
+            failed_task.version,
+            "终结尚未启动的剩余节点",
+        )
+        .unwrap();
+
+    assert!(repository
+        .nodes(&failed_task.task_run_id)
+        .unwrap()
+        .iter()
+        .all(|node| node.state == NodeState::Failed));
+    let events = repository.events(&failed_task.task_run_id, 0).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == TaskEventKind::TaskFailed)
+            .count(),
+        1,
+        "Task 已失败时不应重复写 TaskFailed"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == TaskEventKind::NodeFailed)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn pre_execution_failure_preserves_completed_and_cancelled_tasks() {
+    let (_directory, repository) = repository();
+
+    let mut completed_request = task("task-completed-before-failure");
+    completed_request.nodes = vec![node("completed-only", &[])];
+    repository.create_task(completed_request).unwrap();
+    let completed_node = repository.node("completed-only").unwrap();
+    let completed_instance = repository
+        .start_node(
+            "completed-only",
+            completed_node.version,
+            "instance-completed-before-failure",
+        )
+        .unwrap();
+    let completed = repository
+        .complete_node(
+            &completed_instance.instance.instance_run_id,
+            completed_instance.instance.version,
+            ActualUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+            None,
+        )
+        .unwrap()
+        .task;
+    assert_eq!(completed.state, TaskRunState::Completed);
+    let preserved = repository
+        .fail_task_before_execution(&completed.task_run_id, completed.version, "不得覆盖完成态")
+        .unwrap();
+    assert_eq!(preserved.state, TaskRunState::Completed);
+    assert_eq!(
+        repository.node("completed-only").unwrap().state,
+        NodeState::Completed
+    );
+
+    let cancelled = repository
+        .create_task(task("task-cancelled-before-failure"))
+        .unwrap();
+    let cancelled = repository
+        .cancel_task(&cancelled.task_run_id, cancelled.version)
+        .unwrap();
+    let preserved = repository
+        .fail_task_before_execution(&cancelled.task_run_id, cancelled.version, "不得覆盖取消态")
+        .unwrap();
+    assert_eq!(preserved.state, TaskRunState::Cancelled);
+    assert!(repository
+        .nodes(&cancelled.task_run_id)
+        .unwrap()
+        .iter()
+        .all(|node| node.state == NodeState::Cancelled));
 }
 
 #[test]

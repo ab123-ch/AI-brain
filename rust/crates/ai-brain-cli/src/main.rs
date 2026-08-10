@@ -164,7 +164,10 @@ async fn run_command(cli: Cli) {
         }
         Some(Commands::Web { addr }) => {
             let orch = init_or_die().await;
-            api_server::serve_web(orch, &addr).await;
+            if let Err(error) = api_server::serve_web(orch, &addr).await {
+                eprintln!("Web UI 启动失败: {error}");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Remote { port }) => match remote_access::configure(*port) {
             Ok(endpoint) => {
@@ -176,7 +179,11 @@ async fn run_command(cli: Cli) {
 
                 let orch = init_or_die().await;
                 let addr = format!("127.0.0.1:{port}");
-                api_server::serve_web_remote(orch, &addr, endpoint.host()).await;
+                if let Err(error) = api_server::serve_web_remote(orch, &addr, endpoint.host()).await
+                {
+                    eprintln!("远程 Web UI 启动失败: {error}");
+                    std::process::exit(1);
+                }
             }
             Err(error) => {
                 eprintln!("远程模式启动失败: {error}");
