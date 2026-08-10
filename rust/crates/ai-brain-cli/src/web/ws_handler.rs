@@ -2080,6 +2080,12 @@ mod tests {
         let room_reply_position = html.find("src=\"/room_reply.js\"").unwrap();
         let app_position = html.find("src=\"/app.js\"").unwrap();
         assert!(room_reply_position < app_position);
+        let socket_close_handler = script
+            .split_once("ws.onclose = () => {")
+            .and_then(|(_, rest)| rest.split_once("ws.onerror ="))
+            .map(|(handler, _)| handler)
+            .expect("脚本缺少 WebSocket 关闭处理函数");
+        assert!(socket_close_handler.contains("failPendingRoomOperation();"));
         assert!(script.contains("function handleRoomWorkingDirectoryAccepted"));
         assert!(script.contains("command_id: commandId"));
         let directory_ack_handler = script

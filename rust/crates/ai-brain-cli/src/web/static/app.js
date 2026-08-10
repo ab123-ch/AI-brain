@@ -201,6 +201,7 @@ function connect() {
     ws.onclose = () => {
         console.log('WebSocket closed');
         stopHeartbeat();
+        failPendingRoomOperation();
         setConnectionState('offline');
         addBrainEvent('WebSocket 已断开，等待重连');
         if (reconnectAttempts < MAX_RECONNECT) {
