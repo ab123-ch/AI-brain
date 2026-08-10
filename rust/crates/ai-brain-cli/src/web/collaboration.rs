@@ -37,6 +37,20 @@ fn unix_directory_mode_has_search(mode: u32) -> bool {
     mode & 0o111 != 0
 }
 
+#[cfg(any(unix, test))]
+fn validate_directory_search_with<F>(path: &Path, probe: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let candidate = path.join(".");
+    probe(&candidate).map_err(|error| {
+        CollaborationError::Config(format!(
+            "工作目录缺少目录搜索权限: {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 pub(crate) fn validate_working_directory_access(path: &Path) -> Result<()> {
     let metadata = fs::metadata(path).map_err(|error| {
         CollaborationError::Config(format!("工作目录不可访问: {}: {error}", path.display()))
@@ -57,6 +71,7 @@ pub(crate) fn validate_working_directory_access(path: &Path) -> Result<()> {
                 path.display()
             )));
         }
+        validate_directory_search_with(path, |candidate| fs::metadata(candidate).map(|_| ()))?;
     }
     fs::read_dir(path).map_err(|error| {
         CollaborationError::Config(format!("工作目录无法读取: {}: {error}", path.display()))
@@ -5855,6 +5870,18 @@ mod tests {
     fn unix_directory_search_mode_requires_execute_bit() {
         assert!(!unix_directory_mode_has_search(0o600));
         assert!(unix_directory_mode_has_search(0o700));
+
+        let path = Path::new("workspace");
+        let error = validate_directory_search_with(path, |candidate| {
+            assert_eq!(candidate, path.join("."));
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, CollaborationError::Config(message) if
+                message.contains("目录搜索权限") && message.contains("workspace")),
+            "内核拒绝 search 时应返回明确的目录搜索权限配置错误"
+        );
     }
 
     fn repository() -> (tempfile::TempDir, CollaborationRepository) {
