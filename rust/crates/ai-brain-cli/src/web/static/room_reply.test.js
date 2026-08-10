@@ -10,6 +10,7 @@ const {
     captureTimelineViewport,
     canReplyToEvent,
     matchesPendingRoomPost,
+    mergeVersionedEntity,
     mergeEventsBySequence,
     mergeSnapshotWindow,
     isTimelineNearBottom,
@@ -517,6 +518,7 @@ test('切换房间会重置全部 room-local 编辑器与分页状态', () => {
         pendingRoomOperation: null,
         authoritativeRoomEventSequence: 0,
         authoritativeRoomSnapshotVersion: 0,
+        authoritativeRoomStateRevision: 0,
     });
 });
 
@@ -559,24 +561,57 @@ test('空权威窗口不会复活已有事件且失效引用会被清理', () =>
     assert.equal(reconcileReplyState(current, [{ event_id: 'fresh', sequence: 5 }]), current);
 });
 
-test('同房间 snapshot 版本或事件水位回退时拒绝应用', () => {
+test('协作快照水位和实体版本只允许单调前进', () => {
+    assert.equal(shouldApplyRoomSnapshot(null, {
+        room: { room_id: 'room-a', state_revision: 0, version: 1, latest_event_seq: 0 },
+    }), true);
     const current = {
         roomId: 'room-a',
+        stateRevision: 8,
         version: 7,
         eventSequence: 10,
     };
+    [
+        { state_revision: 7, version: 7, latest_event_seq: 10 },
+        { state_revision: 8, version: 6, latest_event_seq: 10 },
+        { state_revision: 8, version: 7, latest_event_seq: 9 },
+    ].forEach((room) => assert.equal(shouldApplyRoomSnapshot(current, {
+        room: { room_id: 'room-a', ...room },
+    }), false));
     assert.equal(shouldApplyRoomSnapshot(current, {
-        room: { room_id: 'room-a', version: 6, latest_event_seq: 10 },
+        room: { room_id: 'room-a', state_revision: 8, version: 7, latest_event_seq: 10 },
     }), false);
     assert.equal(shouldApplyRoomSnapshot(current, {
-        room: { room_id: 'room-a', version: 7, latest_event_seq: 9 },
-    }), false);
-    assert.equal(shouldApplyRoomSnapshot(current, {
-        room: { room_id: 'room-a', version: 7, latest_event_seq: 10 },
+        room: { room_id: 'room-a', state_revision: 9, version: 7, latest_event_seq: 10 },
     }), true);
-    assert.equal(shouldApplyRoomSnapshot(current, {
-        room: { room_id: 'room-b', version: 1, latest_event_seq: 0 },
-    }), true);
+
+    const original = [{ member_id: 'member-a', version: 2, display_name: '旧名称' }];
+    const added = mergeVersionedEntity(
+        original,
+        { member_id: 'member-b', version: 1, display_name: '新成员' },
+        'member_id',
+    );
+    assert.equal(added.changed, true);
+    assert.deepEqual(added.items.map((item) => item.member_id), ['member-a', 'member-b']);
+    assert.deepEqual(original, [{ member_id: 'member-a', version: 2, display_name: '旧名称' }]);
+
+    [1, 2].forEach((version) => {
+        const unchanged = mergeVersionedEntity(
+            original,
+            { member_id: 'member-a', version, display_name: '过期名称' },
+            'member_id',
+        );
+        assert.equal(unchanged.changed, false);
+        assert.equal(unchanged.items, original);
+    });
+    const replaced = mergeVersionedEntity(
+        original,
+        { member_id: 'member-a', version: 3, display_name: '新名称' },
+        'member_id',
+    );
+    assert.equal(replaced.changed, true);
+    assert.equal(replaced.items[0].display_name, '新名称');
+    assert.deepEqual(original, [{ member_id: 'member-a', version: 2, display_name: '旧名称' }]);
 });
 
 test('加载过较早页后普通快照不会覆盖分页 has_more 结论', () => {

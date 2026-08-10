@@ -88,8 +88,32 @@
     function shouldApplyRoomSnapshot(current, snapshot) {
         if (!snapshot?.room) return false;
         if (!current || current.roomId !== snapshot.room.room_id) return true;
-        return Number(snapshot.room.version) >= Number(current.version)
-            && Number(snapshot.room.latest_event_seq) >= Number(current.eventSequence);
+        const incoming = [
+            Number(snapshot.room.state_revision || 0),
+            Number(snapshot.room.version || 0),
+            Number(snapshot.room.latest_event_seq || 0),
+        ];
+        const authoritative = [
+            Number(current.stateRevision || 0),
+            Number(current.version || 0),
+            Number(current.eventSequence || 0),
+        ];
+        return incoming.every((value, index) => value >= authoritative[index])
+            && incoming.some((value, index) => value > authoritative[index]);
+    }
+
+    function mergeVersionedEntity(items, incoming, idKey) {
+        const currentItems = Array.isArray(items) ? items : [];
+        const index = currentItems.findIndex((item) => item[idKey] === incoming[idKey]);
+        if (index < 0) {
+            return { items: [...currentItems, incoming], changed: true };
+        }
+        if (Number(incoming.version) <= Number(currentItems[index].version)) {
+            return { items: currentItems, changed: false };
+        }
+        const merged = [...currentItems];
+        merged[index] = incoming;
+        return { items: merged, changed: true };
     }
 
     function reconcileReplyState(replyState, events) {
@@ -232,6 +256,7 @@
             pendingRoomOperation: null,
             authoritativeRoomEventSequence: 0,
             authoritativeRoomSnapshotVersion: 0,
+            authoritativeRoomStateRevision: 0,
         };
     }
 
@@ -287,6 +312,7 @@
         captureTimelineViewport,
         isTimelineNearBottom,
         matchesPendingRoomPost,
+        mergeVersionedEntity,
         mergeEventsBySequence,
         mergeSnapshotWindow,
         reconcileReplyState,

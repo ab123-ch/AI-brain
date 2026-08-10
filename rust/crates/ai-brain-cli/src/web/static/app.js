@@ -33,6 +33,7 @@ let pendingRoomPost = null;
 let pendingRoomOperation = null;
 let authoritativeRoomEventSequence = 0;
 let authoritativeRoomSnapshotVersion = 0;
+let authoritativeRoomStateRevision = 0;
 let hasEarlierRoomEvents = false;
 let hasLoadedEarlierRoomEvents = false;
 let preserveTimelineAnchor = false;
@@ -484,6 +485,7 @@ function resetRoomLocalState() {
     pendingRoomOperation = reset.pendingRoomOperation;
     authoritativeRoomEventSequence = reset.authoritativeRoomEventSequence;
     authoritativeRoomSnapshotVersion = reset.authoritativeRoomSnapshotVersion;
+    authoritativeRoomStateRevision = reset.authoritativeRoomStateRevision;
     hasEarlierRoomEvents = reset.hasEarlierRoomEvents;
     hasLoadedEarlierRoomEvents = reset.hasLoadedEarlierRoomEvents;
     preserveTimelineAnchor = reset.preserveTimelineAnchor;
@@ -533,6 +535,7 @@ function applyRoomSnapshot(snapshot) {
     const sameRoom = roomSnapshot?.room?.room_id === snapshot.room.room_id;
     if (!RoomReply.shouldApplyRoomSnapshot(sameRoom ? {
         roomId: snapshot.room.room_id,
+        stateRevision: authoritativeRoomStateRevision,
         version: authoritativeRoomSnapshotVersion,
         eventSequence: authoritativeRoomEventSequence,
     } : null, snapshot)) return;
@@ -568,6 +571,7 @@ function applyRoomSnapshot(snapshot) {
     };
     authoritativeRoomEventSequence = snapshotEventSequence;
     authoritativeRoomSnapshotVersion = Number(snapshot.room.version || 0);
+    authoritativeRoomStateRevision = Number(snapshot.room.state_revision || 0);
     replyState = RoomReply.reconcileReplyState(replyState, roomSnapshot.events);
     roomSnapshot.members.forEach((member) => {
         ensureBrainNode(member.member_id, {
@@ -1101,18 +1105,18 @@ function handleRoomWorkingDirectoryAccepted(data) {
 
 function mergeMember(member) {
     if (!roomSnapshot || member.room_id !== activeSessionId) return;
-    const index = roomSnapshot.members.findIndex((candidate) => candidate.member_id === member.member_id);
-    if (index >= 0) roomSnapshot.members[index] = member;
-    else roomSnapshot.members.push(member);
+    const result = RoomReply.mergeVersionedEntity(roomSnapshot.members, member, 'member_id');
+    if (!result.changed) return;
+    roomSnapshot.members = result.items;
     reconcileSelectedMembers();
     renderCollaborationRoom();
 }
 
 function mergeInboxItem(roomId, item) {
     if (!roomSnapshot || roomId !== activeSessionId) return;
-    const index = roomSnapshot.inbox.findIndex((candidate) => candidate.inbox_item_id === item.inbox_item_id);
-    if (index >= 0) roomSnapshot.inbox[index] = item;
-    else roomSnapshot.inbox.push(item);
+    const result = RoomReply.mergeVersionedEntity(roomSnapshot.inbox, item, 'inbox_item_id');
+    if (!result.changed) return;
+    roomSnapshot.inbox = result.items;
     renderCollaborationRoom();
 }
 

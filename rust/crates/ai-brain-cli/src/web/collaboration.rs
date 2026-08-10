@@ -18,7 +18,7 @@ use task_engine::SchedulerLimits;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 const DEFAULT_PROFILE_ID: &str = "general_member";
 pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
@@ -637,6 +637,8 @@ pub struct CollaborationRoomView {
     pub working_directory: String,
     pub default_member_id: String,
     pub latest_event_seq: u64,
+    #[serde(default)]
+    pub state_revision: u64,
     pub version: u64,
     pub created_at: DateTime<Utc>,
 }
@@ -944,6 +946,7 @@ impl CollaborationRepository {
                  working_directory TEXT NOT NULL,
                  default_member_id TEXT NOT NULL,
                  latest_event_seq INTEGER NOT NULL DEFAULT 0,
+                 state_revision INTEGER NOT NULL DEFAULT 0,
                  room_summary_ref TEXT,
                  room_summary_through_seq INTEGER NOT NULL DEFAULT 0,
                  version INTEGER NOT NULL DEFAULT 1,
@@ -1325,6 +1328,28 @@ impl CollaborationRepository {
             )?;
             transaction.commit()?;
             version = 7;
+        }
+        if version == 7 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !table_has_column(&transaction, "collaboration_rooms", "state_revision")? {
+                transaction.execute(
+                    "ALTER TABLE collaboration_rooms
+                     ADD COLUMN state_revision INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE collaboration_rooms SET state_revision = 1
+                 WHERE state_revision = 0",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE collaboration_schema SET version = 8 WHERE singleton = 1",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 8;
         }
         if version != SCHEMA_VERSION {
             return Err(CollaborationError::Config(format!(
@@ -4705,7 +4730,7 @@ fn enqueue_room_changed(
     aggregate_id: &str,
     idempotency_key: &str,
 ) -> Result<()> {
-    transaction.execute(
+    let inserted = transaction.execute(
         "INSERT INTO runtime_outbox_events(
              outbox_event_id, room_id, event_kind, aggregate_kind,
              aggregate_id, idempotency_key, state, version, created_at
@@ -4720,6 +4745,17 @@ fn enqueue_room_changed(
             Utc::now().to_rfc3339(),
         ],
     )?;
+    if inserted == 1 {
+        let updated = transaction.execute(
+            "UPDATE collaboration_rooms
+             SET state_revision = state_revision + 1
+             WHERE room_id = ?1",
+            [room_id],
+        )?;
+        if updated != 1 {
+            return Err(CollaborationError::RoomNotFound(room_id.into()));
+        }
+    }
     Ok(())
 }
 
@@ -5399,7 +5435,7 @@ fn room_from_connection(connection: &Connection, room_id: &str) -> Result<Collab
     connection
         .query_row(
             "SELECT room_id, title, working_directory, default_member_id,
-                    latest_event_seq, version, created_at
+                    latest_event_seq, state_revision, version, created_at
              FROM collaboration_rooms WHERE room_id = ?1",
             [room_id],
             |row| {
@@ -5409,8 +5445,9 @@ fn room_from_connection(connection: &Connection, room_id: &str) -> Result<Collab
                     working_directory: row.get(2)?,
                     default_member_id: row.get(3)?,
                     latest_event_seq: row.get(4)?,
-                    version: row.get(5)?,
-                    created_at: parse_datetime(&row.get::<_, String>(6)?),
+                    state_revision: row.get(5)?,
+                    version: row.get(6)?,
+                    created_at: parse_datetime(&row.get::<_, String>(7)?),
                 })
             },
         )
@@ -7386,6 +7423,35 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_snapshot_state_revision_tracks_inbox_only_mutations() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                &[member_id],
+                "等待租约",
+                RoomInputMode::Task,
+                "state-revision-command",
+            )
+            .unwrap();
+        let before = repository.snapshot("room-1").unwrap();
+
+        repository.lease_next().unwrap().unwrap();
+        let after_lease = repository.snapshot("room-1").unwrap();
+
+        assert_eq!(after_lease.room.version, before.room.version);
+        assert_eq!(
+            after_lease.room.latest_event_seq,
+            before.room.latest_event_seq
+        );
+        assert!(after_lease.room.state_revision > before.room.state_revision);
+        assert_eq!(after_lease.inbox[0].state, InboxState::Leased);
+        assert!(after_lease.inbox[0].version > before.inbox[0].version);
+    }
+
+    #[test]
     fn one_member_serializes_while_different_members_can_claim() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
@@ -8990,7 +9056,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, 7);
+        assert_eq!(schema_version, SCHEMA_VERSION);
         let mut statement = connection
             .prepare(
                 "SELECT event_id, execution_working_directory
@@ -9090,7 +9156,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(table_has_column(&connection, "room_events", "invalidated_at").unwrap());
         assert!(table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap());
         assert!(
@@ -9278,7 +9344,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, 7);
+        assert_eq!(schema_version, SCHEMA_VERSION);
         assert!(table_has_column(&connection, "collaboration_rooms", "working_directory").unwrap());
         assert!(
             table_has_column(&connection, "room_events", "execution_working_directory").unwrap()
