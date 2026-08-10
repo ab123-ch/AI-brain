@@ -317,6 +317,10 @@ function handleServerMessage(data) {
             handleRoomMessageAccepted(data);
             break;
 
+        case 'room_working_directory_accepted':
+            handleRoomWorkingDirectoryAccepted(data);
+            break;
+
         case 'member_changed':
             mergeMember(data.member);
             break;
@@ -531,10 +535,6 @@ function applyRoomSnapshot(snapshot) {
         version: authoritativeRoomSnapshotVersion,
         eventSequence: authoritativeRoomEventSequence,
     } : null, snapshot)) return;
-    const operationResult = settlePendingRoomOperation({
-        type: 'room_snapshot',
-        snapshot,
-    });
     const authoritativeEvents = snapshot.events || [];
     const snapshotEventSequence = Number(snapshot.room.latest_event_seq || 0);
     const events = sameRoom
@@ -582,15 +582,6 @@ function applyRoomSnapshot(snapshot) {
     });
     reconcileSelectedMembers();
     renderCollaborationRoom({ scrollToLatest: true });
-    if (operationResult.settled && operationResult.operationType === 'directory') {
-        if (operationResult.directoryConfirmed) {
-            pendingRoomDirectoryUpdate = null;
-            closeRoomDirectoryModal();
-        } else {
-            if (pendingRoomDirectoryUpdate) pendingRoomDirectoryUpdate.failed = true;
-            showToast('房间目录已刷新，请确认规范化后的路径');
-        }
-    }
     setInputEnabled(true);
     updateRoomOperationControls();
 }
@@ -1096,6 +1087,16 @@ function handleRoomMessageAccepted(data) {
     updateRoomOperationControls();
 }
 
+function handleRoomWorkingDirectoryAccepted(data) {
+    const accepted = RoomReply.settleRoomOperation(pendingRoomOperation, data);
+    if (!accepted.settled || accepted.operationType !== 'directory') return;
+    applyRoomSnapshot(data.snapshot);
+    const operationResult = settlePendingRoomOperation(data);
+    if (!operationResult.settled || operationResult.operationType !== 'directory') return;
+    pendingRoomDirectoryUpdate = null;
+    closeRoomDirectoryModal();
+}
+
 function mergeMember(member) {
     if (!roomSnapshot || member.room_id !== activeSessionId) return;
     const index = roomSnapshot.members.findIndex((candidate) => candidate.member_id === member.member_id);
@@ -1227,9 +1228,13 @@ function submitRoomDirectoryForm() {
     if (!roomSnapshot) return;
     const workingDirectory = $roomDirectoryInput.value.trim();
     if (!workingDirectory) return;
+    const commandId = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const operation = {
         type: 'directory',
         roomId: roomSnapshot.room.room_id,
+        commandId,
         expectedVersion: Number(roomSnapshot.room.version),
         previousDirectory: roomSnapshot.room.working_directory || '',
         requestedDirectory: workingDirectory,
@@ -1243,6 +1248,7 @@ function submitRoomDirectoryForm() {
     const sent = send('update_room_working_directory', {
         working_directory: workingDirectory,
         expected_room_version: pendingRoomDirectoryUpdate.expectedVersion,
+        command_id: commandId,
     });
     if (!sent) {
         failPendingRoomOperation();

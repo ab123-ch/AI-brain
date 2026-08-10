@@ -104,6 +104,8 @@ enum ClientMessage {
     UpdateRoomWorkingDirectory {
         working_directory: String,
         expected_room_version: u64,
+        #[serde(default)]
+        command_id: String,
     },
     LoadRoomEventsBefore {
         before_sequence: u64,
@@ -252,8 +254,7 @@ enum RoomOperationErrorIdentity {
     },
     Directory {
         room_id: String,
-        expected_room_version: u64,
-        working_directory: String,
+        command_id: String,
     },
     Pagination {
         room_id: String,
@@ -278,11 +279,16 @@ async fn dispatch_room_protocol_message(
         ClientMessage::UpdateRoomWorkingDirectory {
             working_directory,
             expected_room_version,
+            command_id,
         } => {
+            let command_id = if command_id.trim().is_empty() {
+                format!("web-{}", uuid::Uuid::new_v4())
+            } else {
+                command_id
+            };
             let identity = RoomOperationErrorIdentity::Directory {
                 room_id: active_room_id.clone(),
-                expected_room_version,
-                working_directory: working_directory.clone(),
+                command_id: command_id.clone(),
             };
             match runtime
                 .update_room_working_directory(
@@ -292,7 +298,14 @@ async fn dispatch_room_protocol_message(
                 )
                 .await
             {
-                Ok(_) => (Vec::new(), None),
+                Ok(snapshot) => (
+                    vec![WebProgressEvent::RoomWorkingDirectoryAccepted {
+                        room_id: active_room_id,
+                        command_id,
+                        snapshot,
+                    }],
+                    None,
+                ),
                 Err(error) => {
                     let version_conflict = error.is_version_conflict();
                     let mut events = vec![WebProgressEvent::Error {
@@ -1759,15 +1772,13 @@ fn room_operation_error_json(
         }),
         RoomOperationErrorIdentity::Directory {
             room_id,
-            expected_room_version,
-            working_directory,
+            command_id,
         } => serde_json::json!({
             "type": "error",
             "message": message,
             "room_operation": "directory",
             "room_id": room_id,
-            "expected_room_version": expected_room_version,
-            "working_directory": working_directory,
+            "command_id": command_id,
         }),
         RoomOperationErrorIdentity::Pagination {
             room_id,
@@ -1955,16 +1966,14 @@ mod tests {
             (
                 RoomOperationErrorIdentity::Directory {
                     room_id: "room-a".into(),
-                    expected_room_version: 3,
-                    working_directory: "D:\\workspace\\next".into(),
+                    command_id: "directory-command-1".into(),
                 },
                 serde_json::json!({
                     "type": "error",
                     "message": "failed",
                     "room_operation": "directory",
                     "room_id": "room-a",
-                    "expected_room_version": 3,
-                    "working_directory": "D:\\workspace\\next",
+                    "command_id": "directory-command-1",
                 }),
             ),
             (
@@ -1991,8 +2000,7 @@ mod tests {
     fn room_operation_error_identity_is_consumed_by_only_the_primary_error() {
         let expected = RoomOperationErrorIdentity::Directory {
             room_id: "room-a".into(),
-            expected_room_version: 3,
-            working_directory: "D:\\workspace\\next".into(),
+            command_id: "directory-command-1".into(),
         };
         let mut identity = Some(expected.clone());
         let primary = WebProgressEvent::Error {
@@ -2072,7 +2080,8 @@ mod tests {
         let room_reply_position = html.find("src=\"/room_reply.js\"").unwrap();
         let app_position = html.find("src=\"/app.js\"").unwrap();
         assert!(room_reply_position < app_position);
-        assert!(script.contains("operationResult.directoryConfirmed"));
+        assert!(script.contains("function handleRoomWorkingDirectoryAccepted"));
+        assert!(script.contains("command_id: commandId"));
         assert!(script.contains("RoomReply.captureTimelineViewport"));
         assert!(script.contains("RoomReply.timelineScrollTarget"));
         assert!(!script.contains("authoritativeRoomEventSequence = Math.max"));
@@ -2228,7 +2237,10 @@ mod tests {
             ClientMessage::UpdateRoomWorkingDirectory {
                 working_directory,
                 expected_room_version,
-            } if working_directory == "workspace-a" && expected_room_version == 12
+                command_id,
+            } if working_directory == "workspace-a"
+                && expected_room_version == 12
+                && command_id.is_empty()
         ));
 
         let page: ClientMessage = serde_json::from_str(
@@ -2278,7 +2290,8 @@ mod tests {
     async fn room_working_directory_websocket_uses_only_the_active_room() {
         let runtime_directory = tempfile::tempdir().unwrap();
         let startup_directory = tempfile::tempdir().unwrap();
-        let requested_directory = tempfile::tempdir().unwrap();
+        let requested_directory = startup_directory.path().join("nested").join("workspace");
+        std::fs::create_dir_all(&requested_directory).unwrap();
         let repository = Arc::new(
             crate::web::collaboration::CollaborationRepository::new_with_startup_working_directory(
                 runtime_directory.path(),
@@ -2297,8 +2310,9 @@ mod tests {
         let message: ClientMessage = serde_json::from_value(serde_json::json!({
             "type": "update_room_working_directory",
             "room_id": "forged-room",
-            "working_directory": requested_directory.path(),
+            "working_directory": "nested/workspace",
             "expected_room_version": active.room.version,
+            "command_id": "directory-command-1",
         }))
         .unwrap();
 
@@ -2306,7 +2320,17 @@ mod tests {
             dispatch_room_protocol_message(&protocol, "active-room".into(), message).await,
         );
 
-        assert!(events.is_empty(), "成功目录更新由 runtime 广播快照");
+        assert!(matches!(
+            events.as_slice(),
+            [WebProgressEvent::RoomWorkingDirectoryAccepted {
+                room_id,
+                command_id,
+                snapshot,
+            }] if room_id == "active-room"
+                && command_id == "directory-command-1"
+                && std::path::PathBuf::from(&snapshot.room.working_directory)
+                    == requested_directory.canonicalize().unwrap()
+        ));
         assert_eq!(
             protocol.calls.lock().await.as_slice(),
             &[("update_directory".into(), "active-room".into())]
@@ -2319,7 +2343,7 @@ mod tests {
                     .room
                     .working_directory
             ),
-            requested_directory.path().canonicalize().unwrap()
+            requested_directory.canonicalize().unwrap()
         );
         assert_eq!(
             std::path::PathBuf::from(
@@ -2367,6 +2391,7 @@ mod tests {
                 ClientMessage::UpdateRoomWorkingDirectory {
                     working_directory: rejected_directory.path().display().to_string(),
                     expected_room_version: initial.room.version,
+                    command_id: "directory-command-stale".into(),
                 },
             )
             .await,
@@ -2376,8 +2401,7 @@ mod tests {
             error_identity,
             Some(RoomOperationErrorIdentity::Directory {
                 room_id: "active-room".into(),
-                expected_room_version: initial.room.version,
-                working_directory: rejected_directory.path().display().to_string(),
+                command_id: "directory-command-stale".into(),
             })
         );
         assert_eq!(events.len(), 2);
@@ -2426,6 +2450,7 @@ mod tests {
                 ClientMessage::UpdateRoomWorkingDirectory {
                     working_directory: non_directory.display().to_string(),
                     expected_room_version: initial.room.version,
+                    command_id: "directory-command-invalid".into(),
                 },
             )
             .await,
@@ -2435,8 +2460,7 @@ mod tests {
             error_identity,
             Some(RoomOperationErrorIdentity::Directory {
                 room_id: "active-room".into(),
-                expected_room_version: initial.room.version,
-                working_directory: non_directory.display().to_string(),
+                command_id: "directory-command-invalid".into(),
             })
         );
         assert!(matches!(

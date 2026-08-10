@@ -168,6 +168,11 @@ pub enum WebProgressEvent {
         event_id: String,
         duplicate: bool,
     },
+    RoomWorkingDirectoryAccepted {
+        room_id: String,
+        command_id: String,
+        snapshot: RoomSnapshot,
+    },
     MemberChanged {
         member: BrainMemberView,
     },

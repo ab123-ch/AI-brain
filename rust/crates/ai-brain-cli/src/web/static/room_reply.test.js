@@ -10,7 +10,6 @@ const {
     captureTimelineViewport,
     canReplyToEvent,
     matchesPendingRoomPost,
-    matchesPendingRoomDirectorySnapshot,
     mergeEventsBySequence,
     mergeSnapshotWindow,
     isTimelineNearBottom,
@@ -253,149 +252,51 @@ test('只有 room 和 command 都匹配的 accepted 才结算待发送消息', (
     }), false);
 });
 
-test('目录更新只接受目标路径匹配的同房间新版本快照', () => {
+test('目录更新只由 room 和 command 都匹配的 accepted 结算', () => {
     const pending = {
+        type: 'directory',
         roomId: 'room-a',
+        commandId: 'directory-command-1',
         expectedVersion: 1,
         previousDirectory: 'D:\\workspace\\old',
-        requestedDirectory: 'D:\\workspace\\next',
+        requestedDirectory: 'nested/workspace',
         failed: false,
     };
-    assert.equal(matchesPendingRoomDirectorySnapshot(pending, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: 'D:\\workspace\\old',
-        },
-    }), false);
-    assert.equal(matchesPendingRoomDirectorySnapshot(pending, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: 'D:\\workspace\\next',
-        },
-    }), true);
-    assert.equal(matchesPendingRoomDirectorySnapshot(pending, {
-        room: {
-            room_id: 'room-b',
-            version: 2,
-            working_directory: 'D:\\workspace\\next',
-        },
-    }), false);
-    assert.equal(matchesPendingRoomDirectorySnapshot(pending, {
-        room: {
-            room_id: 'room-a',
-            version: 1,
-            working_directory: 'D:\\workspace\\next',
-        },
-    }), false);
-    assert.equal(matchesPendingRoomDirectorySnapshot(pending, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: '\\\\?\\D:\\workspace\\next',
-        },
-    }), true);
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...pending,
-        requestedDirectory: 'nested/workspace',
-    }, {
+    const canonicalSnapshot = {
         room: {
             room_id: 'room-a',
             version: 2,
             working_directory: 'D:\\root\\nested\\workspace',
         },
-    }), false);
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...pending,
-        previousDirectory: '\\\\server\\share\\old',
-        requestedDirectory: '\\\\server\\share\\next',
-    }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: '\\\\?\\UNC\\server\\share\\next',
-        },
-    }), true);
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...pending,
-        requestedDirectory: 'nested/../workspace',
-    }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: 'D:\\root\\workspace',
-        },
-    }), false);
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...pending,
-        requestedDirectory: '../foo',
-    }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: 'D:\\unrelated\\foo',
-        },
-    }), false);
-    assert.equal(matchesPendingRoomDirectorySnapshot({ ...pending, failed: true }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: 'D:\\workspace\\next',
-        },
-    }), false);
-});
-
-test('Windows 目录匹配忽略大小写和尾分隔符，POSIX 保持大小写敏感', () => {
-    const base = {
-        roomId: 'room-a',
-        expectedVersion: 1,
-        previousDirectory: 'D:\\workspace\\old',
-        failed: false,
     };
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...base,
-        requestedDirectory: 'd:\\WORKSPACE\\next\\',
-    }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: '\\\\?\\D:\\workspace\\NEXT',
-        },
-    }), true);
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...base,
-        previousDirectory: '\\\\SERVER\\SHARE\\old',
-        requestedDirectory: '\\\\SERVER\\SHARE\\NEXT\\',
-    }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: '\\\\?\\UNC\\server\\share\\next',
-        },
-    }), true);
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...base,
-        previousDirectory: '/srv/old',
-        requestedDirectory: '/srv/Next/',
-    }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: '/srv/Next',
-        },
-    }), true);
-    assert.equal(matchesPendingRoomDirectorySnapshot({
-        ...base,
-        previousDirectory: '/srv/old',
-        requestedDirectory: '/srv/next',
-    }, {
-        room: {
-            room_id: 'room-a',
-            version: 2,
-            working_directory: '/srv/Next',
-        },
-    }), false);
+
+    const accepted = settleRoomOperation(pending, {
+        type: 'room_working_directory_accepted',
+        room_id: 'room-a',
+        command_id: 'directory-command-1',
+        snapshot: canonicalSnapshot,
+    });
+    assert.equal(accepted.settled, true);
+    assert.equal(accepted.pending, null);
+    assert.equal(accepted.operationType, 'directory');
+    assert.deepEqual(accepted.snapshot, canonicalSnapshot);
+
+    assert.equal(settleRoomOperation(pending, {
+        type: 'room_working_directory_accepted',
+        room_id: 'room-b',
+        command_id: 'directory-command-1',
+        snapshot: canonicalSnapshot,
+    }).settled, false);
+    assert.equal(settleRoomOperation(pending, {
+        type: 'room_working_directory_accepted',
+        room_id: 'room-a',
+        command_id: 'directory-command-2',
+        snapshot: canonicalSnapshot,
+    }).settled, false);
+    assert.equal(settleRoomOperation(pending, {
+        type: 'room_snapshot',
+        snapshot: canonicalSnapshot,
+    }).settled, false);
 });
 
 test('单一 room operation 阻止跨类型并发且精确 error 不要求清草稿', () => {
@@ -500,22 +401,19 @@ test('三类 room operation 只由完整相关身份的 error 结算', () => {
     const directory = {
         type: 'directory',
         roomId: 'room-a',
-        expectedVersion: 3,
-        requestedDirectory: 'D:\\workspace\\next',
+        commandId: 'directory-command-1',
     };
     assert.equal(settleRoomOperation(directory, {
         type: 'error',
         room_operation: 'directory',
         room_id: 'room-a',
-        expected_room_version: 3,
-        working_directory: 'D:\\workspace\\other',
+        command_id: 'directory-command-2',
     }).settled, false);
     const directoryError = settleRoomOperation(directory, {
         type: 'error',
         room_operation: 'directory',
         room_id: 'room-a',
-        expected_room_version: 3,
-        working_directory: 'D:\\workspace\\next',
+        command_id: 'directory-command-1',
     });
     assert.equal(directoryError.settled, true);
     assert.equal(directoryError.clearComposer, false);
@@ -554,14 +452,12 @@ test('本地发送失败能为三类 operation 构造完整错误身份', () => 
     assert.deepEqual(buildRoomOperationError({
         type: 'directory',
         roomId: 'room-a',
-        expectedVersion: 3,
-        requestedDirectory: 'D:\\workspace\\next',
+        commandId: 'directory-command-1',
     }), {
         type: 'error',
         room_operation: 'directory',
         room_id: 'room-a',
-        expected_room_version: 3,
-        working_directory: 'D:\\workspace\\next',
+        command_id: 'directory-command-1',
     });
     assert.deepEqual(buildRoomOperationError({
         type: 'pagination', roomId: 'room-a', beforeSequence: 10,
@@ -573,7 +469,7 @@ test('本地发送失败能为三类 operation 构造完整错误身份', () => 
     });
 });
 
-test('room operation 只由匹配类型及标识的权威响应结算', () => {
+test('发帖和分页 operation 只由匹配类型及标识的权威响应结算', () => {
     const post = {
         type: 'post',
         roomId: 'room-a',
@@ -609,63 +505,6 @@ test('room operation 只由匹配类型及标识的权威响应结算', () => {
         before_sequence: 10,
     }).settled, true);
 
-    const directory = {
-        type: 'directory',
-        roomId: 'room-a',
-        expectedVersion: 1,
-        previousDirectory: 'D:\\workspace\\old',
-        requestedDirectory: 'D:\\workspace\\next',
-        failed: false,
-    };
-    const mismatchedDirectory = settleRoomOperation(directory, {
-        type: 'room_snapshot',
-        snapshot: {
-            room: {
-                room_id: 'room-a',
-                version: 2,
-                working_directory: 'D:\\workspace\\old',
-            },
-        },
-    });
-    assert.equal(mismatchedDirectory.settled, true);
-    assert.equal(mismatchedDirectory.directoryConfirmed, false);
-    assert.equal(settleRoomOperation(directory, {
-        type: 'room_snapshot',
-        snapshot: {
-            room: {
-                room_id: 'room-a',
-                version: 1,
-                working_directory: 'D:\\workspace\\next',
-            },
-        },
-    }).settled, false);
-    const canonicalizedDirectory = settleRoomOperation({
-        ...directory,
-        requestedDirectory: 'D:\\workspace\\link',
-    }, {
-        type: 'room_snapshot',
-        snapshot: {
-            room: {
-                room_id: 'room-a',
-                version: 2,
-                working_directory: 'D:\\workspace\\canonical-target',
-            },
-        },
-    });
-    assert.equal(canonicalizedDirectory.settled, true);
-    assert.equal(canonicalizedDirectory.directoryConfirmed, false);
-    const acceptedDirectory = settleRoomOperation(directory, {
-        type: 'room_snapshot',
-        snapshot: {
-            room: {
-                room_id: 'room-a',
-                version: 2,
-                working_directory: 'D:\\workspace\\next',
-            },
-        },
-    });
-    assert.equal(acceptedDirectory.settled, true);
-    assert.equal(acceptedDirectory.directoryConfirmed, true);
 });
 
 test('切换房间会重置全部 room-local 编辑器与分页状态', () => {

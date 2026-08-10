@@ -125,46 +125,6 @@
             && pending.commandId === accepted.command_id;
     }
 
-    function normalizeDirectoryPath(path) {
-        let value = String(path || '').trim().replace(/\\/g, '/');
-        if (/^\/\/\?\/UNC\//i.test(value)) {
-            value = `//${value.slice(8)}`;
-        } else if (value.startsWith('//?/')) {
-            value = value.slice(4);
-        }
-
-        const isUnc = value.startsWith('//');
-        const prefix = isUnc ? '//' : '';
-        value = `${prefix}${value.slice(isUnc ? 2 : 0).replace(/\/{2,}/g, '/')}`;
-        if (value.length > 1 && !/^[a-z]:\/$/i.test(value)) {
-            value = value.replace(/\/+$/, '');
-        }
-        return value;
-    }
-
-    function isWindowsDirectoryPath(path) {
-        return /^[a-z]:\//i.test(path) || path.startsWith('//');
-    }
-
-    function isAbsoluteDirectoryPath(path) {
-        return path.startsWith('/') || /^[a-z]:\//i.test(path);
-    }
-
-    function matchesPendingRoomDirectorySnapshot(pending, snapshot) {
-        if (!pending || pending.failed || !snapshot?.room) return false;
-        if (pending.roomId !== snapshot.room.room_id) return false;
-        if (Number(snapshot.room.version) <= Number(pending.expectedVersion)) return false;
-
-        const actual = normalizeDirectoryPath(snapshot.room.working_directory);
-        const requested = normalizeDirectoryPath(pending.requestedDirectory);
-        if (!isAbsoluteDirectoryPath(requested)) return false;
-        const windowsPath = isWindowsDirectoryPath(actual)
-            || isWindowsDirectoryPath(requested);
-        const comparableActual = windowsPath ? actual.toLowerCase() : actual;
-        const comparableRequested = windowsPath ? requested.toLowerCase() : requested;
-        return comparableActual === comparableRequested;
-    }
-
     function beginRoomOperation(current, next) {
         if (current) return { started: false, pending: current };
         return { started: true, pending: { ...next } };
@@ -189,8 +149,7 @@
         if (pending.type === 'post') {
             error.command_id = pending.commandId;
         } else if (pending.type === 'directory') {
-            error.expected_room_version = Number(pending.expectedVersion);
-            error.working_directory = pending.requestedDirectory;
+            error.command_id = pending.commandId;
         } else if (pending.type === 'pagination') {
             error.before_sequence = Number(pending.beforeSequence);
         }
@@ -204,8 +163,7 @@
             return event.command_id === pending.commandId;
         }
         if (pending.type === 'directory') {
-            return Number(event.expected_room_version) === Number(pending.expectedVersion)
-                && event.working_directory === pending.requestedDirectory;
+            return event.command_id === pending.commandId;
         }
         if (pending.type === 'pagination') {
             return Number(event.before_sequence) === Number(pending.beforeSequence);
@@ -225,6 +183,7 @@
             operationType: null,
             clearComposer: false,
             directoryConfirmed: null,
+            snapshot: null,
         };
         if (!pending) return unsettled;
 
@@ -243,20 +202,9 @@
         if (pending.type === 'post') {
             matches = matchesPendingRoomPost(pending, event);
         } else if (pending.type === 'directory') {
-            const newerRoomSnapshot = event?.type === 'room_snapshot'
-                && pending.roomId === event.snapshot?.room?.room_id
-                && Number(event.snapshot.room.version) > Number(pending.expectedVersion);
-            if (!newerRoomSnapshot) return unsettled;
-            return {
-                settled: true,
-                pending: null,
-                operationType: pending.type,
-                clearComposer: false,
-                directoryConfirmed: matchesPendingRoomDirectorySnapshot(
-                    pending,
-                    event.snapshot,
-                ),
-            };
+            matches = event?.type === 'room_working_directory_accepted'
+                && pending.roomId === event.room_id
+                && pending.commandId === event.command_id;
         } else if (pending.type === 'pagination') {
             matches = event?.type === 'room_events_loaded_before'
                 && pending.roomId === event.room_id
@@ -270,6 +218,7 @@
             operationType: pending.type,
             clearComposer: pending.type === 'post',
             directoryConfirmed: null,
+            snapshot: pending.type === 'directory' ? event.snapshot : null,
         };
     }
 
@@ -337,7 +286,6 @@
         canReplyToEvent,
         captureTimelineViewport,
         isTimelineNearBottom,
-        matchesPendingRoomDirectorySnapshot,
         matchesPendingRoomPost,
         mergeEventsBySequence,
         mergeSnapshotWindow,
