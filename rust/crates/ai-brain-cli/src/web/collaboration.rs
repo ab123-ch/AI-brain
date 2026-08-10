@@ -32,6 +32,47 @@ pub(crate) fn default_runtime_dir() -> PathBuf {
     dirs::home_dir().unwrap_or(fallback).join(".ai-brain")
 }
 
+#[cfg(any(unix, test))]
+fn unix_directory_mode_has_search(mode: u32) -> bool {
+    mode & 0o111 != 0
+}
+
+pub(crate) fn validate_working_directory_access(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        CollaborationError::Config(format!("工作目录不可访问: {}: {error}", path.display()))
+    })?;
+    if !metadata.is_dir() {
+        return Err(CollaborationError::Config(format!(
+            "工作目录不是目录: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if !unix_directory_mode_has_search(metadata.mode()) {
+            return Err(CollaborationError::Config(format!(
+                "工作目录缺少目录搜索权限: {}",
+                path.display()
+            )));
+        }
+    }
+    fs::read_dir(path).map_err(|error| {
+        CollaborationError::Config(format!("工作目录无法读取: {}: {error}", path.display()))
+    })?;
+    Ok(())
+}
+
+fn path_to_storage_text(path: &Path) -> Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        CollaborationError::Config(format!(
+            "工作目录路径不是有效 UTF-8，无法无损保存: {}",
+            path.display()
+        ))
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum CollaborationError {
     #[error("协作存储错误: {0}")]
@@ -897,12 +938,8 @@ impl CollaborationRepository {
         startup_working_directory: &Path,
     ) -> Result<Self> {
         let startup_working_directory = startup_working_directory.canonicalize()?;
-        if !startup_working_directory.is_dir() {
-            return Err(CollaborationError::Config(format!(
-                "启动工作目录不是目录: {}",
-                startup_working_directory.display()
-            )));
-        }
+        validate_working_directory_access(&startup_working_directory)?;
+        path_to_storage_text(&startup_working_directory)?;
         fs::create_dir_all(runtime_dir)?;
         let repository = Self {
             database_path: runtime_dir.join("runtime.db"),
@@ -1302,7 +1339,7 @@ impl CollaborationRepository {
                     [],
                 )?;
             }
-            let startup_working_directory = self.startup_working_directory.display().to_string();
+            let startup_working_directory = path_to_storage_text(&self.startup_working_directory)?;
             transaction.execute(
                 "UPDATE collaboration_rooms SET working_directory = ?1",
                 [&startup_working_directory],
@@ -1447,6 +1484,7 @@ impl CollaborationRepository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let default_member_id = format!("member-{room_id}-main");
         let now = Utc::now();
+        let startup_working_directory = path_to_storage_text(&self.startup_working_directory)?;
         let mut changed = transaction.execute(
             "INSERT INTO collaboration_rooms(
                  room_id, title, working_directory, default_member_id,
@@ -1457,7 +1495,7 @@ impl CollaborationRepository {
             params![
                 room_id,
                 title,
-                self.startup_working_directory.display().to_string(),
+                startup_working_directory,
                 default_member_id,
                 now.to_rfc3339(),
             ],
@@ -1598,13 +1636,8 @@ impl CollaborationRepository {
             self.startup_working_directory.join(requested_path)
         };
         let canonical = candidate.canonicalize()?;
-        if !canonical.is_dir() {
-            return Err(CollaborationError::Config(format!(
-                "房间工作目录不是目录: {}",
-                canonical.display()
-            )));
-        }
-        let canonical = canonical.display().to_string();
+        validate_working_directory_access(&canonical)?;
+        let canonical = path_to_storage_text(&canonical)?;
 
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -5818,6 +5851,12 @@ fn truncate_title(content: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unix_directory_search_mode_requires_execute_bit() {
+        assert!(!unix_directory_mode_has_search(0o600));
+        assert!(unix_directory_mode_has_search(0o700));
+    }
+
     fn repository() -> (tempfile::TempDir, CollaborationRepository) {
         let directory = tempfile::tempdir().unwrap();
         let repository = CollaborationRepository::new(
@@ -7239,6 +7278,42 @@ mod tests {
             Path::new(&absolute.working_directory),
             absolute_workspace.path().canonicalize().unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_canonical_room_directory_is_rejected_without_mutation() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let runtime = tempfile::tempdir().unwrap();
+        let startup = tempfile::tempdir().unwrap();
+        let non_utf8_directory = startup
+            .path()
+            .join(OsString::from_vec(b"non-utf8-\x80".to_vec()));
+        fs::create_dir(&non_utf8_directory).unwrap();
+        let utf8_link = startup.path().join("utf8-link");
+        std::os::unix::fs::symlink(&non_utf8_directory, &utf8_link).unwrap();
+        let repository = CollaborationRepository::new_with_startup_working_directory(
+            runtime.path(),
+            CollaborationConfig::default(),
+            startup.path(),
+        )
+        .unwrap();
+        let before = repository.ensure_room("room-1", "Room", &[]).unwrap().room;
+
+        let error = repository
+            .update_room_working_directory("room-1", utf8_link.to_str().unwrap(), before.version)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CollaborationError::Config(message) if message.contains("UTF-8")),
+            "应明确报告无法无损存储路径"
+        );
+        let after = repository.snapshot("room-1").unwrap().room;
+        assert_eq!(after.working_directory, before.working_directory);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.state_revision, before.state_revision);
     }
 
     #[test]

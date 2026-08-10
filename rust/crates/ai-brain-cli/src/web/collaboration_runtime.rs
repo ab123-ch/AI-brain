@@ -27,11 +27,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::orchestrator::{MemberQueryError, Orchestrator};
 use crate::web::collaboration::{
-    BrainMemberView, ClaimReleaseDisposition, ClaimedInboxItem, CollaborationActor,
-    CollaborationConfig, CollaborationError, CollaborationRepository, InboxFailureDisposition,
-    InboxPurpose, LegacyMessageSeed, MemberAddress, MemberHistoryMessage, ParticipationCompletion,
-    ParticipationDisposition, PostMessageResult, RoomEventPage, RoomEventReferenceView,
-    RoomEventView, RoomInputMode, RoomSnapshot,
+    validate_working_directory_access, BrainMemberView, ClaimReleaseDisposition, ClaimedInboxItem,
+    CollaborationActor, CollaborationConfig, CollaborationError, CollaborationRepository,
+    InboxFailureDisposition, InboxPurpose, LegacyMessageSeed, MemberAddress, MemberHistoryMessage,
+    ParticipationCompletion, ParticipationDisposition, PostMessageResult, RoomEventPage,
+    RoomEventReferenceView, RoomEventView, RoomInputMode, RoomSnapshot,
 };
 use crate::web::collaboration_tools::GroupMessageToolScope;
 use crate::web::progress_adapter::WebProgressEvent;
@@ -2308,11 +2308,8 @@ fn tool_execution_context_for_claim(
     claim: &ClaimedInboxItem,
 ) -> Result<ToolExecutionContext, String> {
     let path = &claim.execution_working_directory;
-    let metadata = std::fs::metadata(path)
+    validate_working_directory_access(path)
         .map_err(|error| format!("冻结工作目录 {} 不可用: {error}", path.display()))?;
-    if !metadata.is_dir() {
-        return Err(format!("冻结工作目录不是目录: {}", path.display()));
-    }
     Ok(ToolExecutionContext::new(path.clone()))
 }
 
@@ -3420,6 +3417,98 @@ mod tests {
         assert_missing_frozen_directory_failure(false, false).await;
         assert_missing_frozen_directory_failure(true, false).await;
         assert_missing_frozen_directory_failure(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inaccessible_frozen_directory_stops_before_provider() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionRestore {
+            path: std::path::PathBuf,
+            permissions: std::fs::Permissions,
+        }
+
+        impl Drop for PermissionRestore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+            }
+        }
+
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = Arc::new(
+            CollaborationRepository::new_with_startup_working_directory(
+                runtime_directory.path(),
+                config.clone(),
+                &workspace_path,
+            )
+            .unwrap(),
+        );
+        let room = collaboration
+            .ensure_room(
+                "room-inaccessible-workspace",
+                "Inaccessible Workspace Room",
+                &[],
+            )
+            .unwrap();
+        let member_id = room.room.default_member_id;
+        let posted = collaboration
+            .post_message(
+                "room-inaccessible-workspace",
+                std::slice::from_ref(&member_id),
+                "读取冻结目录中的文件",
+                RoomInputMode::Task,
+                "inaccessible-workspace-task",
+            )
+            .unwrap();
+        let inbox_item_id = posted.inbox_items[0].inbox_item_id.clone();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+        let snapshot = built_context_snapshot_for_claim(&collaboration, &claim, &config);
+        let llm_config = LlmConfig::default_config();
+        let model = llm_config.resolve_model_policy(&claim.model_policy);
+        let tasks = Arc::new(TaskRepository::open(collaboration.database_path()).unwrap());
+        let task = tasks
+            .create_task(task_request_for_claim(&claim, &config, &model, &snapshot))
+            .unwrap();
+        collaboration.release_lease(&claim).unwrap();
+
+        let original_permissions = std::fs::metadata(&workspace_path).unwrap().permissions();
+        let _permission_restore = PermissionRestore {
+            path: workspace_path.clone(),
+            permissions: original_permissions.clone(),
+        };
+        let mut inaccessible_permissions = original_permissions;
+        let inaccessible_mode = inaccessible_permissions.mode() & !0o111;
+        inaccessible_permissions.set_mode(inaccessible_mode);
+        std::fs::set_permissions(&workspace_path, inaccessible_permissions).unwrap();
+
+        let services = Arc::new(TestRuntimeServices::new(&collaboration, &config));
+        let query_count = Arc::clone(&services.query_count);
+        let runtime = CollaborationRuntime::start(
+            Arc::clone(&collaboration),
+            services,
+            Arc::new(llm_config),
+            LlmConfig::default_config().available_instance_model_policies(),
+        )
+        .await
+        .unwrap();
+
+        let error = wait_for_failed_inbox(
+            &runtime,
+            "room-inaccessible-workspace",
+            &inbox_item_id,
+            &query_count,
+        )
+        .await;
+        assert!(error.contains("冻结工作目录"), "unexpected error: {error}");
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            tasks.task(&task.task_run_id).unwrap().state,
+            TaskRunState::Failed
+        );
     }
 
     #[tokio::test]
