@@ -2082,6 +2082,13 @@ mod tests {
         assert!(room_reply_position < app_position);
         assert!(script.contains("function handleRoomWorkingDirectoryAccepted"));
         assert!(script.contains("command_id: commandId"));
+        let directory_ack_handler = script
+            .split_once("function handleRoomWorkingDirectoryAccepted")
+            .and_then(|(_, rest)| rest.split_once("function mergeMember"))
+            .map(|(handler, _)| handler)
+            .expect("脚本缺少目录 ACK 处理函数");
+        assert!(directory_ack_handler
+            .contains("closeRoomDirectoryModal();\n    setInputEnabled(true);"));
         assert!(script.contains("RoomReply.captureTimelineViewport"));
         assert!(script.contains("RoomReply.timelineScrollTarget"));
         assert!(!script.contains("authoritativeRoomEventSequence = Math.max"));

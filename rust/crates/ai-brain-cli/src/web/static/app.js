@@ -1095,6 +1095,7 @@ function handleRoomWorkingDirectoryAccepted(data) {
     if (!operationResult.settled || operationResult.operationType !== 'directory') return;
     pendingRoomDirectoryUpdate = null;
     closeRoomDirectoryModal();
+    setInputEnabled(true);
 }
 
 function mergeMember(member) {
