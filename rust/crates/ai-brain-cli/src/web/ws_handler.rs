@@ -2479,7 +2479,7 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [WebProgressEvent::Error { message }]
-                if message.contains("房间工作目录不是目录") && message.contains("版本冲突.txt")
+                if message.contains("工作目录不是目录") && message.contains("版本冲突.txt")
         ));
         assert_eq!(
             protocol.calls.lock().await.as_slice(),
