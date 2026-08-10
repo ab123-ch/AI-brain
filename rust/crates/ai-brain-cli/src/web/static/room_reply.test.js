@@ -585,11 +585,22 @@ test('协作快照水位和实体版本只允许单调前进', () => {
         room: { room_id: 'room-a', state_revision: 9, version: 7, latest_event_seq: 10 },
     }), true);
 
+    const inbox = [{ inbox_item_id: 'inbox-current', version: 2, state: 'running' }];
+    const ignoredInbox = mergeVersionedEntity(
+        inbox,
+        { inbox_item_id: 'inbox-removed', version: 3, state: 'completed' },
+        'inbox_item_id',
+        false,
+    );
+    assert.equal(ignoredInbox.changed, false);
+    assert.equal(ignoredInbox.items, inbox);
+
     const original = [{ member_id: 'member-a', version: 2, display_name: '旧名称' }];
     const added = mergeVersionedEntity(
         original,
         { member_id: 'member-b', version: 1, display_name: '新成员' },
         'member_id',
+        true,
     );
     assert.equal(added.changed, true);
     assert.deepEqual(added.items.map((item) => item.member_id), ['member-a', 'member-b']);
@@ -600,6 +611,7 @@ test('协作快照水位和实体版本只允许单调前进', () => {
             original,
             { member_id: 'member-a', version, display_name: '过期名称' },
             'member_id',
+            true,
         );
         assert.equal(unchanged.changed, false);
         assert.equal(unchanged.items, original);
@@ -608,6 +620,7 @@ test('协作快照水位和实体版本只允许单调前进', () => {
         original,
         { member_id: 'member-a', version: 3, display_name: '新名称' },
         'member_id',
+        true,
     );
     assert.equal(replaced.changed, true);
     assert.equal(replaced.items[0].display_name, '新名称');

@@ -102,10 +102,11 @@
             && incoming.some((value, index) => value > authoritative[index]);
     }
 
-    function mergeVersionedEntity(items, incoming, idKey) {
+    function mergeVersionedEntity(items, incoming, idKey, appendMissing) {
         const currentItems = Array.isArray(items) ? items : [];
         const index = currentItems.findIndex((item) => item[idKey] === incoming[idKey]);
         if (index < 0) {
+            if (!appendMissing) return { items: currentItems, changed: false };
             return { items: [...currentItems, incoming], changed: true };
         }
         if (Number(incoming.version) <= Number(currentItems[index].version)) {

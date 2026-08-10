@@ -136,7 +136,7 @@ WHERE room_id = ?1
 
 - [ ] **Step 4: 实现前端单调门禁**
 
-room-local 状态增加 `authoritativeRoomStateRevision`。同房间完整 snapshot 仅在 state revision、room version、event sequence 都不回退且至少一项增长时应用。新增纯函数按 `member_id`/`inbox_item_id` 比较 `version`；`mergeMember`、`mergeInboxItem` 对重复或更低版本直接返回且不重绘。
+room-local 状态增加 `authoritativeRoomStateRevision`。同房间完整 snapshot 仅在 state revision、room version、event sequence 都不回退且至少一项增长时应用。新增纯函数按 `member_id`/`inbox_item_id` 比较 `version`；`MemberChanged` 可新增成员，`InboxItemChanged` 只更新现存项，Inbox 新增与删除由完整 snapshot 权威处理，重复或更低版本不重绘。
 
 - [ ] **Step 5: 运行 GREEN 与迁移回归**
 

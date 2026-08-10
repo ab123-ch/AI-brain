@@ -35,7 +35,7 @@ state_revision INTEGER NOT NULL DEFAULT 0
 
 `CollaborationRoomView` 对外返回 `state_revision`。仓储快照本来就在一个 SQLite Deferred transaction 内读取 room、member、event、Inbox 和 delivery，因此 revision 与快照内容属于同一一致读视图。
 
-同房间前端以 `(state_revision, room.version, latest_event_seq)` 作为完整 snapshot 的单调水位：三项都不得低于当前权威值，并且至少一项必须增长；旧或完全重复 snapshot 不再整体替换状态。这样 Inbox/member-only 变化由 `state_revision` 排序，旧数据库导入或事件追加仍可由既有 room/event 水位推进。`MemberChanged` 与 `InboxItemChanged` 继续提供低延迟更新，但只能以更高实体 `version` 覆盖当前实体。事件 append 不推进 snapshot 权威水位。
+同房间前端以 `(state_revision, room.version, latest_event_seq)` 作为完整 snapshot 的单调水位：三项都不得低于当前权威值，并且至少一项必须增长；旧或完全重复 snapshot 不再整体替换状态。这样 Inbox/member-only 变化由 `state_revision` 排序，旧数据库导入或事件追加仍可由既有 room/event 水位推进。`MemberChanged` 可以直接新增成员，`InboxItemChanged` 只以更高 `version` 更新权威窗口内的现存项，Inbox 新增与删除由紧随的完整 snapshot 权威处理。事件 append 不推进 snapshot 权威水位。
 
 ## 目录可用性与无损持久化
 

@@ -1105,7 +1105,12 @@ function handleRoomWorkingDirectoryAccepted(data) {
 
 function mergeMember(member) {
     if (!roomSnapshot || member.room_id !== activeSessionId) return;
-    const result = RoomReply.mergeVersionedEntity(roomSnapshot.members, member, 'member_id');
+    const result = RoomReply.mergeVersionedEntity(
+        roomSnapshot.members,
+        member,
+        'member_id',
+        true,
+    );
     if (!result.changed) return;
     roomSnapshot.members = result.items;
     reconcileSelectedMembers();
@@ -1114,7 +1119,12 @@ function mergeMember(member) {
 
 function mergeInboxItem(roomId, item) {
     if (!roomSnapshot || roomId !== activeSessionId) return;
-    const result = RoomReply.mergeVersionedEntity(roomSnapshot.inbox, item, 'inbox_item_id');
+    const result = RoomReply.mergeVersionedEntity(
+        roomSnapshot.inbox,
+        item,
+        'inbox_item_id',
+        false,
+    );
     if (!result.changed) return;
     roomSnapshot.inbox = result.items;
     renderCollaborationRoom();
