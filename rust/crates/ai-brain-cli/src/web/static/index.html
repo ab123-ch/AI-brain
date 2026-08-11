@@ -206,17 +206,40 @@
                 <span id="preview-source">智脑内容</span>
                 <h2 id="preview-title">内容预览</h2>
             </div>
-            <button id="preview-close" class="icon-btn" type="button" title="关闭预览" aria-label="关闭预览"><i data-lucide="x"></i></button>
+            <div class="preview-header-actions">
+                <button id="file-editor-refresh" class="icon-btn hidden" type="button" title="加载磁盘最新内容" aria-label="加载磁盘最新内容"><i data-lucide="refresh-cw"></i></button>
+                <button id="file-editor-copy-path" class="icon-btn hidden" type="button" title="复制绝对路径" aria-label="复制绝对路径"><i data-lucide="copy"></i></button>
+                <button id="preview-close" class="icon-btn" type="button" title="关闭预览" aria-label="关闭预览"><i data-lucide="x"></i></button>
+            </div>
         </header>
         <div id="preview-selection-tools" class="preview-selection-tools hidden">
             <span id="preview-selection-info">已选择内容</span>
             <button id="preview-quote" type="button"><i data-lucide="quote"></i><span>引用到消息框</span></button>
         </div>
+        <div id="file-editor-tabs" class="file-editor-tabs hidden" role="tablist" aria-label="已打开文件">
+            <button id="file-editor-tab" class="file-editor-tab" type="button" role="tab" aria-selected="true">
+                <i data-lucide="file-code-2"></i><span id="file-editor-tab-name">文件</span><span class="file-editor-dirty-dot" aria-hidden="true"></span>
+            </button>
+        </div>
         <div id="file-editor-toolbar" class="file-editor-toolbar hidden">
-            <span id="file-editor-status">已保存</span>
+            <div id="file-editor-save-state" class="file-editor-save-state" data-state="saved" aria-live="polite"><span class="file-editor-save-dot"></span><span id="file-editor-status">已保存</span></div>
             <button id="file-editor-quote" type="button" disabled><i data-lucide="quote"></i><span>引用选中内容</span></button>
         </div>
-        <textarea id="file-editor-content" class="file-editor-content hidden" spellcheck="false" aria-label="文件内容编辑器"></textarea>
+        <div id="file-editor-conflict" class="file-editor-conflict hidden" role="alert">
+            <div class="file-editor-conflict-message"><i data-lucide="triangle-alert"></i><div><strong>磁盘内容已更新</strong><span>当前编辑尚未保存，自动保存已暂停。</span></div></div>
+            <div class="file-editor-conflict-actions">
+                <button id="file-editor-keep-local" type="button">保留并保存</button>
+                <button id="file-editor-load-disk" class="primary" type="button">加载磁盘版本</button>
+            </div>
+        </div>
+        <div id="file-editor-frame" class="file-editor-frame hidden">
+            <div class="file-editor-gutter" aria-hidden="true"><pre id="file-editor-line-numbers">1</pre></div>
+            <textarea id="file-editor-content" class="file-editor-content" spellcheck="false" wrap="off" aria-label="文件内容编辑器"></textarea>
+        </div>
+        <footer id="file-editor-statusbar" class="file-editor-statusbar hidden">
+            <div><i data-lucide="cloud-check"></i><span>自动保存</span><span id="file-editor-revision">版本 -</span></div>
+            <div><span id="file-editor-caret">行 1，列 1</span><span id="file-editor-lines">1 行</span><span id="file-editor-line-ending">LF</span><span>UTF-8</span><span id="file-editor-language">文本</span></div>
+        </footer>
         <div id="preview-content" class="preview-content markdown-body"></div>
     </aside>
     <div id="ask-modal" class="modal hidden">

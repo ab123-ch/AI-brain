@@ -17,3 +17,4 @@ pub mod repl;
 pub mod runtime_trace;
 pub mod tui;
 pub mod web;
+pub(crate) mod workspace_changes;

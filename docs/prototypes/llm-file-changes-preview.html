@@ -1,0 +1,1544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智脑 - 本轮文件变更原型</title>
+    <link rel="icon" href="data:,">
+    <style>
+        :root {
+            --bg-primary: #111416;
+            --bg-secondary: #191d20;
+            --bg-chat: #22282c;
+            --bg-user-msg: #176c62;
+            --bg-ai-msg: #15191b;
+            --bg-elevated: #202629;
+            --text-primary: #edf1f0;
+            --text-secondary: #9ca7a5;
+            --text-muted: #74807e;
+            --accent: #43b8a5;
+            --accent-soft: rgba(67, 184, 165, 0.12);
+            --success: #66c487;
+            --success-soft: rgba(102, 196, 135, 0.12);
+            --warning: #e2a653;
+            --warning-soft: rgba(226, 166, 83, 0.12);
+            --border: #343b40;
+            --border-strong: #465057;
+            --header-height: 48px;
+            --session-width: 224px;
+            --member-width: 232px;
+            --preview-width: min(720px, 52vw);
+        }
+
+        *, *::before, *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html, body { height: 100%; }
+
+        body {
+            min-width: 320px;
+            overflow: hidden;
+            color: var(--text-primary);
+            background: var(--bg-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            letter-spacing: 0;
+        }
+
+        button, textarea, select { font: inherit; letter-spacing: 0; }
+        button { color: inherit; }
+        .hidden { display: none !important; }
+
+        .app-header {
+            position: relative;
+            z-index: 110;
+            height: var(--header-height);
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            gap: 12px;
+            padding: 0 14px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .header-left, .header-center, .header-right {
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .header-center { justify-content: center; }
+        .header-right { justify-content: flex-end; }
+
+        .brand {
+            font-size: 18px;
+            font-weight: 650;
+        }
+
+        .icon-btn {
+            width: 32px;
+            height: 32px;
+            flex: 0 0 32px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            background: transparent;
+            cursor: pointer;
+        }
+
+        .icon-btn:hover, .icon-btn:focus-visible {
+            border-color: var(--border-strong);
+            background: #2b3236;
+            outline: none;
+        }
+
+        .icon-btn svg { width: 17px; height: 17px; }
+        .mobile-menu { display: none; }
+
+        .persona-select {
+            min-width: 148px;
+            height: 30px;
+            padding: 0 28px 0 9px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            background: var(--bg-primary);
+            outline: none;
+        }
+
+        .view-switch {
+            display: flex;
+            gap: 3px;
+            padding: 2px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-primary);
+        }
+
+        .view-switch button {
+            height: 24px;
+            padding: 0 10px;
+            border: 0;
+            border-radius: 6px;
+            color: var(--text-secondary);
+            background: transparent;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .view-switch .active {
+            color: #07110f;
+            background: var(--accent);
+            font-weight: 650;
+        }
+
+        .app-main {
+            height: calc(100% - var(--header-height));
+            display: grid;
+            grid-template-columns: var(--session-width) var(--member-width) minmax(0, 1fr);
+            overflow: hidden;
+        }
+
+        .session-sidebar,
+        .member-sidebar {
+            min-height: 0;
+            overflow-y: auto;
+            background: var(--bg-secondary);
+        }
+
+        .session-sidebar { border-right: 1px solid var(--border); }
+        .member-sidebar { border-right: 1px solid var(--border); }
+
+        .sidebar-heading {
+            height: 46px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 0 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sidebar-heading strong { font-size: 13px; }
+        .sidebar-heading span { color: var(--text-secondary); font-size: 11px; }
+
+        .session-list { padding: 7px; }
+
+        .session-row {
+            width: 100%;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding: 9px 10px;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            color: var(--text-secondary);
+            background: transparent;
+            text-align: left;
+            cursor: pointer;
+        }
+
+        .session-row + .session-row { margin-top: 2px; }
+        .session-row:hover { background: #22282c; }
+        .session-row.active { border-color: rgba(67, 184, 165, 0.36); background: var(--accent-soft); }
+        .session-row svg { width: 15px; height: 15px; margin-top: 1px; flex: 0 0 auto; }
+        .session-row > span { min-width: 0; }
+        .session-row strong, .session-row small { display: block; }
+        .session-row strong { overflow: hidden; color: var(--text-primary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+        .session-row small { margin-top: 3px; color: var(--text-muted); font-size: 10px; }
+
+        .member-list { padding: 8px; }
+
+        .member-row {
+            display: grid;
+            grid-template-columns: 30px minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 8px;
+            min-height: 46px;
+            padding: 7px;
+            border-radius: 6px;
+        }
+
+        .member-row + .member-row { margin-top: 3px; }
+        .member-row.selected { background: #22282c; }
+
+        .member-avatar {
+            width: 30px;
+            height: 30px;
+            display: grid;
+            place-items: center;
+            border: 1px solid rgba(67, 184, 165, 0.45);
+            border-radius: 50%;
+            color: var(--accent);
+            background: var(--accent-soft);
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .member-info { min-width: 0; }
+        .member-info strong, .member-info span { display: block; }
+        .member-info strong { font-size: 12px; }
+        .member-info span { margin-top: 2px; overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+        .state-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 0 3px rgba(102, 196, 135, 0.1);
+        }
+
+        .state-dot.idle { background: var(--text-muted); box-shadow: none; }
+
+        .worker-status {
+            position: sticky;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            padding: 10px 14px;
+            border-top: 1px solid var(--border);
+            color: var(--text-secondary);
+            background: var(--bg-secondary);
+            font-size: 11px;
+        }
+
+        .chat-shell {
+            min-width: 0;
+            min-height: 0;
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr) auto;
+            background: var(--bg-chat);
+        }
+
+        .room-header {
+            min-height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(25, 29, 32, 0.86);
+        }
+
+        .room-title { min-width: 0; }
+        .room-title > div { display: flex; align-items: baseline; gap: 8px; }
+        .room-title h2 { font-size: 14px; font-weight: 650; }
+        .room-title span { color: var(--text-secondary); font-size: 10px; }
+        .working-directory {
+            max-width: min(560px, 54vw);
+            margin-top: 4px;
+            overflow: hidden;
+            color: var(--text-muted);
+            font: 10px/1.3 "SFMono-Regular", Consolas, monospace;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .timeline {
+            min-height: 0;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            padding: 22px clamp(16px, 3vw, 38px) 30px;
+            scroll-behavior: smooth;
+        }
+
+        .service-event {
+            align-self: center;
+            padding: 4px 8px;
+            color: var(--text-muted);
+            font-size: 10px;
+        }
+
+        .msg {
+            position: relative;
+            width: fit-content;
+            max-width: min(820px, 88%);
+            padding: 11px 13px;
+            border-radius: 8px;
+            font-size: 13px;
+            line-height: 1.58;
+        }
+
+        .msg.user {
+            align-self: flex-end;
+            max-width: min(680px, 80%);
+            border-bottom-right-radius: 4px;
+            background: var(--bg-user-msg);
+        }
+
+        .msg.assistant {
+            align-self: flex-start;
+            width: min(820px, 88%);
+            border: 1px solid var(--border);
+            border-bottom-left-radius: 4px;
+            background: var(--bg-ai-msg);
+        }
+
+        .msg-meta {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            margin-bottom: 6px;
+            color: var(--text-secondary);
+            font-size: 10px;
+        }
+
+        .msg-meta strong { color: var(--text-primary); font-size: 11px; }
+        .msg p + p { margin-top: 7px; }
+        .msg code { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
+
+        .turn-files {
+            margin-top: 13px;
+            padding-top: 11px;
+            border-top: 1px solid var(--border);
+        }
+
+        .turn-files-heading {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 7px;
+        }
+
+        .turn-files-heading > span {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-primary);
+            font-size: 11px;
+            font-weight: 650;
+        }
+
+        .turn-files-heading svg { width: 14px; height: 14px; color: var(--accent); }
+
+        .file-count {
+            color: var(--text-secondary);
+            font-size: 10px;
+            font-weight: 500;
+        }
+
+        .file-bubbles {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+        }
+
+        .file-bubble {
+            width: 100%;
+            min-height: 38px;
+            display: grid;
+            grid-template-columns: 18px minmax(0, 1fr) auto 14px;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 9px;
+            border: 1px solid var(--border);
+            border-radius: 7px;
+            color: var(--text-primary);
+            background: var(--bg-elevated);
+            text-align: left;
+            cursor: pointer;
+            transition: border-color 120ms ease, background 120ms ease;
+        }
+
+        .file-bubble:hover,
+        .file-bubble:focus-visible {
+            border-color: rgba(67, 184, 165, 0.72);
+            background: #26302f;
+            outline: none;
+        }
+
+        .file-bubble.active {
+            border-color: var(--accent);
+            background: var(--accent-soft);
+        }
+
+        .file-bubble > svg:first-child {
+            width: 16px;
+            height: 16px;
+            color: var(--accent);
+        }
+
+        .file-bubble > svg:last-child {
+            width: 13px;
+            height: 13px;
+            color: var(--text-muted);
+        }
+
+        .file-path {
+            min-width: 0;
+            overflow-wrap: anywhere;
+            color: #dce5e3;
+            font: 11px/1.45 "SFMono-Regular", Consolas, monospace;
+        }
+
+        .change-kind {
+            min-width: 34px;
+            padding: 2px 5px;
+            border: 1px solid;
+            border-radius: 5px;
+            text-align: center;
+            font-size: 9px;
+            line-height: 1.35;
+        }
+
+        .change-kind.modified { border-color: rgba(226, 166, 83, 0.42); color: var(--warning); background: var(--warning-soft); }
+        .change-kind.added { border-color: rgba(102, 196, 135, 0.42); color: var(--success); background: var(--success-soft); }
+
+        .composer {
+            padding: 9px 14px 13px;
+            border-top: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .composer-tools {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 7px;
+        }
+
+        .mode-control {
+            display: inline-flex;
+            padding: 2px;
+            border: 1px solid var(--border);
+            border-radius: 7px;
+            background: var(--bg-primary);
+        }
+
+        .mode-control button {
+            height: 23px;
+            padding: 0 9px;
+            border: 0;
+            border-radius: 5px;
+            color: var(--text-muted);
+            background: transparent;
+            font-size: 10px;
+        }
+
+        .mode-control .active { color: #08110f; background: var(--accent); font-weight: 650; }
+
+        .recipient {
+            padding: 4px 7px;
+            border: 1px solid rgba(67, 184, 165, 0.38);
+            border-radius: 6px;
+            color: var(--accent);
+            background: var(--accent-soft);
+            font-size: 10px;
+        }
+
+        .composer-row { display: flex; align-items: flex-end; gap: 8px; }
+
+        .composer textarea {
+            min-width: 0;
+            min-height: 38px;
+            max-height: 104px;
+            flex: 1;
+            resize: none;
+            padding: 9px 11px;
+            border: 1px solid var(--border);
+            border-radius: 7px;
+            outline: none;
+            color: var(--text-primary);
+            background: var(--bg-primary);
+            line-height: 1.4;
+        }
+
+        .composer textarea:focus { border-color: rgba(67, 184, 165, 0.72); }
+
+        .send-btn {
+            width: 38px;
+            height: 38px;
+            display: grid;
+            place-items: center;
+            flex: 0 0 38px;
+            border: 0;
+            border-radius: 7px;
+            color: #08110f;
+            background: var(--accent);
+            cursor: pointer;
+        }
+
+        .send-btn:hover { background: #58c6b4; }
+        .send-btn svg { width: 17px; height: 17px; }
+
+        .preview-backdrop {
+            position: fixed;
+            inset: var(--header-height) 0 0;
+            z-index: 80;
+            opacity: 0;
+            visibility: hidden;
+            background: rgba(2, 6, 8, 0.5);
+            transition: opacity 160ms ease, visibility 160ms ease;
+        }
+
+        .preview-backdrop.visible { opacity: 1; visibility: visible; }
+
+        .preview-drawer {
+            position: fixed;
+            top: var(--header-height);
+            right: 0;
+            bottom: 0;
+            z-index: 90;
+            width: var(--preview-width);
+            min-width: 460px;
+            display: flex;
+            flex-direction: column;
+            border-left: 1px solid var(--border);
+            background: var(--bg-secondary);
+            box-shadow: -18px 0 44px rgba(0, 0, 0, 0.35);
+            transform: translateX(102%);
+            visibility: hidden;
+            transition: transform 180ms ease, visibility 180ms ease;
+        }
+
+        .preview-drawer.open { transform: translateX(0); visibility: visible; }
+
+        .preview-header {
+            min-height: 74px;
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 12px 14px 11px 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .preview-heading { min-width: 0; flex: 1; }
+        .preview-kicker { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+        .preview-kicker > span:first-child { color: var(--accent); font-size: 10px; font-weight: 650; }
+
+        .preview-heading h2 {
+            overflow: hidden;
+            font-size: 15px;
+            font-weight: 650;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .preview-path {
+            margin-top: 4px;
+            overflow-wrap: anywhere;
+            color: var(--text-secondary);
+            font: 10px/1.4 "SFMono-Regular", Consolas, monospace;
+        }
+
+        .preview-actions { display: flex; gap: 6px; }
+
+        .editor-tabs {
+            height: 35px;
+            display: flex;
+            align-items: flex-end;
+            padding-left: 8px;
+            border-bottom: 1px solid var(--border);
+            background: #15191b;
+        }
+
+        .editor-tab {
+            height: 34px;
+            min-width: 130px;
+            max-width: 260px;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 0 11px;
+            border: 0;
+            border-right: 1px solid var(--border);
+            border-bottom: 2px solid var(--accent);
+            color: var(--text-primary);
+            background: #202629;
+            cursor: default;
+            font-size: 11px;
+        }
+
+        .editor-tab svg { width: 14px; height: 14px; color: var(--accent); }
+        .editor-tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        .tab-dirty {
+            width: 7px;
+            height: 7px;
+            flex: 0 0 7px;
+            border-radius: 50%;
+            background: var(--warning);
+            opacity: 0;
+        }
+
+        .editor-tab.is-dirty .tab-dirty { opacity: 1; }
+
+        .editor-toolbar {
+            min-height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 6px 12px 6px 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(67, 184, 165, 0.04);
+        }
+
+        .save-state {
+            min-width: 0;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            color: var(--text-secondary);
+            font-size: 10px;
+        }
+
+        .save-dot {
+            width: 7px;
+            height: 7px;
+            flex: 0 0 7px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+
+        .save-state[data-state="loading"] .save-dot,
+        .save-state[data-state="saving"] .save-dot { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+        .save-state[data-state="dirty"] .save-dot { background: var(--warning); }
+        .save-state[data-state="conflict"] .save-dot,
+        .save-state[data-state="error"] .save-dot { background: var(--error); }
+
+        .quote-btn {
+            min-height: 28px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            flex: 0 0 auto;
+            padding: 0 8px;
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            color: var(--text-primary);
+            background: var(--accent-soft);
+            cursor: pointer;
+            font-size: 10px;
+        }
+
+        .quote-btn:disabled { opacity: 0.38; cursor: default; }
+        .quote-btn svg { width: 13px; height: 13px; }
+
+        .conflict-bar {
+            min-height: 58px;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 12px 8px 16px;
+            border-bottom: 1px solid rgba(226, 166, 83, 0.38);
+            background: rgba(226, 166, 83, 0.1);
+        }
+
+        .conflict-message {
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 9px;
+        }
+
+        .conflict-message svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--warning); }
+        .conflict-message strong, .conflict-message span { display: block; }
+        .conflict-message strong { font-size: 11px; }
+        .conflict-message span { margin-top: 2px; color: var(--text-secondary); font-size: 10px; }
+        .conflict-actions { display: flex; gap: 6px; }
+
+        .conflict-action {
+            min-height: 28px;
+            padding: 0 8px;
+            border: 1px solid var(--border-strong);
+            border-radius: 6px;
+            color: var(--text-primary);
+            background: #252b2f;
+            cursor: pointer;
+            font-size: 10px;
+        }
+
+        .conflict-action.primary { border-color: var(--warning); background: var(--warning-soft); }
+        .conflict-action:hover, .conflict-action:focus-visible { border-color: var(--text-secondary); outline: none; }
+
+        .editor-frame {
+            min-height: 0;
+            flex: 1;
+            display: grid;
+            grid-template-columns: 48px minmax(0, 1fr);
+            overflow: hidden;
+            background: #111615;
+        }
+
+        .line-gutter {
+            min-height: 0;
+            overflow: hidden;
+            border-right: 1px solid #29302f;
+            background: #151a19;
+            user-select: none;
+        }
+
+        .line-numbers {
+            padding: 14px 9px 42px 4px;
+            color: #596462;
+            font: 10px/20.4px "SFMono-Regular", Consolas, monospace;
+            text-align: right;
+            white-space: pre;
+            will-change: transform;
+        }
+
+        .file-editor {
+            width: 100%;
+            min-width: 0;
+            min-height: 0;
+            resize: none;
+            overflow: auto;
+            border: 0;
+            outline: 0;
+            padding: 14px 22px 42px 14px;
+            color: #dce5e3;
+            caret-color: var(--accent);
+            background: #111615;
+            font: 12px/1.7 "SFMono-Regular", Consolas, monospace;
+            tab-size: 4;
+            white-space: pre;
+        }
+
+        .file-editor:disabled { opacity: 0.68; cursor: wait; }
+
+        .editor-statusbar {
+            min-height: 27px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 4px 12px;
+            border-top: 1px solid var(--border);
+            color: var(--text-muted);
+            background: #181d1f;
+            font-size: 9px;
+        }
+
+        .status-left, .status-right { min-width: 0; display: flex; align-items: center; gap: 11px; }
+        .status-left svg { width: 12px; height: 12px; color: var(--success); }
+        .status-right { justify-content: flex-end; flex-wrap: wrap; }
+
+        .toast {
+            position: fixed;
+            right: 18px;
+            bottom: 18px;
+            z-index: 140;
+            max-width: min(360px, calc(100vw - 36px));
+            padding: 9px 12px;
+            border: 1px solid rgba(67, 184, 165, 0.48);
+            border-radius: 7px;
+            color: var(--text-primary);
+            background: #202927;
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
+            font-size: 11px;
+        }
+
+        @media (max-width: 1060px) {
+            :root { --session-width: 190px; --member-width: 196px; }
+            .persona-select { display: none; }
+            .working-directory { max-width: 48vw; }
+        }
+
+        @media (max-width: 820px) {
+            .app-main { grid-template-columns: var(--member-width) minmax(0, 1fr); }
+            .session-sidebar {
+                position: fixed;
+                top: var(--header-height);
+                left: 0;
+                bottom: 0;
+                z-index: 75;
+                width: min(280px, 84vw);
+                display: none;
+                box-shadow: 18px 0 36px rgba(0, 0, 0, 0.32);
+            }
+            .session-sidebar.mobile-open { display: block; }
+            .mobile-menu { display: inline-flex; }
+            .header-center { justify-content: flex-end; }
+            .brand { font-size: 16px; }
+        }
+
+        @media (max-width: 620px) {
+            :root { --preview-width: 100vw; }
+            .app-header { grid-template-columns: 1fr auto; }
+            .header-center { display: none; }
+            .app-main { grid-template-columns: minmax(0, 1fr); }
+            .member-sidebar { display: none; }
+            .room-header { min-height: 54px; padding: 8px 11px; }
+            .working-directory { max-width: calc(100vw - 88px); }
+            .timeline { padding: 16px 10px 24px; }
+            .msg, .msg.assistant { max-width: 96%; width: 96%; }
+            .msg.user { width: auto; max-width: 90%; }
+            .file-bubble { grid-template-columns: 17px minmax(0, 1fr) auto; }
+            .file-bubble > svg:last-child { display: none; }
+            .preview-drawer { min-width: 0; border-left: 0; }
+            .preview-header { min-height: 76px; padding-left: 12px; }
+            .editor-toolbar { padding-left: 12px; }
+            .editor-frame { grid-template-columns: 40px minmax(0, 1fr); }
+            .line-numbers { padding-right: 7px; }
+            .conflict-bar { grid-template-columns: 1fr; padding-left: 12px; }
+            .conflict-actions { justify-content: flex-end; }
+            .quote-btn span { display: none; }
+            .quote-btn { width: 30px; justify-content: center; padding: 0; }
+            .editor-statusbar { align-items: flex-start; }
+            .status-left { gap: 6px; }
+            .status-right { gap: 6px 9px; }
+            .composer { padding: 8px 9px 10px; }
+        }
+    </style>
+</head>
+<body>
+    <header class="app-header">
+        <div class="header-left">
+            <button id="mobile-menu" class="icon-btn mobile-menu" type="button" title="打开会话列表" aria-label="打开会话列表"><i data-lucide="menu"></i></button>
+            <h1 class="brand">智脑</h1>
+        </div>
+        <div class="header-center">
+            <select class="persona-select" aria-label="人格"><option>NAO · 开发协作</option></select>
+            <div class="view-switch" aria-label="视图">
+                <button class="active" type="button">聊天</button>
+                <button type="button">驾驶舱</button>
+            </div>
+        </div>
+        <div class="header-right">
+            <button class="icon-btn" type="button" title="展开全部思考" aria-label="展开全部思考"><i data-lucide="brain-circuit"></i></button>
+            <button class="icon-btn" type="button" title="新建会话" aria-label="新建会话"><i data-lucide="plus"></i></button>
+        </div>
+    </header>
+
+    <main class="app-main">
+        <aside id="session-sidebar" class="session-sidebar" aria-label="会话列表">
+            <div class="sidebar-heading"><strong>会话</strong><span>3</span></div>
+            <nav class="session-list">
+                <button class="session-row active" type="button">
+                    <i data-lucide="message-square"></i>
+                    <span><strong>文件变更预览</strong><small>刚刚 · 6 条消息</small></span>
+                </button>
+                <button class="session-row" type="button">
+                    <i data-lucide="message-square"></i>
+                    <span><strong>群聊回复上下文</strong><small>昨天 · 18 条消息</small></span>
+                </button>
+                <button class="session-row" type="button">
+                    <i data-lucide="message-square"></i>
+                    <span><strong>运行可靠性检查</strong><small>8 月 9 日 · 24 条消息</small></span>
+                </button>
+            </nav>
+        </aside>
+
+        <aside class="member-sidebar" aria-label="智脑成员">
+            <div class="sidebar-heading"><strong>成员</strong><span>2 / 8</span></div>
+            <div class="member-list">
+                <div class="member-row selected">
+                    <div class="member-avatar">N</div>
+                    <div class="member-info"><strong>Nao</strong><span>Claude Sonnet · 已完成</span></div>
+                    <span class="state-dot"></span>
+                </div>
+                <div class="member-row">
+                    <div class="member-avatar">R</div>
+                    <div class="member-info"><strong>Reviewer</strong><span>GPT-5 · 空闲</span></div>
+                    <span class="state-dot idle"></span>
+                </div>
+            </div>
+            <div class="worker-status"><span class="state-dot idle"></span><span>0 个运行中</span></div>
+        </aside>
+
+        <section class="chat-shell">
+            <header class="room-header">
+                <div class="room-title">
+                    <div><h2>文件变更预览</h2><span>6 条事件</span></div>
+                    <div class="working-directory">/Users/chenh/RustObject/claw-code-parity</div>
+                </div>
+                <button class="icon-btn" type="button" title="刷新房间" aria-label="刷新房间"><i data-lucide="refresh-cw"></i></button>
+            </header>
+
+            <div class="timeline" aria-label="消息列表">
+                <div class="msg user">
+                    <div class="msg-meta"><strong>用户</strong><span>14:32</span><span>→ Nao</span></div>
+                    <p>回复完成后，把本轮新增和修改过的文件展示出来，点击后直接预览文件内容。</p>
+                </div>
+
+                <div class="service-event">Nao 已完成 · 14:34</div>
+
+                <article class="msg assistant">
+                    <div class="msg-meta"><strong>Nao</strong><span>14:34</span></div>
+                    <p>已完成。本轮补充了文件变更归集与消息下方的入口，并复用了现有右侧预览区域。</p>
+                    <p>新增文件会使用绿色标识，已存在文件的修改使用黄色标识。</p>
+
+                    <section class="turn-files" aria-labelledby="turn-files-title">
+                        <div class="turn-files-heading">
+                            <span id="turn-files-title"><i data-lucide="files"></i>本轮文件变更</span>
+                            <span class="file-count">3 个</span>
+                        </div>
+                        <div class="file-bubbles">
+                            <button class="file-bubble" type="button" data-file-id="app" title="预览 /Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/web/static/app.js">
+                                <i data-lucide="file-pen-line"></i>
+                                <span class="file-path">/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/web/static/app.js</span>
+                                <span class="change-kind modified">修改</span>
+                                <i data-lucide="chevron-right"></i>
+                            </button>
+                            <button class="file-bubble" type="button" data-file-id="style" title="预览 /Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/web/static/style.css">
+                                <i data-lucide="file-pen-line"></i>
+                                <span class="file-path">/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/web/static/style.css</span>
+                                <span class="change-kind modified">修改</span>
+                                <i data-lucide="chevron-right"></i>
+                            </button>
+                            <button class="file-bubble" type="button" data-file-id="component" title="预览 /Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/web/static/file_changes.js">
+                                <i data-lucide="file-plus-2"></i>
+                                <span class="file-path">/Users/chenh/RustObject/claw-code-parity/rust/crates/ai-brain-cli/src/web/static/file_changes.js</span>
+                                <span class="change-kind added">新增</span>
+                                <i data-lucide="chevron-right"></i>
+                            </button>
+                        </div>
+                    </section>
+                </article>
+            </div>
+
+            <footer class="composer">
+                <div class="composer-tools">
+                    <div class="mode-control" aria-label="消息模式"><button type="button" class="active">聊天</button><button type="button">任务</button></div>
+                    <span class="recipient">@Nao</span>
+                </div>
+                <div class="composer-row">
+                    <textarea id="composer-input" rows="1" placeholder="发送消息..." aria-label="发送消息"></textarea>
+                    <button class="send-btn" type="button" title="发送" aria-label="发送"><i data-lucide="send-horizontal"></i></button>
+                </div>
+            </footer>
+        </section>
+    </main>
+
+    <div id="preview-backdrop" class="preview-backdrop"></div>
+    <aside id="preview-drawer" class="preview-drawer" aria-hidden="true" aria-label="文件预览与编辑">
+        <header class="preview-header">
+            <div class="preview-heading">
+                <div class="preview-kicker"><span>文件编辑</span><span id="preview-kind" class="change-kind modified">修改</span></div>
+                <h2 id="preview-title">app.js</h2>
+                <div id="preview-path" class="preview-path"></div>
+            </div>
+            <div class="preview-actions">
+                <button id="simulate-disk-update" class="icon-btn" type="button" title="模拟磁盘内容被外部修改" aria-label="模拟磁盘内容被外部修改"><i data-lucide="refresh-cw"></i></button>
+                <button id="copy-path" class="icon-btn" type="button" title="复制绝对路径" aria-label="复制绝对路径"><i data-lucide="copy"></i></button>
+                <button id="preview-close" class="icon-btn" type="button" title="关闭预览" aria-label="关闭预览"><i data-lucide="x"></i></button>
+            </div>
+        </header>
+        <div class="editor-tabs" role="tablist" aria-label="已打开文件">
+            <button id="editor-tab" class="editor-tab" type="button" role="tab" aria-selected="true">
+                <i data-lucide="file-code-2"></i><span id="editor-tab-name" class="editor-tab-name">app.js</span><span class="tab-dirty" aria-hidden="true"></span>
+            </button>
+        </div>
+        <div class="editor-toolbar">
+            <div id="save-state" class="save-state" data-state="saved" aria-live="polite"><span class="save-dot"></span><span id="save-status">已保存</span></div>
+            <button id="quote-selection" class="quote-btn" type="button" disabled><i data-lucide="quote"></i><span>引用选中内容</span></button>
+        </div>
+        <div id="conflict-bar" class="conflict-bar hidden" role="alert">
+            <div class="conflict-message"><i data-lucide="triangle-alert"></i><div><strong>磁盘内容已更新</strong><span>当前编辑内容尚未保存，自动保存已暂停。</span></div></div>
+            <div class="conflict-actions">
+                <button id="keep-local" class="conflict-action" type="button">保留并保存</button>
+                <button id="load-disk" class="conflict-action primary" type="button">加载磁盘版本</button>
+            </div>
+        </div>
+        <div class="editor-frame">
+            <div class="line-gutter" aria-hidden="true"><pre id="line-numbers" class="line-numbers">1</pre></div>
+            <textarea id="file-editor" class="file-editor" spellcheck="false" wrap="off" aria-label="文件内容编辑器"></textarea>
+        </div>
+        <footer class="editor-statusbar">
+            <div class="status-left"><i data-lucide="cloud-check"></i><span>自动保存</span><span id="revision-label">版本 1</span></div>
+            <div class="status-right"><span id="caret-position">行 1，列 1</span><span id="preview-lines">0 行</span><span>LF</span><span>UTF-8</span><span id="preview-language">JavaScript</span></div>
+        </footer>
+    </aside>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script>
+        const projectRoot = '/Users/chenh/RustObject/claw-code-parity';
+        const files = {
+            app: {
+                name: 'app.js',
+                path: `${projectRoot}/rust/crates/ai-brain-cli/src/web/static/app.js`,
+                kind: 'modified',
+                language: 'JavaScript',
+                lines: [
+                    'function appendTurnFiles(container, files) {',
+                    '    container.querySelector(\':scope > .turn-files\')?.remove();',
+                    '    if (!files?.length) return;',
+                    '',
+                    '    const section = document.createElement(\'section\');',
+                    '    section.className = \'turn-files\';',
+                    '    section.setAttribute(\'aria-label\', \'本轮文件变更\');',
+                    '',
+                    '    files.forEach((file) => {',
+                    '        const button = createChangedFileBubble(file);',
+                    '        button.addEventListener(\'click\', () => {',
+                    '            openLocalFilePreview(file);',
+                    '        });',
+                    '        section.appendChild(button);',
+                    '    });',
+                    '',
+                    '    container.appendChild(section);',
+                    '    refreshIcons();',
+                    '}',
+                    '',
+                    'function createChangedFileBubble(file) {',
+                    '    const button = document.createElement(\'button\');',
+                    '    button.type = \'button\';',
+                    '    button.className = \'file-bubble\';',
+                    '    button.title = `预览 ${file.path}`;',
+                    '    button.dataset.path = file.path;',
+                    '    return button;',
+                    '}',
+                ],
+            },
+            style: {
+                name: 'style.css',
+                path: `${projectRoot}/rust/crates/ai-brain-cli/src/web/static/style.css`,
+                kind: 'modified',
+                language: 'CSS',
+                lines: [
+                    '.turn-files {',
+                    '    margin-top: 13px;',
+                    '    padding-top: 11px;',
+                    '    border-top: 1px solid var(--border);',
+                    '}',
+                    '',
+                    '.file-bubble {',
+                    '    width: 100%;',
+                    '    min-height: 38px;',
+                    '    display: grid;',
+                    '    grid-template-columns: 18px minmax(0, 1fr) auto 14px;',
+                    '    align-items: center;',
+                    '    gap: 8px;',
+                    '    padding: 7px 9px;',
+                    '    border: 1px solid var(--border);',
+                    '    border-radius: 7px;',
+                    '    background: var(--bg-elevated);',
+                    '}',
+                    '',
+                    '.file-path {',
+                    '    min-width: 0;',
+                    '    overflow-wrap: anywhere;',
+                    '    font-family: "SFMono-Regular", Consolas, monospace;',
+                    '}',
+                ],
+            },
+            component: {
+                name: 'file_changes.js',
+                path: `${projectRoot}/rust/crates/ai-brain-cli/src/web/static/file_changes.js`,
+                kind: 'added',
+                language: 'JavaScript',
+                lines: [
+                    'export function normalizeChangedFiles(files) {',
+                    '    const byPath = new Map();',
+                    '',
+                    '    for (const file of files || []) {',
+                    '        if (!file?.path) continue;',
+                    '        byPath.set(file.path, {',
+                    '            path: file.path,',
+                    '            name: file.name || basename(file.path),',
+                    '            changeKind: file.change_kind || \'modified\',',
+                    '        });',
+                    '    }',
+                    '',
+                    '    return [...byPath.values()];',
+                    '}',
+                    '',
+                    'function basename(path) {',
+                    '    return String(path).split(/[\\\\/]/).at(-1) || path;',
+                    '}',
+                ],
+            },
+        };
+
+        Object.values(files).forEach((file, index) => {
+            file.diskContent = file.lines.join('\n');
+            file.diskRevision = 1;
+            file.diskUpdatedAt = Date.now() - (index * 1000);
+            delete file.lines;
+        });
+
+        const drawer = document.getElementById('preview-drawer');
+        const backdrop = document.getElementById('preview-backdrop');
+        const title = document.getElementById('preview-title');
+        const path = document.getElementById('preview-path');
+        const kind = document.getElementById('preview-kind');
+        const language = document.getElementById('preview-language');
+        const lineCount = document.getElementById('preview-lines');
+        const fileEditor = document.getElementById('file-editor');
+        const lineNumbers = document.getElementById('line-numbers');
+        const editorTab = document.getElementById('editor-tab');
+        const editorTabName = document.getElementById('editor-tab-name');
+        const saveState = document.getElementById('save-state');
+        const saveStatus = document.getElementById('save-status');
+        const revisionLabel = document.getElementById('revision-label');
+        const caretPosition = document.getElementById('caret-position');
+        const conflictBar = document.getElementById('conflict-bar');
+        const quoteSelection = document.getElementById('quote-selection');
+        const composerInput = document.getElementById('composer-input');
+        const toast = document.getElementById('toast');
+        const sessionSidebar = document.getElementById('session-sidebar');
+        let activeFile = null;
+        let activeFileId = null;
+        let activeTrigger = null;
+        let acknowledgedRevision = 0;
+        let isDirty = false;
+        let conflictSnapshot = null;
+        let saveTimer = null;
+        let savePromise = null;
+        let watcherTimer = null;
+        let openRequestId = 0;
+        let toastTimer = null;
+
+        const delay = (duration) => new Promise((resolve) => setTimeout(resolve, duration));
+
+        async function readLatestFile(file) {
+            await delay(140);
+            return {
+                content: file.diskContent,
+                revision: file.diskRevision,
+                updatedAt: file.diskUpdatedAt,
+            };
+        }
+
+        async function persistFile(file, content, expectedRevision) {
+            await delay(360);
+            if (file.diskRevision !== expectedRevision) {
+                return { conflict: true, latest: await readLatestFile(file) };
+            }
+            file.diskContent = content;
+            file.diskRevision += 1;
+            file.diskUpdatedAt = Date.now();
+            return {
+                saved: true,
+                revision: file.diskRevision,
+                updatedAt: file.diskUpdatedAt,
+            };
+        }
+
+        function setSaveState(state, message) {
+            saveState.dataset.state = state;
+            saveStatus.textContent = message;
+        }
+
+        function setDirty(nextDirty) {
+            isDirty = nextDirty;
+            editorTab.classList.toggle('is-dirty', nextDirty);
+        }
+
+        function updateCaretPosition() {
+            const beforeCaret = fileEditor.value.slice(0, fileEditor.selectionStart);
+            const rows = beforeCaret.split('\n');
+            caretPosition.textContent = `行 ${rows.length}，列 ${rows.at(-1).length + 1}`;
+        }
+
+        function updateEditorMetrics() {
+            const totalLines = Math.max(1, fileEditor.value.split('\n').length);
+            lineNumbers.textContent = Array.from({ length: totalLines }, (_, index) => index + 1).join('\n');
+            lineCount.textContent = `${totalLines} 行`;
+            updateCaretPosition();
+        }
+
+        function syncLineNumberScroll() {
+            lineNumbers.style.transform = `translateY(${-fileEditor.scrollTop}px)`;
+        }
+
+        function setEditorContent(content, preserveView = false) {
+            const view = preserveView
+                ? {
+                    start: fileEditor.selectionStart,
+                    end: fileEditor.selectionEnd,
+                    top: fileEditor.scrollTop,
+                    left: fileEditor.scrollLeft,
+                }
+                : null;
+            fileEditor.value = content;
+            updateEditorMetrics();
+            if (view) {
+                const max = fileEditor.value.length;
+                fileEditor.setSelectionRange(Math.min(view.start, max), Math.min(view.end, max));
+                fileEditor.scrollTop = view.top;
+                fileEditor.scrollLeft = view.left;
+                syncLineNumberScroll();
+            } else {
+                fileEditor.setSelectionRange(0, 0);
+                fileEditor.scrollTop = 0;
+                fileEditor.scrollLeft = 0;
+                syncLineNumberScroll();
+            }
+        }
+
+        function applyDiskSnapshot(snapshot, options = {}) {
+            acknowledgedRevision = snapshot.revision;
+            conflictSnapshot = null;
+            conflictBar.classList.add('hidden');
+            setEditorContent(snapshot.content, Boolean(options.preserveView));
+            setDirty(false);
+            fileEditor.disabled = false;
+            quoteSelection.disabled = true;
+            revisionLabel.textContent = `版本 ${snapshot.revision}`;
+            setSaveState('saved', options.message || '已加载最新内容');
+        }
+
+        function enterConflict(snapshot) {
+            clearTimeout(saveTimer);
+            conflictSnapshot = snapshot;
+            setDirty(true);
+            conflictBar.classList.remove('hidden');
+            revisionLabel.textContent = `版本 ${acknowledgedRevision} → ${snapshot.revision}`;
+            setSaveState('conflict', '检测到磁盘冲突');
+        }
+
+        function scheduleAutoSave() {
+            clearTimeout(saveTimer);
+            if (!isDirty || conflictSnapshot) return;
+            saveTimer = setTimeout(() => saveActiveFile(), 700);
+        }
+
+        async function performSave(options = {}) {
+            if (!activeFile || !isDirty) return true;
+            if (conflictSnapshot && !options.adoptLatest) return false;
+            clearTimeout(saveTimer);
+            if (options.adoptLatest && conflictSnapshot) {
+                acknowledgedRevision = conflictSnapshot.revision;
+                conflictSnapshot = null;
+                conflictBar.classList.add('hidden');
+            }
+            const savingFile = activeFile;
+            const savingFileId = activeFileId;
+            const savingContent = fileEditor.value;
+            setSaveState('saving', '正在自动保存...');
+            try {
+                const result = await persistFile(savingFile, savingContent, acknowledgedRevision);
+                if (savingFileId !== activeFileId) return true;
+                if (result.conflict) {
+                    enterConflict(result.latest);
+                    return false;
+                }
+                acknowledgedRevision = result.revision;
+                revisionLabel.textContent = `版本 ${result.revision}`;
+                if (fileEditor.value === savingContent) {
+                    setDirty(false);
+                    setSaveState('saved', `已自动保存 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`);
+                } else {
+                    setDirty(true);
+                    setSaveState('dirty', '有新的未保存修改');
+                    scheduleAutoSave();
+                }
+                return true;
+            } catch (error) {
+                setDirty(true);
+                setSaveState('error', `保存失败：${error.message}`);
+                return false;
+            }
+        }
+
+        function saveActiveFile(options = {}) {
+            if (savePromise) return savePromise;
+            savePromise = performSave(options).finally(() => {
+                savePromise = null;
+            });
+            return savePromise;
+        }
+
+        async function flushActiveFile() {
+            clearTimeout(saveTimer);
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                if (!isDirty) return true;
+                const saved = await saveActiveFile();
+                if (!saved) return false;
+            }
+            return !isDirty;
+        }
+
+        async function checkLatestContent(options = {}) {
+            if (!activeFile || !drawer.classList.contains('open')) return;
+            const checkingFile = activeFile;
+            const latest = await readLatestFile(checkingFile);
+            if (checkingFile !== activeFile || latest.revision === acknowledgedRevision) return;
+            if (isDirty || savePromise) {
+                enterConflict(latest);
+                return;
+            }
+            applyDiskSnapshot(latest, {
+                preserveView: true,
+                message: '已自动加载磁盘最新版本',
+            });
+            if (options.announce) showToast('已自动加载磁盘最新内容');
+        }
+
+        function startLatestContentWatcher() {
+            clearInterval(watcherTimer);
+            watcherTimer = setInterval(() => checkLatestContent(), 4000);
+        }
+
+        async function openPreview(fileId, trigger) {
+            const file = files[fileId];
+            if (!file) return;
+            if (activeFile === file && drawer.classList.contains('open')) {
+                fileEditor.focus();
+                return;
+            }
+            if (activeFile && isDirty) {
+                const saved = await flushActiveFile();
+                if (!saved) {
+                    showToast('请先处理当前文件的磁盘冲突');
+                    return;
+                }
+            } else if (savePromise) {
+                const saved = await savePromise;
+                if (!saved) return;
+            }
+
+            const requestId = ++openRequestId;
+            clearInterval(watcherTimer);
+            activeFile = file;
+            activeFileId = fileId;
+            activeTrigger = trigger;
+            conflictSnapshot = null;
+            quoteSelection.disabled = true;
+            document.querySelectorAll('.file-bubble').forEach((button) => {
+                button.classList.toggle('active', button === trigger);
+            });
+            title.textContent = file.name;
+            editorTabName.textContent = file.name;
+            path.textContent = file.path;
+            kind.textContent = file.kind === 'added' ? '新增' : '修改';
+            kind.className = `change-kind ${file.kind}`;
+            language.textContent = file.language;
+            drawer.classList.add('open');
+            drawer.setAttribute('aria-hidden', 'false');
+            backdrop.classList.add('visible');
+            conflictBar.classList.add('hidden');
+            fileEditor.disabled = true;
+            setDirty(false);
+            setSaveState('loading', '正在加载最新内容...');
+            const snapshot = await readLatestFile(file);
+            if (requestId !== openRequestId || file !== activeFile) return;
+            applyDiskSnapshot(snapshot);
+            startLatestContentWatcher();
+            fileEditor.focus();
+        }
+
+        async function closePreview() {
+            if (isDirty) {
+                const saved = await flushActiveFile();
+                if (!saved) {
+                    showToast('请先处理磁盘版本冲突');
+                    return;
+                }
+            }
+            openRequestId += 1;
+            clearInterval(watcherTimer);
+            drawer.classList.remove('open');
+            drawer.setAttribute('aria-hidden', 'true');
+            backdrop.classList.remove('visible');
+            conflictBar.classList.add('hidden');
+            document.querySelectorAll('.file-bubble').forEach((button) => button.classList.remove('active'));
+            const trigger = activeTrigger;
+            activeFile = null;
+            activeFileId = null;
+            activeTrigger = null;
+            if (trigger) trigger.focus();
+        }
+
+        function showToast(message) {
+            clearTimeout(toastTimer);
+            toast.textContent = message;
+            toast.classList.remove('hidden');
+            toastTimer = setTimeout(() => toast.classList.add('hidden'), 1800);
+        }
+
+        async function copyActivePath() {
+            if (!activeFile) return;
+            try {
+                await navigator.clipboard.writeText(activeFile.path);
+            } catch (_) {
+                const helper = document.createElement('textarea');
+                helper.value = activeFile.path;
+                helper.style.position = 'fixed';
+                helper.style.opacity = '0';
+                document.body.appendChild(helper);
+                helper.select();
+                document.execCommand('copy');
+                helper.remove();
+            }
+            showToast('绝对路径已复制');
+        }
+
+        function updateEditorSelection() {
+            quoteSelection.disabled = fileEditor.selectionStart === fileEditor.selectionEnd;
+            updateCaretPosition();
+        }
+
+        function quoteSelectedText() {
+            if (!activeFile || fileEditor.selectionStart === fileEditor.selectionEnd) return;
+            const start = fileEditor.selectionStart;
+            const end = fileEditor.selectionEnd;
+            const selectedText = fileEditor.value.slice(start, end);
+            const startLine = fileEditor.value.slice(0, start).split('\n').length;
+            const endLine = startLine + selectedText.split('\n').length - 1;
+            const lines = startLine === endLine ? `${startLine}` : `${startLine}-${endLine}`;
+            const quoted = selectedText.split('\n').map((line) => `> ${line}`).join('\n');
+            const reference = `[引用文件: ${activeFile.name} | 路径: ${activeFile.path} | 行号: ${lines}]\n${quoted}\n\n`;
+            composerInput.setRangeText(reference, composerInput.selectionStart, composerInput.selectionEnd, 'end');
+            showToast('已引用到消息框');
+        }
+
+        async function simulateDiskUpdate() {
+            if (!activeFile) return;
+            const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+            const marker = activeFile.language === 'CSS'
+                ? `/* 磁盘外部更新 ${timestamp} */`
+                : `// 磁盘外部更新 ${timestamp}`;
+            activeFile.diskContent = `${marker}\n${activeFile.diskContent}`;
+            activeFile.diskRevision += 1;
+            activeFile.diskUpdatedAt = Date.now();
+            showToast('已模拟磁盘更新');
+            await checkLatestContent({ announce: true });
+        }
+
+        function loadDiskVersion() {
+            if (!conflictSnapshot) return;
+            applyDiskSnapshot(conflictSnapshot, {
+                message: '已加载磁盘版本',
+            });
+            showToast('已加载磁盘版本');
+            fileEditor.focus();
+        }
+
+        async function keepAndSaveLocalVersion() {
+            if (!conflictSnapshot) return;
+            setSaveState('dirty', '准备保存当前修改...');
+            const saved = await saveActiveFile({ adoptLatest: true });
+            if (saved) showToast('当前修改已保存为最新版本');
+            fileEditor.focus();
+        }
+
+        document.querySelectorAll('.file-bubble').forEach((button) => {
+            button.addEventListener('click', () => openPreview(button.dataset.fileId, button));
+        });
+        document.getElementById('preview-close').addEventListener('click', closePreview);
+        document.getElementById('copy-path').addEventListener('click', copyActivePath);
+        document.getElementById('simulate-disk-update').addEventListener('click', simulateDiskUpdate);
+        document.getElementById('load-disk').addEventListener('click', loadDiskVersion);
+        document.getElementById('keep-local').addEventListener('click', keepAndSaveLocalVersion);
+        document.getElementById('quote-selection').addEventListener('click', quoteSelectedText);
+        document.getElementById('mobile-menu').addEventListener('click', () => sessionSidebar.classList.toggle('mobile-open'));
+        backdrop.addEventListener('click', closePreview);
+        fileEditor.addEventListener('input', () => {
+            setDirty(true);
+            setSaveState('dirty', conflictSnapshot ? '等待处理磁盘冲突' : '有未保存修改');
+            updateEditorMetrics();
+            scheduleAutoSave();
+        });
+        fileEditor.addEventListener('scroll', syncLineNumberScroll);
+        fileEditor.addEventListener('select', updateEditorSelection);
+        fileEditor.addEventListener('click', updateEditorSelection);
+        fileEditor.addEventListener('keyup', updateEditorSelection);
+        fileEditor.addEventListener('keydown', (event) => {
+            if (event.key === 'Tab') {
+                event.preventDefault();
+                fileEditor.setRangeText('    ', fileEditor.selectionStart, fileEditor.selectionEnd, 'end');
+                fileEditor.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        });
+        document.addEventListener('keydown', (event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's' && drawer.classList.contains('open')) {
+                event.preventDefault();
+                saveActiveFile();
+                return;
+            }
+            if (event.key === 'Escape' && drawer.classList.contains('open')) closePreview();
+        });
+        window.addEventListener('focus', () => checkLatestContent({ announce: true }));
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') checkLatestContent({ announce: true });
+        });
+        window.addEventListener('beforeunload', (event) => {
+            if (!isDirty) return;
+            event.preventDefault();
+            event.returnValue = '';
+        });
+        window.addEventListener('resize', () => {
+            if (window.innerWidth > 820) sessionSidebar.classList.remove('mobile-open');
+        });
+
+        window.prototypeFileEditor = {
+            getState: () => ({
+                fileId: activeFileId,
+                dirty: isDirty,
+                state: saveState.dataset.state,
+                acknowledgedRevision,
+                diskRevision: activeFile?.diskRevision || null,
+            }),
+            openFile: (fileId) => {
+                const trigger = [...document.querySelectorAll('.file-bubble')]
+                    .find((button) => button.dataset.fileId === fileId);
+                return openPreview(fileId, trigger);
+            },
+            edit: (content) => {
+                fileEditor.value = content;
+                fileEditor.dispatchEvent(new Event('input', { bubbles: true }));
+            },
+            content: () => fileEditor.value,
+            flush: flushActiveFile,
+            close: closePreview,
+            loadDiskVersion,
+            keepAndSaveLocalVersion,
+            simulateDiskUpdate,
+        };
+
+        if (typeof lucide !== 'undefined') {
+            lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+        }
+    </script>
+</body>
+</html>

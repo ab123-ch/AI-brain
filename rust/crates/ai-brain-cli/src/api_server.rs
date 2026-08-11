@@ -1,3 +1,6 @@
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query as AxumQuery, Request, State};
@@ -9,6 +12,7 @@ use axum::Json;
 use axum::Router;
 use brain_llm::config::LlmConfig;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::orchestrator::Orchestrator;
@@ -433,7 +437,9 @@ async fn serve_web_with_policy(
         orch,
         sessions,
         collaboration,
+        collaboration_repository,
         workspace_root: workspace_root.clone(),
+        local_file_save_lock: Mutex::new(()),
     });
 
     let app = Router::new()
@@ -577,122 +583,322 @@ async fn serve_room_reply_js() -> impl IntoResponse {
 #[derive(Deserialize)]
 struct LocalFileQuery {
     path: String,
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct SaveLocalFileRequest {
     path: String,
     content: String,
+    expected_revision: String,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+const MAX_LOCAL_FILE_BYTES: usize = 5 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LocalFileSnapshot {
+    name: String,
+    path: String,
+    content: String,
+    revision: String,
+}
+
+#[derive(Debug)]
+enum LocalFileFailure {
+    Status(StatusCode, String),
+    Conflict(LocalFileSnapshot),
+}
+
+impl LocalFileFailure {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Status(status, error) => {
+                (status, Json(serde_json::json!({"error": error}))).into_response()
+            }
+            Self::Conflict(snapshot) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "文件已在磁盘上更新，请先处理版本冲突",
+                    "name": snapshot.name,
+                    "path": snapshot.path,
+                    "content": snapshot.content,
+                    "revision": snapshot.revision,
+                })),
+            )
+                .into_response(),
+        }
+    }
 }
 
 async fn serve_local_file(
     State(state): State<Arc<AppState>>,
     AxumQuery(query): AxumQuery<LocalFileQuery>,
 ) -> axum::response::Response {
-    let requested = std::path::PathBuf::from(query.path.trim_start_matches(r"\\?\"));
+    let result = authorize_local_file(&state, &query.path, query.run_id.as_deref())
+        .and_then(|canonical| read_local_file_snapshot_at(&canonical));
+    match result {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn canonicalize_local_file(
+    workspace_root: &std::path::Path,
+    requested_path: &str,
+) -> Result<PathBuf, LocalFileFailure> {
+    let requested = PathBuf::from(requested_path.trim_start_matches(r"\\?\"));
     let requested = if requested.is_absolute() {
         requested
     } else {
-        state.workspace_root.join(requested)
+        workspace_root.join(requested)
     };
-    let Ok(canonical) = std::fs::canonicalize(&requested) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "文件不存在"})),
-        )
-            .into_response();
-    };
-    if !canonical.starts_with(&state.workspace_root) || !canonical.is_file() {
-        return (
+    let canonical = fs::canonicalize(&requested)
+        .map_err(|_| LocalFileFailure::Status(StatusCode::NOT_FOUND, "文件不存在".into()))?;
+    if !canonical.is_file() {
+        return Err(LocalFileFailure::Status(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "只允许预览当前工作区文件"})),
-        )
-            .into_response();
+            "只允许访问文件".into(),
+        ));
     }
-    let Ok(metadata) = std::fs::metadata(&canonical) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "无法读取文件信息"})),
+    Ok(canonical)
+}
+
+fn authorize_local_file(
+    state: &AppState,
+    requested_path: &str,
+    run_id: Option<&str>,
+) -> Result<PathBuf, LocalFileFailure> {
+    let canonical = canonicalize_local_file(&state.workspace_root, requested_path)?;
+    let canonical_workspace = fs::canonicalize(&state.workspace_root).map_err(|error| {
+        LocalFileFailure::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法读取工作区: {error}"),
         )
-            .into_response();
+    })?;
+    if canonical.starts_with(canonical_workspace) {
+        return Ok(canonical);
+    }
+    let authorized = match run_id {
+        Some(run_id) => state
+            .collaboration_repository
+            .run_changed_file_exists(run_id, &canonical)
+            .map_err(|error| {
+                LocalFileFailure::Status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("校验运行文件权限失败: {error}"),
+                )
+            })?,
+        None => false,
     };
-    if metadata.len() > 5 * 1024 * 1024 {
-        return (
+    if authorized {
+        return Ok(canonical);
+    }
+    Err(LocalFileFailure::Status(
+        StatusCode::FORBIDDEN,
+        "只允许访问当前工作区或本轮变更文件".into(),
+    ))
+}
+
+#[cfg(test)]
+fn resolve_workspace_local_file(
+    workspace_root: &std::path::Path,
+    requested_path: &str,
+) -> Result<PathBuf, LocalFileFailure> {
+    let canonical = canonicalize_local_file(workspace_root, requested_path)?;
+    let canonical_workspace = fs::canonicalize(workspace_root).map_err(|error| {
+        LocalFileFailure::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法读取工作区: {error}"),
+        )
+    })?;
+    if !canonical.starts_with(canonical_workspace) {
+        return Err(LocalFileFailure::Status(
+            StatusCode::FORBIDDEN,
+            "只允许访问当前工作区文件".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(test)]
+fn read_local_file_snapshot(
+    workspace_root: &std::path::Path,
+    requested_path: &str,
+) -> Result<LocalFileSnapshot, LocalFileFailure> {
+    let canonical = resolve_workspace_local_file(workspace_root, requested_path)?;
+    read_local_file_snapshot_at(&canonical)
+}
+
+fn read_local_file_snapshot_at(
+    canonical: &std::path::Path,
+) -> Result<LocalFileSnapshot, LocalFileFailure> {
+    let metadata = fs::metadata(&canonical)
+        .map_err(|_| LocalFileFailure::Status(StatusCode::NOT_FOUND, "无法读取文件信息".into()))?;
+    if metadata.len() > MAX_LOCAL_FILE_BYTES as u64 {
+        return Err(LocalFileFailure::Status(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "文件超过 5MB，无法在线预览"})),
-        )
-            .into_response();
+            "文件超过 5MB，无法在线预览".into(),
+        ));
     }
-    let Ok(content) = std::fs::read_to_string(&canonical) else {
-        return (
+    let bytes = fs::read(&canonical).map_err(|error| {
+        LocalFileFailure::Status(StatusCode::NOT_FOUND, format!("无法读取文件: {error}"))
+    })?;
+    if bytes.len() > MAX_LOCAL_FILE_BYTES {
+        return Err(LocalFileFailure::Status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "文件超过 5MB，无法在线预览".into(),
+        ));
+    }
+    let content = String::from_utf8(bytes).map_err(|_| {
+        LocalFileFailure::Status(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Json(serde_json::json!({"error": "当前仅支持文本文件预览"})),
+            "当前仅支持文本文件预览".into(),
         )
-            .into_response();
-    };
+    })?;
     let name = canonical
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("文件");
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "name": name,
-            "path": canonical.to_string_lossy(),
-            "content": content,
-        })),
-    )
-        .into_response()
+        .unwrap_or("文件")
+        .to_owned();
+    let revision = local_file_revision(content.as_bytes());
+    Ok(LocalFileSnapshot {
+        name,
+        path: canonical.to_string_lossy().into_owned(),
+        content,
+        revision,
+    })
 }
 
 async fn save_local_file(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SaveLocalFileRequest>,
 ) -> axum::response::Response {
-    if request.content.len() > 5 * 1024 * 1024 {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "文件超过 5MB"})),
-        )
-            .into_response();
-    }
-    let requested = std::path::PathBuf::from(request.path.trim_start_matches(r"\\?\"));
-    let requested = if requested.is_absolute() {
-        requested
-    } else {
-        state.workspace_root.join(requested)
+    let canonical = match authorize_local_file(&state, &request.path, request.run_id.as_deref()) {
+        Ok(canonical) => canonical,
+        Err(error) => return error.into_response(),
     };
-    let Ok(canonical) = std::fs::canonicalize(requested) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "文件不存在"})),
-        )
-            .into_response();
-    };
-    if !canonical.starts_with(&state.workspace_root) || !canonical.is_file() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "只允许修改当前工作区文件"})),
-        )
-            .into_response();
-    }
-    match std::fs::write(canonical, request.content) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"saved": true}))).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("保存失败: {error}")})),
+    let _save_guard = state.local_file_save_lock.lock().await;
+    match save_local_file_snapshot_at(&canonical, request) {
+        Ok(snapshot) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "saved": true,
+                "name": snapshot.name,
+                "path": snapshot.path,
+                "revision": snapshot.revision,
+            })),
         )
             .into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
 #[cfg(test)]
+fn save_local_file_snapshot(
+    workspace_root: &std::path::Path,
+    request: SaveLocalFileRequest,
+) -> Result<LocalFileSnapshot, LocalFileFailure> {
+    let canonical = resolve_workspace_local_file(workspace_root, &request.path)?;
+    save_local_file_snapshot_at(&canonical, request)
+}
+
+fn save_local_file_snapshot_at(
+    canonical: &std::path::Path,
+    request: SaveLocalFileRequest,
+) -> Result<LocalFileSnapshot, LocalFileFailure> {
+    if request.content.len() > MAX_LOCAL_FILE_BYTES {
+        return Err(LocalFileFailure::Status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "文件超过 5MB".into(),
+        ));
+    }
+    if request.expected_revision.trim().is_empty() {
+        return Err(LocalFileFailure::Status(
+            StatusCode::BAD_REQUEST,
+            "保存请求缺少文件版本".into(),
+        ));
+    }
+    let current = read_local_file_snapshot_at(canonical)?;
+    if current.revision != request.expected_revision {
+        return Err(LocalFileFailure::Conflict(current));
+    }
+    let parent = canonical.parent().ok_or_else(|| {
+        LocalFileFailure::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法确定文件所在目录".into(),
+        )
+    })?;
+    let permissions = fs::metadata(&canonical)
+        .map_err(|error| {
+            LocalFileFailure::Status(StatusCode::NOT_FOUND, format!("无法读取文件信息: {error}"))
+        })?
+        .permissions();
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        LocalFileFailure::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建临时文件失败: {error}"),
+        )
+    })?;
+    temporary
+        .write_all(request.content.as_bytes())
+        .and_then(|()| temporary.flush())
+        .map_err(|error| {
+            LocalFileFailure::Status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("写入临时文件失败: {error}"),
+            )
+        })?;
+    fs::set_permissions(temporary.path(), permissions).map_err(|error| {
+        LocalFileFailure::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保留文件权限失败: {error}"),
+        )
+    })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        LocalFileFailure::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("同步临时文件失败: {error}"),
+        )
+    })?;
+
+    let latest = read_local_file_snapshot_at(canonical)?;
+    if latest.revision != request.expected_revision {
+        return Err(LocalFileFailure::Conflict(latest));
+    }
+    temporary.persist(canonical).map_err(|error| {
+        LocalFileFailure::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("原子替换文件失败: {}", error.error),
+        )
+    })?;
+    let revision = local_file_revision(request.content.as_bytes());
+    Ok(LocalFileSnapshot {
+        name: current.name,
+        path: current.path,
+        content: request.content,
+        revision,
+    })
+}
+
+fn local_file_revision(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
+}
+
+#[cfg(test)]
 mod static_asset_tests {
+    use std::fs;
+
     use axum::body::to_bytes;
-    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{header::CONTENT_TYPE, StatusCode};
     use axum::response::IntoResponse;
 
-    use super::{serve_model_catalog_js, serve_room_reply_js};
+    use super::{
+        local_file_revision, read_local_file_snapshot, save_local_file_snapshot,
+        serve_model_catalog_js, serve_room_reply_js, LocalFileFailure, SaveLocalFileRequest,
+    };
 
     #[tokio::test]
     async fn collaboration_web_assets_serves_room_reply_script() {
@@ -708,6 +914,84 @@ mod static_asset_tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.contains("RoomReply"));
+    }
+
+    #[test]
+    fn local_file_read_returns_content_revision_and_rejects_outside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("sample.rs");
+        let outside_file = outside.path().join("outside.rs");
+        fs::write(&file, "fn sample() {}\n").unwrap();
+        fs::write(&outside_file, "fn outside() {}\n").unwrap();
+
+        let snapshot = read_local_file_snapshot(workspace.path(), file.to_str().unwrap()).unwrap();
+        assert_eq!(snapshot.name, "sample.rs");
+        assert_eq!(snapshot.content, "fn sample() {}\n");
+        assert_eq!(
+            snapshot.revision,
+            local_file_revision(snapshot.content.as_bytes())
+        );
+
+        let outside_error =
+            read_local_file_snapshot(workspace.path(), outside_file.to_str().unwrap()).unwrap_err();
+        assert!(matches!(
+            outside_error,
+            LocalFileFailure::Status(StatusCode::FORBIDDEN, _)
+        ));
+    }
+
+    #[test]
+    fn local_file_save_is_revision_guarded_and_preserves_permissions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("editable.sh");
+        fs::write(&file, "before\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o744)).unwrap();
+        }
+        let initial = read_local_file_snapshot(workspace.path(), file.to_str().unwrap()).unwrap();
+        let saved = save_local_file_snapshot(
+            workspace.path(),
+            SaveLocalFileRequest {
+                path: initial.path.clone(),
+                content: "saved\n".into(),
+                expected_revision: initial.revision,
+                run_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "saved\n");
+        assert_eq!(saved.revision, local_file_revision(b"saved\n"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o744
+            );
+        }
+
+        fs::write(&file, "external\n").unwrap();
+        let conflict = save_local_file_snapshot(
+            workspace.path(),
+            SaveLocalFileRequest {
+                path: saved.path,
+                content: "local overwrite\n".into(),
+                expected_revision: saved.revision,
+                run_id: None,
+            },
+        )
+        .unwrap_err();
+        let LocalFileFailure::Conflict(disk) = conflict else {
+            panic!("expected an optimistic concurrency conflict");
+        };
+        assert_eq!(disk.content, "external\n");
+        assert_eq!(disk.revision, local_file_revision(b"external\n"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "external\n");
     }
 
     #[tokio::test]

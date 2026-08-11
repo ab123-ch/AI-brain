@@ -30,11 +30,13 @@ use crate::web::collaboration::{
     validate_working_directory_access, BrainMemberView, ClaimReleaseDisposition, ClaimedInboxItem,
     CollaborationActor, CollaborationConfig, CollaborationError, CollaborationRepository,
     InboxFailureDisposition, InboxPurpose, LegacyMessageSeed, MemberAddress, MemberHistoryMessage,
-    ParticipationCompletion, ParticipationDisposition, PostMessageResult, RoomEventPage,
-    RoomEventReferenceView, RoomEventView, RoomInputMode, RoomSnapshot,
+    ParticipationCompletion, ParticipationDisposition, PostMessageResult, RoomChangedFileView,
+    RoomEventPage, RoomEventReferenceView, RoomEventView, RoomFileChangeKind, RoomInputMode,
+    RoomSnapshot,
 };
 use crate::web::collaboration_tools::GroupMessageToolScope;
 use crate::web::progress_adapter::WebProgressEvent;
+use crate::workspace_changes::{DetectedChangeKind, WorkspaceSnapshot};
 
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const EVENT_CHANNEL_CAPACITY: usize = 1_024;
@@ -1181,6 +1183,13 @@ impl CollaborationRuntime {
         execution_policy: &MemberExecutionPolicy,
         tool_execution_context: ToolExecutionContext,
     ) -> Result<(), ClaimRunError> {
+        let execution_working_directory = tool_execution_context.working_directory.clone();
+        let workspace_before = capture_workspace_snapshot(
+            execution_working_directory.clone(),
+            &claim.run_id,
+            "before",
+        )
+        .await;
         let memory_scope =
             ConversationMemoryScope::new(&claim.member_id, &claim.run_id).map_err(|error| {
                 ClaimRunError::pre_execution(format!("创建成员记忆作用域失败: {error}"))
@@ -1269,6 +1278,32 @@ impl CollaborationRuntime {
                 if interrupted {
                     return Err(ClaimRunError::with_runtime_usage("运行已中断", usage));
                 }
+
+                let changed_files = detect_workspace_changes(
+                    workspace_before,
+                    execution_working_directory,
+                    &claim.run_id,
+                )
+                .await;
+                let changed_file_repository = Arc::clone(&self.repository);
+                let run_for_changed_files = claim.run_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    changed_file_repository
+                        .replace_run_changed_files(&run_for_changed_files, &changed_files)
+                })
+                .await
+                .map_err(|error| {
+                    ClaimRunError::with_runtime_usage(
+                        format!("持久化本轮文件变更线程失败: {error}"),
+                        usage,
+                    )
+                })?
+                .map_err(|error| {
+                    ClaimRunError::with_runtime_usage(
+                        format!("持久化本轮文件变更失败: {error}"),
+                        usage,
+                    )
+                })?;
 
                 let final_answer = output.answer;
                 let artifact_repository = Arc::clone(&self.task_repository);
@@ -2012,6 +2047,53 @@ impl CollaborationRuntime {
             }
         }
     }
+}
+
+async fn capture_workspace_snapshot(
+    working_directory: std::path::PathBuf,
+    run_id: &str,
+    phase: &str,
+) -> Option<WorkspaceSnapshot> {
+    match tokio::task::spawn_blocking(move || WorkspaceSnapshot::capture(&working_directory)).await
+    {
+        Ok(Ok(snapshot)) => Some(snapshot),
+        Ok(Err(error)) => {
+            tracing::warn!(run_id, phase, "抓取工作区文件快照失败: {error}");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(run_id, phase, "抓取工作区文件快照线程失败: {error}");
+            None
+        }
+    }
+}
+
+async fn detect_workspace_changes(
+    before: Option<WorkspaceSnapshot>,
+    working_directory: std::path::PathBuf,
+    run_id: &str,
+) -> Vec<RoomChangedFileView> {
+    let Some(before) = before else {
+        return Vec::new();
+    };
+    let current = capture_workspace_snapshot(working_directory, run_id, "after").await;
+    let Some(current) = current else {
+        return Vec::new();
+    };
+    before
+        .changes_since(&current)
+        .into_iter()
+        .filter_map(|change| {
+            let path = change.path.to_str()?.to_owned();
+            Some(RoomChangedFileView {
+                path,
+                change_kind: match change.kind {
+                    DetectedChangeKind::Added => RoomFileChangeKind::Added,
+                    DetectedChangeKind::Modified => RoomFileChangeKind::Modified,
+                },
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]

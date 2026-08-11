@@ -18,7 +18,7 @@ use task_engine::SchedulerLimits;
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 const DEFAULT_PROFILE_ID: &str = "general_member";
 pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
@@ -731,6 +731,8 @@ pub struct RoomEventView {
     pub kind: String,
     pub content: String,
     pub run_id: Option<String>,
+    #[serde(default)]
+    pub changed_files: Vec<RoomChangedFileView>,
     pub parent_event_id: Option<String>,
     #[serde(default)]
     pub reply_reference: Option<RoomEventReferenceView>,
@@ -739,6 +741,36 @@ pub struct RoomEventView {
     pub group_enabled: bool,
     pub conversation_mode: RoomInputMode,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomFileChangeKind {
+    Added,
+    Modified,
+}
+
+impl RoomFileChangeKind {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+        }
+    }
+
+    fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "added" => Some(Self::Added),
+            "modified" => Some(Self::Modified),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomChangedFileView {
+    pub path: String,
+    pub change_kind: RoomFileChangeKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -973,6 +1005,73 @@ impl CollaborationRepository {
         &self.database_path
     }
 
+    pub fn replace_run_changed_files(
+        &self,
+        run_id: &str,
+        files: &[RoomChangedFileView],
+    ) -> Result<()> {
+        if run_id.trim().is_empty() {
+            return Err(CollaborationError::Config(
+                "文件变更记录缺少运行标识".into(),
+            ));
+        }
+        let mut unique = HashMap::<String, RoomFileChangeKind>::new();
+        for file in files {
+            if !Path::new(&file.path).is_absolute() {
+                return Err(CollaborationError::Config(format!(
+                    "文件变更路径不是绝对路径: {}",
+                    file.path
+                )));
+            }
+            unique
+                .entry(file.path.clone())
+                .and_modify(|kind| {
+                    if file.change_kind == RoomFileChangeKind::Added {
+                        *kind = RoomFileChangeKind::Added;
+                    }
+                })
+                .or_insert(file.change_kind);
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM collaboration_run_changed_files WHERE run_id = ?1",
+            [run_id],
+        )?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO collaboration_run_changed_files(run_id, path, change_kind)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            let mut files = unique.into_iter().collect::<Vec<_>>();
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            for (path, change_kind) in files {
+                statement.execute(params![run_id, path, change_kind.as_db()])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn run_changed_file_exists(&self, run_id: &str, path: &Path) -> Result<bool> {
+        let Some(path) = path.to_str() else {
+            return Ok(false);
+        };
+        if run_id.trim().is_empty() || !Path::new(path).is_absolute() {
+            return Ok(false);
+        }
+        self.connect()?
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM collaboration_run_changed_files
+                     WHERE run_id = ?1 AND path = ?2
+                 )",
+                params![run_id, path],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     fn connect(&self) -> Result<Connection> {
         let connection = Connection::open(&self.database_path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -1070,6 +1169,12 @@ impl CollaborationRepository {
              );
              CREATE INDEX IF NOT EXISTS room_events_room_seq_idx
                  ON room_events(room_id, sequence);
+             CREATE TABLE IF NOT EXISTS collaboration_run_changed_files (
+                 run_id TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 change_kind TEXT NOT NULL CHECK(change_kind IN ('added', 'modified')),
+                 PRIMARY KEY(run_id, path)
+             );
              CREATE TABLE IF NOT EXISTS room_event_recipients (
                  event_id TEXT NOT NULL REFERENCES room_events(event_id) ON DELETE CASCADE,
                  member_id TEXT NOT NULL REFERENCES brain_members(member_id),
@@ -1402,6 +1507,24 @@ impl CollaborationRepository {
             )?;
             transaction.commit()?;
             version = 8;
+        }
+        if version == 8 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS collaboration_run_changed_files (
+                     run_id TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     change_kind TEXT NOT NULL CHECK(change_kind IN ('added', 'modified')),
+                     PRIMARY KEY(run_id, path)
+                 );",
+            )?;
+            transaction.execute(
+                "UPDATE collaboration_schema SET version = 9 WHERE singleton = 1",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 9;
         }
         if version != SCHEMA_VERSION {
             return Err(CollaborationError::Config(format!(
@@ -2510,6 +2633,7 @@ impl CollaborationRepository {
             kind: "user_message".into(),
             content: content.into(),
             run_id: None,
+            changed_files: Vec::new(),
             parent_event_id,
             reply_reference,
             conversation_root_event_id,
@@ -3225,6 +3349,7 @@ impl CollaborationRepository {
             kind: "member_message".into(),
             content: answer.into(),
             run_id: Some(context.run_id.into()),
+            changed_files: Vec::new(),
             parent_event_id: Some(parent_event_id),
             reply_reference: None,
             conversation_root_event_id,
@@ -5305,6 +5430,7 @@ fn append_service_event(
         kind: kind.into(),
         content: content.into(),
         run_id: None,
+        changed_files: Vec::new(),
         parent_event_id: None,
         reply_reference: None,
         conversation_root_event_id: event_id.clone(),
@@ -5406,6 +5532,44 @@ fn hydrate_events(
         }
     }
 
+    let mut run_ids = events
+        .iter()
+        .filter_map(|event| event.run_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    run_ids.sort();
+    let mut changed_files_by_run = HashMap::<String, Vec<RoomChangedFileView>>::new();
+    if !run_ids.is_empty() {
+        let run_placeholders = vec!["?"; run_ids.len()].join(", ");
+        let mut statement = connection.prepare(&format!(
+            "SELECT run_id, path, change_kind
+             FROM collaboration_run_changed_files
+             WHERE run_id IN ({run_placeholders})
+             ORDER BY run_id, path"
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(run_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (run_id, path, change_kind) in rows {
+            let change_kind = RoomFileChangeKind::from_db(&change_kind).ok_or_else(|| {
+                CollaborationError::Config(format!(
+                    "运行 {run_id} 的文件变更类型无效: {change_kind}"
+                ))
+            })?;
+            changed_files_by_run
+                .entry(run_id)
+                .or_default()
+                .push(RoomChangedFileView { path, change_kind });
+        }
+    }
+
     let mut parent_ids = events
         .iter()
         .filter_map(|event| event.parent_event_id.clone())
@@ -5452,6 +5616,12 @@ fn hydrate_events(
             .unwrap_or_default();
         event.audience = audience_by_event
             .remove(&event.event_id)
+            .unwrap_or_default();
+        event.changed_files = event
+            .run_id
+            .as_ref()
+            .and_then(|run_id| changed_files_by_run.get(run_id))
+            .cloned()
             .unwrap_or_default();
         let Some(parent_event_id) = event.parent_event_id.as_ref() else {
             event.reply_reference = None;
@@ -5700,6 +5870,7 @@ fn event_from_row_without_recipients(row: &rusqlite::Row<'_>) -> rusqlite::Resul
         kind: row.get(6)?,
         content: row.get(7)?,
         run_id: row.get(8)?,
+        changed_files: Vec::new(),
         parent_event_id: row.get(9)?,
         reply_reference: None,
         conversation_root_event_id: row.get(10)?,
@@ -8058,6 +8229,82 @@ mod tests {
     }
 
     #[test]
+    fn run_changed_files_are_deduplicated_and_hydrated_with_member_reply() {
+        let (_directory, repository) = repository();
+        let file_directory = tempfile::tempdir().unwrap();
+        let root = file_directory.path().canonicalize().unwrap();
+        let added_path = root.join("added.rs").display().to_string();
+        let modified_path = root.join("modified.rs").display().to_string();
+        let snapshot = ensure(&repository);
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&snapshot.room.default_member_id),
+                "修改两个文件",
+                RoomInputMode::Task,
+                "changed-files",
+            )
+            .unwrap();
+        let claim = repository.claim_next().unwrap().unwrap();
+        repository
+            .replace_run_changed_files(
+                &claim.run_id,
+                &[
+                    RoomChangedFileView {
+                        path: modified_path.clone(),
+                        change_kind: RoomFileChangeKind::Modified,
+                    },
+                    RoomChangedFileView {
+                        path: added_path.clone(),
+                        change_kind: RoomFileChangeKind::Modified,
+                    },
+                    RoomChangedFileView {
+                        path: added_path.clone(),
+                        change_kind: RoomFileChangeKind::Added,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let event = repository
+            .complete_item(&claim, "文件修改完成")
+            .unwrap()
+            .unwrap();
+        let expected = vec![
+            RoomChangedFileView {
+                path: added_path,
+                change_kind: RoomFileChangeKind::Added,
+            },
+            RoomChangedFileView {
+                path: modified_path,
+                change_kind: RoomFileChangeKind::Modified,
+            },
+        ];
+        assert_eq!(event.changed_files, expected);
+
+        let persisted = repository.snapshot("room-1").unwrap();
+        let persisted_reply = persisted
+            .events
+            .iter()
+            .find(|candidate| candidate.event_id == event.event_id)
+            .unwrap();
+        assert_eq!(persisted_reply.changed_files, expected);
+        assert!(repository
+            .run_changed_file_exists(&claim.run_id, Path::new(&expected[0].path))
+            .unwrap());
+        assert!(!repository
+            .run_changed_file_exists("another-run", Path::new(&expected[0].path))
+            .unwrap());
+        assert_eq!(
+            serde_json::to_value(&persisted_reply.changed_files).unwrap(),
+            serde_json::json!([
+                {"path": expected[0].path, "change_kind": "added"},
+                {"path": expected[1].path, "change_kind": "modified"},
+            ])
+        );
+    }
+
+    #[test]
     fn blank_member_reply_cannot_complete_inbox_item() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
@@ -9325,6 +9572,7 @@ mod tests {
             "member_summary_snapshots",
             "member_cursors",
             "room_event_deliveries",
+            "collaboration_run_changed_files",
         ] {
             let exists: bool = connection
                 .query_row(

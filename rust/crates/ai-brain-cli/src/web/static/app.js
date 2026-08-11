@@ -19,7 +19,13 @@ let sessionFiles = [];
 let currentTurnFiles = [];
 let turnFileBaseline = new Map();
 let openedLocalFile = null;
+let openedLocalFileTrigger = null;
 let fileSaveTimer = null;
+let fileSavePromise = null;
+let fileEditorWatcherTimer = null;
+let fileEditorConflictSnapshot = null;
+let fileEditorDirty = false;
+let fileEditorRequestId = 0;
 let currentPreview = null;
 let currentPreviewSelection = null;
 const toolItems = new Map();
@@ -58,6 +64,23 @@ const $fileEditorToolbar = document.getElementById('file-editor-toolbar');
 const $fileEditorStatus = document.getElementById('file-editor-status');
 const $fileEditorQuote = document.getElementById('file-editor-quote');
 const $fileEditorContent = document.getElementById('file-editor-content');
+const $fileEditorRefresh = document.getElementById('file-editor-refresh');
+const $fileEditorCopyPath = document.getElementById('file-editor-copy-path');
+const $fileEditorTabs = document.getElementById('file-editor-tabs');
+const $fileEditorTab = document.getElementById('file-editor-tab');
+const $fileEditorTabName = document.getElementById('file-editor-tab-name');
+const $fileEditorSaveState = document.getElementById('file-editor-save-state');
+const $fileEditorConflict = document.getElementById('file-editor-conflict');
+const $fileEditorKeepLocal = document.getElementById('file-editor-keep-local');
+const $fileEditorLoadDisk = document.getElementById('file-editor-load-disk');
+const $fileEditorFrame = document.getElementById('file-editor-frame');
+const $fileEditorLineNumbers = document.getElementById('file-editor-line-numbers');
+const $fileEditorStatusbar = document.getElementById('file-editor-statusbar');
+const $fileEditorRevision = document.getElementById('file-editor-revision');
+const $fileEditorCaret = document.getElementById('file-editor-caret');
+const $fileEditorLines = document.getElementById('file-editor-lines');
+const $fileEditorLineEnding = document.getElementById('file-editor-line-ending');
+const $fileEditorLanguage = document.getElementById('file-editor-language');
 const $sidebar = document.getElementById('sidebar');
 const $sidebarToggle = document.getElementById('sidebar-toggle');
 const $newSessionBtn = document.getElementById('new-session-btn');
@@ -842,6 +865,9 @@ function renderRoomEvent(event, isLastUserEvent = false) {
         message.appendChild(createRoomReplyReference(event.reply_reference));
     }
     message.appendChild(content);
+    if (event.sender_kind === 'member') {
+        appendModifiedFiles(message, event.changed_files || [], event.run_id);
+    }
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
     if (RoomReply.canReplyToEvent(event)) {
@@ -1689,12 +1715,15 @@ function attachPreviewAction(element, title, source, content) {
     refreshIcons();
 }
 
-function openMarkdownPreview(title, source, content, metadata = {}) {
-    if (openedLocalFile && !$fileEditorContent.classList.contains('hidden')) {
-        clearTimeout(fileSaveTimer);
-        saveOpenedLocalFile();
+async function openMarkdownPreview(title, source, content, metadata = {}) {
+    if (openedLocalFile) {
+        const flushed = await flushOpenedLocalFile();
+        if (!flushed) {
+            showToast('请先处理当前文件的保存冲突');
+            return false;
+        }
+        resetLocalFileEditorSession();
     }
-    openedLocalFile = null;
     const rawContent = String(content || '');
     currentPreview = buildPreviewMetadata(title, source, rawContent, metadata);
     currentPreviewSelection = null;
@@ -1703,27 +1732,40 @@ function openMarkdownPreview(title, source, content, metadata = {}) {
     renderMarkdown($previewContent, rawContent);
     $previewContent.classList.remove('hidden');
     $fileEditorToolbar.classList.add('hidden');
-    $fileEditorContent.classList.add('hidden');
+    $fileEditorTabs.classList.add('hidden');
+    $fileEditorConflict.classList.add('hidden');
+    $fileEditorFrame.classList.add('hidden');
+    $fileEditorStatusbar.classList.add('hidden');
+    $fileEditorRefresh.classList.add('hidden');
+    $fileEditorCopyPath.classList.add('hidden');
     $previewSelectionTools.classList.add('hidden');
     $markdownPreview.classList.add('open');
     $markdownPreview.setAttribute('aria-hidden', 'false');
     $previewBackdrop.classList.remove('hidden');
     document.body.classList.add('preview-open');
     refreshIcons();
+    return true;
 }
 
-function closeMarkdownPreview() {
-    if (openedLocalFile && !$fileEditorContent.classList.contains('hidden')) {
-        clearTimeout(fileSaveTimer);
-        saveOpenedLocalFile();
+async function closeMarkdownPreview() {
+    const returnFocus = openedLocalFileTrigger;
+    if (openedLocalFile) {
+        const flushed = await flushOpenedLocalFile();
+        if (!flushed) {
+            showToast('请先处理当前文件的保存冲突');
+            $fileEditorContent.focus();
+            return false;
+        }
     }
+    resetLocalFileEditorSession();
     $markdownPreview.classList.remove('open');
     $markdownPreview.setAttribute('aria-hidden', 'true');
     $previewBackdrop.classList.add('hidden');
     document.body.classList.remove('preview-open');
     currentPreview = null;
     currentPreviewSelection = null;
-    openedLocalFile = null;
+    if (returnFocus?.isConnected) returnFocus.focus();
+    return true;
 }
 
 function buildPreviewMetadata(title, source, content, metadata = {}) {
@@ -2987,79 +3029,430 @@ function renderMessages(messages) {
     scrollToBottom();
 }
 
-function appendModifiedFiles(container, files) {
+function appendModifiedFiles(container, files, runId = null) {
     container.querySelector(':scope > .modified-files')?.remove();
-    if (!files?.length) return;
+    const normalizedFiles = Array.from(new Map((files || [])
+        .filter((file) => typeof file?.path === 'string' && file.path.trim())
+        .map((file) => {
+            const path = file.path.trim();
+            const changeKind = file.change_kind === 'added' ? 'added' : 'modified';
+            return [path, {
+                name: file.name || localFileName(path),
+                path,
+                change_kind: changeKind,
+                run_id: file.run_id || runId || null,
+            }];
+        })).values());
+    if (!normalizedFiles.length) return;
     const section = document.createElement('section');
     section.className = 'modified-files';
     const heading = document.createElement('div');
     heading.className = 'modified-files-heading';
-    heading.innerHTML = `<strong>本次修改的文件</strong><span>${files.length} 个</span>`;
+    heading.innerHTML = `<strong>本轮变更文件</strong><span>${normalizedFiles.length} 个</span>`;
     section.appendChild(heading);
-    files.forEach((file) => {
-        const link = document.createElement('a');
-        link.className = 'modified-file-link';
-        link.href = `/api/local-file?path=${encodeURIComponent(file.path)}`;
-        link.title = file.path;
-        link.innerHTML = `
-            <i data-lucide="file-text" aria-hidden="true"></i>
-            <span><strong>${escapeHtml(file.name)}</strong><small>${escapeHtml(file.path)}</small></span>
+    const list = document.createElement('div');
+    list.className = 'modified-file-list';
+    normalizedFiles.forEach((file) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `modified-file-link ${file.change_kind}`;
+        button.dataset.filePath = file.path;
+        button.title = `预览并编辑 ${file.path}`;
+        button.innerHTML = `
+            <i data-lucide="${file.change_kind === 'added' ? 'file-plus-2' : 'file-pen-line'}" aria-hidden="true"></i>
+            <span class="modified-file-path">${escapeHtml(file.path)}</span>
+            <span class="modified-file-kind">${file.change_kind === 'added' ? '新增' : '修改'}</span>
         `;
-        link.addEventListener('click', async (event) => {
-            event.preventDefault();
-            await openLocalFileEditor(file);
+        button.addEventListener('click', async () => {
+            await openLocalFileEditor(file, button);
         });
-        section.appendChild(link);
+        list.appendChild(button);
     });
+    section.appendChild(list);
     container.appendChild(section);
     refreshIcons();
 }
 
-async function openLocalFileEditor(file) {
-    try {
-        const response = await fetch(`/api/local-file?path=${encodeURIComponent(file.path)}`);
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || '文件读取失败');
-        openedLocalFile = { name: data.name, path: data.path };
-        currentPreview = buildPreviewMetadata(data.name, data.path, data.content, {
-            fileName: data.name,
-            path: data.path,
-        });
-        $previewTitle.textContent = data.name;
-        $previewSource.textContent = data.path;
-        $fileEditorContent.value = data.content;
-        $fileEditorStatus.textContent = '已保存';
-        $fileEditorQuote.disabled = true;
-        $previewContent.classList.add('hidden');
-        $previewSelectionTools.classList.add('hidden');
-        $fileEditorToolbar.classList.remove('hidden');
-        $fileEditorContent.classList.remove('hidden');
-        $markdownPreview.classList.add('open');
-        $markdownPreview.setAttribute('aria-hidden', 'false');
-        $previewBackdrop.classList.remove('hidden');
-        document.body.classList.add('preview-open');
+function localFileName(path) {
+    return String(path || '').split(/[\\/]/).filter(Boolean).at(-1) || '文件';
+}
+
+function localFileLanguage(name) {
+    const extension = String(name || '').split('.').at(-1)?.toLowerCase();
+    return ({
+        c: 'C', cpp: 'C++', css: 'CSS', go: 'Go', html: 'HTML', java: 'Java',
+        js: 'JavaScript', json: 'JSON', jsx: 'JSX', md: 'Markdown', py: 'Python',
+        rs: 'Rust', sh: 'Shell', sql: 'SQL', toml: 'TOML', ts: 'TypeScript',
+        tsx: 'TSX', xml: 'XML', yaml: 'YAML', yml: 'YAML',
+    })[extension] || '文本';
+}
+
+function shortFileRevision(revision) {
+    return revision ? String(revision).slice(0, 8) : '-';
+}
+
+function setFileEditorSaveState(state, message) {
+    $fileEditorSaveState.dataset.state = state;
+    $fileEditorStatus.textContent = message;
+}
+
+function setFileEditorDirty(dirty) {
+    fileEditorDirty = dirty;
+    $fileEditorTab.classList.toggle('is-dirty', dirty);
+}
+
+function updateFileEditorCaret() {
+    const beforeCaret = $fileEditorContent.value.slice(0, $fileEditorContent.selectionStart);
+    const rows = beforeCaret.split('\n');
+    $fileEditorCaret.textContent = `行 ${rows.length}，列 ${rows.at(-1).length + 1}`;
+}
+
+function updateFileEditorMetrics() {
+    const totalLines = Math.max(1, $fileEditorContent.value.split('\n').length);
+    $fileEditorLineNumbers.textContent = Array.from(
+        { length: totalLines },
+        (_, index) => index + 1,
+    ).join('\n');
+    $fileEditorLines.textContent = `${totalLines} 行`;
+    $fileEditorLineEnding.textContent = $fileEditorContent.value.includes('\r\n') ? 'CRLF' : 'LF';
+    updateFileEditorCaret();
+}
+
+function syncFileEditorLineNumbers() {
+    $fileEditorLineNumbers.style.transform = `translateY(${-$fileEditorContent.scrollTop}px)`;
+}
+
+function setFileEditorContent(content, preserveView = false) {
+    const view = preserveView ? {
+        start: $fileEditorContent.selectionStart,
+        end: $fileEditorContent.selectionEnd,
+        top: $fileEditorContent.scrollTop,
+        left: $fileEditorContent.scrollLeft,
+    } : null;
+    $fileEditorContent.value = String(content || '');
+    updateFileEditorMetrics();
+    if (view) {
+        const max = $fileEditorContent.value.length;
+        $fileEditorContent.setSelectionRange(Math.min(view.start, max), Math.min(view.end, max));
+        $fileEditorContent.scrollTop = view.top;
+        $fileEditorContent.scrollLeft = view.left;
+    } else {
+        $fileEditorContent.setSelectionRange(0, 0);
+        $fileEditorContent.scrollTop = 0;
+        $fileEditorContent.scrollLeft = 0;
+    }
+    syncFileEditorLineNumbers();
+}
+
+function showLocalFileEditorSurface() {
+    $previewContent.classList.add('hidden');
+    $previewSelectionTools.classList.add('hidden');
+    $fileEditorTabs.classList.remove('hidden');
+    $fileEditorToolbar.classList.remove('hidden');
+    $fileEditorFrame.classList.remove('hidden');
+    $fileEditorStatusbar.classList.remove('hidden');
+    $fileEditorRefresh.classList.remove('hidden');
+    $fileEditorCopyPath.classList.remove('hidden');
+    $markdownPreview.classList.add('open');
+    $markdownPreview.setAttribute('aria-hidden', 'false');
+    $previewBackdrop.classList.remove('hidden');
+    document.body.classList.add('preview-open');
+}
+
+function applyLocalFileSnapshot(snapshot, options = {}) {
+    if (!openedLocalFile) return;
+    openedLocalFile.name = snapshot.name || openedLocalFile.name;
+    openedLocalFile.path = snapshot.path || openedLocalFile.path;
+    openedLocalFile.revision = snapshot.revision;
+    fileEditorConflictSnapshot = null;
+    $fileEditorConflict.classList.add('hidden');
+    $previewTitle.textContent = openedLocalFile.name;
+    $previewSource.textContent = openedLocalFile.path;
+    $fileEditorTabName.textContent = openedLocalFile.name;
+    $fileEditorLanguage.textContent = localFileLanguage(openedLocalFile.name);
+    $fileEditorRevision.textContent = `版本 ${shortFileRevision(snapshot.revision)}`;
+    $fileEditorRevision.title = snapshot.revision || '';
+    setFileEditorContent(snapshot.content, Boolean(options.preserveView));
+    setFileEditorDirty(false);
+    $fileEditorContent.disabled = false;
+    $fileEditorQuote.disabled = true;
+    currentPreview = buildPreviewMetadata(
+        openedLocalFile.name,
+        openedLocalFile.path,
+        snapshot.content,
+        { fileName: openedLocalFile.name, path: openedLocalFile.path },
+    );
+    setFileEditorSaveState('saved', options.message || '已加载最新内容');
+}
+
+function enterLocalFileConflict(snapshot) {
+    if (!openedLocalFile || !snapshot?.revision) return;
+    clearTimeout(fileSaveTimer);
+    fileEditorConflictSnapshot = snapshot;
+    setFileEditorDirty(true);
+    $fileEditorConflict.classList.remove('hidden');
+    $fileEditorRevision.textContent = `版本 ${shortFileRevision(openedLocalFile.revision)} → ${shortFileRevision(snapshot.revision)}`;
+    $fileEditorRevision.title = snapshot.revision;
+    setFileEditorSaveState('conflict', '检测到磁盘冲突');
+}
+
+function scheduleLocalFileSave() {
+    clearTimeout(fileSaveTimer);
+    if (!openedLocalFile || !fileEditorDirty || fileEditorConflictSnapshot) return;
+    fileSaveTimer = setTimeout(() => saveOpenedLocalFile(), 700);
+}
+
+async function fetchLocalFileSnapshot(path, runId = null) {
+    const query = new URLSearchParams({ path });
+    if (runId) query.set('run_id', runId);
+    const response = await fetch(`/api/local-file?${query}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || '文件读取失败');
+    if (!data.revision) throw new Error('文件读取结果缺少版本信息');
+    return data;
+}
+
+async function openLocalFileEditor(file, trigger = null) {
+    const requestedPath = String(file?.path || '').trim();
+    if (!requestedPath) return false;
+    if (openedLocalFile?.path === requestedPath && $markdownPreview.classList.contains('open')) {
+        await checkLatestLocalFile({ announce: true });
         $fileEditorContent.focus();
-        refreshIcons();
+        return true;
+    }
+    if (openedLocalFile) {
+        const flushed = await flushOpenedLocalFile();
+        if (!flushed) {
+            showToast('请先处理当前文件的保存冲突');
+            $fileEditorContent.focus();
+            return false;
+        }
+        resetLocalFileEditorSession();
+    }
+
+    const requestId = ++fileEditorRequestId;
+    stopLocalFileWatcher();
+    clearTimeout(fileSaveTimer);
+    openedLocalFile = {
+        name: file.name || localFileName(requestedPath),
+        path: requestedPath,
+        revision: null,
+        change_kind: file.change_kind === 'added' ? 'added' : 'modified',
+        run_id: file.run_id || null,
+    };
+    openedLocalFileTrigger = trigger;
+    document.querySelectorAll('.modified-file-link').forEach((button) => {
+        button.classList.toggle('active', button === trigger);
+    });
+    fileEditorConflictSnapshot = null;
+    $fileEditorConflict.classList.add('hidden');
+    $previewTitle.textContent = openedLocalFile.name;
+    $previewSource.textContent = openedLocalFile.path;
+    $fileEditorTabName.textContent = openedLocalFile.name;
+    $fileEditorLanguage.textContent = localFileLanguage(openedLocalFile.name);
+    $fileEditorRevision.textContent = '版本 -';
+    $fileEditorContent.disabled = true;
+    $fileEditorQuote.disabled = true;
+    setFileEditorDirty(false);
+    setFileEditorContent('');
+    setFileEditorSaveState('loading', '正在加载最新内容...');
+    showLocalFileEditorSurface();
+    refreshIcons();
+
+    try {
+        const snapshot = await fetchLocalFileSnapshot(requestedPath, openedLocalFile.run_id);
+        if (requestId !== fileEditorRequestId || !openedLocalFile) return false;
+        applyLocalFileSnapshot(snapshot);
+        startLocalFileWatcher();
+        $fileEditorContent.focus();
+        return true;
     } catch (error) {
+        if (requestId !== fileEditorRequestId) return false;
+        resetLocalFileEditorSession();
+        $markdownPreview.classList.remove('open');
+        $markdownPreview.setAttribute('aria-hidden', 'true');
+        $previewBackdrop.classList.add('hidden');
+        document.body.classList.remove('preview-open');
         addSystemMessage(`无法预览文件：${error.message}`);
+        return false;
     }
 }
 
-async function saveOpenedLocalFile() {
-    if (!openedLocalFile) return;
-    $fileEditorStatus.textContent = '保存中...';
+async function performOpenedLocalFileSave(options = {}) {
+    if (!openedLocalFile || !fileEditorDirty) return true;
+    if (fileEditorConflictSnapshot && !options.adoptLatest) return false;
+    clearTimeout(fileSaveTimer);
+    if (options.adoptLatest && fileEditorConflictSnapshot) {
+        openedLocalFile.revision = fileEditorConflictSnapshot.revision;
+        fileEditorConflictSnapshot = null;
+        $fileEditorConflict.classList.add('hidden');
+    }
+    const requestId = fileEditorRequestId;
+    const savingPath = openedLocalFile.path;
+    const savingContent = $fileEditorContent.value;
+    const expectedRevision = openedLocalFile.revision;
+    if (!expectedRevision) return false;
+    setFileEditorSaveState('saving', '正在自动保存...');
     try {
         const response = await fetch('/api/local-file', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ path: openedLocalFile.path, content: $fileEditorContent.value }),
+            body: JSON.stringify({
+                path: savingPath,
+                content: savingContent,
+                expected_revision: expectedRevision,
+                run_id: openedLocalFile.run_id,
+            }),
         });
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+        if (requestId !== fileEditorRequestId || openedLocalFile?.path !== savingPath) return true;
+        if (response.status === 409) {
+            enterLocalFileConflict(data);
+            return false;
+        }
         if (!response.ok) throw new Error(data.error || '保存失败');
-        $fileEditorStatus.textContent = `已保存 ${new Date().toLocaleTimeString()}`;
+        openedLocalFile.revision = data.revision;
+        $fileEditorRevision.textContent = `版本 ${shortFileRevision(data.revision)}`;
+        $fileEditorRevision.title = data.revision || '';
+        if ($fileEditorContent.value === savingContent) {
+            setFileEditorDirty(false);
+            setFileEditorSaveState('saved', `已自动保存 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`);
+        } else {
+            setFileEditorDirty(true);
+            setFileEditorSaveState('dirty', '有新的未保存修改');
+            scheduleLocalFileSave();
+        }
+        return true;
     } catch (error) {
-        $fileEditorStatus.textContent = `保存失败：${error.message}`;
+        if (requestId !== fileEditorRequestId) return false;
+        setFileEditorDirty(true);
+        setFileEditorSaveState('error', `保存失败：${error.message}`);
+        return false;
     }
+}
+
+function saveOpenedLocalFile(options = {}) {
+    if (fileSavePromise) {
+        return fileSavePromise.then((saved) => {
+            if (options.adoptLatest && fileEditorConflictSnapshot) {
+                return saveOpenedLocalFile(options);
+            }
+            return saved;
+        });
+    }
+    fileSavePromise = performOpenedLocalFileSave(options).finally(() => {
+        fileSavePromise = null;
+    });
+    return fileSavePromise;
+}
+
+async function flushOpenedLocalFile() {
+    clearTimeout(fileSaveTimer);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+        if (fileEditorConflictSnapshot) return false;
+        if (fileSavePromise) {
+            const saved = await fileSavePromise;
+            if (!saved) return false;
+            continue;
+        }
+        if (!fileEditorDirty) return true;
+        const saved = await saveOpenedLocalFile();
+        if (!saved) return false;
+    }
+    return !fileEditorDirty;
+}
+
+async function checkLatestLocalFile(options = {}) {
+    if (!openedLocalFile || !$markdownPreview.classList.contains('open')) return false;
+    const requestId = fileEditorRequestId;
+    const checkingPath = openedLocalFile.path;
+    try {
+        const latest = await fetchLocalFileSnapshot(checkingPath, openedLocalFile.run_id);
+        if (requestId !== fileEditorRequestId || openedLocalFile?.path !== checkingPath) return false;
+        // The matching save response is the authoritative acknowledgement for our own write.
+        // A concurrent refresh can otherwise observe that write first and report a false conflict.
+        if (fileSavePromise) return false;
+        if (latest.revision === openedLocalFile.revision) {
+            if (options.announce) showToast('当前已是磁盘最新内容');
+            return false;
+        }
+        if (fileEditorDirty || fileSavePromise) {
+            enterLocalFileConflict(latest);
+            return false;
+        }
+        applyLocalFileSnapshot(latest, {
+            preserveView: true,
+            message: '已自动加载磁盘最新版本',
+        });
+        if (options.announce) showToast('已加载磁盘最新内容');
+        return true;
+    } catch (error) {
+        if (options.announce) showToast(`检查最新内容失败：${error.message}`);
+        return false;
+    }
+}
+
+function startLocalFileWatcher() {
+    stopLocalFileWatcher();
+    fileEditorWatcherTimer = setInterval(() => checkLatestLocalFile(), 4000);
+}
+
+function stopLocalFileWatcher() {
+    clearInterval(fileEditorWatcherTimer);
+    fileEditorWatcherTimer = null;
+}
+
+function resetLocalFileEditorSession() {
+    clearTimeout(fileSaveTimer);
+    stopLocalFileWatcher();
+    fileEditorRequestId += 1;
+    fileEditorConflictSnapshot = null;
+    fileEditorDirty = false;
+    openedLocalFile = null;
+    openedLocalFileTrigger = null;
+    document.querySelectorAll('.modified-file-link.active').forEach((button) => {
+        button.classList.remove('active');
+    });
+    $fileEditorTab.classList.remove('is-dirty');
+    $fileEditorConflict.classList.add('hidden');
+    $fileEditorTabs.classList.add('hidden');
+    $fileEditorToolbar.classList.add('hidden');
+    $fileEditorFrame.classList.add('hidden');
+    $fileEditorStatusbar.classList.add('hidden');
+    $fileEditorRefresh.classList.add('hidden');
+    $fileEditorCopyPath.classList.add('hidden');
+}
+
+function loadConflictingDiskVersion() {
+    if (!fileEditorConflictSnapshot) return;
+    applyLocalFileSnapshot(fileEditorConflictSnapshot, { message: '已加载磁盘版本' });
+    showToast('已加载磁盘版本');
+    $fileEditorContent.focus();
+}
+
+async function keepAndSaveLocalFile() {
+    if (!fileEditorConflictSnapshot) return;
+    setFileEditorSaveState('dirty', '准备保存当前修改...');
+    const saved = await saveOpenedLocalFile({ adoptLatest: true });
+    if (saved) showToast('当前修改已保存为最新版本');
+    $fileEditorContent.focus();
+}
+
+async function copyOpenedLocalFilePath() {
+    if (!openedLocalFile) return;
+    try {
+        await navigator.clipboard.writeText(openedLocalFile.path);
+    } catch (_) {
+        const helper = document.createElement('textarea');
+        helper.value = openedLocalFile.path;
+        helper.style.position = 'fixed';
+        helper.style.opacity = '0';
+        document.body.appendChild(helper);
+        helper.select();
+        document.execCommand('copy');
+        helper.remove();
+    }
+    showToast('绝对路径已复制');
 }
 
 function quoteFileEditorSelection() {
@@ -3338,21 +3731,62 @@ $previewContent.addEventListener('mouseup', updatePreviewSelection);
 $previewContent.addEventListener('keyup', updatePreviewSelection);
 $previewQuote.addEventListener('click', quotePreviewSelection);
 $fileEditorContent.addEventListener('input', () => {
-    $fileEditorStatus.textContent = '有未保存修改...';
-    clearTimeout(fileSaveTimer);
-    fileSaveTimer = setTimeout(saveOpenedLocalFile, 600);
+    setFileEditorDirty(true);
+    setFileEditorSaveState(
+        'dirty',
+        fileEditorConflictSnapshot ? '等待处理磁盘冲突' : '有未保存修改',
+    );
+    updateFileEditorMetrics();
+    scheduleLocalFileSave();
 });
-$fileEditorContent.addEventListener('select', () => {
+$fileEditorContent.addEventListener('scroll', syncFileEditorLineNumbers);
+function updateFileEditorSelection() {
     $fileEditorQuote.disabled = $fileEditorContent.selectionStart === $fileEditorContent.selectionEnd;
-});
-$fileEditorContent.addEventListener('keyup', () => {
-    $fileEditorQuote.disabled = $fileEditorContent.selectionStart === $fileEditorContent.selectionEnd;
+    updateFileEditorCaret();
+}
+$fileEditorContent.addEventListener('select', updateFileEditorSelection);
+$fileEditorContent.addEventListener('click', updateFileEditorSelection);
+$fileEditorContent.addEventListener('keyup', updateFileEditorSelection);
+$fileEditorContent.addEventListener('keydown', (event) => {
+    if (event.key !== 'Tab') return;
+    event.preventDefault();
+    $fileEditorContent.setRangeText(
+        '    ',
+        $fileEditorContent.selectionStart,
+        $fileEditorContent.selectionEnd,
+        'end',
+    );
+    $fileEditorContent.dispatchEvent(new Event('input', { bubbles: true }));
 });
 $fileEditorQuote.addEventListener('click', quoteFileEditorSelection);
+$fileEditorRefresh.addEventListener('click', () => checkLatestLocalFile({ announce: true }));
+$fileEditorCopyPath.addEventListener('click', copyOpenedLocalFilePath);
+$fileEditorKeepLocal.addEventListener('click', keepAndSaveLocalFile);
+$fileEditorLoadDisk.addEventListener('click', loadConflictingDiskVersion);
+$fileEditorTab.addEventListener('click', () => $fileEditorContent.focus());
 document.addEventListener('keydown', (event) => {
+    if ((event.metaKey || event.ctrlKey)
+        && event.key.toLowerCase() === 's'
+        && openedLocalFile
+        && $markdownPreview.classList.contains('open')) {
+        event.preventDefault();
+        saveOpenedLocalFile();
+        return;
+    }
     if (event.key === 'Escape' && $markdownPreview.classList.contains('open')) {
         closeMarkdownPreview();
     }
+});
+window.addEventListener('focus', () => checkLatestLocalFile());
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        checkLatestLocalFile();
+    }
+});
+window.addEventListener('beforeunload', (event) => {
+    if (!fileEditorDirty) return;
+    event.preventDefault();
+    event.returnValue = '';
 });
 
 // Close sidebar when clicking outside on mobile

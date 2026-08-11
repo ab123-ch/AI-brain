@@ -26,8 +26,8 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 use crate::orchestrator::Orchestrator;
 use crate::runtime_trace::ExchangePhase;
 use crate::web::collaboration::{
-    InboxState, LegacyMessageSeed, MemberAddress, PostMessageResult, RoomEventPage, RoomInputMode,
-    RoomSnapshot, DEFAULT_THREAD_KEY,
+    CollaborationRepository, InboxState, LegacyMessageSeed, MemberAddress, PostMessageResult,
+    RoomEventPage, RoomInputMode, RoomSnapshot, DEFAULT_THREAD_KEY,
 };
 use crate::web::collaboration_runtime::{CollaborationRuntime, RoomWorkingDirectoryUpdateError};
 use crate::web::progress_adapter::{ChatMessage, PersonaInfo, SessionInfo, WebProgressEvent};
@@ -52,7 +52,9 @@ pub struct AppState {
     pub orch: Arc<Orchestrator>,
     pub sessions: Arc<Mutex<SessionManager>>,
     pub collaboration: Arc<CollaborationRuntime>,
+    pub collaboration_repository: Arc<CollaborationRepository>,
     pub workspace_root: std::path::PathBuf,
+    pub local_file_save_lock: Mutex<()>,
 }
 
 // ─── 客户端消息枚举 ──────────────────────────────────────────────────

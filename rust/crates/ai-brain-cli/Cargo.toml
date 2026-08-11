@@ -59,8 +59,6 @@ async-trait = "0.1"
 sha2 = "0.10"
 regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
-
-[dev-dependencies]
 tempfile = "3"
 
 [lints]
