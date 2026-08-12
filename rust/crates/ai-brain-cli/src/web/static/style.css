@@ -849,6 +849,29 @@ body {
 .file-editor-toolbar button:disabled { opacity: 0.4; cursor: default; }
 .file-editor-toolbar svg { width: 13px; height: 13px; }
 
+.file-editor-mode-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: #171c1e;
+}
+
+.file-editor-mode-switch.hidden { display: none; }
+.file-editor-mode-switch button {
+    border-color: transparent;
+    background: transparent;
+    color: var(--text-secondary);
+}
+.file-editor-mode-switch button:hover { color: var(--text-primary); }
+.file-editor-mode-switch button.active {
+    border-color: rgba(67, 184, 165, 0.48);
+    color: var(--text-primary);
+    background: rgba(67, 184, 165, 0.14);
+}
+
 .file-editor-tabs {
     height: 35px;
     display: flex;

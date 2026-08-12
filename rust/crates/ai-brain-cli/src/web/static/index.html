@@ -223,6 +223,10 @@
         </div>
         <div id="file-editor-toolbar" class="file-editor-toolbar hidden">
             <div id="file-editor-save-state" class="file-editor-save-state" data-state="saved" aria-live="polite"><span class="file-editor-save-dot"></span><span id="file-editor-status">已保存</span></div>
+            <div id="file-editor-mode-switch" class="file-editor-mode-switch hidden" role="group" aria-label="Markdown 文件显示模式">
+                <button id="file-editor-preview-mode" type="button" aria-pressed="false"><i data-lucide="eye"></i><span>预览</span></button>
+                <button id="file-editor-edit-mode" type="button" class="active" aria-pressed="true"><i data-lucide="file-pen-line"></i><span>编辑</span></button>
+            </div>
             <button id="file-editor-quote" type="button" disabled><i data-lucide="quote"></i><span>引用选中内容</span></button>
         </div>
         <div id="file-editor-conflict" class="file-editor-conflict hidden" role="alert">
@@ -240,7 +244,7 @@
             <div><i data-lucide="cloud-check"></i><span>自动保存</span><span id="file-editor-revision">版本 -</span></div>
             <div><span id="file-editor-caret">行 1，列 1</span><span id="file-editor-lines">1 行</span><span id="file-editor-line-ending">LF</span><span>UTF-8</span><span id="file-editor-language">文本</span></div>
         </footer>
-        <div id="preview-content" class="preview-content markdown-body"></div>
+        <div id="preview-content" class="preview-content markdown-body" tabindex="0"></div>
     </aside>
     <div id="ask-modal" class="modal hidden">
         <div class="modal-content">
@@ -286,6 +290,7 @@
     <div id="toast-region" aria-live="polite" aria-atomic="true"></div>
     <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.13/dist/purify.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
     <script src="/mentions.js"></script>
     <script src="/model_catalog.js"></script>
