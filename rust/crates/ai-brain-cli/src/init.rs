@@ -108,6 +108,14 @@ temperature = 0.5
 [llm.brain_params.compact]
 max_tokens = 4096
 temperature = 0.3
+
+# ── Tailscale 私有远程访问 ─────────────────────────
+# 首次登录 Tailscale 并批准系统网络权限后，普通 web 启动会自动恢复私有 HTTPS 入口。
+[remote_access]
+enabled = true
+port = 8080
+# 首次成功连接后由 AI Brain 自动写入固定的 https://<设备>.<Tailnet>.ts.net 地址。
+# url = ""
 "#;
 
 /// 初始化 AI Brain 运行环境
@@ -231,6 +239,9 @@ mod tests {
         assert!(CONFIG_TEMPLATE.contains("id = \"gemini-2-5-flash\""));
         assert!(CONFIG_TEMPLATE.contains("api_base = \"https://ai.xfws88.com/v1\""));
         assert!(CONFIG_TEMPLATE.contains("kind = \"openai\""));
+        assert!(CONFIG_TEMPLATE.contains("[remote_access]"));
+        assert!(CONFIG_TEMPLATE.contains("enabled = true"));
+        assert!(CONFIG_TEMPLATE.contains("port = 8080"));
     }
 
     fn assert_logging_dispatch_writes_file(is_tui: bool) {

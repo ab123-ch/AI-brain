@@ -32,26 +32,41 @@ published to the public internet.
    <https://tailscale.com/download/windows>
 2. Install Tailscale on the phone and sign it into the same Tailnet.
 3. Enable Tailscale unattended mode if the PC should remain in the Tailnet at
-   the Windows sign-in screen. This keeps Tailscale online, not an interactive
-   `ai-brain.exe` process.
-4. In a normal PowerShell window, start AI Brain from the workspace it should
-   control. Administrator privileges are not required for port-based Serve:
+   the Windows sign-in screen.
+4. Start the normal AI Brain Web service from the workspace it should control:
 
 ```powershell
 cargo build --release -p ai-brain-cli
-.\target\release\ai-brain.exe remote
-# Custom local port:
-.\target\release\ai-brain.exe remote --port 9090
+.\target\release\ai-brain.exe web
 ```
 
-The command prints a private `https://<device>.<tailnet>.ts.net` address. Open
-that address in the phone browser. Remote mode accepts only requests carrying
-Tailscale identity headers and rejects cross-origin WebSocket connections.
+Normal `web` startup launches the installed Tailscale app/service, restores its
+persistent private Serve proxy, and prints a stable
+`https://<device>.<tailnet>.ts.net` address. The first successful setup writes
+that address to `~/.ai-brain/config.toml`; open it from any device signed into
+the same Tailnet. Local loopback access remains available, while non-local
+requests require Tailscale identity and a matching HTTPS origin.
+
+Existing installations without this section use these code defaults:
+
+```toml
+[remote_access]
+enabled = true
+port = 8080
+# Filled automatically after the first successful connection:
+# url = "https://home-brain.example.ts.net"
+```
+
+Set `enabled = false` to keep `web` local-only. `web --addr 127.0.0.1:9090`
+overrides the configured port and updates it after a successful remote setup.
+The explicit `ai-brain.exe remote --port 8080` command remains available as a
+strict remote-only diagnostic mode.
 
 Run Tailscale on the Windows host, not in a second WSL 2 installation. Keep the
-`ai-brain.exe remote` process running while remote control is needed. Windows
-may be locked, but signing out, restarting, or sleeping stops this interactive
-workflow until the command is started again.
+`ai-brain.exe web` process running while remote control is needed. Windows may
+be locked, but signing out, restarting, or sleeping stops an interactively
+started process. Starting AI Brain itself after reboot remains the
+responsibility of its existing shortcut, scheduled task, or service launcher.
 
 Tailscale Serve persists its proxy configuration. Disable it when no longer
 needed:
