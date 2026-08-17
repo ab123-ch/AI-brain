@@ -123,6 +123,8 @@ impl OpenAiCompatClient {
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .timeout(std::time::Duration::from_mins(5))
+                // 未显式配置 provider 代理时必须直连，不能继承 Windows 系统代理。
+                .no_proxy()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             retry_config: RetryConfig::default(),
