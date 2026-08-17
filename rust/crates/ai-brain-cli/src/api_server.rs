@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query as AxumQuery, Request, State};
+use axum::http::uri::Authority;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -367,13 +368,39 @@ pub async fn serve_web(orch: Orchestrator, addr: &str) -> Result<(), String> {
     serve_web_with_policy(orch, addr, None).await
 }
 
+/// Start the local Web UI while also accepting authenticated requests from a
+/// configured Tailscale Serve endpoint.
+pub async fn serve_web_auto_remote(
+    orch: Orchestrator,
+    addr: &str,
+    expected_host: Option<&str>,
+) -> Result<(), String> {
+    serve_web_with_policy(
+        orch,
+        addr,
+        Some(TailscaleAccessPolicy {
+            expected_host: expected_host.map(str::to_string),
+            allow_loopback: true,
+        }),
+    )
+    .await
+}
+
 /// 启动只接受 Tailscale Serve 请求的 Web UI。
 pub async fn serve_web_remote(
     orch: Orchestrator,
     addr: &str,
     expected_host: &str,
 ) -> Result<(), String> {
-    serve_web_with_policy(orch, addr, Some(expected_host.to_string())).await
+    serve_web_with_policy(
+        orch,
+        addr,
+        Some(TailscaleAccessPolicy {
+            expected_host: Some(expected_host.to_string()),
+            allow_loopback: false,
+        }),
+    )
+    .await
 }
 
 fn capture_workspace_root<C, K>(
@@ -392,7 +419,7 @@ where
 async fn serve_web_with_policy(
     orch: Orchestrator,
     addr: &str,
-    tailscale_host: Option<String>,
+    access_policy: Option<TailscaleAccessPolicy>,
 ) -> Result<(), String> {
     let workspace_root =
         capture_workspace_root(std::env::current_dir, |path| std::fs::canonicalize(path))?;
@@ -455,9 +482,9 @@ async fn serve_web_with_policy(
         )
         .route("/ws", get(ws_upgrade))
         .with_state(state);
-    let app = if let Some(expected_host) = tailscale_host {
+    let app = if let Some(policy) = access_policy {
         app.layer(middleware::from_fn_with_state(
-            TailscaleAccessPolicy { expected_host },
+            policy,
             enforce_tailscale_access,
         ))
     } else {
@@ -475,7 +502,8 @@ async fn serve_web_with_policy(
 
 #[derive(Clone)]
 struct TailscaleAccessPolicy {
-    expected_host: String,
+    expected_host: Option<String>,
+    allow_loopback: bool,
 }
 
 async fn enforce_tailscale_access(
@@ -483,22 +511,71 @@ async fn enforce_tailscale_access(
     request: Request,
     next: Next,
 ) -> Response {
-    if !has_tailscale_identity(request.headers()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "仅允许通过 Tailscale Serve 访问"})),
-        )
-            .into_response();
+    if has_tailscale_identity(request.headers()) {
+        let Some(expected_host) = policy.expected_host.as_deref() else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "智脑远程访问当前未启用"})),
+            )
+                .into_response();
+        };
+        if !origin_matches_tailscale_host(request.headers(), expected_host) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "请求来源与智脑远程地址不匹配"})),
+            )
+                .into_response();
+        }
+        return next.run(request).await;
     }
-    if !origin_matches_tailscale_host(request.headers(), &policy.expected_host) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "请求来源与智脑远程地址不匹配"})),
-        )
-            .into_response();
+    if policy.allow_loopback
+        && request_targets_loopback(request.headers())
+        && origin_matches_loopback(request.headers())
+    {
+        return next.run(request).await;
     }
 
-    next.run(request).await
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "仅允许本机或通过 Tailscale Serve 访问"})),
+    )
+        .into_response()
+}
+
+fn request_targets_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(axum::http::header::HOST) else {
+        return false;
+    };
+    let Ok(host) = host.to_str() else {
+        return false;
+    };
+    let Ok(authority) = host.parse::<Authority>() else {
+        return false;
+    };
+    matches!(
+        authority.host().trim_matches(['[', ']']),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+fn origin_matches_loopback(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(uri) = origin.parse::<Uri>() else {
+        return false;
+    };
+
+    uri.scheme_str() == Some("http")
+        && uri.host().is_some_and(|host| {
+            matches!(
+                host.trim_matches(['[', ']']),
+                "localhost" | "127.0.0.1" | "::1"
+            )
+        })
 }
 
 fn has_tailscale_identity(headers: &HeaderMap) -> bool {
@@ -1048,7 +1125,58 @@ mod startup_working_directory_tests {
 mod remote_policy_tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{has_tailscale_identity, origin_matches_tailscale_host};
+    use super::{
+        has_tailscale_identity, origin_matches_loopback, origin_matches_tailscale_host,
+        request_targets_loopback,
+    };
+
+    #[test]
+    fn recognizes_only_loopback_host_headers_for_mixed_mode() {
+        let mut headers = HeaderMap::new();
+        assert!(!request_targets_loopback(&headers));
+
+        headers.insert(
+            axum::http::header::HOST,
+            HeaderValue::from_static("127.0.0.1:8080"),
+        );
+        assert!(request_targets_loopback(&headers));
+
+        headers.insert(
+            axum::http::header::HOST,
+            HeaderValue::from_static("[::1]:8080"),
+        );
+        assert!(request_targets_loopback(&headers));
+
+        headers.insert(
+            axum::http::header::HOST,
+            HeaderValue::from_static("brain-mac.example.ts.net"),
+        );
+        assert!(!request_targets_loopback(&headers));
+    }
+
+    #[test]
+    fn accepts_local_origin_and_rejects_cross_site_local_requests() {
+        let mut headers = HeaderMap::new();
+        assert!(origin_matches_loopback(&headers));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        );
+        assert!(origin_matches_loopback(&headers));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://[::1]:8080"),
+        );
+        assert!(origin_matches_loopback(&headers));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(!origin_matches_loopback(&headers));
+    }
 
     #[test]
     fn requires_non_empty_tailscale_login_header() {

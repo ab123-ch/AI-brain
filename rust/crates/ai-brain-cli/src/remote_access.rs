@@ -2,7 +2,11 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::io;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -10,11 +14,100 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use thiserror::Error;
+use toml_edit::{value, DocumentMut, Item, Table};
 
 const TAILSCALE_BIN_ENV: &str = "AI_BRAIN_TAILSCALE_BIN";
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_TIMEOUT_HINT: &str =
     "Tailscale 在 5 秒内没有响应；请打开 Tailscale 应用，完成网络扩展授权和账号登录";
+pub const DEFAULT_REMOTE_PORT: u16 = 8080;
+
+/// Machine-local settings stored in `~/.ai-brain/config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAccessSettings {
+    enabled: bool,
+    port: u16,
+    cached_url: Option<String>,
+}
+
+impl Default for RemoteAccessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: DEFAULT_REMOTE_PORT,
+            cached_url: None,
+        }
+    }
+}
+
+impl RemoteAccessSettings {
+    pub fn load(config_path: &Path) -> Result<Self, RemoteAccessError> {
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+        let content = fs::read_to_string(config_path).map_err(|error| {
+            RemoteAccessError::Config(format!("读取 {} 失败: {error}", config_path.display()))
+        })?;
+        let document = content.parse::<toml::Value>().map_err(|error| {
+            RemoteAccessError::Config(format!("解析 {} 失败: {error}", config_path.display()))
+        })?;
+        Self::from_document(&document)
+    }
+
+    fn from_document(document: &toml::Value) -> Result<Self, RemoteAccessError> {
+        let Some(section) = document.get("remote_access") else {
+            return Ok(Self::default());
+        };
+        let section = section
+            .as_table()
+            .ok_or_else(|| RemoteAccessError::Config("remote_access 必须是 TOML 表".to_string()))?;
+
+        let enabled = section.get("enabled").map_or(Ok(true), |entry| {
+            entry.as_bool().ok_or_else(|| {
+                RemoteAccessError::Config("remote_access.enabled 必须是布尔值".to_string())
+            })
+        })?;
+        let port = section
+            .get("port")
+            .map_or(Ok(i64::from(DEFAULT_REMOTE_PORT)), |entry| {
+                entry.as_integer().ok_or_else(|| {
+                    RemoteAccessError::Config("remote_access.port 必须是整数".to_string())
+                })
+            })?;
+        let port = u16::try_from(port)
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| {
+                RemoteAccessError::Config("remote_access.port 必须在 1..=65535 之间".to_string())
+            })?;
+        let cached_url = section
+            .get("url")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string);
+
+        Ok(Self {
+            enabled,
+            port,
+            cached_url,
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn cached_endpoint(&self) -> Option<RemoteEndpoint> {
+        self.cached_url
+            .as_deref()
+            .and_then(RemoteEndpoint::from_https_url)
+    }
+}
 
 /// The private HTTPS endpoint created by Tailscale Serve.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +123,21 @@ impl RemoteEndpoint {
 
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    fn from_https_url(url: &str) -> Option<Self> {
+        let host = url.strip_prefix("https://")?.trim_end_matches('/');
+        if host.is_empty()
+            || host.contains(['/', ':', '?', '#'])
+            || !host.to_ascii_lowercase().ends_with(".ts.net")
+        {
+            return None;
+        }
+        let host = host.to_ascii_lowercase();
+        Some(Self {
+            url: format!("https://{host}"),
+            host,
+        })
     }
 }
 
@@ -49,6 +157,8 @@ pub enum RemoteAccessError {
     InvalidPort,
     #[error("启用 Tailscale Serve 失败（{0}）。请根据上方提示完成一次性授权后重试")]
     ServeCommand(String),
+    #[error("远程访问配置无效：{0}")]
+    Config(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,6 +176,7 @@ pub fn configure(port: u16) -> Result<RemoteEndpoint, RemoteAccessError> {
     }
 
     let executable = find_tailscale_cli().ok_or(RemoteAccessError::NotInstalled)?;
+    start_tailscale_service();
     let status_output =
         run_command_output_with_timeout(&executable, &["status", "--json"], STATUS_TIMEOUT)
             .map_err(|error| {
@@ -119,6 +230,93 @@ pub fn configure(port: u16) -> Result<RemoteEndpoint, RemoteAccessError> {
         url: format!("https://{host}"),
         host,
     })
+}
+
+/// Return the port only when the Web listener is explicitly bound to a
+/// numeric loopback address. Remote access must never widen the listener.
+pub fn loopback_port(addr: &str) -> Option<u16> {
+    let socket = addr.parse::<SocketAddr>().ok()?;
+    (socket.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).then_some(socket.port())
+}
+
+/// Save the stable MagicDNS URL while preserving comments and unrelated TOML sections.
+pub fn persist_endpoint(
+    config_path: &Path,
+    endpoint: &RemoteEndpoint,
+    port: u16,
+) -> Result<(), RemoteAccessError> {
+    let content = if config_path.exists() {
+        fs::read_to_string(config_path).map_err(|error| {
+            RemoteAccessError::Config(format!("读取 {} 失败: {error}", config_path.display()))
+        })?
+    } else {
+        String::new()
+    };
+    let mut document = content.parse::<DocumentMut>().map_err(|error| {
+        RemoteAccessError::Config(format!("解析 {} 失败: {error}", config_path.display()))
+    })?;
+    if !document.contains_key("remote_access") || !document["remote_access"].is_table() {
+        document["remote_access"] = Item::Table(Table::new());
+    }
+    let section = document["remote_access"]
+        .as_table_mut()
+        .expect("remote_access was initialized as a table");
+    if !section.contains_key("enabled") {
+        section["enabled"] = value(true);
+    }
+    section["port"] = value(i64::from(port));
+    section["url"] = value(endpoint.url());
+
+    let parent = config_path.parent().ok_or_else(|| {
+        RemoteAccessError::Config(format!("配置路径没有父目录: {}", config_path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        RemoteAccessError::Config(format!("创建 {} 失败: {error}", parent.display()))
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| RemoteAccessError::Config(format!("创建临时配置文件失败: {error}")))?;
+    if let Ok(metadata) = fs::metadata(config_path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|error| RemoteAccessError::Config(format!("保留配置文件权限失败: {error}")))?;
+    }
+    temporary
+        .write_all(document.to_string().as_bytes())
+        .and_then(|()| temporary.as_file_mut().sync_all())
+        .map_err(|error| RemoteAccessError::Config(format!("写入配置文件失败: {error}")))?;
+    temporary.persist(config_path).map_err(|error| {
+        RemoteAccessError::Config(format!("替换 {} 失败: {error}", config_path.display()))
+    })?;
+    Ok(())
+}
+
+fn start_tailscale_service() {
+    if env::var_os(TAILSCALE_BIN_ENV).is_some_and(|value| !value.is_empty()) {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open")
+            .args(["-gj", "-a", "Tailscale"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // The installed Windows service normally starts at boot. This also
+        // recovers it after a manual stop when the current user is permitted.
+        let _ = Command::new("sc.exe")
+            .args(["start", "Tailscale"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 fn find_tailscale_cli() -> Option<PathBuf> {
@@ -295,9 +493,87 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        find_on_path, parse_status_json, run_command_output_with_timeout,
-        windows_cli_candidates_from, TailscaleStatus,
+        find_on_path, loopback_port, parse_status_json, persist_endpoint,
+        run_command_output_with_timeout, windows_cli_candidates_from, RemoteAccessSettings,
+        RemoteEndpoint, TailscaleStatus,
     };
+
+    #[test]
+    fn old_config_defaults_to_enabled_remote_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "[llm]\ndefault_model = \"test\"\n").unwrap();
+
+        let settings = RemoteAccessSettings::load(&path).unwrap();
+        assert!(settings.enabled());
+        assert_eq!(settings.port(), 8080);
+        assert_eq!(settings.cached_endpoint(), None);
+    }
+
+    #[test]
+    fn reads_disabled_custom_remote_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"[remote_access]
+enabled = false
+port = 9090
+url = "https://home-brain.example.ts.net"
+"#,
+        )
+        .unwrap();
+
+        let settings = RemoteAccessSettings::load(&path).unwrap();
+        assert!(!settings.enabled());
+        assert_eq!(settings.port(), 9090);
+        assert_eq!(
+            settings.cached_endpoint().unwrap().url(),
+            "https://home-brain.example.ts.net"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_remote_port() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "[remote_access]\nport = 0\n").unwrap();
+
+        let error = RemoteAccessSettings::load(&path).unwrap_err();
+        assert!(error.to_string().contains("1..=65535"));
+    }
+
+    #[test]
+    fn persists_endpoint_without_dropping_comments_or_sections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# keep this comment\n[llm]\ndefault_model = \"test\"\n",
+        )
+        .unwrap();
+        let endpoint = RemoteEndpoint::from_https_url("https://home-brain.example.ts.net").unwrap();
+
+        persist_endpoint(&path, &endpoint, 9090).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# keep this comment"));
+        assert!(content.contains("[llm]"));
+        assert!(content.contains("[remote_access]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("port = 9090"));
+        assert!(content.contains("url = \"https://home-brain.example.ts.net\""));
+    }
+
+    #[test]
+    fn automatic_remote_access_accepts_only_numeric_loopback_listeners() {
+        assert_eq!(loopback_port("127.0.0.1:8080"), Some(8080));
+        assert_eq!(loopback_port("[::1]:9090"), None);
+        assert_eq!(loopback_port("127.0.0.2:9090"), None);
+        assert_eq!(loopback_port("0.0.0.0:8080"), None);
+        assert_eq!(loopback_port("192.168.1.10:8080"), None);
+        assert_eq!(loopback_port("localhost:8080"), None);
+    }
 
     #[test]
     fn parses_running_status_and_normalizes_fields() {

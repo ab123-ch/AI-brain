@@ -7,22 +7,23 @@
         |
         | Tailnet 私有 HTTPS
         v
-Windows 主机上的 Tailscale Serve
+Windows 主机上的 Tailscale Serve（智脑启动时自动恢复）
         |
         | http://127.0.0.1:8080
         v
-ai-brain.exe remote
+ai-brain.exe web
 ```
 
 智脑、模型配置、工具执行和文件读写都发生在 Windows 主机。手机只是发送指令和查看结果，不是远程桌面。
 
 ## 当前状态
 
-- 已实现 `ai-brain remote --port <PORT>`。
+- 已实现普通 `ai-brain web` 启动时自动检查/启动 Tailscale 并恢复 Serve。
 - Web 服务只绑定 Windows 回环地址 `127.0.0.1`。
 - Tailscale Serve 提供 Tailnet 内的 HTTPS 地址。
-- 远程 Web 请求必须包含 Tailscale 用户身份头。
+- 本机浏览器可以继续直接访问；远程 Web 请求必须包含 Tailscale 用户身份头。
 - WebSocket 会校验 HTTPS Origin，拒绝跨站控制。
+- 首次成功连接后，固定 MagicDNS URL 会写入 `~/.ai-brain/config.toml` 的 `[remote_access]`。
 - 已为常见 Windows 安装目录和 `tailscale.exe` 添加发现逻辑及单元测试。
 - 尚未在真实 Windows 主机上完成编译、Tailscale 服务和手机端到端验证。
 
@@ -139,15 +140,15 @@ cargo build --release -p ai-brain-cli --bin ai-brain
 
 `test_orchestrator_query` 会访问外部模型，先从确定性测试中跳过；完成模型配置后再单独验证。
 
-## 五、启动安全远程模式
+## 五、启动智脑（自动恢复远程入口）
 
-先确保普通智脑模式所需的模型/API 配置已经可用。然后在工作区根目录对应的 `rust` 目录执行：
+先确保普通智脑模式所需的模型/API 配置已经可用。然后在工作区根目录对应的 `rust` 目录执行正常 Web 启动命令：
 
 ```powershell
-.\target\release\ai-brain.exe remote --port 8080
+.\target\release\ai-brain.exe web
 ```
 
-首次启用 Tailscale Serve 时，终端可能显示一个 HTTPS 授权地址。按提示在浏览器中批准一次。
+智脑会自动尝试启动已安装的 Tailscale Windows 服务、检查登录状态，并恢复到 `127.0.0.1:8080` 的私有 Serve 代理。首次启用 Tailscale Serve 时，终端可能显示一个 HTTPS 授权地址，按提示在浏览器中批准一次。以后继续使用同一条 `web` 命令，不再需要手工执行 Tailscale 命令。
 
 成功后终端会显示类似地址：
 
@@ -156,6 +157,19 @@ https://windows-host.example.ts.net
 ```
 
 保持这个 PowerShell/智脑进程运行。锁屏不会影响它，但注销或重启后需要重新执行该命令。端口反向代理不需要管理员终端。
+
+成功后固定地址会写入：
+
+```toml
+[remote_access]
+enabled = true
+port = 8080
+url = "https://windows-host.example.ts.net"
+```
+
+配置文件位于当前用户的 `~/.ai-brain/config.toml`（PowerShell 中通常是 `$HOME\.ai-brain\config.toml`）。设备改名或 Tailnet DNS 后缀变化时，智脑会在下次成功启动时更新 `url`。如需只允许本机访问，将 `enabled` 改为 `false` 后重启智脑。
+
+`ai-brain.exe remote --port 8080` 仍保留为严格远程模式和排障命令；日常常驻启动使用 `web`。
 
 ## 六、Windows 主机安全检查
 
@@ -175,7 +189,7 @@ tailscale serve status
 - Tailscale Serve 的目标是 `http://127.0.0.1:8080`。
 - 不配置路由器端口转发，不为 8080 建立公网入站规则。
 
-远程模式下直接访问 `http://127.0.0.1:8080` 可能返回 401，这是预期行为：远程策略要求请求经过 Tailscale Serve 并携带身份头。
+普通 `web` 自动远程模式下，本机仍可访问 `http://127.0.0.1:8080`。只有显式 `remote` 严格模式会要求所有请求都经过 Tailscale Serve。
 
 ## 七、手机端验证
 
@@ -189,7 +203,7 @@ tailscale serve status
 
 ## 八、停止远程访问
 
-在智脑窗口按 `Ctrl+C` 停止 AI Brain。Tailscale Serve 使用后台配置，若要同时取消代理，再执行：
+在智脑窗口按 `Ctrl+C` 停止 AI Brain。Tailscale Serve 使用后台配置，下一次 `web` 启动会自动恢复；若要关闭自动远程访问，先把配置中的 `remote_access.enabled` 改为 `false`。若要同时取消当前代理，再执行：
 
 ```powershell
 tailscale serve off
@@ -213,7 +227,7 @@ Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue
 1. 先确认当前分支和工作区改动，不覆盖已有修改。
 2. 检查 Tailscale Windows 服务和 tailscale.exe 实际路径。
 3. 运行文档中的格式、远程单测、确定性全量测试和 release 构建。
-4. 启动 ai-brain.exe remote --port 8080。
+4. 启动 ai-brain.exe web，确认它自动恢复 Tailscale Serve 并打印固定 URL。
 5. 验证只监听 127.0.0.1，并检查 tailscale serve status。
 6. 根据真实 Windows 错误修改代码并补测试，不用 Mac 交叉编译结果代替实机结果。
 7. 给出手机访问 URL，并协助完成手机浏览器端到端测试。

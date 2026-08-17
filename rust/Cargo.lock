@@ -91,6 +91,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tools",
  "tracing",
  "tracing-subscriber",

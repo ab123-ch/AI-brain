@@ -36,8 +36,9 @@ enum Commands {
     },
     /// 启动 Web UI
     Web {
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        addr: String,
+        /// 覆盖 [remote_access].port；自动远程访问仅用于回环监听地址
+        #[arg(long)]
+        addr: Option<String>,
     },
     /// 通过 Tailscale 私有网络启动远程 Web UI
     Remote {
@@ -163,18 +164,54 @@ async fn run_command(cli: Cli) {
             api_server::serve(orch, addr).await;
         }
         Some(Commands::Web { addr }) => {
+            let config_path = init::base_dir().join("config.toml");
+            let settings = match remote_access::RemoteAccessSettings::load(&config_path) {
+                Ok(settings) => Some(settings),
+                Err(error) => {
+                    eprintln!("远程访问配置读取失败，将使用本地模式: {error}");
+                    None
+                }
+            };
+            let addr = addr.clone().unwrap_or_else(|| {
+                format!(
+                    "127.0.0.1:{}",
+                    settings
+                        .as_ref()
+                        .map_or(remote_access::DEFAULT_REMOTE_PORT, |settings| settings
+                            .port())
+                )
+            });
+            let endpoint = settings.as_ref().and_then(|settings| {
+                prepare_automatic_remote_access(settings, &config_path, &addr)
+            });
             let orch = init_or_die().await;
-            if let Err(error) = api_server::serve_web(orch, &addr).await {
+            let result = if remote_access::loopback_port(&addr).is_some() {
+                api_server::serve_web_auto_remote(
+                    orch,
+                    &addr,
+                    endpoint.as_ref().map(remote_access::RemoteEndpoint::host),
+                )
+                .await
+            } else {
+                api_server::serve_web(orch, &addr).await
+            };
+            if let Err(error) = result {
                 eprintln!("Web UI 启动失败: {error}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Remote { port }) => match remote_access::configure(*port) {
             Ok(endpoint) => {
+                let config_path = init::base_dir().join("config.toml");
+                if let Err(error) = remote_access::persist_endpoint(&config_path, &endpoint, *port)
+                {
+                    eprintln!("固定远程地址写入配置失败，但本次远程访问仍可使用: {error}");
+                }
                 println!("\n=== 智脑安全远程模式 ===");
                 println!("手机 / 异地电脑访问: {}", endpoint.url());
                 println!("访问范围: 仅当前 Tailscale 私有网络");
                 println!("本机监听: http://127.0.0.1:{port}");
+                println!("配置文件: {}", config_path.display());
                 println!("停止共享: tailscale serve off\n");
 
                 let orch = init_or_die().await;
@@ -292,6 +329,49 @@ async fn run_command(cli: Cli) {
                 "系统提示词已导出到: {}",
                 desktop.join("系统提示词.txt").display()
             );
+        }
+    }
+}
+
+fn prepare_automatic_remote_access(
+    settings: &remote_access::RemoteAccessSettings,
+    config_path: &std::path::Path,
+    addr: &str,
+) -> Option<remote_access::RemoteEndpoint> {
+    if !settings.enabled() {
+        tracing::info!("Tailscale 自动远程访问已由配置关闭");
+        return None;
+    }
+
+    let Some(port) = remote_access::loopback_port(addr) else {
+        eprintln!("自动远程访问未启用：Web 监听地址 {addr} 不是回环地址；请使用 127.0.0.1:<端口>");
+        return None;
+    };
+
+    match remote_access::configure(port) {
+        Ok(endpoint) => {
+            if let Err(error) = remote_access::persist_endpoint(config_path, &endpoint, port) {
+                eprintln!("固定远程地址写入配置失败，但本次远程访问仍可使用: {error}");
+            }
+            println!("\n=== 智脑私有远程访问已自动启动 ===");
+            println!("固定地址: {}", endpoint.url());
+            println!("本机地址: http://{addr}");
+            println!("配置文件: {}\n", config_path.display());
+            Some(endpoint)
+        }
+        Err(error) => {
+            if port == settings.port() {
+                if let Some(endpoint) = settings.cached_endpoint() {
+                    eprintln!("Tailscale 当前尚未就绪: {error}");
+                    eprintln!(
+                        "将保留固定入口 {}；已有 Serve 配置会随 Tailscale 服务恢复。",
+                        endpoint.url()
+                    );
+                    return Some(endpoint);
+                }
+            }
+            eprintln!("Tailscale 自动远程访问暂不可用，本机 Web 仍会启动: {error}");
+            None
         }
     }
 }
