@@ -729,8 +729,7 @@ impl MainBrain {
             prompts::build_system_prompt_with_tools()
         };
         // 注入运行环境信息（OS、工作目录、日期）
-        let env_info =
-            prompts::build_environment_info_for(&self.tool_execution_context.working_directory);
+        let env_info = prompts::build_environment_info_for_context(&self.tool_execution_context);
         // 将记忆上下文追加到 system prompt
         // Prompt cache 排序：越稳定的越靠前
         // 1. Bootstrap 技能（插件注入，会话级稳定）

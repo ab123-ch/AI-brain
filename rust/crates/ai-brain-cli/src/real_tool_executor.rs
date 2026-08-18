@@ -297,7 +297,7 @@ impl RealToolExecutor {
     fn execute_internal(
         &self,
         tool_call: &ToolCall,
-        working_directory: Option<PathBuf>,
+        tool_execution_context: Option<ToolExecutionContext>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + '_>> {
         let name = tool_call.tool_name.clone();
         let mut input = tool_call.input.clone();
@@ -548,12 +548,15 @@ impl RealToolExecutor {
                 } else {
                     // 没有 SkillCatalog 时走旧的 tools::execute_tool 路径
                     let n_clone = n.clone();
-                    let result = tokio::task::spawn_blocking(move || match working_directory {
-                        Some(cwd) => tools::execute_tool_in_directory(&n_clone, &inp, &cwd),
-                        None => tools::execute_tool(&n_clone, &inp),
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
+                    let result =
+                        tokio::task::spawn_blocking(move || match tool_execution_context {
+                            Some(context) => {
+                                tools::execute_tool_with_context(&n_clone, &inp, &context)
+                            }
+                            None => tools::execute_tool(&n_clone, &inp),
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("工具执行 panic: {e}")));
                     match result {
                         Ok(output) => ToolExecutionResult {
                             tool_name: n.clone(),
@@ -610,9 +613,10 @@ impl RealToolExecutor {
                 if let Some(trace) = &trace {
                     trace.publish_request();
                 }
-                let result = match working_directory {
-                    Some(cwd) => {
-                        tools::execute_agent_tool_with_completion_in_directory(&input, &cwd).await
+                let result = match tool_execution_context {
+                    Some(context) => {
+                        tools::execute_agent_tool_with_completion_with_context(&input, &context)
+                            .await
                     }
                     None => tools::execute_agent_tool_with_completion(&input).await,
                 };
@@ -685,8 +689,8 @@ impl RealToolExecutor {
         Box::pin(async move {
             let start = std::time::Instant::now();
 
-            let result = tokio::task::spawn_blocking(move || match working_directory {
-                Some(cwd) => tools::execute_tool_in_directory(&name, &input, &cwd),
+            let result = tokio::task::spawn_blocking(move || match tool_execution_context {
+                Some(context) => tools::execute_tool_with_context(&name, &input, &context),
                 None => tools::execute_tool(&name, &input),
             })
             .await
@@ -722,7 +726,7 @@ impl ToolExecutor for RealToolExecutor {
         tool_call: &'a ToolCall,
         context: &'a ToolExecutionContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionResult> + Send + 'a>> {
-        self.execute_internal(tool_call, Some(context.working_directory.clone()))
+        self.execute_internal(tool_call, Some(context.clone()))
     }
 
     fn list_tools(&self) -> Vec<ToolDescriptor> {
@@ -2269,6 +2273,40 @@ mod tests {
         assert!(!result_b.is_error, "目录 B 读取失败: {}", result_b.output);
         assert!(result_b.output.contains("from-b"));
         assert!(!result_b.output.contains("from-a"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn real_executor_passes_frozen_command_backend_to_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let executor = RealToolExecutor::new();
+        let call = ToolCall {
+            tool_name: "bash".into(),
+            input: json!({ "command": "printf inherited-backend" }),
+            validated: false,
+            validation_id: None,
+        };
+        let context = ToolExecutionContext::with_command_execution(
+            &workspace,
+            brain_core::tool_executor::ResolvedCommandExecution::host_sh(std::env::consts::OS),
+        );
+
+        let result = executor.execute_with_context(&call, &context).await;
+
+        assert!(
+            !result.is_error,
+            "contextual bash failed: {}",
+            result.output
+        );
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["stdout"], "inherited-backend");
+        assert_eq!(output["executionBackend"], "sh");
+        assert_eq!(output["commandSyntax"], "posix");
+        assert_eq!(
+            output["hostWorkingDirectory"],
+            workspace.display().to_string()
+        );
     }
 
     #[tokio::test]

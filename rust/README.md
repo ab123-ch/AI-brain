@@ -78,6 +78,36 @@ tailscale serve off
 Do not replace this setup with a `0.0.0.0` bind or router port forwarding: the
 Web UI can execute tools and edit files in the current workspace.
 
+## AI Brain Command Execution on Windows
+
+On native Windows, AI Brain's generic `bash` tool defaults to WSL Bash. The Web
+server, SQLite database, file tools, MCP services, and Tailscale remain native
+Windows processes. macOS and Linux continue to default to host `sh -lc`.
+
+The backend can be selected per user or workspace with `.claw` JSON settings:
+
+```json
+{
+  "commandExecution": {
+    "backend": "auto",
+    "wsl": {
+      "distribution": "Ubuntu-24.04",
+      "user": "brain"
+    }
+  }
+}
+```
+
+Supported backend values are `auto`, `wsl`, `powershell`, and `sh`. `auto`
+selects WSL on Windows and host `sh` elsewhere; it does not fall back after an
+execution failure. New Web member tasks freeze the resolved backend, and
+delegated agents inherit it. The explicit `PowerShell` tool remains independent.
+
+See [docs/command-execution.md](docs/command-execution.md) for configuration
+precedence and lifecycle details, and
+[docs/windows-remote-access.md](docs/windows-remote-access.md) for native Windows
+installation and acceptance checks.
+
 ## Configuration
 
 Set your API credentials:

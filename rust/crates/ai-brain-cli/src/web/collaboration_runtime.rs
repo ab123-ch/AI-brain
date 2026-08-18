@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::tool_executor::ToolExecutionContext;
+use brain_core::tool_executor::{ResolvedCommandExecution, ToolExecutionContext};
 use brain_core::types::{MainBrainOutput, ProgressEvent};
 use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
 use brain_memory::conversation_memory::ConversationMemoryScope;
@@ -1077,7 +1077,7 @@ impl CollaborationRuntime {
         ),
         String,
     > {
-        let tool_execution_context = tool_execution_context_for_claim(claim)?;
+        validate_claim_working_directory(claim)?;
         let task_run_id = claim.task_run_id.clone();
         let tasks = Arc::clone(&self.task_repository);
         let task_id_for_lookup = task_run_id.clone();
@@ -1092,8 +1092,14 @@ impl CollaborationRuntime {
         if let Some(task) = existing {
             let snapshot = validated_task_context(&task, claim)?;
             let policy = execution_policy_from_task(&task)?;
+            let tool_execution_context = tool_execution_context_for_task(&task, claim)?;
             return Ok((task, snapshot, policy, tool_execution_context));
         }
+
+        let tool_execution_context =
+            crate::command_execution::tool_execution_context_for_directory(
+                &claim.execution_working_directory,
+            )?;
 
         let model = self
             .model_policy_details
@@ -1123,7 +1129,13 @@ impl CollaborationRuntime {
         .map_err(|error| format!("构建成员上下文线程失败: {error}"))?
         .map_err(|error| format!("构建成员上下文失败: {error}"))?;
 
-        let request = task_request_for_claim(claim, self.repository.config(), &model, &snapshot);
+        let request = task_request_for_claim_with_command_execution(
+            claim,
+            self.repository.config(),
+            &model,
+            &snapshot,
+            &tool_execution_context.command_execution,
+        );
         let tasks = Arc::clone(&self.task_repository);
         let task = tokio::task::spawn_blocking(move || tasks.create_task(request))
             .await
@@ -2200,6 +2212,7 @@ const MAX_GRAPH_ITEMS: usize = 40;
 const COLLABORATION_TASK_V3: &str = "collaboration-task-v3";
 const COLLABORATION_TASK_V4: &str = "collaboration-task-v4";
 const COLLABORATION_TASK_V5: &str = "collaboration-task-v5";
+const COLLABORATION_TASK_V6: &str = "collaboration-task-v6";
 
 fn validate_task_claim_identity(task: &TaskRun, claim: &ClaimedInboxItem) -> Result<(), String> {
     if task.origin_kind != "member_inbox"
@@ -2230,7 +2243,7 @@ fn validate_task_claim_identity(task: &TaskRun, claim: &ClaimedInboxItem) -> Res
             }
             return Ok(());
         }
-        COLLABORATION_TASK_V4 | COLLABORATION_TASK_V5 => {}
+        COLLABORATION_TASK_V4 | COLLABORATION_TASK_V5 | COLLABORATION_TASK_V6 => {}
         unsupported => {
             return Err(format!(
                 "持久任务 {} 使用不支持的配置 {}",
@@ -2245,6 +2258,19 @@ fn validate_task_claim_identity(task: &TaskRun, claim: &ClaimedInboxItem) -> Res
         ));
     }
 
+    validate_frozen_execution_and_reply_identity(task, claim)?;
+    match task.config_version.as_str() {
+        COLLABORATION_TASK_V5 => validate_v5_task_handoff(task, claim)?,
+        COLLABORATION_TASK_V6 => validate_v6_task_handoff(task, claim)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_frozen_execution_and_reply_identity(
+    task: &TaskRun,
+    claim: &ClaimedInboxItem,
+) -> Result<(), String> {
     let execution_working_directory = task
         .resolved_config
         .get("execution_working_directory")
@@ -2305,28 +2331,59 @@ fn validate_task_claim_identity(task: &TaskRun, claim: &ClaimedInboxItem) -> Res
             task.task_run_id
         ));
     }
-    if task.config_version == COLLABORATION_TASK_V5 {
-        let task_handoff: MemberHandoffContext = serde_json::from_value(
-            task.resolved_config
-                .get("member_handoff")
-                .cloned()
-                .ok_or_else(|| format!("持久任务 {} 缺少 member_handoff", task.task_run_id))?,
+    Ok(())
+}
+
+fn validate_v5_task_handoff(task: &TaskRun, claim: &ClaimedInboxItem) -> Result<(), String> {
+    let task_handoff: MemberHandoffContext = serde_json::from_value(
+        task.resolved_config
+            .get("member_handoff")
+            .cloned()
+            .ok_or_else(|| format!("持久任务 {} 缺少 member_handoff", task.task_run_id))?,
+    )
+    .map_err(|error| format!("解析持久任务实例转交信息失败: {error}"))?;
+    let claim_handoff = claim.member_handoff.as_ref().ok_or_else(|| {
+        format!(
+            "持久任务 {} 使用 v5 但当前租约没有实例转交信息",
+            task.task_run_id
         )
-        .map_err(|error| format!("解析持久任务实例转交信息失败: {error}"))?;
-        let claim_handoff = claim.member_handoff.as_ref().ok_or_else(|| {
-            format!(
-                "持久任务 {} 使用 v5 但当前租约没有实例转交信息",
-                task.task_run_id
-            )
-        })?;
-        validate_member_handoff(claim_handoff, claim)?;
-        validate_member_handoff(&task_handoff, claim)?;
-        if &task_handoff != claim_handoff {
-            return Err(format!(
-                "持久任务 {} 的冻结实例转交信息与当前租约不一致",
-                task.task_run_id
-            ));
+    })?;
+    validate_matching_member_handoffs(task, claim, &task_handoff, claim_handoff)
+}
+
+fn validate_v6_task_handoff(task: &TaskRun, claim: &ClaimedInboxItem) -> Result<(), String> {
+    let task_handoff: Option<MemberHandoffContext> = serde_json::from_value(
+        task.resolved_config
+            .get("member_handoff")
+            .cloned()
+            .ok_or_else(|| format!("持久任务 {} 缺少 member_handoff", task.task_run_id))?,
+    )
+    .map_err(|error| format!("解析持久任务实例转交信息失败: {error}"))?;
+    match (task_handoff.as_ref(), claim.member_handoff.as_ref()) {
+        (None, None) => Ok(()),
+        (Some(task_handoff), Some(claim_handoff)) => {
+            validate_matching_member_handoffs(task, claim, task_handoff, claim_handoff)
         }
+        _ => Err(format!(
+            "持久任务 {} 的冻结实例转交信息与当前租约存在性不一致",
+            task.task_run_id
+        )),
+    }
+}
+
+fn validate_matching_member_handoffs(
+    task: &TaskRun,
+    claim: &ClaimedInboxItem,
+    task_handoff: &MemberHandoffContext,
+    claim_handoff: &MemberHandoffContext,
+) -> Result<(), String> {
+    validate_member_handoff(claim_handoff, claim)?;
+    validate_member_handoff(task_handoff, claim)?;
+    if task_handoff != claim_handoff {
+        return Err(format!(
+            "持久任务 {} 的冻结实例转交信息与当前租约不一致",
+            task.task_run_id
+        ));
     }
     Ok(())
 }
@@ -2367,6 +2424,7 @@ fn context_snapshot_from_task(task: &TaskRun) -> Result<ContextSnapshot, String>
     if task.config_version != COLLABORATION_TASK_V3
         && task.config_version != COLLABORATION_TASK_V4
         && task.config_version != COLLABORATION_TASK_V5
+        && task.config_version != COLLABORATION_TASK_V6
     {
         return Err(format!(
             "持久任务 {} 使用不支持的配置 {}，没有可重放的冻结上下文",
@@ -2391,10 +2449,18 @@ fn validated_task_context(
     claim: &ClaimedInboxItem,
 ) -> Result<ContextSnapshot, String> {
     validate_task_claim_identity(task, claim)?;
+    tool_execution_context_for_task(task, claim)?;
     let snapshot = context_snapshot_from_task(task)?;
     match task.config_version.as_str() {
         COLLABORATION_TASK_V4 => validate_v4_reply_context(task, claim, &snapshot)?,
         COLLABORATION_TASK_V5 => validate_v5_handoff_context(task, claim, &snapshot)?,
+        COLLABORATION_TASK_V6 => {
+            if claim.member_handoff.is_some() {
+                validate_v5_handoff_context(task, claim, &snapshot)?;
+            } else {
+                validate_v4_reply_context(task, claim, &snapshot)?;
+            }
+        }
         _ => {}
     }
     Ok(snapshot)
@@ -2408,7 +2474,7 @@ fn validate_v5_handoff_context(
     let handoff = claim
         .member_handoff
         .as_ref()
-        .ok_or_else(|| format!("持久任务 {} 的 v5 租约缺少实例转交信息", task.task_run_id))?;
+        .ok_or_else(|| format!("持久任务 {} 的租约缺少实例转交信息", task.task_run_id))?;
     let mut expected_references = Vec::new();
     if let Some(reference) = claim.reply_reference.as_ref() {
         expected_references.push(reply_reference_block(reference));
@@ -2547,13 +2613,47 @@ fn execution_policy_from_task(task: &TaskRun) -> Result<MemberExecutionPolicy, S
     })
 }
 
-fn tool_execution_context_for_claim(
-    claim: &ClaimedInboxItem,
-) -> Result<ToolExecutionContext, String> {
+fn validate_claim_working_directory(claim: &ClaimedInboxItem) -> Result<(), String> {
     let path = &claim.execution_working_directory;
     validate_working_directory_access(path)
-        .map_err(|error| format!("冻结工作目录 {} 不可用: {error}", path.display()))?;
-    Ok(ToolExecutionContext::new(path.clone()))
+        .map_err(|error| format!("冻结工作目录 {} 不可用: {error}", path.display()))
+}
+
+fn tool_execution_context_for_task(
+    task: &TaskRun,
+    claim: &ClaimedInboxItem,
+) -> Result<ToolExecutionContext, String> {
+    let command_execution = match task.config_version.as_str() {
+        COLLABORATION_TASK_V3 | COLLABORATION_TASK_V4 | COLLABORATION_TASK_V5 => {
+            ResolvedCommandExecution::host_sh(std::env::consts::OS)
+        }
+        COLLABORATION_TASK_V6 => {
+            let value = task
+                .resolved_config
+                .get("command_execution")
+                .cloned()
+                .ok_or_else(|| format!("持久任务 {} 缺少 command_execution", task.task_run_id))?;
+            serde_json::from_value(value)
+                .map_err(|error| format!("解析持久任务命令执行配置失败: {error}"))?
+        }
+        unsupported => {
+            return Err(format!(
+                "持久任务 {} 使用不支持的配置 {}",
+                task.task_run_id, unsupported
+            ));
+        }
+    };
+    let context = ToolExecutionContext::with_command_execution(
+        claim.execution_working_directory.clone(),
+        command_execution,
+    );
+    crate::command_execution::validate_tool_execution_context(&context).map_err(|error| {
+        format!(
+            "持久任务 {} 的冻结命令执行配置无效: {error}",
+            task.task_run_id
+        )
+    })?;
+    Ok(context)
 }
 
 fn context_request_for_claim(
@@ -2819,11 +2919,28 @@ fn execution_input_for_claim(claim: &ClaimedInboxItem) -> String {
     }
 }
 
+#[cfg(test)]
 fn task_request_for_claim(
     claim: &ClaimedInboxItem,
     config: &CollaborationConfig,
     model: &ResolvedModelPolicy,
     context_snapshot: &ContextSnapshot,
+) -> NewTaskRun {
+    task_request_for_claim_with_command_execution(
+        claim,
+        config,
+        model,
+        context_snapshot,
+        &ResolvedCommandExecution::default_for_current_host(),
+    )
+}
+
+fn task_request_for_claim_with_command_execution(
+    claim: &ClaimedInboxItem,
+    config: &CollaborationConfig,
+    model: &ResolvedModelPolicy,
+    context_snapshot: &ContextSnapshot,
+    command_execution: &ResolvedCommandExecution,
 ) -> NewTaskRun {
     let task_run_id = claim.task_run_id.clone();
     NewTaskRun {
@@ -2841,12 +2958,7 @@ fn task_request_for_claim(
         origin_kind: "member_inbox".into(),
         origin_id: claim.inbox_item_id.clone(),
         room_id: Some(claim.room_id.clone()),
-        config_version: if claim.member_handoff.is_some() {
-            COLLABORATION_TASK_V5
-        } else {
-            COLLABORATION_TASK_V4
-        }
-        .into(),
+        config_version: COLLABORATION_TASK_V6.into(),
         resolved_config: serde_json::json!({
             "profile_id": claim.profile_id,
             "reasoning_depth": claim.reasoning_depth,
@@ -2863,6 +2975,7 @@ fn task_request_for_claim(
             "reply_to_event_id": claim.reply_reference.as_ref().map(|reference| &reference.event_id),
             "reply_reference": claim.reply_reference,
             "member_handoff": claim.member_handoff,
+            "command_execution": command_execution,
             "context_snapshot_id": context_snapshot.context_snapshot_id,
             "context_content_hash": context_snapshot.content_hash,
             "context_snapshot": context_snapshot,
@@ -2909,9 +3022,11 @@ mod tests {
     use super::{
         context_request_for_claim, context_snapshot_from_task, parse_participation_answer,
         reconcile_durable_result, scheduler_limits, task_request_for_claim,
+        task_request_for_claim_with_command_execution, tool_execution_context_for_task,
         validate_task_claim_identity, validated_task_context, with_model_policy_details,
         ClaimRunError, CollaborationRuntime, CollaborationRuntimeServices,
-        DurableResultDisposition, DurableResultRecoveryError,
+        DurableResultDisposition, DurableResultRecoveryError, COLLABORATION_TASK_V3,
+        COLLABORATION_TASK_V4, COLLABORATION_TASK_V5,
     };
     use crate::orchestrator::{execute_member_run, MemberQueryError};
     use crate::real_tool_executor::{mvp_tool_definitions, RealToolExecutor};
@@ -2925,7 +3040,7 @@ mod tests {
     use brain_core::config::{
         BrainConfig, BrainSection, PythonSection, ThresholdConfig, WeightConfig,
     };
-    use brain_core::tool_executor::{ToolExecutionContext, ToolExecutor};
+    use brain_core::tool_executor::{ResolvedCommandExecution, ToolExecutionContext, ToolExecutor};
     use brain_core::types::{MainBrainOutput, ProgressEvent};
     use brain_llm::config::{LlmConfig, ResolvedModelPolicy};
     use brain_llm::{
@@ -5402,7 +5517,7 @@ mod tests {
         assert_eq!(task_recovery.requeued, 2);
         let persisted_reply_task = tasks.task(&reply_task_run_id).unwrap();
         assert_eq!(persisted_reply_task.state, TaskRunState::Queued);
-        assert_eq!(persisted_reply_task.config_version, "collaboration-task-v4");
+        assert_eq!(persisted_reply_task.config_version, "collaboration-task-v6");
 
         let reopened_snapshot = reopened.snapshot("room-reopen-recovery").unwrap();
         assert_eq!(
@@ -5487,7 +5602,7 @@ mod tests {
         let persisted_reference = persisted_reply_claim.reply_reference.as_ref().unwrap();
         let frozen_context =
             validated_task_context(&persisted_reply_task, persisted_reply_claim).unwrap();
-        assert_eq!(persisted_reply_task.config_version, "collaboration-task-v4");
+        assert_eq!(persisted_reply_task.config_version, "collaboration-task-v6");
         assert_eq!(persisted_reply_task.task_run_id, reply_task_run_id);
         assert_eq!(
             frozen_context
@@ -5820,7 +5935,7 @@ mod tests {
     }
 
     #[test]
-    fn member_handoff_v5_freezes_root_user_and_changed_files() {
+    fn member_handoff_v6_freezes_root_user_changed_files_and_command_execution() {
         let directory = tempfile::tempdir().unwrap();
         let config = CollaborationConfig::default();
         let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
@@ -5894,7 +6009,11 @@ mod tests {
         let llm = LlmConfig::default_config();
         let model = llm.resolve_model_policy(&claim_b.model_policy);
         let request = task_request_for_claim(&claim_b, &config, &model, &context);
-        assert_eq!(request.config_version, "collaboration-task-v5");
+        assert_eq!(request.config_version, "collaboration-task-v6");
+        assert_eq!(
+            request.resolved_config["command_execution"]["host_os"],
+            std::env::consts::OS
+        );
         assert!(context.blocks.iter().any(|block| {
             block.kind == ContextBlockKind::ConversationReference
                 && block
@@ -5939,6 +6058,14 @@ mod tests {
         tampered_file.resolved_config["member_handoff"]["changed_files"][0]["path"] =
             serde_json::json!(directory.path().join("伪造文件.md"));
         assert!(validated_task_context(&tampered_file, &recovered_claim).is_err());
+
+        let mut missing_task_handoff = recovered_task.clone();
+        missing_task_handoff.resolved_config["member_handoff"] = serde_json::Value::Null;
+        assert!(validated_task_context(&missing_task_handoff, &recovered_claim).is_err());
+
+        let mut missing_claim_handoff = recovered_claim.clone();
+        missing_claim_handoff.member_handoff = None;
+        assert!(validated_task_context(&recovered_task, &missing_claim_handoff).is_err());
 
         for downgraded_version in ["collaboration-task-v3", "collaboration-task-v4"] {
             let mut downgraded = recovered_task.clone();
@@ -5996,7 +6123,7 @@ mod tests {
         let request = task_request_for_claim(&direct, &config, &model, &context);
 
         assert_eq!(request.workflow, "collaboration.member-chat");
-        assert_eq!(request.config_version, "collaboration-task-v4");
+        assert_eq!(request.config_version, "collaboration-task-v6");
         assert_eq!(request.resolved_config["purpose"], "direct");
         assert_eq!(
             request.resolved_config["context_snapshot_id"],
@@ -6061,7 +6188,7 @@ mod tests {
         let context = built_context_snapshot_for_claim(&collaboration, &claim, &config);
         let request = task_request_for_claim(&claim, &config, &model, &context);
 
-        assert_eq!(request.config_version, "collaboration-task-v4");
+        assert_eq!(request.config_version, "collaboration-task-v6");
         assert_eq!(
             request.resolved_config["execution_working_directory"].as_str(),
             claim.execution_working_directory.to_str()
@@ -6174,7 +6301,7 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_task_v3_v4_and_v5_are_the_only_replayable_versions() {
+    fn collaboration_task_v3_through_v6_are_the_only_replayable_versions() {
         let directory = tempfile::tempdir().unwrap();
         let config = CollaborationConfig::default();
         let collaboration = CollaborationRepository::new(directory.path(), config.clone()).unwrap();
@@ -6216,6 +6343,11 @@ mod tests {
         );
         assert!(validate_task_claim_identity(&v5_without_handoff, &claim).is_err());
 
+        let mut v6 = created.clone();
+        v6.config_version = "collaboration-task-v6".into();
+        assert_eq!(context_snapshot_from_task(&v6).unwrap(), context);
+        validated_task_context(&v6, &claim).unwrap();
+
         let mut unexpected_blocks = context.blocks.clone();
         unexpected_blocks.push(
             ContextBlock::from_input(ContextBlockInput::new(
@@ -6235,7 +6367,7 @@ mod tests {
         for invalid_version in [
             "collaboration-task-v2",
             "collaboration-task-v4 ",
-            "collaboration-task-v6",
+            "collaboration-task-v7",
         ] {
             let mut invalid = created.clone();
             invalid.config_version = invalid_version.into();
@@ -6252,6 +6384,94 @@ mod tests {
         tampered_v4.resolved_config["context_snapshot"]["blocks"][0]["content"] =
             serde_json::json!("tampered v4 policy");
         assert!(context_snapshot_from_task(&tampered_v4).is_err());
+    }
+
+    #[test]
+    fn collaboration_task_command_execution_is_frozen_for_v6_and_legacy_for_v3_v5() {
+        let runtime_directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let config = CollaborationConfig::default();
+        let collaboration = CollaborationRepository::new_with_startup_working_directory(
+            runtime_directory.path(),
+            config.clone(),
+            &workspace,
+        )
+        .unwrap();
+        let room = collaboration
+            .ensure_room("room-command-execution", "Command Execution Room", &[])
+            .unwrap();
+        collaboration
+            .post_message(
+                "room-command-execution",
+                std::slice::from_ref(&room.room.default_member_id),
+                "冻结命令后端",
+                RoomInputMode::Task,
+                "command-execution-input",
+            )
+            .unwrap();
+        let claim = collaboration.lease_next().unwrap().unwrap();
+        let llm = LlmConfig::default_config();
+        let model = llm.resolve_model_policy(&claim.model_policy);
+        let context = task_context_snapshot("context-command-execution", &claim.input);
+        let frozen = ResolvedCommandExecution::host_sh(std::env::consts::OS);
+        let request = task_request_for_claim_with_command_execution(
+            &claim, &config, &model, &context, &frozen,
+        );
+        let tasks = TaskRepository::open(collaboration.database_path()).unwrap();
+        let task = tasks.create_task(request).unwrap();
+
+        std::fs::create_dir_all(workspace.join(".claw")).unwrap();
+        std::fs::write(
+            workspace.join(".claw/settings.local.json"),
+            r#"{"commandExecution":{"backend":"not-a-backend"}}"#,
+        )
+        .unwrap();
+
+        let restored = tool_execution_context_for_task(&task, &claim).unwrap();
+        assert_eq!(restored.command_execution, frozen);
+
+        for legacy_version in [
+            COLLABORATION_TASK_V3,
+            COLLABORATION_TASK_V4,
+            COLLABORATION_TASK_V5,
+        ] {
+            let mut legacy = task.clone();
+            legacy.config_version = legacy_version.into();
+            legacy
+                .resolved_config
+                .as_object_mut()
+                .unwrap()
+                .remove("command_execution");
+            let restored = tool_execution_context_for_task(&legacy, &claim).unwrap();
+            assert_eq!(
+                restored.command_execution,
+                ResolvedCommandExecution::host_sh(std::env::consts::OS)
+            );
+        }
+
+        let mut missing = task.clone();
+        missing
+            .resolved_config
+            .as_object_mut()
+            .unwrap()
+            .remove("command_execution");
+        assert!(tool_execution_context_for_task(&missing, &claim).is_err());
+
+        let mut mismatched_syntax = task.clone();
+        mismatched_syntax.resolved_config["command_execution"]["syntax"] =
+            serde_json::json!("powershell");
+        assert!(tool_execution_context_for_task(&mismatched_syntax, &claim).is_err());
+
+        let mut mismatched_host = task.clone();
+        mismatched_host.resolved_config["command_execution"]["host_os"] =
+            serde_json::json!("not-current-host");
+        assert!(tool_execution_context_for_task(&mismatched_host, &claim).is_err());
+
+        let mut invalid_wsl_field = task;
+        invalid_wsl_field.resolved_config["command_execution"]["wsl_distribution"] =
+            serde_json::json!("Ubuntu-24.04");
+        assert!(tool_execution_context_for_task(&invalid_wsl_field, &claim).is_err());
     }
 
     #[test]
@@ -7261,7 +7481,7 @@ mod tests {
         rewrite_task_config_for_test(
             &collaboration,
             &task,
-            "collaboration-task-v6",
+            "collaboration-task-v7",
             &task.resolved_config,
         );
         drop(collaboration);

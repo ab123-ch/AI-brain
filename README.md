@@ -176,6 +176,31 @@ max_tokens = 4096
 temperature = 0.7
 ```
 
+### Windows 命令执行后端
+
+Windows 上，模型调用通用 `bash` 工具时默认通过 WSL 的 Bash 执行；Web 服务、数据库、
+文件工具和 Tailscale 仍是原生 Windows 进程。macOS/Linux 默认行为仍为宿主 `sh -lc`。
+
+命令后端使用 `.claw` JSON 设置，不写入上面的 `~/.ai-brain/config.toml`。例如在项目目录
+创建 `.claw/settings.local.json`：
+
+```json
+{
+  "commandExecution": {
+    "backend": "auto",
+    "wsl": {
+      "distribution": "Ubuntu-24.04",
+      "user": "brain"
+    }
+  }
+}
+```
+
+`backend` 支持 `auto`、`wsl`、`powershell`、`sh`。Windows 的 `auto` 默认为 WSL，
+且失败时不会静默切换解释器。完整的配置来源、优先级、生效时机和排障说明见
+[命令执行后端配置](rust/docs/command-execution.md)；Windows 安装和实机验收见
+[Windows 主机操作手册](rust/docs/windows-remote-access.md)。
+
 ### API Key 配置
 
 两种方式（环境变量优先）：

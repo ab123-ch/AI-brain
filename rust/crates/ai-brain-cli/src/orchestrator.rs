@@ -537,6 +537,12 @@ impl Orchestrator {
     async fn new_with_runtime(llm_config: LlmConfig, runtime_dir: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|error| format!("创建运行时目录失败: {error}"))?;
+        let direct_working_directory =
+            std::env::current_dir().map_err(|error| format!("无法确定主脑工作目录: {error}"))?;
+        let direct_tool_execution_context =
+            crate::command_execution::tool_execution_context_for_directory(
+                &direct_working_directory,
+            )?;
         let collaboration_config =
             crate::web::collaboration::CollaborationConfig::load(&runtime_dir.join("config.toml"))
                 .map_err(|error| format!("加载统一执行配置失败: {error}"))?;
@@ -794,6 +800,7 @@ impl Orchestrator {
             Some(Arc::clone(&memory)),
             dispatch.clone(),
             runtime_trace_tx.clone(),
+            direct_tool_execution_context,
             // Arc::clone(&novel_application_port),
         );
 
@@ -2902,6 +2909,7 @@ fn create_v2_main_brain(
     memory_brain: Option<Arc<Mutex<PyramidMemoryBrain>>>,
     dispatch: brain_dispatch::TokioDispatch,
     runtime_trace_tx: broadcast::Sender<RuntimeExchange>,
+    tool_execution_context: ToolExecutionContext,
     // novel_application: Arc<dyn TaskApplicationPort>,
 ) -> (
     Arc<Mutex<Option<MainBrain>>>,
@@ -3008,7 +3016,14 @@ fn create_v2_main_brain(
         llm_config.provider_for_brain("main"),
         llm_config.model_for_brain("main")
     );
-    let mut brain = MainBrain::new(client, tool_executor, brain_config, main_mt, main_temp);
+    let mut brain = MainBrain::new_in_context(
+        client,
+        tool_executor,
+        brain_config,
+        main_mt,
+        main_temp,
+        tool_execution_context,
+    );
 
     // 注册所有 MVP 工具（bash、read_file、write_file、edit_file、glob、grep）
     let tool_defs = crate::real_tool_executor::mvp_tool_definitions();

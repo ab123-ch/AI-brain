@@ -22,6 +22,212 @@ pub enum ResolvedPermissionMode {
     DangerFullAccess,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPlatform {
+    Windows,
+    Macos,
+    Linux,
+    Other,
+}
+
+impl HostPlatform {
+    #[must_use]
+    pub fn current() -> Self {
+        match std::env::consts::OS {
+            "windows" => Self::Windows,
+            "macos" => Self::Macos,
+            "linux" => Self::Linux,
+            _ => Self::Other,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Macos => "macos",
+            Self::Linux => "linux",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandBackendPreference {
+    #[default]
+    Auto,
+    Wsl,
+    Powershell,
+    Sh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WslCommandConfig {
+    distribution: Option<String>,
+    user: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommandExecutionConfig {
+    backend: CommandBackendPreference,
+    wsl: WslCommandConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedCommandBackend {
+    Wsl,
+    Powershell,
+    Sh,
+}
+
+impl ResolvedCommandBackend {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wsl => "wsl",
+            Self::Powershell => "powershell",
+            Self::Sh => "sh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSyntax {
+    Posix,
+    Powershell,
+}
+
+impl CommandSyntax {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::Powershell => "powershell",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCommandExecution {
+    pub backend: ResolvedCommandBackend,
+    pub syntax: CommandSyntax,
+    pub host_platform: HostPlatform,
+    pub wsl_distribution: Option<String>,
+    pub wsl_user: Option<String>,
+}
+
+impl ResolvedCommandExecution {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let valid_syntax = match self.backend {
+            ResolvedCommandBackend::Wsl | ResolvedCommandBackend::Sh => CommandSyntax::Posix,
+            ResolvedCommandBackend::Powershell => CommandSyntax::Powershell,
+        };
+        if self.syntax != valid_syntax {
+            return Err(ConfigError::Parse(format!(
+                "resolved command execution: backend {} requires {} syntax",
+                self.backend.as_str(),
+                valid_syntax.as_str()
+            )));
+        }
+        if matches!(
+            self.backend,
+            ResolvedCommandBackend::Wsl | ResolvedCommandBackend::Powershell
+        ) && self.host_platform != HostPlatform::Windows
+        {
+            return Err(ConfigError::Parse(format!(
+                "resolved command execution: backend {} requires Windows host",
+                self.backend.as_str()
+            )));
+        }
+        if self.backend != ResolvedCommandBackend::Wsl
+            && (self.wsl_distribution.is_some() || self.wsl_user.is_some())
+        {
+            return Err(ConfigError::Parse(format!(
+                "resolved command execution: backend {} cannot contain WSL distribution or user",
+                self.backend.as_str()
+            )));
+        }
+        for (field, value) in [
+            ("wsl_distribution", self.wsl_distribution.as_deref()),
+            ("wsl_user", self.wsl_user.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty() || value.contains('\0')) {
+                return Err(ConfigError::Parse(format!(
+                    "resolved command execution: {field} must be non-empty and contain no NUL"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CommandExecutionConfig {
+    #[must_use]
+    pub const fn backend(&self) -> CommandBackendPreference {
+        self.backend
+    }
+
+    #[must_use]
+    pub fn wsl(&self) -> &WslCommandConfig {
+        &self.wsl
+    }
+
+    pub fn resolve(
+        &self,
+        host_platform: HostPlatform,
+    ) -> Result<ResolvedCommandExecution, ConfigError> {
+        let backend = match self.backend {
+            CommandBackendPreference::Auto => {
+                if host_platform == HostPlatform::Windows {
+                    ResolvedCommandBackend::Wsl
+                } else {
+                    ResolvedCommandBackend::Sh
+                }
+            }
+            CommandBackendPreference::Wsl => ResolvedCommandBackend::Wsl,
+            CommandBackendPreference::Powershell => ResolvedCommandBackend::Powershell,
+            CommandBackendPreference::Sh => ResolvedCommandBackend::Sh,
+        };
+        if matches!(
+            backend,
+            ResolvedCommandBackend::Wsl | ResolvedCommandBackend::Powershell
+        ) && host_platform != HostPlatform::Windows
+        {
+            return Err(ConfigError::Parse(format!(
+                "merged settings.commandExecution.backend: {} is only supported on Windows",
+                backend.as_str()
+            )));
+        }
+        Ok(ResolvedCommandExecution {
+            backend,
+            syntax: if backend == ResolvedCommandBackend::Powershell {
+                CommandSyntax::Powershell
+            } else {
+                CommandSyntax::Posix
+            },
+            host_platform,
+            wsl_distribution: (backend == ResolvedCommandBackend::Wsl)
+                .then(|| self.wsl.distribution.clone())
+                .flatten(),
+            wsl_user: (backend == ResolvedCommandBackend::Wsl)
+                .then(|| self.wsl.user.clone())
+                .flatten(),
+        })
+    }
+}
+
+impl WslCommandConfig {
+    #[must_use]
+    pub fn distribution(&self) -> Option<&str> {
+        self.distribution.as_deref()
+    }
+
+    #[must_use]
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEntry {
     pub source: ConfigSource,
@@ -54,6 +260,7 @@ pub struct RuntimeFeatureConfig {
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
+    command_execution: CommandExecutionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -260,6 +467,7 @@ impl ConfigLoader {
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
+            command_execution: parse_optional_command_execution_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -344,6 +552,11 @@ impl RuntimeConfig {
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
+
+    #[must_use]
+    pub fn command_execution(&self) -> &CommandExecutionConfig {
+        &self.feature_config.command_execution
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -398,6 +611,11 @@ impl RuntimeFeatureConfig {
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
     }
+
+    #[must_use]
+    pub fn command_execution(&self) -> &CommandExecutionConfig {
+        &self.command_execution
+    }
 }
 
 impl RuntimePluginConfig {
@@ -441,10 +659,29 @@ impl RuntimePluginConfig {
 
 #[must_use]
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("CLAW_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
-        .unwrap_or_else(|| PathBuf::from(".claw"))
+    default_config_home_for(HostPlatform::current(), |key| std::env::var_os(key))
+}
+
+fn default_config_home_for(
+    platform: HostPlatform,
+    get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(path) = get_env("CLAW_CONFIG_HOME") {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = get_env("HOME") {
+        return PathBuf::from(home).join(".claw");
+    }
+    if platform == HostPlatform::Windows {
+        if let Some(profile) = get_env("USERPROFILE") {
+            return PathBuf::from(profile).join(".claw");
+        }
+        if let (Some(mut drive), Some(home_path)) = (get_env("HOMEDRIVE"), get_env("HOMEPATH")) {
+            drive.push(home_path);
+            return PathBuf::from(drive).join(".claw");
+        }
+    }
+    PathBuf::from(".claw")
 }
 
 impl RuntimeHookConfig {
@@ -742,6 +979,64 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
     })
+}
+
+fn parse_optional_command_execution_config(
+    root: &JsonValue,
+) -> Result<CommandExecutionConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(CommandExecutionConfig::default());
+    };
+    let Some(command_execution_value) = object.get("commandExecution") else {
+        return Ok(CommandExecutionConfig::default());
+    };
+    let context = "merged settings.commandExecution";
+    let command_execution = expect_object(command_execution_value, context)?;
+    let backend = match optional_string(command_execution, "backend", context)?.unwrap_or("auto") {
+        "auto" => CommandBackendPreference::Auto,
+        "wsl" => CommandBackendPreference::Wsl,
+        "powershell" => CommandBackendPreference::Powershell,
+        "sh" => CommandBackendPreference::Sh,
+        other => {
+            return Err(ConfigError::Parse(format!(
+                "{context}.backend: unsupported command backend {other}; expected auto, wsl, powershell, or sh"
+            )));
+        }
+    };
+    let wsl = match command_execution.get("wsl") {
+        Some(value) => {
+            let wsl_context = "merged settings.commandExecution.wsl";
+            let wsl = expect_object(value, wsl_context)?;
+            WslCommandConfig {
+                distribution: optional_non_empty_command_value(wsl, "distribution", wsl_context)?,
+                user: optional_non_empty_command_value(wsl, "user", wsl_context)?,
+            }
+        }
+        None => WslCommandConfig::default(),
+    };
+    Ok(CommandExecutionConfig { backend, wsl })
+}
+
+fn optional_non_empty_command_value(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = optional_string(object, key, context)? else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ConfigError::Parse(format!(
+            "{context}.{key}: value must not be empty"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(ConfigError::Parse(format!(
+            "{context}.{key}: value must not contain NUL"
+        )));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -1044,9 +1339,10 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, default_config_home_for, parse_permission_mode_label,
+        CommandBackendPreference, CommandSyntax, ConfigLoader, ConfigSource, HostPlatform,
+        McpServerConfig, McpTransport, ResolvedCommandBackend, ResolvedPermissionMode,
+        RuntimeConfig, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1204,6 +1500,184 @@ mod tests {
         assert_eq!(loaded.sandbox().allowed_mounts, vec!["logs", "tmp/cache"]);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn command_backend_defaults_are_platform_specific() {
+        let config = RuntimeConfig::empty();
+        assert_eq!(
+            config.command_execution().backend(),
+            CommandBackendPreference::Auto
+        );
+
+        let windows = config
+            .command_execution()
+            .resolve(HostPlatform::Windows)
+            .expect("Windows auto backend");
+        assert_eq!(windows.backend, ResolvedCommandBackend::Wsl);
+        assert_eq!(windows.syntax, CommandSyntax::Posix);
+        assert_eq!(windows.host_platform, HostPlatform::Windows);
+
+        for platform in [
+            HostPlatform::Macos,
+            HostPlatform::Linux,
+            HostPlatform::Other,
+        ] {
+            let resolved = config
+                .command_execution()
+                .resolve(platform)
+                .expect("non-Windows auto backend");
+            assert_eq!(resolved.backend, ResolvedCommandBackend::Sh);
+            assert_eq!(resolved.syntax, CommandSyntax::Posix);
+        }
+    }
+
+    #[test]
+    fn parses_and_deep_merges_command_execution_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"commandExecution":{"backend":"wsl","wsl":{"distribution":" Ubuntu-24.04 ","user":"base"}}}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".claw").join("settings.local.json"),
+            r#"{"commandExecution":{"wsl":{"user":" brain "}}}"#,
+        )
+        .expect("write local settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("command config should load");
+        assert_eq!(
+            loaded.command_execution().backend(),
+            CommandBackendPreference::Wsl
+        );
+        assert_eq!(
+            loaded.command_execution().wsl().distribution(),
+            Some("Ubuntu-24.04")
+        );
+        assert_eq!(loaded.command_execution().wsl().user(), Some("brain"));
+        let resolved = loaded
+            .command_execution()
+            .resolve(HostPlatform::Windows)
+            .expect("Windows WSL config");
+        assert_eq!(resolved.wsl_distribution.as_deref(), Some("Ubuntu-24.04"));
+        assert_eq!(resolved.wsl_user.as_deref(), Some("brain"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_invalid_command_execution_config() {
+        let invalid = [
+            (
+                r#"{"commandExecution":[]}"#,
+                "merged settings.commandExecution: expected JSON object",
+            ),
+            (
+                r#"{"commandExecution":{"backend":"cmd"}}"#,
+                "unsupported command backend cmd",
+            ),
+            (
+                r#"{"commandExecution":{"wsl":{"distribution":"  "}}}"#,
+                "commandExecution.wsl.distribution: value must not be empty",
+            ),
+            (
+                r#"{"commandExecution":{"wsl":{"user":42}}}"#,
+                "commandExecution.wsl: field user must be a string",
+            ),
+        ];
+        for (index, (contents, expected)) in invalid.into_iter().enumerate() {
+            let root = temp_dir().join(index.to_string());
+            let cwd = root.join("project");
+            let home = root.join("home").join(".claw");
+            fs::create_dir_all(&cwd).expect("project dir");
+            fs::create_dir_all(&home).expect("home config dir");
+            fs::write(home.join("settings.json"), contents).expect("write invalid settings");
+
+            let error = ConfigLoader::new(&cwd, &home)
+                .load()
+                .expect_err("invalid command config should fail");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
+    }
+
+    #[test]
+    fn rejects_windows_only_backends_on_other_hosts() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"commandExecution":{"backend":"powershell"}}"#,
+        )
+        .expect("write settings");
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("parse settings");
+        let error = loaded
+            .command_execution()
+            .resolve(HostPlatform::Linux)
+            .expect_err("PowerShell backend should be Windows-only");
+        assert!(error.to_string().contains("only supported on Windows"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_inconsistent_resolved_command_descriptors() {
+        let mut execution = RuntimeConfig::empty()
+            .command_execution()
+            .resolve(HostPlatform::Windows)
+            .expect("default Windows backend");
+        execution.syntax = CommandSyntax::Powershell;
+        assert!(execution.validate().is_err());
+
+        execution.syntax = CommandSyntax::Posix;
+        execution.backend = ResolvedCommandBackend::Sh;
+        execution.wsl_user = Some("brain".into());
+        assert!(execution.validate().is_err());
+    }
+
+    #[test]
+    fn windows_config_home_uses_documented_fallback_order() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        let resolve = |values: &[(&str, &str)]| {
+            let values = values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), OsString::from(value)))
+                .collect::<BTreeMap<_, _>>();
+            default_config_home_for(HostPlatform::Windows, |key| values.get(key).cloned())
+        };
+
+        assert_eq!(
+            resolve(&[("CLAW_CONFIG_HOME", "custom"), ("HOME", "home")]),
+            std::path::PathBuf::from("custom")
+        );
+        assert_eq!(
+            resolve(&[("HOME", "home"), ("USERPROFILE", "profile")]),
+            std::path::PathBuf::from("home").join(".claw")
+        );
+        assert_eq!(
+            resolve(&[("USERPROFILE", "profile")]),
+            std::path::PathBuf::from("profile").join(".claw")
+        );
+        assert_eq!(
+            resolve(&[("HOMEDRIVE", "C:"), ("HOMEPATH", "\\Users\\brain")]),
+            std::path::PathBuf::from("C:\\Users\\brain").join(".claw")
+        );
     }
 
     #[test]

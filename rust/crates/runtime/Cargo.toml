@@ -18,5 +18,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 walkdir = "2"
 ignore = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
 [lints]
 workspace = true

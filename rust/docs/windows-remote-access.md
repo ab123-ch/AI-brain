@@ -14,7 +14,7 @@ Windows 主机上的 Tailscale Serve（智脑启动时自动恢复）
 ai-brain.exe web
 ```
 
-智脑、模型配置、工具执行和文件读写都发生在 Windows 主机。手机只是发送指令和查看结果，不是远程桌面。
+智脑 Web 服务、模型配置、SQLite 和文件读写都发生在 Windows 主机。模型调用通用 `bash` 工具时默认进入 WSL Bash；手机只是发送指令和查看结果，不是远程桌面。
 
 ## 当前状态
 
@@ -25,7 +25,8 @@ ai-brain.exe web
 - WebSocket 会校验 HTTPS Origin，拒绝跨站控制。
 - 首次成功连接后，固定 MagicDNS URL 会写入 `~/.ai-brain/config.toml` 的 `[remote_access]`。
 - 已为常见 Windows 安装目录和 `tailscale.exe` 添加发现逻辑及单元测试。
-- 尚未在真实 Windows 主机上完成编译、Tailscale 服务和手机端到端验证。
+- 已实现 Windows 下通用 `bash` 工具默认使用 WSL，并支持 `.claw` JSON 设置切换后端。
+- 尚未在真实 Windows 主机上完成编译、WSL `--cd`/超时清理、Tailscale 服务和手机端到端验证。
 
 ## 一、准备 Windows 主机
 
@@ -35,6 +36,7 @@ ai-brain.exe web
 - Git for Windows。
 - Rust stable MSVC 工具链。
 - Visual Studio Build Tools 2022，并安装“使用 C++ 的桌面开发”。
+- WSL 2 和至少一个带 `/bin/bash` 的 Linux 发行版。
 - Tailscale Windows 客户端。
 - 可用的智脑模型/API 配置。
 
@@ -139,6 +141,71 @@ cargo build --release -p ai-brain-cli --bin ai-brain
 - 生成 `target\release\ai-brain.exe`。
 
 `test_orchestrator_query` 会访问外部模型，先从确定性测试中跳过；完成模型配置后再单独验证。
+
+## 四-A、安装并验证 WSL 命令后端
+
+在管理员 PowerShell 中安装 WSL 和一个发行版，例如：
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+根据系统提示重启并完成发行版的首次用户初始化，然后在普通 PowerShell 中检查：
+
+```powershell
+wsl --status
+wsl --list --verbose
+wsl --distribution Ubuntu-24.04 --exec /bin/bash -lc 'printf "wsl-ok\n"'
+```
+
+默认无需写配置。Windows 上未配置或 `backend = auto` 时，智脑通用 `bash` 工具会通过
+Windows 系统目录中的 `wsl.exe` 启动 `/bin/bash -lc`。如需指定发行版和用户，在工作区
+创建 `.claw\settings.local.json`：
+
+```json
+{
+  "commandExecution": {
+    "backend": "wsl",
+    "wsl": {
+      "distribution": "Ubuntu-24.04",
+      "user": "brain"
+    }
+  }
+}
+```
+
+临时切换到 PowerShell 语法：
+
+```json
+{
+  "commandExecution": {
+    "backend": "powershell"
+  }
+}
+```
+
+保留 Git Bash/MSYS 的宿主 `sh` 行为时使用 `"backend": "sh"`。配置错误或 WSL 不可用
+会直接报错，不会静默降级。详细来源、优先级和生效时机见
+[command-execution.md](command-execution.md)。
+
+工作区应位于 `C:\...` 等 Windows 本地盘符路径。默认 WSL 后端拒绝 UNC、
+`\\wsl.localhost\...` 和设备路径。WSL 不是沙箱，默认能访问挂载的 Windows 盘和发行版
+文件系统；不要把发行版或 root 用户选择当作权限隔离。
+
+在仓库 `rust` 目录补跑确定性测试：
+
+```powershell
+cargo test -p runtime command_execution
+cargo test -p runtime bash::tests
+cargo test -p ai-brain-cli command_execution::tests --lib
+cargo test -p ai-brain-cli real_executor_passes_frozen_command_backend_to_tools --lib
+cargo test -p ai-brain-cli web::collaboration_runtime::tests --lib
+```
+
+实机验收至少覆盖：默认后端输出 `executionBackend=wsl`；含空格和中文的盘符目录可作为
+`pwd` 和相对文件写入位置；指定发行版/用户生效；错误发行版、用户和 Bash 缺失不降级；
+超时命令不会在返回后继续创建 marker；并发 Web 房间不串 cwd 或后端。完成这些检查前，
+macOS/Linux 的参数构造测试不能替代 Windows 发布门禁。
 
 ## 五、启动智脑（自动恢复远程入口）
 

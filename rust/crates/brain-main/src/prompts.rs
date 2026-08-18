@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use brain_core::tool_executor::{ResolvedCommandBackend, ToolExecutionContext};
 use chrono::Datelike;
 
 /*
@@ -149,6 +150,11 @@ pub fn build_environment_info() -> String {
 
 /// 使用调用方提供的工作目录构建运行环境信息。
 pub fn build_environment_info_for(cwd: &Path) -> String {
+    build_environment_info_for_context(&ToolExecutionContext::new(cwd))
+}
+
+/// 使用完整冻结工具上下文构建运行环境信息。
+pub fn build_environment_info_for_context(context: &ToolExecutionContext) -> String {
     let os = match std::env::consts::OS {
         "macos" => "macOS",
         "linux" => "Linux",
@@ -167,9 +173,20 @@ pub fn build_environment_info_for(cwd: &Path) -> String {
         6 => "周日",
         _ => "未知",
     };
+    let execution = &context.command_execution;
+    let backend = match execution.backend {
+        ResolvedCommandBackend::Wsl => {
+            let distribution = execution.wsl_distribution.as_deref().unwrap_or("默认");
+            let user = execution.wsl_user.as_deref().unwrap_or("默认");
+            format!("WSL Bash（发行版: {distribution}，用户: {user}）")
+        }
+        ResolvedCommandBackend::Powershell => "PowerShell".into(),
+        ResolvedCommandBackend::Sh => "宿主 sh".into(),
+    };
     format!(
-        "\n## 运行环境\n- 操作系统: {os}\n- 工作目录: {}\n- 当前日期: {date_str} {weekday}",
-        cwd.display()
+        "\n## 运行环境\n- 宿主操作系统: {os}\n- 宿主工作目录: {}\n- 默认命令后端: {backend}\n- 命令语法: {}\n- 路径约定: shell 与文件工具之间优先使用相对工作区路径\n- 当前日期: {date_str} {weekday}",
+        context.working_directory.display(),
+        execution.syntax.as_str()
     )
 }
 
@@ -265,6 +282,9 @@ pub fn build_memory_injection_prompt(brain_state: &brain_core::types::BrainState
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain_core::tool_executor::{
+        CommandSyntax, ResolvedCommandBackend, ResolvedCommandExecution,
+    };
 
     #[test]
     fn system_prompt_not_empty() {
@@ -282,6 +302,26 @@ mod tests {
         let prompt = build_context_rebuild_prompt("用户在宁波");
         assert!(prompt.contains("用户在宁波"));
         assert!(prompt.contains("会话总结"));
+    }
+
+    #[test]
+    fn environment_info_uses_frozen_command_backend() {
+        let context = ToolExecutionContext::with_command_execution(
+            r"C:\workspace\project",
+            ResolvedCommandExecution {
+                backend: ResolvedCommandBackend::Wsl,
+                syntax: CommandSyntax::Posix,
+                host_os: "windows".into(),
+                wsl_distribution: Some("Ubuntu-24.04".into()),
+                wsl_user: None,
+            },
+        );
+        let environment = build_environment_info_for_context(&context);
+        assert!(environment.contains("默认命令后端: WSL Bash"));
+        assert!(environment.contains("发行版: Ubuntu-24.04"));
+        assert!(environment.contains("用户: 默认"));
+        assert!(environment.contains("命令语法: posix"));
+        assert!(environment.contains("相对工作区路径"));
     }
 
     #[test]

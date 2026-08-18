@@ -18,19 +18,23 @@ mod session;
 mod sse;
 mod usage;
 
-pub use bash::{execute_bash, execute_bash_in_dir, BashCommandInput, BashCommandOutput};
+pub use bash::{
+    execute_bash, execute_bash_in_dir, execute_bash_with_execution_in_dir,
+    validate_command_working_directory, BashCommandInput, BashCommandOutput,
+};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-    ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    CommandBackendPreference, CommandExecutionConfig, CommandSyntax, ConfigEntry, ConfigError,
+    ConfigLoader, ConfigSource, HostPlatform, McpConfigCollection, McpManagedProxyServerConfig,
+    McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
+    McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    ResolvedCommandBackend, ResolvedCommandExecution, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
+    ScopedMcpServerConfig, WslCommandConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,

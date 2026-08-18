@@ -15,6 +15,10 @@ use api::{
     MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
 };
+use brain_core::tool_executor::{
+    CommandSyntax as BrainCommandSyntax, ResolvedCommandBackend as BrainCommandBackend,
+    ResolvedCommandExecution as BrainCommandExecution, ToolExecutionContext,
+};
 use brain_graph::{
     id::gen_node_id,
     schema::{Edge, EdgeKind, GraphType, Node, NodeKind, TraceDirection},
@@ -23,10 +27,12 @@ use brain_graph::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file_in_dir, execute_bash_in_dir, glob_search_in_dir, grep_search_in_dir,
+    edit_file_in_dir, execute_bash_with_execution_in_dir, glob_search_in_dir, grep_search_in_dir,
     read_file_in_dir, write_file_in_dir, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
-    ContentBlock, ConversationMessage, GrepSearchInput, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, RuntimeError, ToolError, ToolExecutor,
+    CommandSyntax as RuntimeCommandSyntax, ContentBlock, ConversationMessage, GrepSearchInput,
+    HostPlatform, MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent,
+    ResolvedCommandBackend as RuntimeCommandBackend,
+    ResolvedCommandExecution as RuntimeCommandExecution, RuntimeError, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -236,7 +242,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a command in the current workspace using the configured command backend. On native Windows the default backend is WSL Bash.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1067,11 +1073,23 @@ pub fn execute_tool_in_directory(
     input: &Value,
     working_directory: &Path,
 ) -> Result<String, String> {
+    execute_tool_with_context(name, input, &ToolExecutionContext::new(working_directory))
+}
+
+/// 使用调用方提供的冻结上下文执行工具。
+pub fn execute_tool_with_context(
+    name: &str,
+    input: &Value,
+    context: &ToolExecutionContext,
+) -> Result<String, String> {
     if !is_workspace_tool(name) {
         return execute_non_workspace_tool(name, input);
     }
-    let working_directory = validate_working_directory(working_directory)?;
-    execute_workspace_tool_in_directory(name, input, &working_directory)
+    context.command_execution.validate_for_current_host()?;
+    let working_directory = validate_working_directory(&context.working_directory)?;
+    let mut context = context.clone();
+    context.working_directory = working_directory;
+    execute_workspace_tool_with_context(name, input, &context)
 }
 
 fn is_workspace_tool(name: &str) -> bool {
@@ -1127,14 +1145,15 @@ fn validate_working_directory(working_directory: &Path) -> Result<PathBuf, Strin
     Ok(canonical)
 }
 
-fn execute_workspace_tool_in_directory(
+fn execute_workspace_tool_with_context(
     name: &str,
     input: &Value,
-    working_directory: &Path,
+    context: &ToolExecutionContext,
 ) -> Result<String, String> {
+    let working_directory = &context.working_directory;
     match name {
         "bash" => from_value::<BashCommandInput>(input)
-            .and_then(|value| run_bash_in_directory(value, working_directory)),
+            .and_then(|value| run_bash_with_context(value, context)),
         "read_file" => from_value::<ReadFileInput>(input)
             .and_then(|value| run_read_file_in_directory(value, working_directory)),
         "write_file" => from_value::<WriteFileInput>(input)
@@ -1147,8 +1166,9 @@ fn execute_workspace_tool_in_directory(
             .and_then(|value| run_grep_search_in_directory(value, working_directory)),
         "TodoWrite" => from_value::<TodoWriteInput>(input)
             .and_then(|value| run_todo_write_in_directory(value, working_directory)),
-        "Agent" => from_value::<AgentInput>(input)
-            .and_then(|value| run_agent_in_directory(value, working_directory)),
+        "Agent" => {
+            from_value::<AgentInput>(input).and_then(|value| run_agent_with_context(value, context))
+        }
         "NotebookEdit" => from_value::<NotebookEditInput>(input)
             .and_then(|value| run_notebook_edit_in_directory(value, working_directory)),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input)
@@ -1995,14 +2015,43 @@ fn resolve_path_in_directory(working_directory: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn run_bash_in_directory(
+fn run_bash_with_context(
     input: BashCommandInput,
-    working_directory: &Path,
+    context: &ToolExecutionContext,
 ) -> Result<String, String> {
+    let execution = runtime_command_execution(&context.command_execution)?;
     serde_json::to_string_pretty(
-        &execute_bash_in_dir(input, working_directory).map_err(|error| error.to_string())?,
+        &execute_bash_with_execution_in_dir(input, &context.working_directory, &execution)
+            .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+fn runtime_command_execution(
+    execution: &BrainCommandExecution,
+) -> Result<RuntimeCommandExecution, String> {
+    execution.validate_for_current_host()?;
+    let resolved = RuntimeCommandExecution {
+        backend: match execution.backend {
+            BrainCommandBackend::Wsl => RuntimeCommandBackend::Wsl,
+            BrainCommandBackend::Powershell => RuntimeCommandBackend::Powershell,
+            BrainCommandBackend::Sh => RuntimeCommandBackend::Sh,
+        },
+        syntax: match execution.syntax {
+            BrainCommandSyntax::Posix => RuntimeCommandSyntax::Posix,
+            BrainCommandSyntax::Powershell => RuntimeCommandSyntax::Powershell,
+        },
+        host_platform: match execution.host_os.as_str() {
+            "windows" => HostPlatform::Windows,
+            "macos" => HostPlatform::Macos,
+            "linux" => HostPlatform::Linux,
+            _ => HostPlatform::Other,
+        },
+        wsl_distribution: execution.wsl_distribution.clone(),
+        wsl_user: execution.wsl_user.clone(),
+    };
+    resolved.validate().map_err(|error| error.to_string())?;
+    Ok(resolved)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2079,8 +2128,11 @@ fn run_todo_write_in_directory(
     to_pretty_json(execute_todo_write(input, working_directory)?)
 }
 
-fn run_agent_in_directory(input: AgentInput, working_directory: &Path) -> Result<String, String> {
-    to_pretty_json(execute_agent_in_directory(input, working_directory)?)
+fn run_agent_with_context(
+    input: AgentInput,
+    context: &ToolExecutionContext,
+) -> Result<String, String> {
+    to_pretty_json(execute_agent_with_context(input, context)?)
 }
 
 pub struct AgentToolLaunch {
@@ -2108,9 +2160,23 @@ pub async fn execute_agent_tool_with_completion_in_directory(
     input: &Value,
     working_directory: &Path,
 ) -> Result<AgentToolLaunch, String> {
+    execute_agent_tool_with_completion_with_context(
+        input,
+        &ToolExecutionContext::new(working_directory),
+    )
+    .await
+}
+
+pub async fn execute_agent_tool_with_completion_with_context(
+    input: &Value,
+    context: &ToolExecutionContext,
+) -> Result<AgentToolLaunch, String> {
+    context.command_execution.validate_for_current_host()?;
+    let mut context = context.clone();
+    context.working_directory = validate_working_directory(&context.working_directory)?;
     let input = from_value::<AgentInput>(input)?;
     let run_in_background = input.run_in_background;
-    let launch = start_agent_in_directory(input, working_directory).await?;
+    let launch = start_agent_with_context(input, &context).await?;
     if !run_in_background {
         let done = launch
             .completion_rx
@@ -3307,18 +3373,19 @@ fn current_date_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-fn execute_agent_in_directory(
+fn execute_agent_with_context(
     input: AgentInput,
-    working_directory: &Path,
+    context: &ToolExecutionContext,
 ) -> Result<AgentOutput, String> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(String::from(
             "synchronous Agent compatibility entry cannot run inside a Tokio task; use execute_agent_tool_with_completion",
         ));
     }
+    let context = context.clone();
     agent_compat_runtime()?.block_on(async move {
         let run_in_background = input.run_in_background;
-        let launch = start_agent_in_directory(input, working_directory).await?;
+        let launch = start_agent_with_context(input, &context).await?;
         if run_in_background {
             return Ok(launch.manifest);
         }
@@ -3347,10 +3414,19 @@ fn agent_worker_pool() -> &'static AgentWorkerPool {
     })
 }
 
+#[cfg(test)]
 fn prepare_agent_in_directory(
     input: AgentInput,
     working_directory: &Path,
 ) -> Result<PreparedAgent, String> {
+    prepare_agent_with_context(input, &ToolExecutionContext::new(working_directory))
+}
+
+fn prepare_agent_with_context(
+    input: AgentInput,
+    context: &ToolExecutionContext,
+) -> Result<PreparedAgent, String> {
+    let working_directory = &context.working_directory;
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
@@ -3358,7 +3434,7 @@ fn prepare_agent_in_directory(
         return Err(String::from("prompt must not be empty"));
     }
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let profile = build_agent_profile_in_directory(&normalized_subagent_type, working_directory)?;
+    let profile = build_agent_profile_with_context(&normalized_subagent_type, context)?;
 
     let agent_id = make_agent_id();
     let output_dir = agent_store_dir(working_directory);
@@ -3430,11 +3506,12 @@ fn prepare_agent_in_directory(
     })
 }
 
-async fn start_agent_in_directory(
+async fn start_agent_with_context(
     input: AgentInput,
-    working_directory: &Path,
+    context: &ToolExecutionContext,
 ) -> Result<AgentLaunch, String> {
-    let mut prepared = prepare_agent_in_directory(input, working_directory)?;
+    let working_directory = &context.working_directory;
+    let mut prepared = prepare_agent_with_context(input, context)?;
     let allowed_tools = prepared
         .profile
         .tool_grant
@@ -3488,7 +3565,7 @@ async fn start_agent_in_directory(
         .map_err(|error| error.to_string())?;
     let runtime = AgentRuntime::new(
         client,
-        SubagentToolExecutor::new(allowed_tools, working_directory.to_path_buf()),
+        SubagentToolExecutor::with_context(allowed_tools, context.clone()),
         agent_permission_policy(),
         FileAgentArtifactSink {
             manifest: prepared.manifest.clone(),
@@ -3516,10 +3593,19 @@ async fn start_agent_in_directory(
     })
 }
 
+#[cfg(test)]
 fn build_agent_profile_in_directory(
     subagent_type: &str,
     working_directory: &Path,
 ) -> Result<AgentProfileSnapshot, String> {
+    build_agent_profile_with_context(subagent_type, &ToolExecutionContext::new(working_directory))
+}
+
+fn build_agent_profile_with_context(
+    subagent_type: &str,
+    context: &ToolExecutionContext,
+) -> Result<AgentProfileSnapshot, String> {
+    let working_directory = &context.working_directory;
     if !matches!(
         subagent_type,
         "general-purpose" | "Explore" | "Plan" | "Verification" | "claw-guide" | "statusline-setup"
@@ -3538,7 +3624,7 @@ fn build_agent_profile_in_directory(
         ),
         1,
         subagent_type,
-        build_agent_system_prompt(subagent_type, working_directory)?,
+        build_agent_system_prompt_with_context(subagent_type, context),
         ToolGrant::new(allowed_tools_for_subagent(subagent_type)),
         OutputContract::Text,
         load_subagent_config(working_directory)
@@ -3548,26 +3634,40 @@ fn build_agent_profile_in_directory(
     .map_err(|error| error.to_string())
 }
 
-fn build_agent_system_prompt(
+fn build_agent_system_prompt_with_context(
     subagent_type: &str,
-    working_directory: &Path,
-) -> Result<Vec<String>, String> {
+    context: &ToolExecutionContext,
+) -> Vec<String> {
     // 子代理用轻量级系统提示词，不加载完整主脑 prompt（避免 60 万+ 字符撑爆弱模型上下文）
     let os = std::env::consts::OS;
     let today = current_date_str();
+    let execution = &context.command_execution;
+    let backend = match execution.backend {
+        BrainCommandBackend::Wsl => format!(
+            "WSL Bash (distribution: {}, user: {})",
+            execution.wsl_distribution.as_deref().unwrap_or("default"),
+            execution.wsl_user.as_deref().unwrap_or("default")
+        ),
+        BrainCommandBackend::Powershell => "PowerShell".into(),
+        BrainCommandBackend::Sh => "host sh".into(),
+    };
     let prompt = format!(
         "You are a background sub-agent of type `{subagent_type}`.\n\
          Current date: {today}\n\
          Operating system: {os}\n\
-         Working directory: {}\n\n\
+         Working directory: {}\n\
+         Command backend: {backend}\n\
+         Command syntax: {}\n\
+         Prefer workspace-relative paths when passing paths between shell and file tools.\n\n\
          Instructions:\n\
          - Work only on the delegated task described below.\n\
          - Use only the tools available to you.\n\
          - Do not ask the user questions.\n\
          - Finish with a concise result.",
-        working_directory.display()
+        context.working_directory.display(),
+        execution.syntax.as_str()
     );
-    Ok(vec![prompt])
+    vec![prompt]
 }
 
 fn resolve_agent_model(
@@ -4139,14 +4239,19 @@ impl ApiClient for ProviderRuntimeClient {
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
-    working_directory: PathBuf,
+    context: ToolExecutionContext,
 }
 
 impl SubagentToolExecutor {
+    #[cfg(test)]
     fn new(allowed_tools: BTreeSet<String>, working_directory: PathBuf) -> Self {
+        Self::with_context(allowed_tools, ToolExecutionContext::new(working_directory))
+    }
+
+    fn with_context(allowed_tools: BTreeSet<String>, context: ToolExecutionContext) -> Self {
         Self {
             allowed_tools,
-            working_directory,
+            context,
         }
     }
 }
@@ -4160,8 +4265,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value: Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_in_directory(tool_name, &value, &self.working_directory)
-            .map_err(ToolError::new)
+        execute_tool_with_context(tool_name, &value, &self.context).map_err(ToolError::new)
     }
 }
 
@@ -5494,6 +5598,12 @@ fn execute_shell_command(
             persisted_output_path: None,
             persisted_output_size: None,
             sandbox_status: None,
+            execution_backend: Some(String::from("powershell")),
+            command_syntax: Some(String::from("powershell")),
+            host_working_directory: Some(working_directory.display().to_string()),
+            wsl_distribution: None,
+            wsl_user: None,
+            background_task_id_kind: Some(String::from("host-process-pid")),
         });
     }
 
@@ -5526,6 +5636,12 @@ fn execute_shell_command(
                     persisted_output_path: None,
                     persisted_output_size: None,
                     sandbox_status: None,
+                    execution_backend: Some(String::from("powershell")),
+                    command_syntax: Some(String::from("powershell")),
+                    host_working_directory: Some(working_directory.display().to_string()),
+                    wsl_distribution: None,
+                    wsl_user: None,
+                    background_task_id_kind: None,
                 });
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
@@ -5557,6 +5673,12 @@ Command exceeded timeout of {timeout_ms} ms",
                     persisted_output_path: None,
                     persisted_output_size: None,
                     sandbox_status: None,
+                    execution_backend: Some(String::from("powershell")),
+                    command_syntax: Some(String::from("powershell")),
+                    host_working_directory: Some(working_directory.display().to_string()),
+                    wsl_distribution: None,
+                    wsl_user: None,
+                    background_task_id_kind: None,
                 });
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -5584,6 +5706,12 @@ Command exceeded timeout of {timeout_ms} ms",
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
+        execution_backend: Some(String::from("powershell")),
+        command_syntax: Some(String::from("powershell")),
+        host_working_directory: Some(working_directory.display().to_string()),
+        wsl_distribution: None,
+        wsl_user: None,
+        background_task_id_kind: None,
     })
 }
 
@@ -5657,9 +5785,10 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_profile_in_directory,
-        execute_tool, final_assistant_text, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_artifact, persist_agent_terminal_state, prepare_agent_in_directory,
-        push_output_block, AgentInput, ProviderRuntimeClient, SubagentToolExecutor,
+        build_agent_profile_with_context, execute_tool, final_assistant_text, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_artifact, persist_agent_terminal_state,
+        prepare_agent_in_directory, push_output_block, runtime_command_execution, AgentInput,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use agent_runtime::{
         AgentRunSpec, AgentRunStatus, AgentRuntime, AgentRuntimeError, AgentWorkerPool,
@@ -5667,6 +5796,9 @@ mod tests {
         ResolvedModelPolicy,
     };
     use api::OutputContentBlock;
+    use brain_core::tool_executor::{
+        CommandSyntax, ResolvedCommandBackend, ResolvedCommandExecution, ToolExecutionContext,
+    };
     use brain_graph::{
         id::gen_node_id,
         schema::{Edge, EdgeKind, GraphType, Node, NodeKind},
@@ -6215,6 +6347,45 @@ mod tests {
             assert!(read.contains(marker));
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_bridge_preserves_frozen_backend_and_subagent_prompt() {
+        let workspace = test_working_directory();
+        let execution = ResolvedCommandExecution::host_sh(std::env::consts::OS);
+        let context = ToolExecutionContext::with_command_execution(&workspace, execution.clone());
+        let runtime_execution = runtime_command_execution(&execution).expect("runtime bridge");
+        assert_eq!(
+            runtime_execution.backend,
+            runtime::ResolvedCommandBackend::Sh
+        );
+        assert_eq!(runtime_execution.syntax, runtime::CommandSyntax::Posix);
+
+        let profile = build_agent_profile_with_context("Explore", &context)
+            .expect("profile with inherited command context");
+        let prompt = profile.system_prompt.join("\n");
+        assert!(prompt.contains("Command backend: host sh"));
+        assert!(prompt.contains("Command syntax: posix"));
+        assert!(prompt.contains(&workspace.display().to_string()));
+    }
+
+    #[test]
+    fn subagent_prompt_renders_wsl_distribution_without_reparsing_host() {
+        let context = ToolExecutionContext::with_command_execution(
+            test_working_directory(),
+            ResolvedCommandExecution {
+                backend: ResolvedCommandBackend::Wsl,
+                syntax: CommandSyntax::Posix,
+                host_os: "windows".into(),
+                wsl_distribution: Some("Ubuntu-24.04".into()),
+                wsl_user: Some("brain".into()),
+            },
+        );
+        let profile = build_agent_profile_with_context("Explore", &context)
+            .expect("WSL prompt does not launch a process");
+        let prompt = profile.system_prompt.join("\n");
+        assert!(prompt.contains("WSL Bash (distribution: Ubuntu-24.04, user: brain)"));
+        assert!(prompt.contains("Command syntax: posix"));
     }
 
     #[test]

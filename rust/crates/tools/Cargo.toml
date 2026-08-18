@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 agent-runtime = { path = "../agent-runtime" }
 api = { path = "../api" }
+brain-core = { path = "../brain-core" }
 brain-llm = { path = "../brain-llm" }
 brain-graph = { path = "../brain-graph" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
