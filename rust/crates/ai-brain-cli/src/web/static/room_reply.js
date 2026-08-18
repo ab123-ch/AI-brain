@@ -299,6 +299,32 @@
         return Number(viewport?.scrollTop || 0);
     }
 
+    function createFrameScheduler(callback, requestFrame, cancelFrame = null) {
+        if (typeof callback !== 'function' || typeof requestFrame !== 'function') {
+            throw new TypeError('frame scheduler requires callback and requestFrame functions');
+        }
+        let frameId = null;
+        return {
+            schedule() {
+                if (frameId !== null) return false;
+                frameId = requestFrame(() => {
+                    frameId = null;
+                    callback();
+                });
+                return true;
+            },
+            cancel() {
+                if (frameId === null) return false;
+                if (typeof cancelFrame === 'function') cancelFrame(frameId);
+                frameId = null;
+                return true;
+            },
+            isPending() {
+                return frameId !== null;
+            },
+        };
+    }
+
     function shouldFocusComposer(enabled, modalOpen) {
         return Boolean(enabled) && !modalOpen;
     }
@@ -311,6 +337,7 @@
         buildRoomPostPayload,
         canReplyToEvent,
         captureTimelineViewport,
+        createFrameScheduler,
         isTimelineNearBottom,
         matchesPendingRoomPost,
         mergeVersionedEntity,

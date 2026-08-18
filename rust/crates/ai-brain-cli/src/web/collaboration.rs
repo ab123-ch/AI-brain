@@ -23,6 +23,7 @@ const DEFAULT_PROFILE_ID: &str = "general_member";
 pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
 pub const LOCAL_PRINCIPAL_ID: &str = "local-user";
+const ROOM_SNAPSHOT_EVENT_LIMIT: usize = 100;
 
 #[must_use]
 pub(crate) fn default_runtime_dir() -> PathBuf {
@@ -4588,8 +4589,9 @@ impl CollaborationRepository {
         require_capability(&transaction, actor, room_id, RoomCapability::RoomRead)?;
         let room = room_from_connection(&transaction, room_id)?;
         let members = members_from_connection(&transaction, room_id)?;
-        let mut events = events_from_connection(&transaction, room_id, 301)?;
-        let has_earlier_events = events.len() > 300;
+        let mut events =
+            events_from_connection(&transaction, room_id, ROOM_SNAPSHOT_EVENT_LIMIT + 1)?;
+        let has_earlier_events = events.len() > ROOM_SNAPSHOT_EVENT_LIMIT;
         if has_earlier_events {
             events.remove(0);
         }
@@ -6900,7 +6902,7 @@ mod tests {
                 Some(&target.event.event_id),
             );
             let snapshot = repository.snapshot("room-1").unwrap();
-            assert_eq!(snapshot.events.len(), 300);
+            assert_eq!(snapshot.events.len(), ROOM_SNAPSHOT_EVENT_LIMIT);
             assert!(snapshot
                 .events
                 .iter()
@@ -7381,8 +7383,8 @@ mod tests {
             seed_service_events(&repository, "room-1", 305, &[]);
 
             let snapshot = repository.snapshot("room-1").unwrap();
-            assert_eq!(snapshot.events.len(), 300);
-            assert_eq!(snapshot.events[0].sequence, 6);
+            assert_eq!(snapshot.events.len(), ROOM_SNAPSHOT_EVENT_LIMIT);
+            assert_eq!(snapshot.events[0].sequence, 206);
             assert!(snapshot.has_earlier_events);
             let mut serialized = serde_json::to_value(&snapshot).unwrap();
             serialized

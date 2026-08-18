@@ -439,9 +439,14 @@ body {
     display: flex;
     flex-direction: column;
     gap: 12px;
+    contain: layout paint style;
 }
 
-#messages > * { flex-shrink: 0; }
+#messages > * {
+    flex-shrink: 0;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 96px;
+}
 
 /* ── Message Bubbles ──────────────────────────────────────────── */
 .msg {
@@ -2384,6 +2389,8 @@ details[open] > summary .trace-chevron::before { transform: rotate(90deg); }
 
 #input {
     flex: 1;
+    min-width: 0;
+    min-height: 41px;
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -2393,6 +2400,8 @@ details[open] > summary .trace-chevron::before { transform: rotate(90deg); }
     font-family: inherit;
     resize: none;
     outline: none;
+    overflow-y: auto;
+    field-sizing: content;
     max-height: 120px;
     line-height: 1.4;
 }

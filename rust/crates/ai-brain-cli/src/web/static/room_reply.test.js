@@ -9,6 +9,7 @@ const {
     buildRoomPostPayload,
     captureTimelineViewport,
     canReplyToEvent,
+    createFrameScheduler,
     matchesPendingRoomPost,
     mergeVersionedEntity,
     mergeEventsBySequence,
@@ -675,6 +676,62 @@ test('时间线重建统一区分保持视口、跟随底部和分页锚点', ()
     assert.equal(timelineScrollTarget(following, 1200, 'follow-if-near-bottom'), 1200);
     assert.equal(timelineScrollTarget(reading, 1200, 'latest'), 1200);
     assert.equal(timelineScrollTarget(reading, 1200, 'prepend'), 700);
+});
+
+test('帧调度器会合并重复更新并允许回调安排下一帧', () => {
+    const frames = [];
+    let flushes = 0;
+    let scheduler;
+    scheduler = createFrameScheduler(() => {
+        flushes += 1;
+        if (flushes === 1) scheduler.schedule();
+    }, (callback) => {
+        frames.push(callback);
+        return frames.length;
+    });
+
+    assert.equal(scheduler.schedule(), true);
+    assert.equal(scheduler.schedule(), false);
+    assert.equal(scheduler.isPending(), true);
+    assert.equal(frames.length, 1);
+
+    frames.shift()();
+    assert.equal(flushes, 1);
+    assert.equal(scheduler.isPending(), true);
+    assert.equal(frames.length, 1);
+
+    frames.shift()();
+    assert.equal(flushes, 2);
+    assert.equal(scheduler.isPending(), false);
+});
+
+test('帧调度器取消后不会执行旧回调并可再次安排', () => {
+    const frames = new Map();
+    const cancelled = [];
+    let nextId = 0;
+    let flushes = 0;
+    const scheduler = createFrameScheduler(
+        () => { flushes += 1; },
+        (callback) => {
+            nextId += 1;
+            frames.set(nextId, callback);
+            return nextId;
+        },
+        (frameId) => {
+            cancelled.push(frameId);
+            frames.delete(frameId);
+        },
+    );
+
+    assert.equal(scheduler.schedule(), true);
+    assert.equal(scheduler.cancel(), true);
+    assert.deepEqual(cancelled, [1]);
+    assert.equal(scheduler.cancel(), false);
+    assert.equal(flushes, 0);
+
+    assert.equal(scheduler.schedule(), true);
+    frames.get(2)();
+    assert.equal(flushes, 1);
 });
 
 test('composer 仅在启用且没有可见 modal 时获取焦点', () => {

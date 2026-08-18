@@ -2106,9 +2106,34 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("function handleMemberRunFinished"))
             .map(|(handler, _)| handler)
             .expect("脚本缺少成员进度处理函数");
-        assert!(progress_handler.contains("$messages.scrollTop = $messages.scrollHeight"));
+        assert!(progress_handler.contains("scheduleRunElementUpdate(state, shouldFollowLatest)"));
+        assert!(!progress_handler.contains("$messages.scrollHeight"));
+        assert!(!progress_handler.contains("renderMarkdown"));
         assert!(!progress_handler.contains("scrollToBottom()"));
+        let run_render_flush = script
+            .split_once("function flushPendingRunRenders")
+            .and_then(|(_, rest)| rest.split_once("function runStatusLabel"))
+            .map(|(handler, _)| handler)
+            .expect("脚本缺少合并后的成员进度渲染函数");
+        assert!(run_render_flush.contains("$messages.scrollTop = $messages.scrollHeight"));
+        let run_element_renderer = script
+            .split_once("function updateRunElement")
+            .and_then(|(_, rest)| rest.split_once("function scheduleRunElementUpdate"))
+            .map(|(handler, _)| handler)
+            .expect("脚本缺少成员进度 DOM 渲染函数");
+        assert!(run_element_renderer.contains("state.rawText && state.markdownFinalized"));
+        assert!(!run_element_renderer.contains("refreshIcons"));
+        assert!(script.contains("const ROOM_MARKDOWN_CACHE_LIMIT = 400"));
+        assert!(script.contains("renderCachedRoomMarkdown(content, event)"));
         assert!(script.contains("'follow-if-near-bottom'"));
+
+        let composer_input_handler = script
+            .split_once("$input.addEventListener('input', () => {")
+            .and_then(|(_, rest)| rest.split_once("});"))
+            .map(|(handler, _)| handler)
+            .expect("脚本缺少输入框 input 处理函数");
+        assert!(composer_input_handler.contains("scheduleComposerResize();"));
+        assert!(!composer_input_handler.contains("scrollHeight"));
 
         let input_state_handler = script
             .split_once("function setInputEnabled")
@@ -2119,17 +2144,21 @@ mod tests {
         assert!(input_state_handler.contains(".modal[aria-modal=\"true\"]:not(.hidden)"));
 
         let css_rule = |selector: &str| {
+            let rule_start = format!("{selector} {{");
             let after_selector = style
-                .split_once(selector)
+                .split_once(&rule_start)
                 .unwrap_or_else(|| panic!("CSS 缺少 {selector}"))
                 .1;
             after_selector
-                .split_once('{')
-                .and_then(|(_, body)| body.split_once('}').map(|(rule, _)| rule))
+                .split_once('}')
+                .map(|(rule, _)| rule)
                 .unwrap_or_else(|| panic!("CSS {selector} 规则不完整"))
         };
         assert!(css_rule(".reply-preview strong").contains("overflow-wrap: anywhere"));
         assert!(css_rule(".room-reply-reference strong").contains("overflow-wrap: anywhere"));
+        assert!(css_rule("#messages").contains("contain: layout paint style"));
+        assert!(css_rule("#messages > *").contains("content-visibility: auto"));
+        assert!(css_rule("#input").contains("field-sizing: content"));
 
         for contract in [
             "RoomReply.beginReply",

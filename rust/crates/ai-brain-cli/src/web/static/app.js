@@ -46,6 +46,12 @@ let preserveTimelineAnchor = false;
 let pendingRoomDirectoryUpdate = null;
 const selectedMemberIds = new Set();
 const memberRunStates = new Map();
+const roomMarkdownCache = new Map();
+const runContentRenderState = new WeakMap();
+const pendingRunRenderStates = new Set();
+const ROOM_MARKDOWN_CACHE_LIMIT = 400;
+let pendingRunFollowLatest = false;
+let roomTimelineNearBottom = true;
 const modelCatalog = window.ModelCatalog;
 
 // ── Typewriter State ──────────────────────────────────────────
@@ -154,6 +160,19 @@ const $roomDirectoryModalClose = document.getElementById('room-directory-modal-c
 const $roomDirectoryModalCancel = document.getElementById('room-directory-modal-cancel');
 const $roomDirectorySubmit = document.getElementById('room-directory-submit');
 const $toastRegion = document.getElementById('toast-region');
+const composerUsesNativeSizing = typeof CSS !== 'undefined'
+    && typeof CSS.supports === 'function'
+    && CSS.supports('field-sizing', 'content');
+const composerResizeScheduler = RoomReply.createFrameScheduler(
+    resizeComposerNow,
+    (callback) => requestAnimationFrame(callback),
+    (frameId) => cancelAnimationFrame(frameId),
+);
+const runRenderScheduler = RoomReply.createFrameScheduler(
+    flushPendingRunRenders,
+    (callback) => requestAnimationFrame(callback),
+    (frameId) => cancelAnimationFrame(frameId),
+);
 
 // ── Cockpit State ───────────────────────────────────────────────
 const brainProfiles = {
@@ -440,7 +459,7 @@ function handleServerMessage(data) {
             selectedMemberIds.clear();
             memberRunStates.clear();
             $input.value = '';
-            $input.style.height = 'auto';
+            resetComposerHeight();
             closeRoomDirectoryModal();
             sessionFiles = data.files || [];
             currentTurnFiles = [];
@@ -502,6 +521,11 @@ function handleServerMessage(data) {
 
 // ── Collaboration Room ─────────────────────────────────────────
 function resetRoomLocalState() {
+    runRenderScheduler.cancel();
+    pendingRunRenderStates.clear();
+    pendingRunFollowLatest = false;
+    roomTimelineNearBottom = true;
+    roomMarkdownCache.clear();
     const reset = RoomReply.resetRoomUiState();
     replyState = reset.replyState;
     pendingRoomPost = reset.pendingRoomPost;
@@ -764,14 +788,32 @@ function renderRecipientSelector() {
         });
 }
 
+function resizeComposerNow() {
+    if (composerUsesNativeSizing) {
+        $input.style.height = '';
+        return;
+    }
+    $input.style.height = 'auto';
+    $input.style.height = `${Math.min($input.scrollHeight, 120)}px`;
+}
+
+function scheduleComposerResize() {
+    if (!composerUsesNativeSizing) composerResizeScheduler.schedule();
+}
+
+function resetComposerHeight() {
+    composerResizeScheduler.cancel();
+    $input.style.height = '';
+    scheduleComposerResize();
+}
+
 function setMemberSelected(memberId, selected) {
     const member = roomSnapshot?.members.find((candidate) => candidate.member_id === memberId);
     if (!member || member.availability !== 'active') return;
     $input.value = selected
         ? MentionRecipients.appendMention($input.value, member.display_name)
         : MentionRecipients.removeMention($input.value, member.display_name);
-    $input.style.height = 'auto';
-    $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
+    scheduleComposerResize();
     reconcileSelectedMembers();
     renderMemberList();
     renderRecipientSelector();
@@ -829,6 +871,22 @@ function renderRoomTimeline({ scrollToLatest = false } = {}) {
         $messages.scrollHeight,
         scrollPolicy,
     );
+    roomTimelineNearBottom = scrollPolicy === 'latest'
+        || (scrollPolicy === 'follow-if-near-bottom' && viewport.nearBottom);
+}
+
+function renderCachedRoomMarkdown(element, event) {
+    const content = String(event.content || '');
+    const cached = roomMarkdownCache.get(event.event_id);
+    if (cached?.content === content) {
+        element.innerHTML = cached.html;
+        return;
+    }
+    renderMarkdown(element, content);
+    roomMarkdownCache.set(event.event_id, { content, html: element.innerHTML });
+    while (roomMarkdownCache.size > ROOM_MARKDOWN_CACHE_LIMIT) {
+        roomMarkdownCache.delete(roomMarkdownCache.keys().next().value);
+    }
 }
 
 function renderRoomEvent(event, isLastUserEvent = false) {
@@ -854,7 +912,7 @@ function renderRoomEvent(event, isLastUserEvent = false) {
     const content = document.createElement('div');
     content.className = 'msg-content';
     if (event.sender_kind === 'member') {
-        renderMarkdown(content, event.content);
+        renderCachedRoomMarkdown(content, event);
         attachPreviewAction(message, `${event.sender_name} 回复`, event.sender_name, event.content);
         addBrainConclusion(event.member_id || event.sender_id, event.content, `${event.sender_name} 回复`, `room-${event.event_id}`, false);
     } else {
@@ -958,6 +1016,7 @@ function ensureMemberRunState(runId, memberId, roomId) {
             error: null,
             purpose: null,
             element: null,
+            markdownFinalized: false,
         });
     }
     return memberRunStates.get(runId);
@@ -971,15 +1030,42 @@ function updateRunElement(state) {
     if (status) status.textContent = runStatusLabel(state);
     const content = element.querySelector('.run-content');
     if (content) {
-        if (state.rawText) renderMarkdown(content, state.rawText);
-        else content.textContent = state.error || '';
+        const nextText = state.rawText || state.error || '';
+        const rendered = runContentRenderState.get(content);
+        if (rendered?.text !== nextText || rendered.markdown !== state.markdownFinalized) {
+            if (state.rawText && state.markdownFinalized) renderMarkdown(content, state.rawText);
+            else content.textContent = nextText;
+            runContentRenderState.set(content, {
+                text: nextText,
+                markdown: state.markdownFinalized,
+            });
+        }
     }
     const log = element.querySelector('.run-log');
     if (log) {
         log.textContent = state.logs.slice(-5).join('\n');
         log.classList.toggle('hidden', state.logs.length === 0);
     }
-    refreshIcons();
+}
+
+function scheduleRunElementUpdate(state, followLatest) {
+    pendingRunRenderStates.add(state);
+    pendingRunFollowLatest ||= followLatest;
+    runRenderScheduler.schedule();
+}
+
+function flushPendingRunRenders() {
+    const states = [...pendingRunRenderStates];
+    const followLatest = pendingRunFollowLatest;
+    pendingRunRenderStates.clear();
+    pendingRunFollowLatest = false;
+    states.forEach((state) => {
+        if (state.roomId === activeSessionId) updateRunElement(state);
+    });
+    if (followLatest && roomTimelineNearBottom && !preserveTimelineAnchor) {
+        $messages.scrollTop = $messages.scrollHeight;
+        roomTimelineNearBottom = true;
+    }
 }
 
 function runStatusLabel(state) {
@@ -997,7 +1083,7 @@ function runStatusLabel(state) {
 
 function handleMemberRunProgress(data) {
     if (data.room_id !== activeSessionId || !data.event) return;
-    const shouldFollowLatest = RoomReply.isTimelineNearBottom($messages);
+    const shouldFollowLatest = roomTimelineNearBottom;
     const state = ensureMemberRunState(data.run_id, data.member_id, data.room_id);
     const inbox = roomSnapshot?.inbox.find((item) => item.run_id === data.run_id);
     state.purpose = inbox?.purpose || state.purpose;
@@ -1036,6 +1122,7 @@ function handleMemberRunProgress(data) {
         case 'final_answer':
             state.rawText = event.content || state.rawText;
             state.statusText = '提交结果';
+            state.markdownFinalized = true;
             break;
         case 'error':
             state.error = event.message;
@@ -1045,12 +1132,9 @@ function handleMemberRunProgress(data) {
             break;
     }
     if (!state.element?.isConnected) renderRoomTimeline();
-    updateRunElement(state);
+    scheduleRunElementUpdate(state, shouldFollowLatest);
     const member = roomSnapshot?.members.find((candidate) => candidate.member_id === data.member_id);
     updateAgentStatus(data.member_id, state.statusText || '运行中', member?.display_name || data.member_id);
-    if (shouldFollowLatest && !preserveTimelineAnchor) {
-        $messages.scrollTop = $messages.scrollHeight;
-    }
 }
 
 function handleMemberRunFinished(data) {
@@ -1110,7 +1194,7 @@ function handleRoomMessageAccepted(data) {
     pendingRoomPost = null;
     replyState = null;
     $input.value = '';
-    $input.style.height = 'auto';
+    resetComposerHeight();
     selectedMemberIds.clear();
     renderReplyPreview();
     renderMemberList();
@@ -3566,7 +3650,7 @@ function submitQuery() {
     beginHistoryRegeneration('用户提交新任务');
     send('query', { input: text });
     $input.value = '';
-    $input.style.height = 'auto';
+    resetComposerHeight();
 }
 
 // ── Event Bindings ──────────────────────────────────────────────
@@ -3618,10 +3702,13 @@ $sendBtn.addEventListener('click', () => {
 
 // Auto-resize textarea
 $input.addEventListener('input', () => {
-    $input.style.height = 'auto';
-    $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
+    scheduleComposerResize();
     syncMentionRecipients();
 });
+
+$messages.addEventListener('scroll', () => {
+    roomTimelineNearBottom = RoomReply.isTimelineNearBottom($messages);
+}, { passive: true });
 
 $roomMode.querySelectorAll('[data-mode]').forEach((button) => {
     button.addEventListener('click', () => {
