@@ -34,6 +34,7 @@ function element(...classes) {
         classList: new ClassList(...classes),
         dataset: {},
         style: {},
+        innerHTML: '',
         textContent: '',
         title: '',
         value: '',
@@ -62,14 +63,14 @@ function response(status, body) {
     };
 }
 
-function createServer() {
+function createServer(options = {}) {
     let revisionNumber = 1;
     let saveDelayMs = 0;
     let saveAckDelayMs = 0;
     const disk = {
-        name: 'demo.js',
-        path: '/workspace/demo.js',
-        content: 'const value = 1;\n',
+        name: options.name || 'demo.js',
+        path: options.path || '/workspace/demo.js',
+        content: options.content || 'const value = 1;\n',
         revision: `revision-${revisionNumber}`,
     };
     return {
@@ -128,6 +129,9 @@ function loadProductionEditor(server) {
         $previewTitle: element(),
         $previewSource: element(),
         $fileEditorToolbar: element('hidden'),
+        $fileEditorModeSwitch: element('hidden'),
+        $fileEditorPreviewMode: element(),
+        $fileEditorEditMode: element(),
         $fileEditorStatus: element(),
         $fileEditorQuote: element(),
         $fileEditorContent: element(),
@@ -163,6 +167,26 @@ function loadProductionEditor(server) {
         clearInterval: () => {},
         fetch: server.fetch.bind(server),
         navigator: {},
+        marked: {
+            lexer(text) {
+                const tokens = [];
+                const source = String(text || '');
+                if (/^#{1,6}\s+\S/mu.test(source)) tokens.push({ type: 'heading' });
+                if (/^\s*(?:[-*+]\s+|\d+[.)]\s+)/mu.test(source)) {
+                    tokens.push({ type: 'list' });
+                }
+                if (tokens.length === 0 && source.trim()) tokens.push({ type: 'paragraph' });
+                return tokens;
+            },
+            parse(text) {
+                return `<article>${text}</article><script>unsafe()</script>`;
+            },
+        },
+        DOMPurify: {
+            sanitize(html) {
+                return html.replace(/<script>[\s\S]*?<\/script>/gu, '');
+            },
+        },
         document: {
             body: element(),
             querySelectorAll: () => [],
@@ -187,6 +211,8 @@ function loadProductionEditor(server) {
         let fileEditorConflictSnapshot = null;
         let fileEditorDirty = false;
         let fileEditorRequestId = 0;
+        let fileEditorMode = 'edit';
+        let fileEditorSupportsMarkdown = false;
         let currentPreview = null;
     `;
     const testApi = `
@@ -198,6 +224,7 @@ function loadProductionEditor(server) {
             loadDisk: () => loadConflictingDiskVersion(),
             keepLocal: () => keepAndSaveLocalFile(),
             reset: () => resetLocalFileEditorSession(),
+            setMode: (mode) => setLocalFileEditorMode(mode),
             input: (content, schedule = true) => {
                 $fileEditorContent.value = content;
                 $fileEditorContent.selectionStart = content.length;
@@ -214,6 +241,10 @@ function loadProductionEditor(server) {
                 dirty: fileEditorDirty,
                 conflictRevision: fileEditorConflictSnapshot?.revision || null,
                 saveState: $fileEditorSaveState.dataset.state,
+                mode: fileEditorMode,
+                previewHidden: $previewContent.classList.contains('hidden'),
+                editorHidden: $fileEditorFrame.classList.contains('hidden'),
+                previewHtml: $previewContent.innerHTML,
             }),
         };
     `;
@@ -232,6 +263,10 @@ test('production file editor preserves autosave and external-change invariants',
         dirty: false,
         conflictRevision: null,
         saveState: 'saved',
+        mode: 'edit',
+        previewHidden: true,
+        editorHidden: false,
+        previewHtml: '',
     });
 
     editor.input('const value = 2;\n');
@@ -282,4 +317,71 @@ test('production file editor preserves autosave and external-change invariants',
     assert.equal(server.disk.content, 'const ownWrite = 10;\n');
     assert.equal(editor.state().dirty, false);
     editor.reset();
+});
+
+test('production markdown file defaults to a sanitized preview and can switch to editing', async () => {
+    const server = createServer({
+        name: 'guide.md',
+        path: '/workspace/guide.md',
+        content: '# Guide\n\n<script>unsafe()</script>\n',
+    });
+    const editor = loadProductionEditor(server);
+
+    await editor.open({ path: server.disk.path, name: server.disk.name, change_kind: 'modified' });
+
+    assert.equal(editor.state().mode, 'preview');
+    assert.equal(editor.state().previewHidden, false);
+    assert.equal(editor.state().editorHidden, true);
+    assert.match(editor.state().previewHtml, /<article># Guide/u);
+    assert.doesNotMatch(editor.state().previewHtml, /<script>/u);
+
+    editor.setMode('edit');
+    assert.equal(editor.state().mode, 'edit');
+    assert.equal(editor.state().previewHidden, true);
+    assert.equal(editor.state().editorHidden, false);
+    assert.equal(editor.state().content, server.disk.content);
+});
+
+test('extensionless files preview only when marked finds markdown structure', async () => {
+    const markdownServer = createServer({
+        name: '章节细纲',
+        path: '/workspace/章节细纲',
+        content: '# 第一章\n\n- 冲突\n',
+    });
+    const markdown = loadProductionEditor(markdownServer);
+    await markdown.open({ path: markdownServer.disk.path, name: markdownServer.disk.name });
+    assert.equal(markdown.state().mode, 'preview');
+
+    const plainServer = createServer({
+        name: 'README',
+        path: '/workspace/README',
+        content: '这是一段没有 Markdown 结构的普通文本。\n',
+    });
+    const plain = loadProductionEditor(plainServer);
+    await plain.open({ path: plainServer.disk.path, name: plainServer.disk.name });
+    assert.equal(plain.state().mode, 'edit');
+
+    const explicitTextServer = createServer({
+        name: 'notes.txt',
+        path: '/workspace/notes.txt',
+        content: '# 仍然按文本打开\n',
+    });
+    const explicitText = loadProductionEditor(explicitTextServer);
+    await explicitText.open({
+        path: explicitTextServer.disk.path,
+        name: explicitTextServer.disk.name,
+    });
+    assert.equal(explicitText.state().mode, 'edit');
+});
+
+test('file editor assets expose markdown mode controls and load the sanitizer before app code', () => {
+    const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+
+    assert.match(html, /id="file-editor-preview-mode"/u);
+    assert.match(html, /id="file-editor-edit-mode"/u);
+    assert.match(html, /dompurify@3\.4\.13\/dist\/purify\.min\.js/u);
+    assert.ok(
+        html.indexOf('purify.min.js') < html.indexOf('/app.js'),
+        'DOMPurify must load before the application script',
+    );
 });

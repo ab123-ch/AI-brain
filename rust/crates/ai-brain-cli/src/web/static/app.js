@@ -26,6 +26,8 @@ let fileEditorWatcherTimer = null;
 let fileEditorConflictSnapshot = null;
 let fileEditorDirty = false;
 let fileEditorRequestId = 0;
+let fileEditorMode = 'edit';
+let fileEditorSupportsMarkdown = false;
 let currentPreview = null;
 let currentPreviewSelection = null;
 const toolItems = new Map();
@@ -67,6 +69,9 @@ const $sendBtn = document.getElementById('send-btn');
 const $personaSelect = document.getElementById('persona-select');
 const $sessionList = document.getElementById('session-list');
 const $fileEditorToolbar = document.getElementById('file-editor-toolbar');
+const $fileEditorModeSwitch = document.getElementById('file-editor-mode-switch');
+const $fileEditorPreviewMode = document.getElementById('file-editor-preview-mode');
+const $fileEditorEditMode = document.getElementById('file-editor-edit-mode');
 const $fileEditorStatus = document.getElementById('file-editor-status');
 const $fileEditorQuote = document.getElementById('file-editor-quote');
 const $fileEditorContent = document.getElementById('file-editor-content');
@@ -3171,6 +3176,85 @@ function localFileLanguage(name) {
     })[extension] || '文本';
 }
 
+function localFileExtensionKind(file) {
+    const candidate = String(file?.name || file?.path || '').trim();
+    if (/\.(?:md|markdown)$/iu.test(candidate)) return 'markdown';
+    return /(?:^|[/\\])[^./\\]+$/u.test(candidate) ? 'extensionless' : 'other';
+}
+
+function extensionlessContentIsMarkdown(content) {
+    if (typeof marked === 'undefined' || typeof marked.lexer !== 'function') return false;
+    try {
+        const markdownTokens = new Set([
+            'blockquote', 'code', 'def', 'heading', 'hr', 'list', 'table',
+        ]);
+        const inlineMarkdownTokens = new Set([
+            'codespan', 'del', 'em', 'image', 'link', 'strong',
+        ]);
+        const containsMarkdown = (tokens) => (tokens || []).some((token) => (
+            markdownTokens.has(token.type)
+            || inlineMarkdownTokens.has(token.type)
+            || containsMarkdown(token.tokens)
+            || containsMarkdown(token.items)
+        ));
+        return containsMarkdown(marked.lexer(String(content || '')));
+    } catch (_error) {
+        return false;
+    }
+}
+
+function renderLocalFileMarkdown(content) {
+    const source = String(content || '');
+    if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+        $previewContent.innerHTML = '';
+        $previewContent.textContent = source;
+        return;
+    }
+    $previewContent.innerHTML = DOMPurify.sanitize(marked.parse(source), {
+        USE_PROFILES: { html: true },
+    });
+    const codeBlocks = $previewContent.querySelectorAll?.('pre code') || [];
+    codeBlocks.forEach((block) => {
+        if (typeof hljs !== 'undefined') hljs.highlightElement(block);
+    });
+}
+
+function focusLocalFileSurface() {
+    if (fileEditorMode === 'preview') $previewContent.focus();
+    else $fileEditorContent.focus();
+}
+
+function setLocalFileEditorMode(mode, options = {}) {
+    if (!openedLocalFile) return false;
+    const supportsPreview = fileEditorSupportsMarkdown;
+    fileEditorMode = supportsPreview && mode === 'preview' ? 'preview' : 'edit';
+    const previewing = fileEditorMode === 'preview';
+    $fileEditorModeSwitch.classList.toggle('hidden', !supportsPreview);
+    $fileEditorPreviewMode.classList.toggle('active', previewing);
+    $fileEditorEditMode.classList.toggle('active', !previewing);
+    $fileEditorPreviewMode.setAttribute('aria-pressed', String(previewing));
+    $fileEditorEditMode.setAttribute('aria-pressed', String(!previewing));
+    $previewContent.classList.toggle('hidden', !previewing);
+    $fileEditorFrame.classList.toggle('hidden', previewing);
+    $fileEditorQuote.disabled = previewing
+        || $fileEditorContent.selectionStart === $fileEditorContent.selectionEnd;
+    if (previewing) {
+        const content = $fileEditorContent.value;
+        currentPreview = buildPreviewMetadata(
+            openedLocalFile.name,
+            openedLocalFile.path,
+            content,
+            { fileName: openedLocalFile.name, path: openedLocalFile.path },
+        );
+        renderLocalFileMarkdown(content);
+    } else {
+        $previewSelectionTools.classList.add('hidden');
+        currentPreviewSelection = null;
+    }
+    if (options.focus !== false) focusLocalFileSurface();
+    return true;
+}
+
 function shortFileRevision(revision) {
     return revision ? String(revision).slice(0, 8) : '-';
 }
@@ -3229,11 +3313,9 @@ function setFileEditorContent(content, preserveView = false) {
 }
 
 function showLocalFileEditorSurface() {
-    $previewContent.classList.add('hidden');
     $previewSelectionTools.classList.add('hidden');
     $fileEditorTabs.classList.remove('hidden');
     $fileEditorToolbar.classList.remove('hidden');
-    $fileEditorFrame.classList.remove('hidden');
     $fileEditorStatusbar.classList.remove('hidden');
     $fileEditorRefresh.classList.remove('hidden');
     $fileEditorCopyPath.classList.remove('hidden');
@@ -3241,13 +3323,22 @@ function showLocalFileEditorSurface() {
     $markdownPreview.setAttribute('aria-hidden', 'false');
     $previewBackdrop.classList.remove('hidden');
     document.body.classList.add('preview-open');
+    setLocalFileEditorMode(fileEditorMode, { focus: false });
 }
 
 function applyLocalFileSnapshot(snapshot, options = {}) {
     if (!openedLocalFile) return;
+    const initialLoad = !openedLocalFile.revision;
     openedLocalFile.name = snapshot.name || openedLocalFile.name;
     openedLocalFile.path = snapshot.path || openedLocalFile.path;
     openedLocalFile.revision = snapshot.revision;
+    const extensionKind = localFileExtensionKind(openedLocalFile);
+    fileEditorSupportsMarkdown = extensionKind === 'markdown'
+        || (extensionKind === 'extensionless'
+            && extensionlessContentIsMarkdown(snapshot.content));
+    if (initialLoad || !fileEditorSupportsMarkdown) {
+        fileEditorMode = fileEditorSupportsMarkdown ? 'preview' : 'edit';
+    }
     fileEditorConflictSnapshot = null;
     $fileEditorConflict.classList.add('hidden');
     $previewTitle.textContent = openedLocalFile.name;
@@ -3266,6 +3357,7 @@ function applyLocalFileSnapshot(snapshot, options = {}) {
         snapshot.content,
         { fileName: openedLocalFile.name, path: openedLocalFile.path },
     );
+    setLocalFileEditorMode(fileEditorMode, { focus: false });
     setFileEditorSaveState('saved', options.message || '已加载最新内容');
 }
 
@@ -3301,7 +3393,7 @@ async function openLocalFileEditor(file, trigger = null) {
     if (!requestedPath) return false;
     if (openedLocalFile?.path === requestedPath && $markdownPreview.classList.contains('open')) {
         await checkLatestLocalFile({ announce: true });
-        $fileEditorContent.focus();
+        focusLocalFileSurface();
         return true;
     }
     if (openedLocalFile) {
@@ -3324,6 +3416,8 @@ async function openLocalFileEditor(file, trigger = null) {
         change_kind: file.change_kind === 'added' ? 'added' : 'modified',
         run_id: file.run_id || null,
     };
+    fileEditorSupportsMarkdown = localFileExtensionKind(openedLocalFile) === 'markdown';
+    fileEditorMode = fileEditorSupportsMarkdown ? 'preview' : 'edit';
     openedLocalFileTrigger = trigger;
     document.querySelectorAll('.modified-file-link').forEach((button) => {
         button.classList.toggle('active', button === trigger);
@@ -3348,7 +3442,7 @@ async function openLocalFileEditor(file, trigger = null) {
         if (requestId !== fileEditorRequestId || !openedLocalFile) return false;
         applyLocalFileSnapshot(snapshot);
         startLocalFileWatcher();
-        $fileEditorContent.focus();
+        focusLocalFileSurface();
         return true;
     } catch (error) {
         if (requestId !== fileEditorRequestId) return false;
@@ -3492,6 +3586,8 @@ function resetLocalFileEditorSession() {
     fileEditorRequestId += 1;
     fileEditorConflictSnapshot = null;
     fileEditorDirty = false;
+    fileEditorMode = 'edit';
+    fileEditorSupportsMarkdown = false;
     openedLocalFile = null;
     openedLocalFileTrigger = null;
     document.querySelectorAll('.modified-file-link.active').forEach((button) => {
@@ -3501,17 +3597,21 @@ function resetLocalFileEditorSession() {
     $fileEditorConflict.classList.add('hidden');
     $fileEditorTabs.classList.add('hidden');
     $fileEditorToolbar.classList.add('hidden');
+    $fileEditorModeSwitch.classList.add('hidden');
     $fileEditorFrame.classList.add('hidden');
     $fileEditorStatusbar.classList.add('hidden');
     $fileEditorRefresh.classList.add('hidden');
     $fileEditorCopyPath.classList.add('hidden');
+    $previewContent.classList.add('hidden');
+    $previewContent.innerHTML = '';
+    $previewContent.textContent = '';
 }
 
 function loadConflictingDiskVersion() {
     if (!fileEditorConflictSnapshot) return;
     applyLocalFileSnapshot(fileEditorConflictSnapshot, { message: '已加载磁盘版本' });
     showToast('已加载磁盘版本');
-    $fileEditorContent.focus();
+    focusLocalFileSurface();
 }
 
 async function keepAndSaveLocalFile() {
@@ -3519,7 +3619,7 @@ async function keepAndSaveLocalFile() {
     setFileEditorSaveState('dirty', '准备保存当前修改...');
     const saved = await saveOpenedLocalFile({ adoptLatest: true });
     if (saved) showToast('当前修改已保存为最新版本');
-    $fileEditorContent.focus();
+    focusLocalFileSurface();
 }
 
 async function copyOpenedLocalFilePath() {
@@ -3846,11 +3946,13 @@ $fileEditorContent.addEventListener('keydown', (event) => {
     $fileEditorContent.dispatchEvent(new Event('input', { bubbles: true }));
 });
 $fileEditorQuote.addEventListener('click', quoteFileEditorSelection);
+$fileEditorPreviewMode.addEventListener('click', () => setLocalFileEditorMode('preview'));
+$fileEditorEditMode.addEventListener('click', () => setLocalFileEditorMode('edit'));
 $fileEditorRefresh.addEventListener('click', () => checkLatestLocalFile({ announce: true }));
 $fileEditorCopyPath.addEventListener('click', copyOpenedLocalFilePath);
 $fileEditorKeepLocal.addEventListener('click', keepAndSaveLocalFile);
 $fileEditorLoadDisk.addEventListener('click', loadConflictingDiskVersion);
-$fileEditorTab.addEventListener('click', () => $fileEditorContent.focus());
+$fileEditorTab.addEventListener('click', focusLocalFileSurface);
 document.addEventListener('keydown', (event) => {
     if ((event.metaKey || event.ctrlKey)
         && event.key.toLowerCase() === 's'

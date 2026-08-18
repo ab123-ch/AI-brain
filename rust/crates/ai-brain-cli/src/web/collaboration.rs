@@ -775,6 +775,23 @@ pub struct RoomChangedFileView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberHandoffSource {
+    pub member_id: String,
+    pub member_name: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub content_hash: String,
+    pub execution_working_directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberHandoffContext {
+    pub source_member: MemberHandoffSource,
+    pub root_user_reference: RoomEventReferenceView,
+    pub changed_files: Vec<RoomChangedFileView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomEventReferenceView {
     pub event_id: String,
     pub sequence: u64,
@@ -889,6 +906,7 @@ pub struct ClaimedInboxItem {
     pub group_enabled: bool,
     pub execution_working_directory: PathBuf,
     pub reply_reference: Option<RoomEventReferenceView>,
+    pub member_handoff: Option<MemberHandoffContext>,
     pub input: String,
     pub mode: RoomInputMode,
     pub run_id: String,
@@ -2736,20 +2754,24 @@ impl CollaborationRepository {
             return Ok(None);
         };
         let run_id = format!("run-{}", Uuid::new_v4());
-        let claim =
-            match claimed_inbox_from_candidate(&candidate, run_id.clone(), candidate.version + 1) {
-                Ok(claim) => claim,
-                Err(error @ CollaborationError::Config(_)) => {
-                    let quarantined =
-                        quarantine_corrupt_claim(&transaction, &candidate, &error.to_string())?;
-                    transaction.commit()?;
-                    if quarantined {
-                        return Err(error);
-                    }
-                    return Ok(None);
+        let claim = match claimed_inbox_from_candidate(
+            &transaction,
+            &candidate,
+            run_id.clone(),
+            candidate.version + 1,
+        ) {
+            Ok(claim) => claim,
+            Err(error @ CollaborationError::Config(_)) => {
+                let quarantined =
+                    quarantine_corrupt_claim(&transaction, &candidate, &error.to_string())?;
+                transaction.commit()?;
+                if quarantined {
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
-            };
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let lease_expires_at = Utc::now() + chrono::Duration::minutes(5);
         let updated = transaction.execute(
             "UPDATE member_inbox_items
@@ -2852,7 +2874,13 @@ impl CollaborationRepository {
         let Some(candidate) = candidate else {
             return Ok(None);
         };
-        claimed_inbox_from_candidate(&candidate, durable_run_id.into(), candidate.version).map(Some)
+        claimed_inbox_from_candidate(
+            &connection,
+            &candidate,
+            durable_run_id.into(),
+            candidate.version,
+        )
+        .map(Some)
     }
 
     pub fn activate_lease(&self, claim: &ClaimedInboxItem) -> Result<ClaimedInboxItem> {
@@ -3364,6 +3392,151 @@ impl CollaborationRepository {
             .ok_or_else(|| CollaborationError::Config("成员回复事件水合失败".into()))
     }
 
+    fn queue_member_reply_mentions(
+        &self,
+        transaction: &Transaction<'_>,
+        claim: &ClaimedInboxItem,
+        event: &RoomEventView,
+        answer: &str,
+        now: &DateTime<Utc>,
+    ) -> Result<()> {
+        if event.debate_depth >= self.config.max_debate_depth {
+            return Ok(());
+        }
+        let total_replies: usize = transaction.query_row(
+            "SELECT COUNT(*) FROM room_events
+             WHERE room_id = ?1
+               AND COALESCE(conversation_root_event_id, event_id) = ?2
+               AND kind = 'member_message'
+               AND invalidated_at IS NULL",
+            params![claim.room_id, event.conversation_root_event_id],
+            |row| row.get(0),
+        )?;
+        if total_replies >= self.config.max_group_replies_per_conversation {
+            return Ok(());
+        }
+        let room_pending: usize = transaction.query_row(
+            "SELECT COUNT(*) FROM member_inbox_items i
+             JOIN brain_members m ON m.member_id = i.member_id
+             WHERE m.room_id = ?1 AND i.state IN ('pending', 'leased', 'running')",
+            [claim.room_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if room_pending >= self.config.max_pending_items_per_room {
+            return Ok(());
+        }
+
+        let members = {
+            let mut statement = transaction.prepare(
+                "SELECT member_id, display_name, availability, version
+                 FROM brain_members
+                 WHERE room_id = ?1
+                 ORDER BY member_id",
+            )?;
+            let members = statement
+                .query_map([claim.room_id.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            members
+        };
+        let mention_candidates = members
+            .iter()
+            .map(|(member_id, display_name, availability, _)| {
+                (
+                    member_id.clone(),
+                    display_name.clone(),
+                    member_id != &claim.member_id
+                        && availability != MemberAvailability::Archived.as_db(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mentioned_member_ids = mentioned_member_ids(answer, &mention_candidates);
+        let mut queued = 0_usize;
+        for (member_id, _display_name, availability, mut version) in members {
+            if queued >= self.config.max_recipients_per_message
+                || member_id == claim.member_id
+                || availability == MemberAvailability::Archived.as_db()
+                || !mentioned_member_ids.contains(&member_id)
+            {
+                continue;
+            }
+            let (member_pending, member_replies): (usize, usize) = transaction.query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM member_inbox_items
+                      WHERE member_id = ?1 AND state IN ('pending', 'leased', 'running')),
+                     (SELECT COUNT(*) FROM room_events
+                      WHERE room_id = ?2
+                        AND COALESCE(conversation_root_event_id, event_id) = ?3
+                        AND kind = 'member_message'
+                        AND sender_id = ?1
+                        AND invalidated_at IS NULL)",
+                params![member_id, claim.room_id, event.conversation_root_event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if member_pending >= self.config.max_pending_items_per_member
+                || room_pending + queued >= self.config.max_pending_items_per_room
+                || member_replies >= self.config.max_group_replies_per_member
+            {
+                continue;
+            }
+            if availability == MemberAvailability::Sleeping.as_db()
+                || availability == MemberAvailability::SleepAfterCurrent.as_db()
+            {
+                let updated = transaction.execute(
+                    "UPDATE brain_members
+                     SET availability = 'active', last_woken_at = ?1, version = version + 1
+                     WHERE room_id = ?2 AND member_id = ?3 AND version = ?4
+                       AND availability IN ('sleeping', 'sleep_after_current')",
+                    params![now.to_rfc3339(), claim.room_id, member_id, version],
+                )?;
+                if updated != 1 {
+                    let actual = member_version(transaction, &claim.room_id, &member_id)?;
+                    return Err(CollaborationError::VersionConflict {
+                        entity: "member",
+                        id: member_id,
+                        expected: version,
+                        actual,
+                    });
+                }
+                version += 1;
+            }
+            transaction.execute(
+                "INSERT INTO room_event_recipients(event_id, member_id) VALUES (?1, ?2)",
+                params![event.event_id, member_id],
+            )?;
+            let item = insert_inbox_item(
+                transaction,
+                &member_id,
+                &event.event_id,
+                &claim.thread_key,
+                claim.mode,
+                InboxPurpose::Direct,
+                &event.conversation_root_event_id,
+                version,
+                &format!("member-handoff:{}:{member_id}", event.event_id),
+                now,
+            )?;
+            insert_delivery(
+                transaction,
+                &event.event_id,
+                &member_id,
+                DeliveryKind::Direct,
+                DeliveryState::Queued,
+                Some(&item.inbox_item_id),
+                Some("member_mention"),
+                now,
+            )?;
+            queued += 1;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn queue_latest_deferred_participation(
         &self,
@@ -3518,7 +3691,7 @@ impl CollaborationRepository {
             )?;
             None
         } else {
-            let event = self.append_member_reply_event(
+            let mut event = self.append_member_reply_event(
                 &transaction,
                 claim.into(),
                 answer,
@@ -3543,6 +3716,10 @@ impl CollaborationRepository {
                  WHERE inbox_item_id = ?2",
                 params![now.to_rfc3339(), claim.inbox_item_id],
             )?;
+            self.queue_member_reply_mentions(&transaction, claim, &event, answer, &now)?;
+            event = hydrate_events(&transaction, vec![event])?
+                .pop()
+                .ok_or_else(|| CollaborationError::Config("成员回复事件水合失败".into()))?;
             Some(event)
         };
         settle_sleep_after_current(&transaction, &claim.member_id)?;
@@ -4704,6 +4881,41 @@ fn ensure_version(entity: &'static str, id: &str, expected: u64, actual: u64) ->
     }
 }
 
+fn mentioned_member_ids(content: &str, members: &[(String, String, bool)]) -> HashSet<String> {
+    let mut members = members.iter().collect::<Vec<_>>();
+    members.sort_by(|left, right| {
+        right
+            .1
+            .chars()
+            .count()
+            .cmp(&left.1.chars().count())
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut claimed_starts = HashSet::new();
+    let mut mentioned = HashSet::new();
+    for (member_id, display_name, eligible) in members {
+        let mention = format!("@{display_name}");
+        for (start, matched) in content.match_indices(&mention) {
+            let before = content[..start].chars().next_back();
+            let after = content[start + matched.len()..].chars().next();
+            if before.is_none_or(is_mention_boundary)
+                && after.is_none_or(is_mention_boundary)
+                && claimed_starts.insert(start)
+            {
+                if *eligible {
+                    mentioned.insert(member_id.clone());
+                }
+            }
+        }
+    }
+    mentioned
+}
+
+fn is_mention_boundary(character: char) -> bool {
+    !character.is_alphanumeric() && character != '_' && character != '@'
+}
+
 fn normalize_active_member_display_names(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT room_id, member_id, display_name
@@ -4990,6 +5202,7 @@ fn claimed_inbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimCand
 }
 
 fn claimed_inbox_from_candidate(
+    connection: &Connection,
     candidate: &ClaimCandidate,
     run_id: String,
     version: u64,
@@ -5030,6 +5243,17 @@ fn claimed_inbox_from_candidate(
             .unwrap_or_default(),
     )?;
     let reply_reference = reply_reference_from_candidate(candidate, &room_id)?;
+    let purpose = InboxPurpose::from_db(&candidate.purpose);
+    let member_handoff = if purpose == InboxPurpose::Direct {
+        member_handoff_from_connection(
+            connection,
+            &candidate.source_event_id,
+            &room_id,
+            &candidate.conversation_root_event_id,
+        )?
+    } else {
+        None
+    };
     Ok(ClaimedInboxItem {
         inbox_item_id: candidate.inbox_item_id.clone(),
         room_id,
@@ -5041,13 +5265,14 @@ fn claimed_inbox_from_candidate(
         source_event_id: candidate.source_event_id.clone(),
         source_event_seq,
         thread_key: candidate.thread_key.clone(),
-        purpose: InboxPurpose::from_db(&candidate.purpose),
+        purpose,
         conversation_root_event_id: candidate.conversation_root_event_id.clone(),
         context_through_seq,
         response_to_event_id: candidate.response_to_event_id.clone(),
         group_enabled,
         execution_working_directory,
         reply_reference,
+        member_handoff,
         input,
         mode: if candidate.mode == "task" {
             RoomInputMode::Task
@@ -5058,6 +5283,117 @@ fn claimed_inbox_from_candidate(
         task_run_id: candidate.task_run_id.clone(),
         version,
     })
+}
+
+fn member_handoff_from_connection(
+    connection: &Connection,
+    source_event_id: &str,
+    room_id: &str,
+    conversation_root_event_id: &str,
+) -> Result<Option<MemberHandoffContext>> {
+    let source = connection
+        .query_row(
+            "SELECT sender_kind, sender_id, sender_name, sequence, content, run_id,
+                    execution_working_directory
+             FROM room_events
+             WHERE event_id = ?1 AND room_id = ?2 AND invalidated_at IS NULL",
+            params![source_event_id, room_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            CollaborationError::Config(format!("Inbox 来源事件 {source_event_id} 不存在"))
+        })?;
+    if source.0 != "member" {
+        return Ok(None);
+    }
+    let source_run_id = source.5.ok_or_else(|| {
+        CollaborationError::Config(format!("成员来源事件 {source_event_id} 缺少运行标识"))
+    })?;
+    let execution_working_directory = source.6.ok_or_else(|| {
+        CollaborationError::Config(format!("成员来源事件 {source_event_id} 缺少冻结工作目录"))
+    })?;
+    required_execution_working_directory(execution_working_directory.clone())?;
+
+    let root_user_reference = connection
+        .query_row(
+            "SELECT event_id, sequence, sender_kind, sender_id, sender_name, kind,
+                    content, created_at
+             FROM room_events
+             WHERE event_id = ?1 AND room_id = ?2 AND sender_kind = 'user'
+               AND kind = 'user_message' AND invalidated_at IS NULL",
+            params![conversation_root_event_id, room_id],
+            |row| {
+                let content = row.get::<_, String>(6)?;
+                Ok(RoomEventReferenceView {
+                    event_id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    sender_kind: row.get(2)?,
+                    sender_id: row.get(3)?,
+                    sender_name: row.get(4)?,
+                    kind: row.get(5)?,
+                    content_hash: history_content_hash(&content),
+                    content,
+                    created_at: parse_datetime(&row.get::<_, String>(7)?),
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            CollaborationError::Config(format!(
+                "成员来源事件 {source_event_id} 的对话根用户事件 {conversation_root_event_id} 不存在"
+            ))
+        })?;
+
+    let changed_files = {
+        let mut statement = connection.prepare(
+            "SELECT path, change_kind FROM collaboration_run_changed_files
+             WHERE run_id = ?1 ORDER BY path",
+        )?;
+        let rows = statement
+            .query_map([source_run_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut changed_files = Vec::with_capacity(rows.len());
+        for (path, change_kind) in rows {
+            if !Path::new(&path).is_absolute() {
+                return Err(CollaborationError::Config(format!(
+                    "运行 {source_run_id} 的文件变更路径不是绝对路径: {path}"
+                )));
+            }
+            let change_kind = RoomFileChangeKind::from_db(&change_kind).ok_or_else(|| {
+                CollaborationError::Config(format!(
+                    "运行 {source_run_id} 的文件变更类型无效: {change_kind}"
+                ))
+            })?;
+            changed_files.push(RoomChangedFileView { path, change_kind });
+        }
+        changed_files
+    };
+
+    Ok(Some(MemberHandoffContext {
+        source_member: MemberHandoffSource {
+            member_id: source.1,
+            member_name: source.2,
+            event_id: source_event_id.into(),
+            sequence: source.3,
+            content_hash: history_content_hash(&source.4),
+            execution_working_directory,
+        },
+        root_user_reference,
+        changed_files,
+    }))
 }
 
 fn quarantine_corrupt_claim(
@@ -6383,6 +6719,7 @@ mod tests {
         assert_eq!(claim.source_event_id, "participation-source");
         assert_eq!(claim.response_to_event_id, "participation-target");
         assert_eq!(claim.execution_working_directory, canonical_a);
+        assert!(claim.member_handoff.is_none());
 
         let completion = repository
             .complete_participation_item(&claim, Some("参与回复"))
@@ -8795,8 +9132,21 @@ mod tests {
     }
 
     #[test]
-    fn member_reply_is_public_but_does_not_wake_other_members() {
-        let (_directory, repository) = repository();
+    fn member_reply_mentions_wake_active_and_sleeping_members() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = CollaborationRepository::new(
+            directory.path(),
+            CollaborationConfig {
+                max_members_per_room: 5,
+                max_pending_items_per_member: 3,
+                max_pending_items_per_room: 4,
+                max_recipients_per_message: 3,
+                max_workers: 2,
+                max_history_events_per_run: 20,
+                ..CollaborationConfig::default()
+            },
+        )
+        .unwrap();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
         let b = repository
@@ -8804,9 +9154,19 @@ mod tests {
             .unwrap()
             .member_id;
         let c = repository
-            .create_member("room-1", "智脑 C", None, None)
+            .create_member("room-1", "智脑 B 专家", None, None)
             .unwrap()
             .member_id;
+        let d = repository
+            .create_member("room-1", "智脑 E 归档", None, None)
+            .unwrap()
+            .member_id;
+        let e = repository
+            .create_member("room-1", "智脑 E", None, None)
+            .unwrap()
+            .member_id;
+        repository.sleep_member("room-1", &c).unwrap();
+        repository.archive_member("room-1", &d).unwrap();
         let posted = repository
             .post_group_message(
                 "room-1",
@@ -8820,11 +9180,20 @@ mod tests {
         let claim_a = repository.claim_next().unwrap().unwrap();
         assert_eq!(claim_a.member_id, a);
         let reply = repository
-            .complete_item(&claim_a, "我建议先灰度发布")
+            .complete_item(
+                &claim_a,
+                "@智脑 B 专家 @智脑 B 专家 请读取文件；@智脑 B 请复核；@智脑 E 归档 忽略；@智脑 A 自己不处理",
+            )
             .unwrap()
             .unwrap();
-        assert!(reply.recipients.is_empty());
-        assert!(reply.audience.is_empty());
+        let mut recipients = reply.recipients.clone();
+        recipients.sort();
+        let mut expected_recipients = vec![b.clone(), c.clone()];
+        expected_recipients.sort();
+        assert_eq!(recipients, expected_recipients);
+        let mut audience = reply.audience.clone();
+        audience.sort();
+        assert_eq!(audience, expected_recipients);
         assert_eq!(reply.conversation_root_event_id, posted.event.event_id);
         assert_eq!(
             reply.parent_event_id.as_deref(),
@@ -8837,9 +9206,47 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_id == reply.event_id));
-        assert!(!persisted.inbox.iter().any(|item| item.member_id == b));
-        assert!(!persisted.inbox.iter().any(|item| item.member_id == c));
-        assert!(repository.claim_next().unwrap().is_none());
+        let mentioned_inbox = persisted
+            .inbox
+            .iter()
+            .filter(|item| item.source_event_id == reply.event_id)
+            .collect::<Vec<_>>();
+        assert_eq!(mentioned_inbox.len(), 2);
+        assert_eq!(
+            mentioned_inbox
+                .iter()
+                .filter(|item| item.member_id == c)
+                .count(),
+            1
+        );
+        assert_eq!(
+            mentioned_inbox
+                .iter()
+                .filter(|item| item.member_id == b)
+                .count(),
+            1
+        );
+        assert!(!mentioned_inbox.iter().any(|item| item.member_id == a));
+        assert!(!mentioned_inbox.iter().any(|item| item.member_id == d));
+        assert!(!mentioned_inbox.iter().any(|item| item.member_id == e));
+        assert_eq!(
+            repository.member("room-1", &c).unwrap().availability,
+            MemberAvailability::Active
+        );
+        assert_eq!(
+            repository.member("room-1", &d).unwrap().availability,
+            MemberAvailability::Archived
+        );
+        assert_eq!(
+            mentioned_member_ids(
+                "@智脑 E 归档",
+                &[
+                    ("archived".into(), "智脑 E 归档".into(), false),
+                    ("active".into(), "智脑 E 归档".into(), true),
+                ],
+            ),
+            HashSet::from(["active".into()])
+        );
     }
 
     #[test]
