@@ -2115,7 +2115,7 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("function runStatusLabel"))
             .map(|(handler, _)| handler)
             .expect("脚本缺少合并后的成员进度渲染函数");
-        assert!(run_render_flush.contains("$messages.scrollTop = $messages.scrollHeight"));
+        assert!(run_render_flush.contains("roomTimelineFollower.follow();"));
         let run_element_renderer = script
             .split_once("function updateRunElement")
             .and_then(|(_, rest)| rest.split_once("function scheduleRunElementUpdate"))
@@ -2126,6 +2126,9 @@ mod tests {
         assert!(script.contains("const ROOM_MARKDOWN_CACHE_LIMIT = 400"));
         assert!(script.contains("renderCachedRoomMarkdown(content, event)"));
         assert!(script.contains("'follow-if-near-bottom'"));
+        assert!(script.contains("RoomReply.createTimelineBottomFollower"));
+        assert!(script.contains("roomTimelineFollower.isActive()"));
+        assert!(script.contains("['wheel', 'touchstart', 'pointerdown']"));
 
         let composer_input_handler = script
             .split_once("$input.addEventListener('input', () => {")

@@ -178,6 +178,14 @@ const runRenderScheduler = RoomReply.createFrameScheduler(
     (callback) => requestAnimationFrame(callback),
     (frameId) => cancelAnimationFrame(frameId),
 );
+const roomTimelineFollower = RoomReply.createTimelineBottomFollower(
+    () => {
+        $messages.scrollTop = $messages.scrollHeight;
+        roomTimelineNearBottom = true;
+    },
+    (callback) => requestAnimationFrame(callback),
+    (frameId) => cancelAnimationFrame(frameId),
+);
 
 // ── Cockpit State ───────────────────────────────────────────────
 const brainProfiles = {
@@ -527,6 +535,7 @@ function handleServerMessage(data) {
 // ── Collaboration Room ─────────────────────────────────────────
 function resetRoomLocalState() {
     runRenderScheduler.cancel();
+    roomTimelineFollower.cancel();
     pendingRunRenderStates.clear();
     pendingRunFollowLatest = false;
     roomTimelineNearBottom = true;
@@ -835,6 +844,7 @@ function syncMentionRecipients() {
 function renderRoomTimeline({ scrollToLatest = false } = {}) {
     if (!roomSnapshot) return;
     const viewport = RoomReply.captureTimelineViewport($messages);
+    const wasFollowingLatest = viewport.nearBottom || roomTimelineFollower.isActive();
     $messages.innerHTML = '';
     const entries = [];
     const lastVisibleUserEventId = roomSnapshot.events
@@ -871,13 +881,19 @@ function renderRoomTimeline({ scrollToLatest = false } = {}) {
     const scrollPolicy = preserveTimelineAnchor
         ? 'prepend'
         : scrollToLatest ? 'latest' : 'follow-if-near-bottom';
-    $messages.scrollTop = RoomReply.timelineScrollTarget(
-        viewport,
-        $messages.scrollHeight,
-        scrollPolicy,
-    );
-    roomTimelineNearBottom = scrollPolicy === 'latest'
-        || (scrollPolicy === 'follow-if-near-bottom' && viewport.nearBottom);
+    const shouldFollowLatest = scrollPolicy === 'latest'
+        || (scrollPolicy === 'follow-if-near-bottom' && wasFollowingLatest);
+    if (shouldFollowLatest) {
+        roomTimelineFollower.follow();
+    } else {
+        roomTimelineFollower.cancel();
+        $messages.scrollTop = RoomReply.timelineScrollTarget(
+            viewport,
+            $messages.scrollHeight,
+            scrollPolicy,
+        );
+        roomTimelineNearBottom = RoomReply.isTimelineNearBottom($messages);
+    }
 }
 
 function renderCachedRoomMarkdown(element, event) {
@@ -1067,9 +1083,10 @@ function flushPendingRunRenders() {
     states.forEach((state) => {
         if (state.roomId === activeSessionId) updateRunElement(state);
     });
-    if (followLatest && roomTimelineNearBottom && !preserveTimelineAnchor) {
-        $messages.scrollTop = $messages.scrollHeight;
-        roomTimelineNearBottom = true;
+    if (followLatest
+        && (roomTimelineNearBottom || roomTimelineFollower.isActive())
+        && !preserveTimelineAnchor) {
+        roomTimelineFollower.follow();
     }
 }
 
@@ -1088,7 +1105,7 @@ function runStatusLabel(state) {
 
 function handleMemberRunProgress(data) {
     if (data.room_id !== activeSessionId || !data.event) return;
-    const shouldFollowLatest = roomTimelineNearBottom;
+    const shouldFollowLatest = roomTimelineNearBottom || roomTimelineFollower.isActive();
     const state = ensureMemberRunState(data.run_id, data.member_id, data.room_id);
     const inbox = roomSnapshot?.inbox.find((item) => item.run_id === data.run_id);
     state.purpose = inbox?.purpose || state.purpose;
@@ -3807,8 +3824,15 @@ $input.addEventListener('input', () => {
 });
 
 $messages.addEventListener('scroll', () => {
-    roomTimelineNearBottom = RoomReply.isTimelineNearBottom($messages);
+    roomTimelineNearBottom = roomTimelineFollower.isActive()
+        || RoomReply.isTimelineNearBottom($messages);
 }, { passive: true });
+
+['wheel', 'touchstart', 'pointerdown'].forEach((eventName) => {
+    $messages.addEventListener(eventName, () => {
+        roomTimelineFollower.cancel();
+    }, { passive: true });
+});
 
 $roomMode.querySelectorAll('[data-mode]').forEach((button) => {
     button.addEventListener('click', () => {

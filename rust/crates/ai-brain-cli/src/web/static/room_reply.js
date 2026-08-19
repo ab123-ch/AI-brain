@@ -325,6 +325,61 @@
         };
     }
 
+    function createTimelineBottomFollower(
+        scrollToBottom,
+        requestFrame,
+        cancelFrame = null,
+        settleFrameCount = 3,
+    ) {
+        if (typeof scrollToBottom !== 'function' || typeof requestFrame !== 'function') {
+            throw new TypeError('timeline follower requires scroll and frame functions');
+        }
+        const frameCount = Number(settleFrameCount);
+        if (!Number.isInteger(frameCount) || frameCount < 1) {
+            throw new TypeError('timeline follower frame count must be a positive integer');
+        }
+
+        let active = false;
+        let frameId = null;
+        let framesRemaining = 0;
+        let generation = 0;
+
+        function scheduleNextFrame() {
+            if (!active || frameId !== null) return;
+            const scheduledGeneration = generation;
+            frameId = requestFrame(() => {
+                if (scheduledGeneration !== generation) return;
+                frameId = null;
+                if (!active) return;
+                scrollToBottom();
+                framesRemaining -= 1;
+                if (framesRemaining > 0) scheduleNextFrame();
+                else active = false;
+            });
+        }
+
+        return {
+            follow() {
+                active = true;
+                framesRemaining = frameCount;
+                scrollToBottom();
+                scheduleNextFrame();
+            },
+            cancel() {
+                const wasActive = active || frameId !== null;
+                active = false;
+                framesRemaining = 0;
+                generation += 1;
+                if (frameId !== null && typeof cancelFrame === 'function') cancelFrame(frameId);
+                frameId = null;
+                return wasActive;
+            },
+            isActive() {
+                return active;
+            },
+        };
+    }
+
     function shouldFocusComposer(enabled, modalOpen) {
         return Boolean(enabled) && !modalOpen;
     }
@@ -338,6 +393,7 @@
         canReplyToEvent,
         captureTimelineViewport,
         createFrameScheduler,
+        createTimelineBottomFollower,
         isTimelineNearBottom,
         matchesPendingRoomPost,
         mergeVersionedEntity,

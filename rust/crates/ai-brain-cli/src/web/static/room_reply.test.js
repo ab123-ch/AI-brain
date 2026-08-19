@@ -10,6 +10,7 @@ const {
     captureTimelineViewport,
     canReplyToEvent,
     createFrameScheduler,
+    createTimelineBottomFollower,
     matchesPendingRoomPost,
     mergeVersionedEntity,
     mergeEventsBySequence,
@@ -732,6 +733,123 @@ test('帧调度器取消后不会执行旧回调并可再次安排', () => {
     assert.equal(scheduler.schedule(), true);
     frames.get(2)();
     assert.equal(flushes, 1);
+});
+
+test('时间线贴底控制器跨布局结算帧持续跟随增长后的高度', () => {
+    const frames = [];
+    const viewport = { scrollHeight: 1000, scrollTop: 400 };
+    const follower = createTimelineBottomFollower(
+        () => { viewport.scrollTop = viewport.scrollHeight; },
+        (callback) => {
+            frames.push(callback);
+            return frames.length;
+        },
+        null,
+        2,
+    );
+
+    follower.follow();
+    assert.equal(viewport.scrollTop, 1000);
+    assert.equal(follower.isActive(), true);
+
+    viewport.scrollHeight = 1200;
+    frames.shift()();
+    assert.equal(viewport.scrollTop, 1200);
+    assert.equal(follower.isActive(), true);
+
+    viewport.scrollHeight = 1450;
+    frames.shift()();
+    assert.equal(viewport.scrollTop, 1450);
+    assert.equal(follower.isActive(), false);
+});
+
+test('时间线贴底控制器在用户取消后停止后续滚动', () => {
+    const frames = new Map();
+    const cancelled = [];
+    const viewport = { scrollHeight: 1000, scrollTop: 400 };
+    let nextId = 0;
+    const follower = createTimelineBottomFollower(
+        () => { viewport.scrollTop = viewport.scrollHeight; },
+        (callback) => {
+            nextId += 1;
+            frames.set(nextId, callback);
+            return nextId;
+        },
+        (frameId) => {
+            cancelled.push(frameId);
+            frames.delete(frameId);
+        },
+        3,
+    );
+
+    follower.follow();
+    assert.equal(viewport.scrollTop, 1000);
+    assert.equal(follower.cancel(), true);
+    assert.deepEqual(cancelled, [1]);
+    assert.equal(follower.isActive(), false);
+
+    viewport.scrollHeight = 1400;
+    assert.equal(viewport.scrollTop, 1000);
+    assert.equal(follower.cancel(), false);
+});
+
+test('时间线贴底控制器在连续重建时重新计算稳定帧窗口', () => {
+    const frames = [];
+    const viewport = { scrollHeight: 1000, scrollTop: 400 };
+    const follower = createTimelineBottomFollower(
+        () => { viewport.scrollTop = viewport.scrollHeight; },
+        (callback) => {
+            frames.push(callback);
+            return frames.length;
+        },
+        null,
+        2,
+    );
+
+    follower.follow();
+    viewport.scrollHeight = 1100;
+    frames.shift()();
+    assert.equal(follower.isActive(), true);
+
+    viewport.scrollHeight = 1250;
+    follower.follow();
+    assert.equal(viewport.scrollTop, 1250);
+    viewport.scrollHeight = 1400;
+    frames.shift()();
+    assert.equal(follower.isActive(), true);
+    viewport.scrollHeight = 1600;
+    frames.shift()();
+    assert.equal(viewport.scrollTop, 1600);
+    assert.equal(follower.isActive(), false);
+});
+
+test('时间线贴底控制器忽略取消前已投递的陈旧帧', () => {
+    const frames = [];
+    const viewport = { scrollHeight: 1000, scrollTop: 400 };
+    const follower = createTimelineBottomFollower(
+        () => { viewport.scrollTop = viewport.scrollHeight; },
+        (callback) => {
+            frames.push(callback);
+            return frames.length;
+        },
+        null,
+        1,
+    );
+
+    follower.follow();
+    const staleFrame = frames.shift();
+    follower.cancel();
+    viewport.scrollHeight = 1200;
+    follower.follow();
+    const currentFrame = frames.shift();
+
+    viewport.scrollHeight = 1300;
+    staleFrame();
+    assert.equal(viewport.scrollTop, 1200);
+    assert.equal(follower.isActive(), true);
+    currentFrame();
+    assert.equal(viewport.scrollTop, 1300);
+    assert.equal(follower.isActive(), false);
 });
 
 test('composer 仅在启用且没有可见 modal 时获取焦点', () => {
