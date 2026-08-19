@@ -678,6 +678,11 @@ impl MainBrain {
         tracing::info!("已注入技能摘要");
     }
 
+    /// Replace the skill metadata for the current execution directory.
+    pub fn replace_skill_summary(&mut self, summary: Option<String>) {
+        self.skill_summary = summary.filter(|value| !value.trim().is_empty());
+    }
+
     /// 注入 bootstrap 技能内容（启动时自动注入到 system prompt 最前面）
     pub fn inject_bootstrap(&mut self, content: String) {
         if content.is_empty() {
@@ -685,6 +690,11 @@ impl MainBrain {
         }
         self.bootstrap_content = Some(content);
         tracing::info!("已注入 bootstrap 技能");
+    }
+
+    /// Replace trusted bootstrap instructions for the current execution directory.
+    pub fn replace_bootstrap_content(&mut self, content: Option<String>) {
+        self.bootstrap_content = content.filter(|value| !value.trim().is_empty());
     }
 
     /// 注入实时召回的记忆作为独立 system 消息

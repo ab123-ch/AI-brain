@@ -149,7 +149,7 @@ impl MotorBrain {
             ("文件", vec!["Read", "Edit", "Write", "Glob"]),
             ("读取", vec!["Read"]),
             ("查看", vec!["Read", "Glob"]),
-            ("搜索", vec!["Grep", "Glob", "WebSearch"]),
+            ("搜索", vec!["Grep", "Glob"]),
             ("查找", vec!["Grep", "Glob"]),
             ("编辑", vec!["Edit"]),
             ("修改", vec!["Edit"]),
@@ -157,7 +157,6 @@ impl MotorBrain {
             ("写入", vec!["Write"]),
             ("执行", vec!["Bash"]),
             ("命令", vec!["Bash"]),
-            ("网络", vec!["WebSearch"]),
             ("代码", vec!["Read", "Edit", "Grep", "LSP"]),
             ("定义", vec!["LSP"]),
             ("引用", vec!["LSP"]),
@@ -385,7 +384,11 @@ mod tests {
     #[test]
     fn builtin_tools_registered() {
         let brain = make_brain();
-        assert!(brain.tool_count() >= 9);
+        assert!(brain.tool_count() >= 8);
+        assert!(!brain
+            .list_tools()
+            .iter()
+            .any(|tool| tool.name == "WebSearch"));
     }
 
     #[test]
@@ -404,6 +407,7 @@ mod tests {
         let result = brain.fast_think(&msg);
         assert!(result.relevant);
         assert!(result.suggested_tools.contains(&"Grep".to_string()));
+        assert!(!result.suggested_tools.contains(&"WebSearch".to_string()));
     }
 
     #[test]
@@ -472,9 +476,10 @@ mod tests {
     fn list_tools_returns_descriptors() {
         let brain = make_brain();
         let tools = brain.list_tools();
-        assert!(tools.len() >= 9);
+        assert!(tools.len() >= 8);
         assert!(tools.iter().any(|t| t.name == "Read"));
         assert!(tools.iter().any(|t| t.name == "Bash"));
+        assert!(!tools.iter().any(|t| t.name == "WebSearch"));
     }
 
     #[test]

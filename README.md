@@ -343,12 +343,16 @@ ai-brain weights          # 查看副脑权重
 | `edit_file` | 编辑文件内容 | 工作区写入 |
 | `glob_search` | 文件名模式搜索 | 只读 |
 | `grep_search` | 内容正则搜索 | 只读 |
-| `WebFetch` | 获取 URL 内容 | 只读 |
-| `WebSearch` | 网络搜索 | 只读 |
+| `Skill` | 按需加载本地 Agent Skill | 只读 |
+| `ToolSearch` | 查找延迟加载工具 | 只读 |
 | `Agent` | 启动子 Agent | 完全访问 |
 | `NotebookEdit` | Jupyter 笔记本编辑 | 工作区写入 |
 | `EnterPlanMode` | 进入规划模式 | 工作区写入 |
 | `ExitPlanMode` | 退出规划模式 | 工作区写入 |
+
+内置 `WebFetch` 和 `WebSearch` 不再暴露给 LLM。联网流程由用户安装的 Skill
+配合已有 CLI，或由实际连接并注册的 MCP 工具提供。Skill 兼容目录、加载顺序和
+房间隔离规则见 [Agent Skills](rust/docs/agent-skills.md)。
 
 ## HTTP API
 

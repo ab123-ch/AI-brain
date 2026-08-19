@@ -144,7 +144,7 @@ use brain_memory::conversation_memory::{ConversationMemoryInvalidation, Conversa
 use brain_memory::generic::GenericMemoryStore;
 use brain_memory::pyramid_memory_brain::{PyramidMemoryBrain, PyramidMemoryBrainConfig};
 use brain_motor::motor_brain::{MotorBrain, MotorConfig};
-use brain_plugin::{PluginManager, SkillCatalog};
+use brain_plugin::{PluginManager, SkillCatalog, SkillCatalogResolver, SkillRoot};
 use brain_reasoning::reasoning_brain::{ReasoningBrain, ReasoningConfig};
 use brain_sensory::llm::LlmProvider as SensoryLlmProvider;
 use brain_sensory::SensoryBrain;
@@ -225,6 +225,7 @@ fn member_inputs_from_snapshot(
 pub(crate) async fn execute_member_run<F>(
     template: Arc<Mutex<Option<MainBrain>>>,
     memory: Option<Arc<Mutex<PyramidMemoryBrain>>>,
+    skill_catalog_resolver: Option<Arc<SkillCatalogResolver>>,
     context_snapshot: KnowledgeContextSnapshot,
     memory_scope: ConversationMemoryScope,
     resolve_model: F,
@@ -242,6 +243,15 @@ where
     let (input, restore_history, member_context) = member_inputs_from_snapshot(&context_snapshot)
         .map_err(MemberQueryError::before_execution)?;
     let (client, max_tokens, temperature) = resolve_model()?;
+    let skill_catalog = skill_catalog_resolver
+        .map(|resolver| resolver.catalog_for(&tool_execution_context.working_directory))
+        .transpose()
+        .map_err(MemberQueryError::before_execution)?;
+    let skill_bootstrap = skill_catalog
+        .as_ref()
+        .map(|catalog| catalog.bootstrap_content())
+        .transpose()
+        .map_err(MemberQueryError::before_execution)?;
 
     let mut brain = {
         let template = template.lock().await;
@@ -284,6 +294,10 @@ where
     };
     if !allow_tools {
         brain.register_tools(Vec::new());
+    }
+    if let Some(catalog) = skill_catalog {
+        brain.replace_skill_summary(Some(catalog.summary_for_prompt()));
+        brain.replace_bootstrap_content(skill_bootstrap);
     }
     brain.restore_history(restore_history);
     brain.replace_run_system_context(Some(member_context));
@@ -504,6 +518,8 @@ pub struct Orchestrator {
     /// 技能目录
     #[allow(dead_code)] // Task 8 会使用
     skill_catalog: Arc<SkillCatalog>,
+    /// 按执行工作目录解析项目技能覆盖。
+    skill_catalog_resolver: Arc<SkillCatalogResolver>,
     /// MCP 客户端池
     #[allow(dead_code)] // Task 8 会使用
     mcp_pool: Arc<McpClientPool>,
@@ -795,14 +811,15 @@ impl Orchestrator {
         }
 
         // 12. 尝试创建 v2 MainBrain（带 tool_loop + 工具注册 + dispatch）
-        let (v2_brain, plugin_mgr, skill_catalog, mcp_pool) = create_v2_main_brain(
-            &llm_config,
-            Some(Arc::clone(&memory)),
-            dispatch.clone(),
-            runtime_trace_tx.clone(),
-            direct_tool_execution_context,
-            // Arc::clone(&novel_application_port),
-        );
+        let (v2_brain, plugin_mgr, skill_catalog, skill_catalog_resolver, mcp_pool) =
+            create_v2_main_brain(
+                &llm_config,
+                Some(Arc::clone(&memory)),
+                dispatch.clone(),
+                runtime_trace_tx.clone(),
+                direct_tool_execution_context,
+                // Arc::clone(&novel_application_port),
+            );
 
         // 12.0 评估脑接入统一 SkillCatalog
         if let Some(ref mut eb) = eval_brain {
@@ -817,15 +834,16 @@ impl Orchestrator {
         if !skill_catalog.bootstrap_skills.is_empty() {
             if let Ok(mut v2_guard) = v2_brain.try_lock() {
                 if let Some(ref mut brain) = *v2_guard {
-                    for bs in &skill_catalog.bootstrap_skills {
-                        match skill_catalog.load_content(bs) {
-                            Ok(content) => {
-                                brain.inject_bootstrap(content);
-                                tracing::info!("Bootstrap 技能 '{}' 已注入主脑", bs.name);
-                            }
-                            Err(e) => {
-                                tracing::warn!("加载 bootstrap 技能 '{}' 失败: {e}", bs.name);
-                            }
+                    match skill_catalog.bootstrap_content() {
+                        Ok(content) => {
+                            brain.replace_bootstrap_content(Some(content));
+                            tracing::info!(
+                                "已组合注入 {} 个 Bootstrap 技能",
+                                skill_catalog.bootstrap_skills.len()
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!("加载 bootstrap 技能失败: {error}");
                         }
                     }
                 }
@@ -1046,6 +1064,7 @@ impl Orchestrator {
             novel_application: novel_application_port,
             plugin_mgr,
             skill_catalog,
+            skill_catalog_resolver,
             mcp_pool,
         })
     }
@@ -1320,6 +1339,7 @@ impl Orchestrator {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let template = Arc::clone(&self.v2_brain);
         let memory = Some(Arc::clone(&self.memory_brain));
+        let skill_catalog_resolver = Some(Arc::clone(&self.skill_catalog_resolver));
         let model_policy = model_policy.to_string();
         let reasoning_depth = reasoning_depth.to_string();
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -1328,6 +1348,7 @@ impl Orchestrator {
         let handle = tokio::spawn(execute_member_run(
             template,
             memory,
+            skill_catalog_resolver,
             context_snapshot,
             memory_scope,
             move || {
@@ -2915,6 +2936,7 @@ fn create_v2_main_brain(
     Arc<Mutex<Option<MainBrain>>>,
     Option<PluginManager>,
     Arc<SkillCatalog>,
+    Arc<SkillCatalogResolver>,
     Arc<McpClientPool>,
 ) {
     let client = match llm_config.create_brain_client("main") {
@@ -2929,14 +2951,15 @@ fn create_v2_main_brain(
                     packs: vec![],
                     bootstrap_skills: vec![],
                 }),
+                Arc::new(SkillCatalogResolver::new(Vec::new())),
                 Arc::new(McpClientPool::new()),
             );
         }
     };
 
     // === 插件系统初始化 ===
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let ai_brain_dir = std::path::PathBuf::from(&home).join(".ai-brain");
+    let home = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+    let ai_brain_dir = home.join(".ai-brain");
 
     // 1. 加载插件管理器
     let plugin_mgr = PluginManager::load(&ai_brain_dir.join("plugins"))
@@ -2946,28 +2969,8 @@ fn create_v2_main_brain(
         })
         .ok();
 
-    // 2. 扫描 Skill 目录
-    let mut skill_roots: Vec<std::path::PathBuf> = vec![];
-    skill_roots.push(
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(".ai-brain")
-            .join("skills"),
-    );
-    if let Some(ref mgr) = plugin_mgr {
-        skill_roots.extend(mgr.skill_roots());
-    }
-    skill_roots.push(ai_brain_dir.join("skills"));
-    skill_roots.push(
-        std::path::PathBuf::from(&home)
-            .join(".claude")
-            .join("skills"),
-    );
-    skill_roots.push(
-        std::path::PathBuf::from(&home)
-            .join(".codex")
-            .join("skills"),
-    );
+    // 2. 扫描 Skill 目录。项目覆盖由 resolver 按运行工作目录逐层添加。
+    let skill_roots = global_skill_roots(&home, &ai_brain_dir, plugin_mgr.as_ref());
     match install_builtin_skills(&ai_brain_dir) {
         Ok(_root) => {
             // Novel 工作流已停用：技能文件继续保留，但不再加入主脑 SkillCatalog。
@@ -2976,15 +2979,17 @@ fn create_v2_main_brain(
         Err(error) => tracing::warn!("准备内置技能失败: {error}"),
     }
 
-    let skill_catalog = SkillCatalog::scan_all(&skill_roots).unwrap_or_else(|e| {
-        tracing::warn!("扫描技能失败: {e}");
-        SkillCatalog {
-            skills: vec![],
-            packs: vec![],
-            bootstrap_skills: vec![],
-        }
-    });
-    let skill_catalog = Arc::new(skill_catalog);
+    let skill_catalog_resolver = Arc::new(SkillCatalogResolver::new(skill_roots));
+    let skill_catalog = skill_catalog_resolver
+        .catalog_for(&tool_execution_context.working_directory)
+        .unwrap_or_else(|e| {
+            tracing::warn!("扫描技能失败: {e}");
+            Arc::new(SkillCatalog {
+                skills: vec![],
+                packs: vec![],
+                bootstrap_skills: vec![],
+            })
+        });
     tracing::info!("扫描到 {} 个技能", skill_catalog.skills.len());
 
     // 3. 加载 MCP 配置
@@ -3003,6 +3008,7 @@ fn create_v2_main_brain(
     let tool_executor: Arc<dyn brain_core::tool_executor::ToolExecutor> = Arc::new(
         crate::real_tool_executor::RealToolExecutor::with_dispatch(memory_brain, dispatch)
             .with_skill_catalog(skill_catalog.clone())
+            .with_skill_catalog_resolver(Arc::clone(&skill_catalog_resolver))
             .with_mcp_pool(mcp_pool.clone())
             .with_runtime_trace_sender(runtime_trace_tx),
         // Novel 工作流已停用：保留执行器实现，但不再注入应用端口。
@@ -3040,8 +3046,55 @@ fn create_v2_main_brain(
         Arc::new(Mutex::new(Some(brain))),
         plugin_mgr,
         skill_catalog,
+        skill_catalog_resolver,
         mcp_pool,
     )
+}
+
+fn global_skill_roots(
+    home: &Path,
+    ai_brain_dir: &Path,
+    plugin_manager: Option<&PluginManager>,
+) -> Vec<SkillRoot> {
+    let mut plugin_roots = plugin_manager
+        .map(PluginManager::skill_roots)
+        .unwrap_or_default();
+    plugin_roots.sort();
+    configured_global_skill_roots(
+        home,
+        ai_brain_dir,
+        plugin_roots,
+        std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()),
+        std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()),
+    )
+}
+
+fn configured_global_skill_roots(
+    home: &Path,
+    ai_brain_dir: &Path,
+    plugin_roots: Vec<PathBuf>,
+    claude_config_dir: Option<std::ffi::OsString>,
+    codex_home: Option<std::ffi::OsString>,
+) -> Vec<SkillRoot> {
+    let mut roots = plugin_roots
+        .into_iter()
+        .map(SkillRoot::native)
+        .collect::<Vec<_>>();
+    roots.push(SkillRoot::native(ai_brain_dir.join("skills")));
+    roots.push(SkillRoot::external(home.join(".agents/skills")));
+
+    if let Some(path) = claude_config_dir {
+        roots.push(SkillRoot::external(PathBuf::from(path).join("skills")));
+    }
+    roots.push(SkillRoot::external(home.join(".claude/skills")));
+
+    if let Some(path) = codex_home {
+        roots.push(SkillRoot::external(PathBuf::from(path).join("skills")));
+    }
+    roots.push(SkillRoot::external(home.join(".codex/skills")));
+    #[cfg(unix)]
+    roots.push(SkillRoot::external("/etc/codex/skills"));
+    roots
 }
 
 const NOVEL_KNOWLEDGE_SOURCE_TYPES: [&str; 4] = [
@@ -3351,6 +3404,7 @@ mod tests {
         execute_member_run(
             Arc::new(tokio::sync::Mutex::new(Some(template))),
             None,
+            None,
             snapshot,
             ConversationMemoryScope::new("member-a", "run-a").unwrap(),
             move || Ok((execution_llm, 4_096, 0.0)),
@@ -3378,6 +3432,100 @@ mod tests {
         assert!(!messages[1..]
             .iter()
             .any(|message| message.text_content().contains("member A policy")));
+    }
+
+    #[tokio::test]
+    async fn member_execution_uses_room_skill_metadata_without_eager_foreign_body_loading() {
+        let workspace = tempfile::tempdir().unwrap();
+        let room = workspace.path().join("room-a");
+        let skill_directory = room.join(".agents/skills/room-network");
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: room-network\ndescription: Room-scoped network workflow\nbootstrap: true\n---\nROOM_SKILL_BODY_MUST_STAY_LAZY",
+        )
+        .unwrap();
+        let snapshot = KnowledgeContextSnapshot::new(
+            "context-room-skill",
+            vec![
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "policy",
+                    ContextBlockKind::SystemPolicy,
+                    "member policy",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "current",
+                    ContextBlockKind::CurrentInput,
+                    "use the room skill",
+                ))
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let llm = Arc::new(CapturingMemberLlm::new());
+        let template_llm: Arc<dyn brain_llm::LlmProvider> = llm.clone();
+        let mut template = MainBrain::new(
+            template_llm,
+            Arc::new(StubToolExecutor::new()),
+            BrainConfig::default(),
+            4_096,
+            0.0,
+        );
+        template.inject_skill_summary("STALE_STARTUP_SKILL".into());
+        template.inject_bootstrap("STALE_STARTUP_BOOTSTRAP".into());
+        let execution_llm: Arc<dyn brain_llm::LlmProvider> = llm.clone();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+
+        execute_member_run(
+            Arc::new(tokio::sync::Mutex::new(Some(template))),
+            None,
+            Some(Arc::new(SkillCatalogResolver::new(Vec::new()))),
+            snapshot,
+            ConversationMemoryScope::new("member-a", "run-room-skill").unwrap(),
+            move || Ok((execution_llm, 4_096, 0.0)),
+            false,
+            ToolExecutionContext::new(&room),
+            None,
+            progress_tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let requests = llm.requests.lock().unwrap();
+        let system = requests[0].messages[0].text_content();
+        assert!(system.contains("<name>room-network</name>"));
+        assert!(system.contains("<location>"));
+        assert!(!system.contains("ROOM_SKILL_BODY_MUST_STAY_LAZY"));
+        assert!(!system.contains("STALE_STARTUP_SKILL"));
+        assert!(!system.contains("STALE_STARTUP_BOOTSTRAP"));
+    }
+
+    #[test]
+    fn global_skill_roots_cover_native_agent_claude_codex_and_admin_locations() {
+        let home = PathBuf::from("/users/tester");
+        let ai_brain = home.join(".ai-brain");
+        let roots = configured_global_skill_roots(
+            &home,
+            &ai_brain,
+            vec![PathBuf::from("/plugins/native/skills")],
+            Some(std::ffi::OsString::from("/configs/claude")),
+            Some(std::ffi::OsString::from("/configs/codex")),
+        );
+
+        let mut expected = vec![
+            SkillRoot::native("/plugins/native/skills"),
+            SkillRoot::native(ai_brain.join("skills")),
+            SkillRoot::external(home.join(".agents/skills")),
+            SkillRoot::external("/configs/claude/skills"),
+            SkillRoot::external(home.join(".claude/skills")),
+            SkillRoot::external("/configs/codex/skills"),
+            SkillRoot::external(home.join(".codex/skills")),
+        ];
+        #[cfg(unix)]
+        expected.push(SkillRoot::external("/etc/codex/skills"));
+        assert_eq!(roots, expected);
     }
 
     #[test]

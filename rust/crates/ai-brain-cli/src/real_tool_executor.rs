@@ -11,7 +11,7 @@ use brain_core::tool_executor::{ToolExecutionContext, ToolExecutor};
 use brain_core::types::{ToolCall, ToolDescriptor, ToolExecutionResult};
 use brain_mcp::McpClientPool;
 use brain_memory::pyramid_memory_brain::PyramidMemoryBrain;
-use brain_plugin::SkillCatalog;
+use brain_plugin::{SkillCatalog, SkillCatalogResolver};
 use novel_application::{validate_unlock_reason, NovelApplicationError, TaskApplicationPort};
 use novel_domain::{
     MainReviewRecord, NovelConversationSource, NovelProject, NovelResumeInput, NovelTaskRequest,
@@ -33,6 +33,8 @@ pub struct RealToolExecutor {
     dispatch: Option<brain_dispatch::TokioDispatch>,
     /// Skill catalog for skill-based tool routing
     skill_catalog: Option<Arc<SkillCatalog>>,
+    /// Working-directory-aware catalog resolver used by Web room runs.
+    skill_catalog_resolver: Option<Arc<SkillCatalogResolver>>,
     /// MCP client pool for external tool routing (mcp__server__tool)
     mcp_pool: Option<Arc<McpClientPool>>,
     /// Default SQLite path injected for graph_* tools.
@@ -69,6 +71,7 @@ impl RealToolExecutor {
             memory_brain: None,
             dispatch: None,
             skill_catalog: None,
+            skill_catalog_resolver: None,
             mcp_pool: None,
             graph_db_path,
             runtime_trace_tx: None,
@@ -106,6 +109,12 @@ impl RealToolExecutor {
     /// Attach a SkillCatalog for skill-based tool routing.
     pub fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
         self.skill_catalog = Some(catalog);
+        self
+    }
+
+    /// Attach the resolver shared by prompt metadata and selected-skill loading.
+    pub fn with_skill_catalog_resolver(mut self, resolver: Arc<SkillCatalogResolver>) -> Self {
+        self.skill_catalog_resolver = Some(resolver);
         self
     }
 
@@ -517,14 +526,34 @@ impl RealToolExecutor {
 
         // Skill 工具 → SkillCatalog
         if name == "Skill" {
-            let catalog = self.skill_catalog.clone();
+            let fallback_catalog = self.skill_catalog.clone();
+            let catalog_resolver = self.skill_catalog_resolver.clone();
+            let working_directory = tool_execution_context
+                .as_ref()
+                .map(|context| context.working_directory.clone());
             let n = name;
             let inp = input;
             return Box::pin(async move {
+                let catalog = match (catalog_resolver, working_directory) {
+                    (Some(resolver), Some(working_directory)) => {
+                        match resolver.catalog_for(&working_directory) {
+                            Ok(catalog) => Some(catalog),
+                            Err(error) => {
+                                return ToolExecutionResult {
+                                    tool_name: n,
+                                    output: format!("解析技能目录失败: {error}"),
+                                    is_error: true,
+                                    duration_ms: 0,
+                                };
+                            }
+                        }
+                    }
+                    _ => fallback_catalog,
+                };
                 if let Some(ref catalog) = catalog {
                     let skill_name = inp.get("skill").and_then(|v| v.as_str()).unwrap_or("");
                     match catalog.resolve(skill_name) {
-                        Some(meta) => match catalog.load_content(meta) {
+                        Some(meta) => match catalog.load_for_tool(meta) {
                             Ok(content) => ToolExecutionResult {
                                 tool_name: n,
                                 output: content,
@@ -2048,15 +2077,10 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"bash"), "应包含 bash 工具");
         assert!(names.contains(&"read_file"), "应包含 read_file 工具");
-        assert!(names.contains(&"novel_task"));
-        assert!(names.contains(&"novel_project"));
-        assert_eq!(
-            names
-                .iter()
-                .filter(|name| name.starts_with("novel_"))
-                .count(),
-            2
-        );
+        assert!(!names.contains(&"WebFetch"));
+        assert!(!names.contains(&"WebSearch"));
+        assert!(!names.contains(&"novel_task"));
+        assert!(!names.contains(&"novel_project"));
     }
 
     #[tokio::test]
@@ -2359,6 +2383,46 @@ mod tests {
 
         let disabled = RealToolExecutor::with_memory_and_graph_db_path(None, None);
         assert!(disabled.graph_db_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn skill_tool_resolves_the_calling_rooms_catalog_and_returns_its_base_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let room_a = workspace.path().join("room-a");
+        let room_b = workspace.path().join("room-b");
+        for (room, body) in [(&room_a, "ROOM_A_BODY"), (&room_b, "ROOM_B_BODY")] {
+            let skill = room.join(".agents/skills/shared-name");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: shared-name\ndescription: Room skill\n---\n{body}"),
+            )
+            .unwrap();
+        }
+        let executor = RealToolExecutor::new()
+            .with_skill_catalog_resolver(Arc::new(SkillCatalogResolver::new(Vec::new())));
+        let call = ToolCall {
+            tool_name: "Skill".into(),
+            input: json!({"skill": "shared-name"}),
+            validated: false,
+            validation_id: None,
+        };
+
+        let result_a = executor
+            .execute_with_context(&call, &ToolExecutionContext::new(&room_a))
+            .await;
+        let result_b = executor
+            .execute_with_context(&call, &ToolExecutionContext::new(&room_b))
+            .await;
+
+        assert!(!result_a.is_error, "{}", result_a.output);
+        assert!(!result_b.is_error, "{}", result_b.output);
+        assert!(result_a.output.contains("ROOM_A_BODY"));
+        assert!(!result_a.output.contains("ROOM_B_BODY"));
+        assert!(result_a.output.contains(&room_a.display().to_string()));
+        assert!(result_b.output.contains("ROOM_B_BODY"));
+        assert!(!result_b.output.contains("ROOM_A_BODY"));
+        assert!(result_b.output.contains(&room_b.display().to_string()));
     }
 
     #[test]

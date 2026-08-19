@@ -858,8 +858,8 @@ L2 任务摘要数据：
     \"task_type\": \"Coding\",
     \"experiences\": [
       {
-        \"pattern\": \"工具调用失败时的替代方案\",
-        \"description\": \"WebSearch工具调用失败时，可用bash+curl替代获取网页内容\",
+        \"pattern\": \"项目命令失败时的排查顺序\",
+        \"description\": \"项目命令失败时，先检查仓库配置和工具链版本，再选择兼容命令\",
         \"source_tasks\": [\"task-001\", \"task-007\"],
         \"frequency\": 3,
         \"injectable\": true

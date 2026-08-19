@@ -346,42 +346,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::ReadOnly,
         },
-        ToolSpec {
-            name: "WebFetch",
-            description:
-                "Fetch a URL, convert it into readable text, and answer a prompt about it.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "format": "uri" },
-                    "prompt": { "type": "string" }
-                },
-                "required": ["url", "prompt"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
-        ToolSpec {
-            name: "WebSearch",
-            description: "Search the web for current information and return cited results.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "minLength": 2 },
-                    "allowed_domains": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "blocked_domains": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-            required_permission: PermissionMode::ReadOnly,
-        },
+        // Built-in WebFetch/WebSearch are intentionally not model-visible.
+        // Network discovery must come from user-installed skills/CLI tooling or
+        // a connected MCP implementation instead of this hard-coded provider.
         ToolSpec {
             name: "TodoWrite",
             description: "Update the structured task list for the current session.",
@@ -416,7 +383,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "skill": { "type": "string" },
+                    "skill": { "type": "string", "description": "Skill name, namespace:name, or exact SKILL.md location from available_skills." },
                     "args": { "type": "string" }
                 },
                 "required": ["skill"],
@@ -3703,8 +3670,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "write_file",
             "glob_search",
             "grep_search",
-            "WebFetch",
-            "WebSearch",
             "ToolSearch",
             "Skill",
             "StructuredOutput",
@@ -3713,8 +3678,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "read_file",
             "glob_search",
             "grep_search",
-            "WebFetch",
-            "WebSearch",
             "ToolSearch",
             "Skill",
             "TodoWrite",
@@ -3726,8 +3689,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "read_file",
             "glob_search",
             "grep_search",
-            "WebFetch",
-            "WebSearch",
             "ToolSearch",
             "TodoWrite",
             "StructuredOutput",
@@ -3738,8 +3699,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "read_file",
             "glob_search",
             "grep_search",
-            "WebFetch",
-            "WebSearch",
             "ToolSearch",
             "Skill",
             "StructuredOutput",
@@ -3761,8 +3720,6 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "edit_file",
             "glob_search",
             "grep_search",
-            "WebFetch",
-            "WebSearch",
             "TodoWrite",
             "Skill",
             "ToolSearch",
@@ -6766,8 +6723,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"WebFetch"));
-        assert!(names.contains(&"WebSearch"));
+        assert!(!names.contains(&"WebFetch"));
+        assert!(!names.contains(&"WebSearch"));
         assert!(names.contains(&"TodoWrite"));
         assert!(names.contains(&"Skill"));
         assert!(names.contains(&"Agent"));
@@ -6781,8 +6738,8 @@ mod tests {
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
-        assert!(names.contains(&"novel_task"));
-        assert!(names.contains(&"novel_project"));
+        assert!(!names.contains(&"novel_task"));
+        assert!(!names.contains(&"novel_project"));
         assert!(!names.contains(&"novel_commit_delta"));
         assert!(names.contains(&"graph_search_catalog"));
         assert!(names.contains(&"graph_get_node_detail"));
@@ -7415,34 +7372,35 @@ mod tests {
     fn tool_search_supports_keyword_and_select_queries() {
         let keyword = execute_tool(
             "ToolSearch",
-            &json!({"query": "web current", "max_results": 3}),
+            &json!({"query": "local skill", "max_results": 3}),
         )
         .expect("ToolSearch should succeed");
         let keyword_output: serde_json::Value = serde_json::from_str(&keyword).expect("valid json");
         let matches = keyword_output["matches"].as_array().expect("matches");
-        assert!(matches.iter().any(|value| value == "WebSearch"));
+        assert!(matches.iter().any(|value| value == "Skill"));
+        assert!(!matches.iter().any(|value| value == "WebSearch"));
 
-        let selected = execute_tool("ToolSearch", &json!({"query": "select:WebSearch,Skill"}))
+        let selected = execute_tool("ToolSearch", &json!({"query": "select:Skill,NotebookEdit"}))
             .expect("ToolSearch should succeed");
         let selected_output: serde_json::Value =
             serde_json::from_str(&selected).expect("valid json");
-        assert_eq!(selected_output["matches"][0], "WebSearch");
-        assert_eq!(selected_output["matches"][1], "Skill");
+        assert_eq!(selected_output["matches"][0], "Skill");
+        assert_eq!(selected_output["matches"][1], "NotebookEdit");
 
-        let aliased = execute_tool("ToolSearch", &json!({"query": "WebSearchTool"}))
+        let aliased = execute_tool("ToolSearch", &json!({"query": "NotebookEditTool"}))
             .expect("ToolSearch should support tool aliases");
         let aliased_output: serde_json::Value = serde_json::from_str(&aliased).expect("valid json");
-        assert_eq!(aliased_output["matches"][0], "WebSearch");
-        assert_eq!(aliased_output["normalized_query"], "websearch");
+        assert_eq!(aliased_output["matches"][0], "NotebookEdit");
+        assert_eq!(aliased_output["normalized_query"], "notebookedit");
 
         let selected_with_alias = execute_tool(
             "ToolSearch",
-            &json!({"query": "select:WebSearchTool,Skill"}),
+            &json!({"query": "select:NotebookEditTool,Skill"}),
         )
         .expect("ToolSearch alias select should succeed");
         let selected_with_alias_output: serde_json::Value =
             serde_json::from_str(&selected_with_alias).expect("valid json");
-        assert_eq!(selected_with_alias_output["matches"][0], "WebSearch");
+        assert_eq!(selected_with_alias_output["matches"][0], "NotebookEdit");
         assert_eq!(selected_with_alias_output["matches"][1], "Skill");
     }
 
@@ -7609,21 +7567,29 @@ mod tests {
         assert!(general.contains("bash"));
         assert!(general.contains("write_file"));
         assert!(!general.contains("Agent"));
+        assert!(!general.contains("WebFetch"));
+        assert!(!general.contains("WebSearch"));
 
         let explore = allowed_tools_for_subagent("Explore");
         assert!(explore.contains("read_file"));
         assert!(explore.contains("grep_search"));
         assert!(!explore.contains("bash"));
+        assert!(!explore.contains("WebFetch"));
+        assert!(!explore.contains("WebSearch"));
 
         let plan = allowed_tools_for_subagent("Plan");
         assert!(plan.contains("TodoWrite"));
         assert!(plan.contains("StructuredOutput"));
         assert!(!plan.contains("Agent"));
+        assert!(!plan.contains("WebFetch"));
+        assert!(!plan.contains("WebSearch"));
 
         let verification = allowed_tools_for_subagent("Verification");
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("write_file"));
+        assert!(!verification.contains("WebFetch"));
+        assert!(!verification.contains("WebSearch"));
     }
 
     #[test]
@@ -7661,7 +7627,7 @@ mod tests {
     }
 
     #[test]
-    fn novel_workflow_tools_replace_ephemeral_agent_schema() {
+    fn disabled_novel_workflow_is_absent_from_agent_and_mvp_schemas() {
         let specs = mvp_tool_specs();
         let agent = specs
             .iter()
@@ -7674,143 +7640,15 @@ mod tests {
             .unwrap();
         assert!(!agent_types.iter().any(|kind| kind == "Novel"));
 
-        let mut novel_names = specs
-            .iter()
-            .map(|spec| spec.name)
-            .filter(|name| name.starts_with("novel_"))
-            .collect::<Vec<_>>();
-        novel_names.sort_unstable();
-        assert_eq!(novel_names, vec!["novel_project", "novel_task"]);
-        let task = specs.iter().find(|spec| spec.name == "novel_task").unwrap();
-        for guidance in [
-            "仅在 needs_clarification 后调用 resume",
-            "input 必须非空",
-            "start 遇到 ContextRef hash 变化",
-            "resume 遇到变化",
-            "actual hash",
-            "原 role/path",
-            "只重试一次",
-            "project already has active work",
-            "先调用 status 找到旧 task",
-            "status 只用于查找旧 task",
-            "最新工作流错误需从当前工具结果或运行日志确认",
-            "防止同项目并发写作造成 Canon 冲突",
-            "Task Engine 为 failed 或 cancelled",
-            "旧 checkpoint 非终态",
-            "没有草稿/候选/审核决定/发布物",
-            "queued、运行中、paused_budget、needs_input、completed、未知或已有产物时工具会拒绝",
-            "模型必须直接告知，不能循环解锁",
-            "unlock_failed 不调用 Writer/LLM、不重试、不删除历史",
-            "成功后仅在用户仍要求继续创作时另行显式调用 start",
-            "reason 会长期写入审计",
-            "不得包含密钥、Authorization、个人敏感信息",
-        ] {
-            assert!(
-                task.description.contains(guidance),
-                "novel_task description missing {guidance}"
-            );
-        }
-        let task_branches = task.input_schema["oneOf"].as_array().unwrap();
-        let serialized_task_schema = serde_json::to_string(&task.input_schema).unwrap();
-        assert!(!serialized_task_schema.contains("\"const\""));
-        let mut actions = Vec::new();
-        for branch in task_branches {
-            let action = &branch["properties"]["action"];
-            assert_eq!(action["type"], "string");
-            let action_values = action["enum"].as_array().expect("action enum");
-            assert_eq!(action_values.len(), 1, "action enum 必须恰好一个值");
-            actions.push(action_values[0].as_str().unwrap());
-        }
-        actions.sort_unstable();
-        assert_eq!(
-            actions,
-            vec![
-                "decide",
-                "publish",
-                "resume",
-                "review",
-                "start",
-                "status",
-                "unlock_failed"
-            ]
-        );
-
-        let resume = task_branches
-            .iter()
-            .find(|branch| branch["properties"]["action"]["enum"][0] == "resume")
-            .unwrap();
-        assert_eq!(resume["properties"]["task_id"]["minLength"], 1);
-        assert_eq!(resume["properties"]["input"]["minLength"], 1);
-        assert_eq!(resume["properties"]["context_refs"]["type"], "array");
-        assert!(resume["properties"]["context_refs"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("只把 sha256 更新为 actual hash"));
-        let publish = task_branches
-            .iter()
-            .find(|branch| branch["properties"]["action"]["enum"][0] == "publish")
-            .unwrap();
-        let publish_properties = publish["properties"].as_object().unwrap();
-        assert_eq!(publish_properties.len(), 3);
-        assert!(publish_properties.contains_key("action"));
-        assert!(publish_properties.contains_key("task_id"));
-        assert!(publish_properties.contains_key("draft_version"));
-        assert!(!publish_properties.contains_key("content"));
-
-        let unlock_failed = task_branches
-            .iter()
-            .find(|branch| branch["properties"]["action"]["enum"][0] == "unlock_failed")
-            .expect("unlock_failed schema branch");
-        let unlock_properties = unlock_failed["properties"].as_object().unwrap();
-        let mut unlock_property_names = unlock_properties
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        unlock_property_names.sort_unstable();
-        assert_eq!(unlock_property_names, vec!["action", "reason", "task_id"]);
-        assert_eq!(
-            unlock_failed["required"],
-            json!(["action", "task_id", "reason"])
-        );
-        assert_eq!(unlock_failed["additionalProperties"], false);
-        assert_eq!(unlock_properties["task_id"]["minLength"], 1);
-        assert_eq!(unlock_properties["task_id"]["maxLength"], 128);
-        assert_eq!(unlock_properties["task_id"]["pattern"], "^[A-Za-z0-9_-]+$");
-        let task_id_description = unlock_properties["task_id"]["description"]
-            .as_str()
-            .unwrap();
-        for guidance in [
-            "1 到 128",
-            "ASCII",
-            "字母、数字、下划线和连字符",
-            "不得包含空白、Unicode、路径分隔符或控制字符",
-        ] {
-            assert!(task_id_description.contains(guidance));
-        }
-        assert_eq!(unlock_properties["reason"]["minLength"], 1);
-        assert_eq!(unlock_properties["reason"]["maxLength"], 256);
-        let reason_description = unlock_properties["reason"]["description"].as_str().unwrap();
-        for guidance in ["不得包含换行等控制字符", "不得包含凭据或个人敏感信息"]
-        {
-            assert!(
-                reason_description.contains(guidance),
-                "unlock_failed reason description missing {guidance}"
-            );
-        }
-        assert!(!specs.iter().any(|spec| spec.name == "novel_commit_delta"));
+        assert!(!specs.iter().any(|spec| spec.name.starts_with("novel_")));
     }
 
     #[test]
-    fn novel_application_tools_have_object_root_schemas() {
+    fn disabled_novel_application_tools_are_not_model_visible() {
         let specs = mvp_tool_specs();
-
-        for name in ["novel_task", "novel_project"] {
-            let spec = specs.iter().find(|spec| spec.name == name).unwrap();
-            assert_eq!(
-                spec.input_schema["type"], "object",
-                "{name} 顶层 schema 必须声明为 object"
-            );
-        }
+        assert!(!specs
+            .iter()
+            .any(|spec| matches!(spec.name, "novel_task" | "novel_project")));
     }
 
     #[test]

@@ -1580,7 +1580,9 @@ impl App {
             } else {
                 self.output
                     .push_system(&format!("已注册技能 ({}个):", catalog.skills.len()));
-                self.output.push_system("\x1b[33m  \x1b[0m\x1b[33m[兼容 Claude Code]\x1b[0m 也扫描 ~/.claude/skills 目录");
+                self.output.push_system(
+                    "\x1b[33m  [兼容]\x1b[0m AI Brain、Open Agent Skills、Claude Code、Codex",
+                );
                 for skill in &catalog.skills {
                     let display = match &skill.namespace {
                         Some(ns) => format!("{}:{}", ns, skill.name),
@@ -1593,6 +1595,12 @@ impl App {
                         .contains(".claude/skills")
                     {
                         "\x1b[33m[Claude]\x1b[0m "
+                    } else if skill
+                        .source_path
+                        .to_string_lossy()
+                        .contains(".agents/skills")
+                    {
+                        "\x1b[33m[Agent]\x1b[0m "
                     } else if skill
                         .source_path
                         .to_string_lossy()

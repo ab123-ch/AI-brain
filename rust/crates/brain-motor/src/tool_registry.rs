@@ -102,7 +102,6 @@ impl ToolRegistry {
             ("Glob", "搜索文件路径", vec!["文件", "搜索", "查找"]),
             ("Grep", "搜索文件内容", vec!["搜索", "内容", "查找"]),
             ("LSP", "语言服务器代码智能", vec!["代码", "定义", "引用"]),
-            ("WebSearch", "网络搜索", vec!["搜索", "网络", "信息"]),
         ];
         for (name, desc, scenarios) in low_risk {
             self.register(ToolCapability {
@@ -155,7 +154,8 @@ mod tests {
     #[test]
     fn builtin_tools_registered() {
         let registry = ToolRegistry::with_builtin_tools();
-        assert!(registry.len() >= 9); // Read, Glob, Grep, LSP, WebSearch, Edit, Write, NotebookEdit, Bash
+        assert!(registry.len() >= 8); // Read, Glob, Grep, LSP, Edit, Write, NotebookEdit, Bash
+        assert!(registry.get("WebSearch").is_none());
     }
 
     #[test]

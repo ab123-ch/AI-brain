@@ -3465,6 +3465,7 @@ mod tests {
             let handle = tokio::spawn(execute_member_run(
                 Arc::clone(&self.template),
                 None,
+                None,
                 context_snapshot,
                 memory_scope,
                 move || Ok((client, 32_768, 0.0)),
