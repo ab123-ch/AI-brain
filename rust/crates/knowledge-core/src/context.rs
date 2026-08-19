@@ -31,6 +31,8 @@ pub struct ContextBlockInput {
     pub source_revision: Option<u64>,
     pub source_hash: Option<String>,
     pub trust: Option<TrustLevel>,
+    #[serde(skip)]
+    pub optional_group_id: Option<String>,
 }
 
 impl ContextBlockInput {
@@ -49,6 +51,7 @@ impl ContextBlockInput {
             source_revision: None,
             source_hash: None,
             trust: None,
+            optional_group_id: None,
         }
     }
 
@@ -74,6 +77,12 @@ impl ContextBlockInput {
     #[must_use]
     pub const fn with_trust(mut self, trust: TrustLevel) -> Self {
         self.trust = Some(trust);
+        self
+    }
+
+    #[must_use]
+    pub fn with_optional_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.optional_group_id = Some(group_id.into());
         self
     }
 }
@@ -249,6 +258,8 @@ pub struct ContextRequest {
     pub required_blocks: Vec<ContextBlockInput>,
     pub optional_blocks: Vec<ContextBlockInput>,
     pub graph_required: bool,
+    #[serde(skip)]
+    pub input_truncated: bool,
 }
 
 impl ContextRequest {
@@ -275,6 +286,7 @@ impl ContextRequest {
             required_blocks: Vec::new(),
             optional_blocks: Vec::new(),
             graph_required: false,
+            input_truncated: false,
         }
     }
 
@@ -290,6 +302,12 @@ impl ContextRequest {
     #[must_use]
     pub fn with_optional_block(mut self, block: ContextBlockInput) -> Self {
         self.optional_blocks.push(block);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_input_truncated(mut self, truncated: bool) -> Self {
+        self.input_truncated = truncated;
         self
     }
 }
@@ -355,24 +373,64 @@ impl ContextAssembly {
         }
         Ok(Self {
             blocks,
-            truncated: false,
+            truncated: request.input_truncated,
             degradations: Vec::new(),
         })
     }
 
     fn append_optional(&mut self, request: &ContextRequest) -> Result<()> {
-        let mut optional_blocks = Vec::new();
+        let mut optional_groups = Vec::<Vec<ContextBlock>>::new();
         let mut remaining_tokens = request
             .budget
             .max_total_tokens
             .saturating_sub(self.used_tokens())
             .min(request.budget.max_optional_tokens);
         let mut remaining_items = request.budget.max_items.saturating_sub(self.blocks.len());
-        for input in request.optional_blocks.iter().rev() {
+        let mut cursor = request.optional_blocks.len();
+        let mut selected_items = 0_usize;
+        while cursor > 0 {
             if remaining_items == 0 || remaining_tokens == 0 {
                 self.truncated = true;
                 break;
             }
+            let end = cursor;
+            let group_id = request.optional_blocks[end - 1]
+                .optional_group_id
+                .as_deref();
+            let start = group_id.map_or(end - 1, |group_id| {
+                let mut start = end - 1;
+                while start > 0
+                    && request.optional_blocks[start - 1]
+                        .optional_group_id
+                        .as_deref()
+                        == Some(group_id)
+                {
+                    start -= 1;
+                }
+                start
+            });
+            if group_id.is_some() {
+                let group = request.optional_blocks[start..end]
+                    .iter()
+                    .cloned()
+                    .map(ContextBlock::from_input)
+                    .collect::<Result<Vec<_>>>()?;
+                let group_tokens = group
+                    .iter()
+                    .map(|block| block.estimated_tokens)
+                    .sum::<usize>();
+                if group.len() > remaining_items || group_tokens > remaining_tokens {
+                    self.truncated = true;
+                    break;
+                }
+                remaining_items -= group.len();
+                remaining_tokens -= group_tokens;
+                selected_items += group.len();
+                optional_groups.push(group);
+                cursor = start;
+                continue;
+            }
+            let input = &request.optional_blocks[start];
             let mut block = ContextBlock::from_input(input.clone())?;
             if block.estimated_tokens > remaining_tokens {
                 let (content, was_truncated) = truncate_to_tokens(&block.content, remaining_tokens);
@@ -384,13 +442,15 @@ impl ContextAssembly {
             }
             remaining_tokens = remaining_tokens.saturating_sub(block.estimated_tokens);
             remaining_items -= 1;
-            optional_blocks.push(block);
+            selected_items += 1;
+            optional_groups.push(vec![block]);
+            cursor = start;
         }
-        if optional_blocks.len() < request.optional_blocks.len() {
+        if selected_items < request.optional_blocks.len() {
             self.truncated = true;
         }
-        optional_blocks.reverse();
-        self.blocks.extend(optional_blocks);
+        optional_groups.reverse();
+        self.blocks.extend(optional_groups.into_iter().flatten());
         Ok(())
     }
 

@@ -349,3 +349,222 @@ fn optional_context_keeps_newest_history_with_exact_source_metadata() {
     assert_eq!(newest.source_ref.as_ref().unwrap().resource_id, "event-new");
     snapshot.validate().unwrap();
 }
+
+#[test]
+fn grouped_optional_history_never_keeps_an_orphan_message() {
+    let tenant = TenantId::from("tenant-1");
+    let member_scope = ScopeRef::new(
+        tenant.clone(),
+        NamespaceId::from("platform.core"),
+        ScopeTypeId::from("member"),
+        "member-a",
+    )
+    .unwrap();
+    let builder = ContextBuilder::new(
+        Arc::new(EmptyMemory),
+        Arc::new(UnavailableGraph),
+        Arc::new(ContentResolverRegistry::new()),
+    );
+    let request = ContextRequest::new(
+        tenant,
+        vec![member_scope],
+        vec!["history".into()],
+        ContextBudget {
+            max_total_tokens: 64,
+            max_optional_tokens: 32,
+            max_memory_tokens: 0,
+            max_graph_tokens: 0,
+            max_items: 2,
+        },
+    )
+    .with_required_block(ContextBlockInput::new(
+        "current-input",
+        ContextBlockKind::CurrentInput,
+        "current input",
+    ))
+    .with_optional_block(
+        ContextBlockInput::new(
+            "turn-user",
+            ContextBlockKind::ConversationUser,
+            "historical user",
+        )
+        .with_optional_group_id("direct-turn:1"),
+    )
+    .with_optional_block(
+        ContextBlockInput::new(
+            "turn-assistant",
+            ContextBlockKind::ConversationAssistant,
+            "historical assistant",
+        )
+        .with_optional_group_id("direct-turn:1"),
+    );
+
+    let snapshot = builder.build(&request).unwrap();
+    assert!(snapshot.truncated);
+    assert_eq!(snapshot.blocks.len(), 1);
+    assert_eq!(snapshot.blocks[0].block_id, "current-input");
+}
+
+#[test]
+fn grouped_optional_history_drops_an_oversized_turn_without_partial_content() {
+    let tenant = TenantId::from("tenant-1");
+    let member_scope = ScopeRef::new(
+        tenant.clone(),
+        NamespaceId::from("platform.core"),
+        ScopeTypeId::from("member"),
+        "member-a",
+    )
+    .unwrap();
+    let builder = ContextBuilder::new(
+        Arc::new(EmptyMemory),
+        Arc::new(UnavailableGraph),
+        Arc::new(ContentResolverRegistry::new()),
+    );
+    let request = ContextRequest::new(
+        tenant,
+        vec![member_scope],
+        vec!["history".into()],
+        ContextBudget {
+            max_total_tokens: 64,
+            max_optional_tokens: 1,
+            max_memory_tokens: 0,
+            max_graph_tokens: 0,
+            max_items: 3,
+        },
+    )
+    .with_required_block(ContextBlockInput::new(
+        "current-input",
+        ContextBlockKind::CurrentInput,
+        "current input",
+    ))
+    .with_optional_block(
+        ContextBlockInput::new(
+            "turn-user",
+            ContextBlockKind::ConversationUser,
+            "historical user content",
+        )
+        .with_optional_group_id("direct-turn:oversized"),
+    )
+    .with_optional_block(
+        ContextBlockInput::new(
+            "turn-assistant",
+            ContextBlockKind::ConversationAssistant,
+            "historical assistant content",
+        )
+        .with_optional_group_id("direct-turn:oversized"),
+    );
+
+    let snapshot = builder.build(&request).unwrap();
+    assert!(snapshot.truncated);
+    assert_eq!(snapshot.blocks.len(), 1);
+    assert_eq!(snapshot.blocks[0].block_id, "current-input");
+    assert!(!snapshot.blocks[0].truncated);
+}
+
+#[test]
+fn grouped_optional_history_keeps_the_newest_complete_turn_in_original_order() {
+    let tenant = TenantId::from("tenant-1");
+    let member_scope = ScopeRef::new(
+        tenant.clone(),
+        NamespaceId::from("platform.core"),
+        ScopeTypeId::from("member"),
+        "member-a",
+    )
+    .unwrap();
+    let builder = ContextBuilder::new(
+        Arc::new(EmptyMemory),
+        Arc::new(UnavailableGraph),
+        Arc::new(ContentResolverRegistry::new()),
+    );
+    let turn_block = |turn: &str, role: &str, kind| {
+        ContextBlockInput::new(format!("{turn}-{role}"), kind, format!("{turn} {role}"))
+            .with_optional_group_id(format!("direct-turn:{turn}"))
+    };
+    let request = ContextRequest::new(
+        tenant,
+        vec![member_scope],
+        vec!["history".into()],
+        ContextBudget {
+            max_total_tokens: 64,
+            max_optional_tokens: 32,
+            max_memory_tokens: 0,
+            max_graph_tokens: 0,
+            max_items: 3,
+        },
+    )
+    .with_required_block(ContextBlockInput::new(
+        "current-input",
+        ContextBlockKind::CurrentInput,
+        "current input",
+    ))
+    .with_optional_block(turn_block(
+        "old",
+        "user",
+        ContextBlockKind::ConversationUser,
+    ))
+    .with_optional_block(turn_block(
+        "old",
+        "assistant",
+        ContextBlockKind::ConversationAssistant,
+    ))
+    .with_optional_block(turn_block(
+        "new",
+        "user",
+        ContextBlockKind::ConversationUser,
+    ))
+    .with_optional_block(turn_block(
+        "new",
+        "assistant",
+        ContextBlockKind::ConversationAssistant,
+    ));
+
+    let snapshot = builder.build(&request).unwrap();
+    assert!(snapshot.truncated);
+    assert_eq!(
+        snapshot
+            .blocks
+            .iter()
+            .map(|block| block.block_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["current-input", "new-user", "new-assistant"]
+    );
+}
+
+#[test]
+fn context_request_propagates_repository_pretruncation() {
+    let tenant = TenantId::from("tenant-1");
+    let member_scope = ScopeRef::new(
+        tenant.clone(),
+        NamespaceId::from("platform.core"),
+        ScopeTypeId::from("member"),
+        "member-a",
+    )
+    .unwrap();
+    let builder = ContextBuilder::new(
+        Arc::new(EmptyMemory),
+        Arc::new(UnavailableGraph),
+        Arc::new(ContentResolverRegistry::new()),
+    );
+    let request = ContextRequest::new(
+        tenant,
+        vec![member_scope],
+        vec!["history".into()],
+        ContextBudget {
+            max_total_tokens: 64,
+            max_optional_tokens: 32,
+            max_memory_tokens: 0,
+            max_graph_tokens: 0,
+            max_items: 2,
+        },
+    )
+    .with_required_block(ContextBlockInput::new(
+        "current-input",
+        ContextBlockKind::CurrentInput,
+        "current input",
+    ))
+    .with_input_truncated(true);
+
+    let snapshot = builder.build(&request).unwrap();
+    assert!(snapshot.truncated);
+    snapshot.validate().unwrap();
+}

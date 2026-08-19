@@ -29,11 +29,12 @@ impl GroupMessageToolScope {
         repository: Arc<CollaborationRepository>,
         room_id: impl Into<String>,
         context_through_seq: u64,
+        source_event_seq: u64,
     ) -> Self {
         Self {
             repository,
             room_id: room_id.into(),
-            context_through_seq,
+            context_through_seq: context_through_seq.min(source_event_seq.saturating_sub(1)),
         }
     }
 }
@@ -53,7 +54,7 @@ impl GroupMessageToolExecutor {
 pub(crate) fn group_message_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_GROUP_MESSAGES_TOOL.into(),
-        description: "查看当前群聊在本次任务开始前的公共消息池。只能读取当前群，且不会返回本次任务上下文边界之后的消息。".into(),
+        description: "按需查看当前群聊在本次消息之前的用户和实例消息。仅当请求依赖其他实例或公共讨论时使用；只能读取当前群，且不会返回冻结边界之后的消息。".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -94,23 +95,43 @@ impl ToolExecutor for GroupMessageToolExecutor {
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(DEFAULT_MESSAGE_LIMIT)
             .clamp(1, MAX_MESSAGE_LIMIT);
-        let through_sequence = tool_call
+        let before_sequence = tool_call
             .input
             .get("before_sequence")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(serde_json::Value::as_u64);
+        let through_sequence = before_sequence
             .map(|value| maximum_sequence.min(value.saturating_sub(1)))
             .unwrap_or(maximum_sequence);
 
         Box::pin(async move {
             let started = Instant::now();
             let result = repository
-                .events_through(&room_id, through_sequence, requested_limit)
+                .conversation_events_through(&room_id, through_sequence, requested_limit)
                 .map_err(|error| error.to_string())
-                .and_then(|events| {
+                .and_then(|page| {
+                    let next_before_sequence = page
+                        .has_more
+                        .then(|| page.events.first().map(|event| event.sequence))
+                        .flatten();
+                    tracing::info!(
+                        room_id = %room_id,
+                        requested_limit,
+                        returned_messages = page.events.len(),
+                        before_sequence = ?before_sequence,
+                        context_through_sequence = maximum_sequence,
+                        has_more = page.has_more,
+                        "成员按需读取群消息"
+                    );
                     serde_json::to_string_pretty(&GroupMessageToolOutput {
-                        room_id,
+                        room_id: room_id.clone(),
                         context_through_sequence: maximum_sequence,
-                        messages: events.iter().map(GroupMessageToolEvent::from).collect(),
+                        has_more: page.has_more,
+                        next_before_sequence,
+                        messages: page
+                            .events
+                            .iter()
+                            .map(GroupMessageToolEvent::from)
+                            .collect(),
                     })
                     .map_err(|error| error.to_string())
                 });
@@ -163,25 +184,35 @@ impl ToolExecutor for GroupMessageToolExecutor {
 struct GroupMessageToolOutput {
     room_id: String,
     context_through_sequence: u64,
+    has_more: bool,
+    next_before_sequence: Option<u64>,
     messages: Vec<GroupMessageToolEvent>,
 }
 
 #[derive(Serialize)]
 struct GroupMessageToolEvent {
+    event_id: String,
     sequence: u64,
     sender_kind: String,
+    sender_id: String,
     sender_name: String,
     kind: String,
+    parent_event_id: Option<String>,
+    conversation_root_event_id: String,
     content: String,
 }
 
 impl From<&RoomEventView> for GroupMessageToolEvent {
     fn from(event: &RoomEventView) -> Self {
         Self {
+            event_id: event.event_id.clone(),
             sequence: event.sequence,
             sender_kind: event.sender_kind.clone(),
+            sender_id: event.sender_id.clone(),
             sender_name: event.sender_name.clone(),
             kind: event.kind.clone(),
+            parent_event_id: event.parent_event_id.clone(),
+            conversation_root_event_id: event.conversation_root_event_id.clone(),
             content: event.content.clone(),
         }
     }
@@ -250,7 +281,7 @@ mod tests {
         let inner = Arc::new(RecordingToolExecutor::default());
         let executor = GroupMessageToolExecutor::new(
             inner.clone(),
-            GroupMessageToolScope::new(repository, "room-1", 0),
+            GroupMessageToolScope::new(repository, "room-1", 0, 1),
         );
         let call = ToolCall {
             tool_name: "read_file".into(),
@@ -288,7 +319,7 @@ mod tests {
                 "scoped-tool-1",
             )
             .unwrap();
-        repository
+        let second = repository
             .post_group_message(
                 "room-1",
                 std::slice::from_ref(&room.room.default_member_id),
@@ -300,7 +331,12 @@ mod tests {
         let inner = Arc::new(RecordingToolExecutor::default());
         let executor = GroupMessageToolExecutor::new(
             inner.clone(),
-            GroupMessageToolScope::new(Arc::clone(&repository), "room-1", first.event.sequence),
+            GroupMessageToolScope::new(
+                Arc::clone(&repository),
+                "room-1",
+                second.event.sequence,
+                second.event.sequence,
+            ),
         );
 
         let result = executor
@@ -318,6 +354,22 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.output.contains("边界内消息"));
         assert!(!result.output.contains("边界外消息"));
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            output["context_through_sequence"],
+            serde_json::json!(first.event.sequence)
+        );
+        assert_eq!(output["has_more"], serde_json::json!(false));
+        assert!(output["next_before_sequence"].is_null());
+        assert_eq!(output["messages"][0]["event_id"], first.event.event_id);
+        assert_eq!(
+            output["messages"][0]["sender_id"],
+            serde_json::json!("user")
+        );
+        assert_eq!(
+            output["messages"][0]["conversation_root_event_id"],
+            first.event.conversation_root_event_id
+        );
         assert_eq!(inner.execute_calls.load(Ordering::SeqCst), 0);
         assert!(inner
             .contexts
@@ -328,5 +380,93 @@ mod tests {
             .list_tools()
             .iter()
             .any(|tool| tool.name == READ_GROUP_MESSAGES_TOOL));
+    }
+
+    #[tokio::test]
+    async fn scoped_tool_filters_internal_events_and_paginates_without_overlap() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            Arc::new(CollaborationRepository::new(directory.path(), Default::default()).unwrap());
+        let room = repository.ensure_room("room-1", "Tool Room", &[]).unwrap();
+        repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap();
+        for index in 1..=5 {
+            repository
+                .post_group_message(
+                    "room-1",
+                    std::slice::from_ref(&room.room.default_member_id),
+                    &format!("公共消息 {index}"),
+                    RoomInputMode::Chat,
+                    &format!("tool-page-{index}"),
+                )
+                .unwrap();
+        }
+        let current = repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&room.room.default_member_id),
+                "当前消息",
+                RoomInputMode::Chat,
+                "tool-page-current",
+            )
+            .unwrap();
+        let executor = GroupMessageToolExecutor::new(
+            Arc::new(RecordingToolExecutor::default()),
+            GroupMessageToolScope::new(
+                Arc::clone(&repository),
+                "room-1",
+                current.event.sequence,
+                current.event.sequence,
+            ),
+        );
+        let context = ToolExecutionContext::new(directory.path().canonicalize().unwrap());
+        let page = |before_sequence: Option<u64>| ToolCall {
+            tool_name: READ_GROUP_MESSAGES_TOOL.into(),
+            input: before_sequence.map_or_else(
+                || serde_json::json!({"limit": 2}),
+                |cursor| serde_json::json!({"limit": 2, "before_sequence": cursor}),
+            ),
+            validated: true,
+            validation_id: None,
+        };
+
+        let first_result = executor.execute_with_context(&page(None), &context).await;
+        assert!(!first_result.is_error);
+        assert!(!first_result.output.contains("member_created"));
+        assert!(!first_result.output.contains("当前消息"));
+        let first: serde_json::Value = serde_json::from_str(&first_result.output).unwrap();
+        assert_eq!(first["has_more"], serde_json::json!(true));
+        let cursor = first["next_before_sequence"].as_u64().unwrap();
+        let first_ids = first["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["event_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids.len(), 2);
+        assert!(first["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["kind"] == "user_message"));
+        let second = executor
+            .execute_with_context(&page(Some(cursor)), &context)
+            .await;
+        assert!(!second.is_error);
+        let second: serde_json::Value = serde_json::from_str(&second.output).unwrap();
+        let second_ids = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["event_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(second_ids.len(), 2);
+        assert!(first_ids.iter().all(|id| !second_ids.contains(id)));
+        assert!(second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["sequence"].as_u64().unwrap() < cursor));
     }
 }

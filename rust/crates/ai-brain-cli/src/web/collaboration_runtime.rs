@@ -27,10 +27,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::orchestrator::{MemberQueryError, Orchestrator};
 use crate::web::collaboration::{
-    validate_working_directory_access, BrainMemberView, ClaimReleaseDisposition, ClaimedInboxItem,
-    CollaborationActor, CollaborationConfig, CollaborationError, CollaborationRepository,
-    InboxFailureDisposition, InboxPurpose, LegacyMessageSeed, MemberAddress, MemberHandoffContext,
-    MemberHistoryMessage, ParticipationCompletion, ParticipationDisposition, PostMessageResult,
+    format_member_direct_input, validate_working_directory_access, BrainMemberView,
+    ClaimReleaseDisposition, ClaimedInboxItem, CollaborationActor, CollaborationConfig,
+    CollaborationError, CollaborationRepository, InboxFailureDisposition, InboxPurpose,
+    LegacyMessageSeed, MemberAddress, MemberHandoffContext, MemberHistoryMessage,
+    MemberPrivateHistory, ParticipationCompletion, ParticipationDisposition, PostMessageResult,
     RoomChangedFileView, RoomEventPage, RoomEventReferenceView, RoomEventView, RoomFileChangeKind,
     RoomInputMode, RoomSnapshot,
 };
@@ -1112,18 +1113,57 @@ impl CollaborationRuntime {
         let context_config = self.repository.config().clone();
         let context_builder = self.orchestrator.context_builder();
         let snapshot = tokio::task::spawn_blocking(move || {
-            let history = history_repository
-                .member_history(&claim_for_context)
-                .map_err(|error| error.to_string())?;
+            let history = member_context_history_for_claim(
+                history_repository.as_ref(),
+                &claim_for_context,
+            )
+            .map_err(|error| error.to_string())?;
             let request = context_request_for_claim(&claim_for_context, &history, &context_config)?;
-            context_builder
+            let snapshot = context_builder
                 .build(&request)
                 .map_err(|error| match error {
                     KnowledgeError::BudgetExceeded(reason) => format!(
                         "成员上下文 BudgetExceeded: {reason}；请缩短被回复引用或提高 task_input_token_limit"
                     ),
                     other => other.to_string(),
-                })
+                })?;
+            if let MemberContextHistory::Direct(private) = &history {
+                let private_history_events = snapshot
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            block.kind,
+                            ContextBlockKind::ConversationUser
+                                | ContextBlockKind::ConversationAssistant
+                        )
+                    })
+                    .count();
+                let private_history_tokens = snapshot
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            block.kind,
+                            ContextBlockKind::ConversationUser
+                                | ContextBlockKind::ConversationAssistant
+                        )
+                    })
+                    .map(|block| block.estimated_tokens)
+                    .sum::<usize>();
+                tracing::info!(
+                    room_id = %claim_for_context.room_id,
+                    member_id = %claim_for_context.member_id,
+                    private_turns_considered = private.turns.len(),
+                    private_turns_selected = private_history_events / 2,
+                    private_history_events_selected = private_history_events,
+                    private_history_tokens,
+                    private_history_truncated = private.truncated
+                        || private_history_events < private.turns.len().saturating_mul(2),
+                    "已冻结成员私有上下文"
+                );
+            }
+            Ok::<ContextSnapshot, String>(snapshot)
         })
         .await
         .map_err(|error| format!("构建成员上下文线程失败: {error}"))?
@@ -1212,6 +1252,7 @@ impl CollaborationRuntime {
                 Arc::clone(&self.repository),
                 claim.room_id.clone(),
                 claim.context_through_seq,
+                claim.source_event_seq,
             )
         });
         let (mut progress, handle, cancel) = Arc::clone(&self.orchestrator)
@@ -2656,9 +2697,40 @@ fn tool_execution_context_for_task(
     Ok(context)
 }
 
+#[derive(Debug, Clone)]
+enum MemberContextHistory {
+    Direct(MemberPrivateHistory),
+    Participation(Vec<MemberHistoryMessage>),
+}
+
+impl MemberContextHistory {
+    #[cfg(test)]
+    fn empty_direct() -> Self {
+        Self::Direct(MemberPrivateHistory {
+            turns: Vec::new(),
+            truncated: false,
+        })
+    }
+}
+
+fn member_context_history_for_claim(
+    repository: &CollaborationRepository,
+    claim: &ClaimedInboxItem,
+) -> Result<MemberContextHistory, CollaborationError> {
+    if claim.purpose == InboxPurpose::Participation {
+        repository
+            .member_history(claim)
+            .map(MemberContextHistory::Participation)
+    } else {
+        repository
+            .member_private_history(claim)
+            .map(MemberContextHistory::Direct)
+    }
+}
+
 fn context_request_for_claim(
     claim: &ClaimedInboxItem,
-    history: &[MemberHistoryMessage],
+    history: &MemberContextHistory,
     config: &CollaborationConfig,
 ) -> Result<ContextRequest, String> {
     let tenant_id = TenantId::from("local");
@@ -2721,44 +2793,75 @@ fn context_request_for_claim(
         }
     }
     request = request.with_required_block(current_input_block(claim));
-    for message in history {
-        if message.content.trim().is_empty()
-            || claim
-                .reply_reference
-                .as_ref()
-                .is_some_and(|reference| reference.event_id == message.event_id)
-            || claim
-                .member_handoff
-                .as_ref()
-                .is_some_and(|handoff| handoff.root_user_reference.event_id == message.event_id)
-        {
-            continue;
+    let mut required_event_ids = HashSet::new();
+    if let Some(reference) = claim.reply_reference.as_ref() {
+        required_event_ids.insert(reference.event_id.as_str());
+    }
+    if let Some(handoff) = claim.member_handoff.as_ref() {
+        required_event_ids.insert(handoff.root_user_reference.event_id.as_str());
+    }
+    match history {
+        MemberContextHistory::Direct(history) => {
+            request = request.with_input_truncated(history.truncated);
+            for turn in &history.turns {
+                if turn.source.content.trim().is_empty()
+                    || turn.reply.content.trim().is_empty()
+                    || required_event_ids.contains(turn.source.event_id.as_str())
+                    || required_event_ids.contains(turn.reply.event_id.as_str())
+                {
+                    continue;
+                }
+                let group_id = format!("direct-turn:{}", turn.inbox_item_id);
+                request = request
+                    .with_optional_block(
+                        history_message_block(&namespace, &turn.source)
+                            .with_optional_group_id(group_id.clone()),
+                    )
+                    .with_optional_block(
+                        history_message_block(&namespace, &turn.reply)
+                            .with_optional_group_id(group_id),
+                    );
+            }
         }
-        let source = SourceRef::new(
-            namespace.clone(),
-            ResourceTypeId::from("conversation.turn"),
-            message.event_id.clone(),
-            Some(message.sequence.to_string()),
-            Some(message.content_hash.clone()),
-        );
-        request = request.with_optional_block(
-            ContextBlockInput::new(
-                format!("room-event:{}", message.event_id),
-                if message.role == "assistant" {
-                    ContextBlockKind::ConversationAssistant
-                } else {
-                    ContextBlockKind::ConversationUser
-                },
-                message.content.clone(),
-            )
-            .with_source_metadata(
-                source,
-                Some(message.sequence),
-                Some(message.content_hash.clone()),
-            ),
-        );
+        MemberContextHistory::Participation(messages) => {
+            for message in messages {
+                if message.content.trim().is_empty()
+                    || required_event_ids.contains(message.event_id.as_str())
+                {
+                    continue;
+                }
+                request = request.with_optional_block(history_message_block(&namespace, message));
+            }
+        }
     }
     Ok(request)
+}
+
+fn history_message_block(
+    namespace: &NamespaceId,
+    message: &MemberHistoryMessage,
+) -> ContextBlockInput {
+    let source = SourceRef::new(
+        namespace.clone(),
+        ResourceTypeId::from("conversation.turn"),
+        message.event_id.clone(),
+        Some(message.sequence.to_string()),
+        Some(message.content_hash.clone()),
+    );
+    ContextBlockInput::new(
+        format!("room-event:{}", message.event_id),
+        if message.role == "assistant" {
+            ContextBlockKind::ConversationAssistant
+        } else {
+            ContextBlockKind::ConversationUser
+        },
+        message.content.clone(),
+    )
+    .with_source_metadata(
+        source,
+        Some(message.sequence),
+        Some(message.content_hash.clone()),
+    )
 }
 
 fn current_input_block(claim: &ClaimedInboxItem) -> ContextBlockInput {
@@ -2891,10 +2994,15 @@ fn member_policy_for_claim(claim: &ClaimedInboxItem) -> String {
             claim.execution_working_directory.display(),
         )
     } else {
+        let public_context_policy = if claim.group_enabled {
+            "\n自动历史只包含明确发给你的 Direct 对话。仅当当前请求引用其他实例、要求比较房间结论，或缺少完成任务所必需的公共信息时，调用 read_group_messages；不要每轮默认读取房间。"
+        } else {
+            ""
+        };
         format!(
             "你是群聊中的独立智脑成员。\n成员名称：{}\n成员配置：{}\n当前模式：{}\n\
              只处理明确发给你的消息；不要冒充其他成员，也不要把其他成员未提供的内容当作自己的记忆。\n\
-             本次消息的冻结工作目录：{}。所有相对路径均以此目录解析。",
+             本次消息的冻结工作目录：{}。所有相对路径均以此目录解析。{}",
             claim.member_name,
             claim.profile_id,
             match claim.mode {
@@ -2902,6 +3010,7 @@ fn member_policy_for_claim(claim: &ClaimedInboxItem) -> String {
                 RoomInputMode::Task => "任务",
             },
             claim.execution_working_directory.display(),
+            public_context_policy,
         )
     }
 }
@@ -2910,9 +3019,10 @@ fn execution_input_for_claim(claim: &ClaimedInboxItem) -> String {
     if claim.purpose == InboxPurpose::Participation {
         "请根据上面的群聊记录，决定现在是否需要发言。".into()
     } else if let Some(handoff) = claim.member_handoff.as_ref() {
-        format!(
-            "[来自实例 {}（{}）的定向消息]\n{}",
-            handoff.source_member.member_name, handoff.source_member.member_id, claim.input
+        format_member_direct_input(
+            &handoff.source_member.member_name,
+            &handoff.source_member.member_id,
+            &claim.input,
         )
     } else {
         claim.input.clone()
@@ -3020,20 +3130,21 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        context_request_for_claim, context_snapshot_from_task, parse_participation_answer,
-        reconcile_durable_result, scheduler_limits, task_request_for_claim,
-        task_request_for_claim_with_command_execution, tool_execution_context_for_task,
-        validate_task_claim_identity, validated_task_context, with_model_policy_details,
-        ClaimRunError, CollaborationRuntime, CollaborationRuntimeServices,
-        DurableResultDisposition, DurableResultRecoveryError, COLLABORATION_TASK_V3,
-        COLLABORATION_TASK_V4, COLLABORATION_TASK_V5,
+        context_request_for_claim, context_snapshot_from_task, member_context_history_for_claim,
+        parse_participation_answer, reconcile_durable_result, scheduler_limits,
+        task_request_for_claim, task_request_for_claim_with_command_execution,
+        tool_execution_context_for_task, validate_task_claim_identity, validated_task_context,
+        with_model_policy_details, ClaimRunError, CollaborationRuntime,
+        CollaborationRuntimeServices, DurableResultDisposition, DurableResultRecoveryError,
+        MemberContextHistory, COLLABORATION_TASK_V3, COLLABORATION_TASK_V4, COLLABORATION_TASK_V5,
     };
     use crate::orchestrator::{execute_member_run, MemberQueryError};
     use crate::real_tool_executor::{mvp_tool_definitions, RealToolExecutor};
     use crate::web::collaboration::{
         CollaborationActor, CollaborationConfig, CollaborationRepository, InboxPurpose, InboxState,
-        LegacyMessageSeed, MemberAddress, MemberHistoryMessage, ParticipationDisposition,
-        RoomChangedFileView, RoomFileChangeKind, RoomInputMode, DEFAULT_THREAD_KEY,
+        LegacyMessageSeed, MemberAddress, MemberHistoryMessage, MemberPrivateTurn,
+        ParticipationDisposition, RoomChangedFileView, RoomFileChangeKind, RoomInputMode,
+        DEFAULT_THREAD_KEY,
     };
     use crate::web::collaboration_tools::GroupMessageToolScope;
     use crate::web::progress_adapter::WebProgressEvent;
@@ -3086,7 +3197,7 @@ mod tests {
         claim: &crate::web::collaboration::ClaimedInboxItem,
         config: &CollaborationConfig,
     ) -> ContextSnapshot {
-        let history = collaboration.member_history(claim).unwrap();
+        let history = member_context_history_for_claim(collaboration, claim).unwrap();
         let request = context_request_for_claim(claim, &history, config).unwrap();
         ContextBuilder::new(
             Arc::new(EmptyMemory),
@@ -3116,6 +3227,7 @@ mod tests {
             source_revision: reference.source_revision,
             source_hash: reference.source_hash.clone(),
             trust: reference.trust,
+            optional_group_id: None,
         };
         mutation(&mut input);
         blocks[reference_index] = ContextBlock::from_input(input).unwrap();
@@ -5792,11 +5904,8 @@ mod tests {
             "reply-context-current",
             &target.event_id,
         );
-        let claim = collaboration.lease_next().unwrap().unwrap();
-        let history = collaboration.member_history(&claim).unwrap();
-        assert!(history
-            .iter()
-            .all(|message| message.event_id != target.event_id));
+        let claim = collaboration.claim_next().unwrap().unwrap();
+        let history = member_context_history_for_claim(&collaboration, &claim).unwrap();
 
         let request = context_request_for_claim(&claim, &history, &config).unwrap();
         let references = request
@@ -5883,7 +5992,9 @@ mod tests {
         );
         let mut baseline_claim = claim.clone();
         baseline_claim.reply_reference = None;
-        let baseline = context_request_for_claim(&baseline_claim, &[], &budget_config).unwrap();
+        let empty_history = MemberContextHistory::empty_direct();
+        let baseline =
+            context_request_for_claim(&baseline_claim, &empty_history, &budget_config).unwrap();
         builder.build(&baseline).unwrap();
 
         let mut oversized_claim = claim;
@@ -5891,7 +6002,8 @@ mod tests {
         oversized_reference.content = "不可截断的长引用".repeat(1_000);
         oversized_reference.content_hash =
             knowledge_core::sha256_hex(oversized_reference.content.as_bytes());
-        let oversized = context_request_for_claim(&oversized_claim, &[], &budget_config).unwrap();
+        let oversized =
+            context_request_for_claim(&oversized_claim, &empty_history, &budget_config).unwrap();
         assert!(matches!(
             builder.build(&oversized),
             Err(KnowledgeError::BudgetExceeded(_))
@@ -7678,19 +7790,30 @@ mod tests {
             )
             .unwrap();
         let second = collaboration.claim_next().unwrap().unwrap();
-        let mut history = collaboration.member_history(&second).unwrap();
-        assert_eq!(history.len(), 2);
-        history.insert(
+        let mut private_history = collaboration.member_private_history(&second).unwrap();
+        assert_eq!(private_history.turns.len(), 1);
+        private_history.turns.insert(
             0,
-            MemberHistoryMessage {
-                event_id: "historical-blank-event".into(),
-                sequence: 1,
-                role: "assistant".into(),
-                content: String::new(),
-                content_hash: knowledge_core::sha256_hex(b""),
+            MemberPrivateTurn {
+                inbox_item_id: "historical-blank-turn".into(),
+                source: MemberHistoryMessage {
+                    event_id: "historical-blank-event".into(),
+                    sequence: 1,
+                    role: "user".into(),
+                    content: String::new(),
+                    content_hash: knowledge_core::sha256_hex(b""),
+                },
+                reply: MemberHistoryMessage {
+                    event_id: "historical-orphan-reply".into(),
+                    sequence: 2,
+                    role: "assistant".into(),
+                    content: "must be omitted with its source".into(),
+                    content_hash: knowledge_core::sha256_hex(b"must be omitted with its source"),
+                },
             },
         );
 
+        let history = MemberContextHistory::Direct(private_history.clone());
         let request = context_request_for_claim(&second, &history, &config).unwrap();
         let snapshot = ContextBuilder::new(
             Arc::new(EmptyMemory),
@@ -7710,10 +7833,12 @@ mod tests {
             .blocks
             .iter()
             .all(|block| block.block_id != "room-event:historical-blank-event"));
-        for message in history
-            .into_iter()
-            .filter(|message| !message.content.trim().is_empty())
-        {
+        assert!(snapshot
+            .blocks
+            .iter()
+            .all(|block| block.block_id != "room-event:historical-orphan-reply"));
+        let persisted_turn = &private_history.turns[1];
+        for message in [&persisted_turn.source, &persisted_turn.reply] {
             let block = snapshot
                 .blocks
                 .iter()
@@ -7729,6 +7854,11 @@ mod tests {
                 message.event_id
             );
         }
+        assert_eq!(request.optional_blocks.len(), 2);
+        assert_eq!(
+            request.optional_blocks[0].optional_group_id,
+            request.optional_blocks[1].optional_group_id
+        );
         let current = snapshot
             .blocks
             .iter()

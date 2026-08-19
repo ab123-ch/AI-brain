@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use brain_llm::config::ResolvedModelPolicy;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use task_engine::SchedulerLimits;
@@ -24,6 +24,25 @@ pub const DEFAULT_MEMBER_TEMPLATE_ID: &str = "general-member";
 pub const DEFAULT_THREAD_KEY: &str = "room";
 pub const LOCAL_PRINCIPAL_ID: &str = "local-user";
 const ROOM_SNAPSHOT_EVENT_LIMIT: usize = 100;
+const MEMBER_PRIVATE_HISTORY_QUERY: &str = "SELECT i.inbox_item_id, i.reply_event_id,
+            source.event_id, source.sequence, source.sender_kind,
+            source.sender_id, source.sender_name, source.kind, source.content,
+            reply.event_id, reply.room_id, reply.sequence, reply.sender_kind,
+            reply.sender_id, reply.kind, reply.content, reply.invalidated_at
+     FROM member_inbox_items i INDEXED BY member_inbox_member_state_idx
+     JOIN room_events source ON source.event_id = i.source_event_id
+     LEFT JOIN room_events reply ON reply.event_id = i.reply_event_id
+     WHERE i.member_id = ?1
+       AND i.purpose = 'direct'
+       AND i.state = 'completed'
+       AND i.inbox_item_id <> ?2
+       AND i.completed_at IS NOT NULL
+       AND i.completed_at <= ?3
+       AND source.room_id = ?4
+       AND source.sequence < ?5
+       AND source.invalidated_at IS NULL
+     ORDER BY source.sequence DESC, i.created_at DESC
+     LIMIT ?6 OFFSET ?7";
 
 #[must_use]
 pub(crate) fn default_runtime_dir() -> PathBuf {
@@ -979,6 +998,79 @@ pub struct MemberHistoryMessage {
     pub role: String,
     pub content: String,
     pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberPrivateTurn {
+    pub inbox_item_id: String,
+    pub source: MemberHistoryMessage,
+    pub reply: MemberHistoryMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberPrivateHistory {
+    pub turns: Vec<MemberPrivateTurn>,
+    pub truncated: bool,
+}
+
+impl MemberPrivateHistory {
+    fn into_messages(self) -> Vec<MemberHistoryMessage> {
+        self.turns
+            .into_iter()
+            .flat_map(|turn| [turn.source, turn.reply])
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct MemberPrivateTurnRow {
+    inbox_item_id: String,
+    reply_event_id: Option<String>,
+    source_event_id: String,
+    source_sequence: u64,
+    source_sender_kind: String,
+    source_sender_id: String,
+    source_sender_name: String,
+    source_kind: String,
+    source_content: String,
+    joined_reply_event_id: Option<String>,
+    reply_room_id: Option<String>,
+    reply_sequence: Option<u64>,
+    reply_sender_kind: Option<String>,
+    reply_sender_id: Option<String>,
+    reply_kind: Option<String>,
+    reply_content: Option<String>,
+    reply_invalidated_at: Option<String>,
+}
+
+fn member_private_turn_row(row: &Row<'_>) -> rusqlite::Result<MemberPrivateTurnRow> {
+    Ok(MemberPrivateTurnRow {
+        inbox_item_id: row.get(0)?,
+        reply_event_id: row.get(1)?,
+        source_event_id: row.get(2)?,
+        source_sequence: row.get(3)?,
+        source_sender_kind: row.get(4)?,
+        source_sender_id: row.get(5)?,
+        source_sender_name: row.get(6)?,
+        source_kind: row.get(7)?,
+        source_content: row.get(8)?,
+        joined_reply_event_id: row.get(9)?,
+        reply_room_id: row.get(10)?,
+        reply_sequence: row.get(11)?,
+        reply_sender_kind: row.get(12)?,
+        reply_sender_id: row.get(13)?,
+        reply_kind: row.get(14)?,
+        reply_content: row.get(15)?,
+        reply_invalidated_at: row.get(16)?,
+    })
+}
+
+pub(crate) fn format_member_direct_input(
+    member_name: &str,
+    member_id: &str,
+    content: &str,
+) -> String {
+    format!("[来自实例 {member_name}（{member_id}）的定向消息]\n{content}")
 }
 
 fn history_content_hash(content: &str) -> String {
@@ -3131,10 +3223,14 @@ impl CollaborationRepository {
 
     #[allow(clippy::too_many_lines)]
     pub fn member_history(&self, claim: &ClaimedInboxItem) -> Result<Vec<MemberHistoryMessage>> {
+        if claim.purpose != InboxPurpose::Participation {
+            return self
+                .member_private_history(claim)
+                .map(MemberPrivateHistory::into_messages);
+        }
         let connection = self.connect()?;
-        if claim.purpose == InboxPurpose::Participation {
-            let mut statement = connection.prepare(
-                "SELECT e.event_id, e.sequence, e.sender_kind, e.sender_id,
+        let mut statement = connection.prepare(
+            "SELECT e.event_id, e.sequence, e.sender_kind, e.sender_id,
                         e.sender_name, e.content
                  FROM room_events e
                  WHERE e.room_id = ?1
@@ -3151,126 +3247,12 @@ impl CollaborationRepository {
                    )
                  ORDER BY e.sequence DESC
                  LIMIT ?5",
-            )?;
-            let rows = statement.query_map(
-                params![
-                    claim.room_id,
-                    claim.context_through_seq,
-                    claim.conversation_root_event_id,
-                    claim.member_id,
-                    self.config.max_history_events_per_run,
-                ],
-                |row| {
-                    let event_id: String = row.get(0)?;
-                    let sequence: u64 = row.get(1)?;
-                    let sender_kind: String = row.get(2)?;
-                    let sender_id: String = row.get(3)?;
-                    let sender_name: String = row.get(4)?;
-                    let content: String = row.get(5)?;
-                    let own_message = sender_kind == "member" && sender_id == claim.member_id;
-                    Ok(MemberHistoryMessage {
-                        event_id,
-                        sequence,
-                        role: if own_message {
-                            "assistant".into()
-                        } else {
-                            "user".into()
-                        },
-                        content_hash: history_content_hash(&content),
-                        content: if own_message {
-                            content
-                        } else {
-                            format!("[{sender_name}] {content}")
-                        },
-                    })
-                },
-            )?;
-            let mut history = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-            history.reverse();
-            return Ok(history);
-        }
-        if claim.group_enabled {
-            let mut statement = connection.prepare(
-                "WITH recent_user_events AS (
-                    SELECT e.sequence
-                    FROM room_events e
-                    WHERE e.room_id = ?1
-                      AND e.sequence <= ?2
-                      AND e.invalidated_at IS NULL
-                      AND e.kind = 'user_message'
-                    ORDER BY e.sequence DESC
-                    LIMIT 3
-                 ), window_start AS (
-                    SELECT MIN(sequence) AS sequence FROM recent_user_events
-                 )
-                 SELECT e.event_id, e.sequence, e.sender_kind, e.sender_id,
-                        e.sender_name, e.content
-                 FROM room_events e
-                 CROSS JOIN window_start w
-                 WHERE e.room_id = ?1
-                   AND e.sequence >= w.sequence
-                   AND e.sequence < ?2
-                   AND e.invalidated_at IS NULL
-                   AND e.kind IN ('user_message', 'member_message')
-                   AND (
-                       e.sender_kind = 'user'
-                       OR (e.sender_kind = 'member' AND e.sender_id = ?3)
-                   )
-                 ORDER BY e.sequence ASC",
-            )?;
-            let rows = statement.query_map(
-                params![claim.room_id, claim.source_event_seq, claim.member_id],
-                |row| {
-                    let event_id: String = row.get(0)?;
-                    let sequence: u64 = row.get(1)?;
-                    let sender_kind: String = row.get(2)?;
-                    let sender_id: String = row.get(3)?;
-                    let sender_name: String = row.get(4)?;
-                    let content: String = row.get(5)?;
-                    let own_message = sender_kind == "member" && sender_id == claim.member_id;
-                    Ok(MemberHistoryMessage {
-                        event_id,
-                        sequence,
-                        role: if own_message {
-                            "assistant".into()
-                        } else {
-                            "user".into()
-                        },
-                        content_hash: history_content_hash(&content),
-                        content: if own_message {
-                            content
-                        } else {
-                            format!("[{sender_name}] {content}")
-                        },
-                    })
-                },
-            )?;
-            return rows
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Into::into);
-        }
-        let mut statement = connection.prepare(
-            "SELECT e.event_id, e.sequence, e.sender_kind, e.content
-             FROM room_events e
-             WHERE e.room_id = ?1
-               AND e.sequence < ?2
-               AND e.invalidated_at IS NULL
-               AND e.kind IN ('user_message', 'member_message')
-               AND (
-                   (e.sender_kind = 'member' AND e.sender_id = ?3)
-                   OR
-                   (e.sender_kind = 'user' AND EXISTS (
-                       SELECT 1 FROM room_event_recipients r
-                       WHERE r.event_id = e.event_id AND r.member_id = ?3
-                   ))
-               )
-             ORDER BY e.sequence DESC
-             LIMIT ?4",
         )?;
         let rows = statement.query_map(
             params![
                 claim.room_id,
-                claim.source_event_seq,
+                claim.context_through_seq,
+                claim.conversation_root_event_id,
                 claim.member_id,
                 self.config.max_history_events_per_run,
             ],
@@ -3278,23 +3260,259 @@ impl CollaborationRepository {
                 let event_id: String = row.get(0)?;
                 let sequence: u64 = row.get(1)?;
                 let sender_kind: String = row.get(2)?;
-                let content: String = row.get(3)?;
+                let sender_id: String = row.get(3)?;
+                let sender_name: String = row.get(4)?;
+                let content: String = row.get(5)?;
+                let own_message = sender_kind == "member" && sender_id == claim.member_id;
                 Ok(MemberHistoryMessage {
                     event_id,
                     sequence,
-                    role: if sender_kind == "user" {
-                        "user".into()
-                    } else {
+                    role: if own_message {
                         "assistant".into()
+                    } else {
+                        "user".into()
                     },
                     content_hash: history_content_hash(&content),
-                    content,
+                    content: if own_message {
+                        content
+                    } else {
+                        format!("[{sender_name}] {content}")
+                    },
                 })
             },
         )?;
         let mut history = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         history.reverse();
         Ok(history)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn member_private_history(&self, claim: &ClaimedInboxItem) -> Result<MemberPrivateHistory> {
+        if claim.purpose != InboxPurpose::Direct {
+            return Err(CollaborationError::Config(format!(
+                "Inbox {} 不是 Direct，不能构建成员私有历史",
+                claim.inbox_item_id
+            )));
+        }
+        let connection = self.connect()?;
+        let current_started_at = connection
+            .query_row(
+                "SELECT started_at FROM member_inbox_items
+                 WHERE inbox_item_id = ?1 AND member_id = ?2 AND purpose = 'direct'",
+                params![claim.inbox_item_id, claim.member_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CollaborationError::Config(format!(
+                    "Direct Inbox {} 不存在，无法冻结成员私有历史",
+                    claim.inbox_item_id
+                ))
+            })?
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        let max_turns = self.config.max_history_events_per_run / 2;
+        let desired_turns = max_turns.saturating_add(1);
+        let batch_size = desired_turns.max(32);
+        let mut direct_turns = Vec::with_capacity(desired_turns);
+        let mut offset = 0_usize;
+        let mut statement = connection.prepare(MEMBER_PRIVATE_HISTORY_QUERY)?;
+        'scan: loop {
+            let rows = statement.query_map(
+                params![
+                    claim.member_id,
+                    claim.inbox_item_id,
+                    current_started_at,
+                    claim.room_id,
+                    claim.source_event_seq,
+                    batch_size,
+                    offset,
+                ],
+                member_private_turn_row,
+            )?;
+            let mut scanned = 0_usize;
+            for row in rows {
+                scanned += 1;
+                let row = row?;
+                let Some(reply_event_id) = row.reply_event_id.as_deref() else {
+                    return Err(CollaborationError::Config(format!(
+                        "已完成 Direct Inbox {} 缺少 reply_event_id",
+                        row.inbox_item_id
+                    )));
+                };
+                let Some(joined_reply_event_id) = row.joined_reply_event_id.as_deref() else {
+                    return Err(CollaborationError::Config(format!(
+                        "已完成 Direct Inbox {} 的回复事件 {} 不存在",
+                        row.inbox_item_id, reply_event_id
+                    )));
+                };
+                if joined_reply_event_id != reply_event_id {
+                    return Err(CollaborationError::Config(format!(
+                        "已完成 Direct Inbox {} 的回复事件标识不一致",
+                        row.inbox_item_id
+                    )));
+                }
+                if row.reply_invalidated_at.is_some() {
+                    continue;
+                }
+                let valid_source_kind = matches!(
+                    (row.source_sender_kind.as_str(), row.source_kind.as_str()),
+                    ("user", "user_message") | ("member", "member_message")
+                );
+                if !valid_source_kind {
+                    return Err(CollaborationError::Config(format!(
+                        "Direct Inbox {} 的来源事件 {} 类型无效",
+                        row.inbox_item_id, row.source_event_id
+                    )));
+                }
+                let reply_room_id = row.reply_room_id.as_deref().ok_or_else(|| {
+                    CollaborationError::Config(format!(
+                        "Direct Inbox {} 的回复事件缺少房间",
+                        row.inbox_item_id
+                    ))
+                })?;
+                let reply_sequence = row.reply_sequence.ok_or_else(|| {
+                    CollaborationError::Config(format!(
+                        "Direct Inbox {} 的回复事件缺少序号",
+                        row.inbox_item_id
+                    ))
+                })?;
+                let reply_sender_kind = row.reply_sender_kind.as_deref().unwrap_or_default();
+                let reply_sender_id = row.reply_sender_id.as_deref().unwrap_or_default();
+                let reply_kind = row.reply_kind.as_deref().unwrap_or_default();
+                if reply_room_id != claim.room_id
+                    || reply_sender_kind != "member"
+                    || reply_sender_id != claim.member_id
+                    || reply_kind != "member_message"
+                {
+                    return Err(CollaborationError::Config(format!(
+                        "已完成 Direct Inbox {} 的回复事件 {} 不属于成员 {}",
+                        row.inbox_item_id, joined_reply_event_id, claim.member_id
+                    )));
+                }
+                let reply_content = row.reply_content.ok_or_else(|| {
+                    CollaborationError::Config(format!(
+                        "Direct Inbox {} 的回复事件缺少正文",
+                        row.inbox_item_id
+                    ))
+                })?;
+                let source_content_hash = history_content_hash(&row.source_content);
+                let source_content = if row.source_sender_kind == "member" {
+                    format_member_direct_input(
+                        &row.source_sender_name,
+                        &row.source_sender_id,
+                        &row.source_content,
+                    )
+                } else {
+                    row.source_content
+                };
+                direct_turns.push(MemberPrivateTurn {
+                    inbox_item_id: row.inbox_item_id,
+                    source: MemberHistoryMessage {
+                        event_id: row.source_event_id,
+                        sequence: row.source_sequence,
+                        role: "user".into(),
+                        content_hash: source_content_hash,
+                        content: source_content,
+                    },
+                    reply: MemberHistoryMessage {
+                        event_id: joined_reply_event_id.into(),
+                        sequence: reply_sequence,
+                        role: "assistant".into(),
+                        content_hash: history_content_hash(&reply_content),
+                        content: reply_content,
+                    },
+                });
+                if direct_turns.len() >= desired_turns {
+                    break 'scan;
+                }
+            }
+            if scanned < batch_size {
+                break;
+            }
+            offset = offset.saturating_add(scanned);
+        }
+
+        let mut legacy_statement = connection.prepare(
+            "SELECT 'legacy:' || source.event_id, NULL,
+                    source.event_id, source.sequence, source.sender_kind,
+                    source.sender_id, source.sender_name, source.kind, source.content,
+                    reply.event_id, reply.room_id, reply.sequence, reply.sender_kind,
+                    reply.sender_id, reply.kind, reply.content, reply.invalidated_at
+             FROM collaboration_rooms room
+             JOIN room_events source ON source.room_id = room.room_id
+             JOIN room_events reply
+               ON reply.room_id = source.room_id AND reply.sequence = source.sequence + 1
+             WHERE room.room_id = ?1
+               AND room.default_member_id = ?2
+               AND source.sequence < ?3
+               AND source.idempotency_key LIKE 'legacy:%'
+               AND reply.idempotency_key LIKE 'legacy:%'
+               AND source.sender_kind = 'user'
+               AND source.kind = 'user_message'
+               AND reply.sender_kind = 'member'
+               AND reply.sender_id = ?2
+               AND reply.kind = 'member_message'
+               AND source.invalidated_at IS NULL
+               AND reply.invalidated_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM room_event_recipients recipient
+                   WHERE recipient.event_id = source.event_id AND recipient.member_id = ?2
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM member_inbox_items inbox
+                   WHERE inbox.source_event_id = source.event_id AND inbox.member_id = ?2
+               )
+             ORDER BY source.sequence DESC
+             LIMIT ?4",
+        )?;
+        let legacy_rows = legacy_statement.query_map(
+            params![
+                claim.room_id,
+                claim.member_id,
+                claim.source_event_seq,
+                desired_turns,
+            ],
+            member_private_turn_row,
+        )?;
+        for row in legacy_rows {
+            let row = row?;
+            let reply_event_id = row.joined_reply_event_id.ok_or_else(|| {
+                CollaborationError::Config(format!("旧会话轮次 {} 缺少回复事件", row.inbox_item_id))
+            })?;
+            let reply_content = row.reply_content.ok_or_else(|| {
+                CollaborationError::Config(format!("旧会话轮次 {} 缺少回复正文", row.inbox_item_id))
+            })?;
+            let reply_sequence = row.reply_sequence.ok_or_else(|| {
+                CollaborationError::Config(format!("旧会话轮次 {} 缺少回复序号", row.inbox_item_id))
+            })?;
+            direct_turns.push(MemberPrivateTurn {
+                inbox_item_id: row.inbox_item_id,
+                source: MemberHistoryMessage {
+                    event_id: row.source_event_id,
+                    sequence: row.source_sequence,
+                    role: "user".into(),
+                    content_hash: history_content_hash(&row.source_content),
+                    content: row.source_content,
+                },
+                reply: MemberHistoryMessage {
+                    event_id: reply_event_id,
+                    sequence: reply_sequence,
+                    role: "assistant".into(),
+                    content_hash: history_content_hash(&reply_content),
+                    content: reply_content,
+                },
+            });
+        }
+        direct_turns.sort_by_key(|turn| (turn.source.sequence, turn.reply.sequence));
+        let truncated = direct_turns.len() > max_turns;
+        if truncated {
+            let drop_count = direct_turns.len().saturating_sub(max_turns);
+            direct_turns.drain(..drop_count);
+        }
+        Ok(MemberPrivateHistory {
+            turns: direct_turns,
+            truncated,
+        })
     }
 
     fn append_member_reply_event(
@@ -4495,6 +4713,24 @@ impl CollaborationRepository {
             RoomCapability::RoomRead,
         )?;
         events_through_from_connection(&connection, room_id, through_sequence, limit)
+    }
+
+    /// 返回冻结边界内最近的有效用户/成员消息，并提供稳定的向前分页标记。
+    pub fn conversation_events_through(
+        &self,
+        room_id: &str,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<RoomEventPage> {
+        let connection = self.connect()?;
+        room_from_connection(&connection, room_id)?;
+        require_capability(
+            &connection,
+            &CollaborationActor::local(),
+            room_id,
+            RoomCapability::RoomRead,
+        )?;
+        conversation_events_through_from_connection(&connection, room_id, through_sequence, limit)
     }
 
     pub fn retry_last_user_event(&self, room_id: &str, event_id: &str) -> Result<RoomSnapshot> {
@@ -6170,6 +6406,38 @@ fn events_through_from_connection(
     let mut events = hydrate_events(connection, rows)?;
     events.reverse();
     Ok(events)
+}
+
+fn conversation_events_through_from_connection(
+    connection: &Connection,
+    room_id: &str,
+    through_sequence: u64,
+    limit: usize,
+) -> Result<RoomEventPage> {
+    let requested = limit.clamp(1, 100);
+    let mut statement = connection.prepare(
+        "SELECT event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                kind, content, run_id, parent_event_id,
+                COALESCE(conversation_root_event_id, event_id), debate_depth,
+                group_enabled, conversation_mode, created_at
+         FROM room_events
+         WHERE room_id = ?1
+           AND sequence <= ?2
+           AND invalidated_at IS NULL
+           AND kind IN ('user_message', 'member_message')
+         ORDER BY sequence DESC LIMIT ?3",
+    )?;
+    let mut events = statement
+        .query_map(
+            params![room_id, through_sequence, requested + 1],
+            event_from_row_without_recipients,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = events.len() > requested;
+    events.truncate(requested);
+    let mut events = hydrate_events(connection, events)?;
+    events.reverse();
+    Ok(RoomEventPage { events, has_more })
 }
 
 fn inbox_from_connection(
@@ -7998,8 +8266,24 @@ mod tests {
         assert_eq!(second.events.len(), 2);
         assert_eq!(
             second.events[0].recipients,
-            vec![first.room.default_member_id]
+            vec![first.room.default_member_id.clone()]
         );
+
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&first.room.default_member_id),
+                "继续旧对话",
+                RoomInputMode::Chat,
+                "legacy-follow-up",
+            )
+            .unwrap();
+        let claim = repository.claim_next().unwrap().unwrap();
+        let history = repository.member_private_history(&claim).unwrap();
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].source.content, "第一问");
+        assert_eq!(history.turns[0].reply.content, "第一答");
+        assert!(history.turns[0].inbox_item_id.starts_with("legacy:"));
     }
 
     #[test]
@@ -8756,7 +9040,7 @@ mod tests {
     }
 
     #[test]
-    fn group_member_history_keeps_three_latest_user_messages_and_own_replies() {
+    fn group_member_private_history_keeps_all_addressed_turns_and_excludes_other_member() {
         let (_directory, repository) = repository();
         let snapshot = ensure(&repository);
         let a = snapshot.room.default_member_id;
@@ -8765,97 +9049,418 @@ mod tests {
             .unwrap()
             .member_id;
 
+        for index in 1..=10 {
+            repository
+                .post_group_message(
+                    "room-1",
+                    std::slice::from_ref(&a),
+                    &format!("A 用户消息 {index}"),
+                    RoomInputMode::Chat,
+                    &format!("history-a-{index}"),
+                )
+                .unwrap();
+            let claim = repository.claim_next().unwrap().unwrap();
+            assert_eq!(claim.member_id, a);
+            repository
+                .complete_item(&claim, &format!("A 回复 {index}"))
+                .unwrap();
+        }
+
+        for index in 1..=10 {
+            repository
+                .post_group_message(
+                    "room-1",
+                    std::slice::from_ref(&b),
+                    &format!("B 用户消息 {index}"),
+                    RoomInputMode::Chat,
+                    &format!("history-b-{index}"),
+                )
+                .unwrap();
+            let claim = repository.claim_next().unwrap().unwrap();
+            assert_eq!(claim.member_id, b);
+            repository
+                .complete_item(&claim, &format!("B 回复 {index}"))
+                .unwrap();
+        }
+
         repository
             .post_group_message(
                 "room-1",
                 std::slice::from_ref(&a),
-                "用户消息 1",
+                "A 当前消息",
                 RoomInputMode::Chat,
-                "history-1",
+                "history-a-current",
+            )
+            .unwrap();
+        let current = repository.claim_next().unwrap().unwrap();
+        assert_eq!(current.member_id, a);
+
+        let history = repository.member_private_history(&current).unwrap();
+        assert_eq!(history.turns.len(), 10);
+        assert!(!history.truncated);
+        for (offset, turn) in history.turns.iter().enumerate() {
+            let index = offset + 1;
+            assert_eq!(turn.source.content, format!("A 用户消息 {index}"));
+            assert_eq!(turn.source.role, "user");
+            assert_eq!(turn.reply.content, format!("A 回复 {index}"));
+            assert_eq!(turn.reply.role, "assistant");
+            assert!(!turn.source.content.contains("B 用户消息"));
+            assert!(!turn.reply.content.contains("B 回复"));
+        }
+    }
+
+    #[test]
+    fn member_private_history_excludes_participation_replies() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "公共讨论",
+                RoomInputMode::Chat,
+                "participation-history",
+            )
+            .unwrap();
+        let participation = repository.claim_next().unwrap().unwrap();
+        repository
+            .complete_item(&participation, "A 的公共参与回复")
+            .unwrap();
+        repository
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE member_inbox_items SET purpose = 'participation' WHERE inbox_item_id = ?1",
+                [participation.inbox_item_id],
+            )
+            .unwrap();
+
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "新的定向问题",
+                RoomInputMode::Chat,
+                "after-participation",
+            )
+            .unwrap();
+        let current = repository.claim_next().unwrap().unwrap();
+        let history = repository.member_private_history(&current).unwrap();
+        assert!(history.turns.is_empty());
+    }
+
+    #[test]
+    fn member_private_history_restores_explicit_member_handoff_as_user_input() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        let b = repository
+            .create_member("room-1", "智脑 B", None, None)
+            .unwrap()
+            .member_id;
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&b),
+                "请先分析",
+                RoomInputMode::Chat,
+                "handoff-root",
+            )
+            .unwrap();
+        let claim_b = repository.claim_next().unwrap().unwrap();
+        repository
+            .complete_item(&claim_b, "@智脑 A 请继续实现")
+            .unwrap();
+        let handoff = repository.claim_next().unwrap().unwrap();
+        assert_eq!(handoff.member_id, a);
+        assert!(handoff.member_handoff.is_some());
+        repository.complete_item(&handoff, "A 已接手").unwrap();
+
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "现在进展如何",
+                RoomInputMode::Chat,
+                "handoff-follow-up",
+            )
+            .unwrap();
+        let current = repository.claim_next().unwrap().unwrap();
+        let history = repository.member_private_history(&current).unwrap();
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(
+            history.turns[0].source.content,
+            format!("[来自实例 智脑 B（{b}）的定向消息]\n@智脑 A 请继续实现")
+        );
+        assert_eq!(history.turns[0].reply.content, "A 已接手");
+    }
+
+    #[test]
+    fn queued_direct_claim_sees_completed_earlier_turn_even_when_reply_sequence_is_later() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let a = snapshot.room.default_member_id;
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "U1",
+                RoomInputMode::Chat,
+                "queued-u1",
+            )
+            .unwrap();
+        repository
+            .post_group_message(
+                "room-1",
+                std::slice::from_ref(&a),
+                "U2",
+                RoomInputMode::Chat,
+                "queued-u2",
             )
             .unwrap();
         let first = repository.claim_next().unwrap().unwrap();
-        repository
-            .complete_item(&first, "A 对消息 1 的回复")
-            .unwrap();
-
-        repository
-            .post_group_message(
-                "room-1",
-                std::slice::from_ref(&b),
-                "用户消息 2",
-                RoomInputMode::Chat,
-                "history-2",
-            )
-            .unwrap();
+        assert_eq!(first.input, "U1");
+        repository.complete_item(&first, "A1").unwrap();
         let second = repository.claim_next().unwrap().unwrap();
-        repository
-            .complete_item(&second, "B 对消息 2 的回复")
-            .unwrap();
+        assert_eq!(second.input, "U2");
+        let history = repository.member_private_history(&second).unwrap();
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].source.content, "U1");
+        assert_eq!(history.turns[0].reply.content, "A1");
+        assert!(history.turns[0].reply.sequence > second.source_event_seq);
+    }
 
-        repository
-            .post_group_message(
-                "room-1",
-                std::slice::from_ref(&a),
-                "用户消息 3",
-                RoomInputMode::Chat,
-                "history-3",
-            )
-            .unwrap();
-        let third = repository.claim_next().unwrap().unwrap();
-        repository
-            .complete_item(&third, "A 对消息 3 的回复")
-            .unwrap();
-
-        repository
-            .post_group_message(
-                "room-1",
-                std::slice::from_ref(&b),
-                "用户消息 4",
-                RoomInputMode::Chat,
-                "history-4",
-            )
-            .unwrap();
-        let fourth = repository.claim_next().unwrap().unwrap();
-        repository
-            .complete_item(&fourth, "B 对消息 4 的回复")
-            .unwrap();
-
-        repository
-            .post_group_message(
-                "room-1",
-                std::slice::from_ref(&a),
-                "用户消息 5",
-                RoomInputMode::Chat,
-                "history-5",
-            )
-            .unwrap();
-        let fifth = repository.claim_next().unwrap().unwrap();
-        assert_eq!(fifth.member_id, a);
-        assert_eq!(fifth.input, "用户消息 5");
-
-        let history = repository.member_history(&fifth).unwrap();
-        assert_eq!(history.len(), 3);
-        assert!(history
-            .iter()
-            .any(|message| message.content.contains("用户消息 3")));
-        assert!(history
-            .iter()
-            .any(|message| message.content.contains("A 对消息 3 的回复")));
-        assert!(history
-            .iter()
-            .any(|message| message.content.contains("用户消息 4")));
-        for unexpected in [
-            "用户消息 1",
-            "A 对消息 1 的回复",
-            "用户消息 2",
-            "B 对消息 2 的回复",
-            "B 对消息 4 的回复",
-        ] {
-            assert!(!history
-                .iter()
-                .any(|message| message.content.contains(unexpected)));
+    #[test]
+    fn member_private_history_event_limit_keeps_only_complete_latest_turns() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = CollaborationRepository::new(
+            directory.path(),
+            CollaborationConfig {
+                max_history_events_per_run: 3,
+                ..CollaborationConfig::default()
+            },
+        )
+        .unwrap();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        for index in 1..=3 {
+            repository
+                .post_message(
+                    "room-1",
+                    std::slice::from_ref(&member_id),
+                    &format!("问题 {index}"),
+                    RoomInputMode::Chat,
+                    &format!("limited-history-{index}"),
+                )
+                .unwrap();
+            let claim = repository.claim_next().unwrap().unwrap();
+            repository
+                .complete_item(&claim, &format!("回答 {index}"))
+                .unwrap();
         }
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "当前问题",
+                RoomInputMode::Chat,
+                "limited-history-current",
+            )
+            .unwrap();
+        let current = repository.claim_next().unwrap().unwrap();
+
+        let history = repository.member_private_history(&current).unwrap();
+        assert!(history.truncated);
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].source.content, "问题 3");
+        assert_eq!(history.turns[0].reply.content, "回答 3");
+    }
+
+    #[test]
+    fn member_private_history_uses_member_index_in_a_ten_thousand_event_room() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "索引前的问题",
+                RoomInputMode::Chat,
+                "indexed-history",
+            )
+            .unwrap();
+        let prior = repository.claim_next().unwrap().unwrap();
+        repository.complete_item(&prior, "索引前的回答").unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        let mut connection = repository.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO room_events(
+                         event_id, room_id, sequence, sender_kind, sender_id, sender_name,
+                         kind, content, idempotency_key, created_at
+                     ) VALUES (?1, 'room-1', ?2, 'service', 'system', '系统',
+                               'load_fixture', 'fixture', ?3, ?4)",
+                )
+                .unwrap();
+            for sequence in 3_u64..=10_000 {
+                let event_id = format!("load-event-{sequence}");
+                let idempotency_key = format!("load-fixture-{sequence}");
+                insert
+                    .execute(params![event_id, sequence, idempotency_key, now])
+                    .unwrap();
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE collaboration_rooms SET latest_event_seq = 10000 WHERE room_id = 'room-1'",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "索引后的当前问题",
+                RoomInputMode::Chat,
+                "indexed-history-current",
+            )
+            .unwrap();
+        let current = repository.claim_next().unwrap().unwrap();
+        let connection = repository.connect().unwrap();
+        let current_started_at: String = connection
+            .query_row(
+                "SELECT started_at FROM member_inbox_items WHERE inbox_item_id = ?1",
+                [current.inbox_item_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {MEMBER_PRIVATE_HISTORY_QUERY}");
+        let mut statement = connection.prepare(&explain).unwrap();
+        let details = statement
+            .query_map(
+                params![
+                    current.member_id,
+                    current.inbox_item_id,
+                    current_started_at,
+                    current.room_id,
+                    current.source_event_seq,
+                    32,
+                    0,
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("member_inbox_member_state_idx")),
+            "query plan must use the member/state inbox index: {details:?}"
+        );
+        drop(statement);
+        drop(connection);
+
+        let history = repository.member_private_history(&current).unwrap();
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].source.content, "索引前的问题");
+        assert_eq!(history.turns[0].reply.content, "索引前的回答");
+    }
+
+    #[test]
+    fn member_private_history_skips_invalidated_reply_turn() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "即将失效的问题",
+                RoomInputMode::Chat,
+                "invalidated-history",
+            )
+            .unwrap();
+        let prior = repository.claim_next().unwrap().unwrap();
+        let reply = repository
+            .complete_item(&prior, "即将失效的回答")
+            .unwrap()
+            .unwrap();
+        repository
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE room_events SET invalidated_at = ?1 WHERE event_id = ?2",
+                params![Utc::now().to_rfc3339(), reply.event_id],
+            )
+            .unwrap();
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "当前问题",
+                RoomInputMode::Chat,
+                "after-invalidated-history",
+            )
+            .unwrap();
+        let current = repository.claim_next().unwrap().unwrap();
+
+        let history = repository.member_private_history(&current).unwrap();
+        assert!(history.turns.is_empty());
+    }
+
+    #[test]
+    fn member_private_history_rejects_completed_inbox_without_reply() {
+        let (_directory, repository) = repository();
+        let snapshot = ensure(&repository);
+        let member_id = snapshot.room.default_member_id;
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "损坏前的问题",
+                RoomInputMode::Chat,
+                "corrupt-history",
+            )
+            .unwrap();
+        let prior = repository.claim_next().unwrap().unwrap();
+        repository.complete_item(&prior, "损坏前的回答").unwrap();
+        repository
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE member_inbox_items SET reply_event_id = NULL WHERE inbox_item_id = ?1",
+                [prior.inbox_item_id.as_str()],
+            )
+            .unwrap();
+        repository
+            .post_message(
+                "room-1",
+                std::slice::from_ref(&member_id),
+                "当前问题",
+                RoomInputMode::Chat,
+                "after-corrupt-history",
+            )
+            .unwrap();
+        let current = repository.claim_next().unwrap().unwrap();
+
+        let error = repository.member_private_history(&current).unwrap_err();
+        assert!(matches!(
+            error,
+            CollaborationError::Config(message)
+                if message.contains("缺少 reply_event_id")
+                    && message.contains(&prior.inbox_item_id)
+        ));
     }
 
     #[test]

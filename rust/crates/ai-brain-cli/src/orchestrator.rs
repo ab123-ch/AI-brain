@@ -286,7 +286,7 @@ where
         brain.register_tools(Vec::new());
     }
     brain.restore_history(restore_history);
-    brain.push_memory_context(&member_context);
+    brain.replace_run_system_context(Some(member_context));
 
     let process = brain.process_input(&input, Some(&progress_tx), Some(cancel));
     let result = crate::query_context::with_conversation_memory_scope(&memory_scope, process)
@@ -3160,9 +3160,44 @@ fn create_sub_brains() -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain_core::tool_executor::StubToolExecutor;
     use brain_core::types::TurnUsage;
     use brain_llm::config::{InstanceModelConfig, ProviderConfig, ProviderKind};
     use knowledge_core::{ContextBlock, ContextBlockInput};
+
+    struct CapturingMemberLlm {
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
+    }
+
+    impl CapturingMemberLlm {
+        fn new() -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl brain_llm::LlmProvider for CapturingMemberLlm {
+        fn model(&self) -> &'static str {
+            "capturing-member-test"
+        }
+
+        fn complete(
+            &self,
+            request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = brain_llm::Result<brain_llm::ChatResponse>> + Send + '_>>
+        {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(async {
+                Ok(brain_llm::ChatResponse {
+                    content: vec![brain_llm::ContentBlock::text("current answer")],
+                    model: "capturing-member-test".into(),
+                    usage: brain_llm::TokenUsage::default(),
+                    finish_reason: Some(brain_llm::FinishReason::EndTurn),
+                })
+            })
+        }
+    }
 
     #[test]
     fn general_eval_brain_is_opt_in() {
@@ -3267,6 +3302,82 @@ mod tests {
         let mut tampered = snapshot;
         tampered.blocks[0].content = "changed after freeze".into();
         assert!(member_inputs_from_snapshot(&tampered).is_err());
+    }
+
+    #[tokio::test]
+    async fn member_execution_sends_system_then_private_turns_then_current_user() {
+        let snapshot = KnowledgeContextSnapshot::new(
+            "context-provider-order",
+            vec![
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "policy",
+                    ContextBlockKind::SystemPolicy,
+                    "member A policy",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "history-user",
+                    ContextBlockKind::ConversationUser,
+                    "earlier question",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "history-assistant",
+                    ContextBlockKind::ConversationAssistant,
+                    "earlier answer",
+                ))
+                .unwrap(),
+                ContextBlock::from_input(ContextBlockInput::new(
+                    "current",
+                    ContextBlockKind::CurrentInput,
+                    "current question",
+                ))
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let llm = Arc::new(CapturingMemberLlm::new());
+        let template_llm: Arc<dyn brain_llm::LlmProvider> = llm.clone();
+        let template = MainBrain::new(
+            template_llm,
+            Arc::new(StubToolExecutor::new()),
+            BrainConfig::default(),
+            4_096,
+            0.0,
+        );
+        let execution_llm: Arc<dyn brain_llm::LlmProvider> = llm.clone();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+
+        execute_member_run(
+            Arc::new(tokio::sync::Mutex::new(Some(template))),
+            None,
+            snapshot,
+            ConversationMemoryScope::new("member-a", "run-a").unwrap(),
+            move || Ok((execution_llm, 4_096, 0.0)),
+            false,
+            ToolExecutionContext::default(),
+            None,
+            progress_tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let requests = llm.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = &requests[0].messages;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, brain_llm::MessageRole::System);
+        assert!(messages[0].text_content().contains("member A policy"));
+        assert_eq!(messages[1].role, brain_llm::MessageRole::User);
+        assert_eq!(messages[1].text_content(), "earlier question");
+        assert_eq!(messages[2].role, brain_llm::MessageRole::Assistant);
+        assert_eq!(messages[2].text_content(), "earlier answer");
+        assert_eq!(messages[3].role, brain_llm::MessageRole::User);
+        assert_eq!(messages[3].text_content(), "current question");
+        assert!(!messages[1..]
+            .iter()
+            .any(|message| message.text_content().contains("member A policy")));
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub struct MainBrain {
     llm_temperature: f64,
     /// 记忆脑启动时注入的上下文（追加到 system prompt 尾部）
     memory_context: Option<String>,
+    /// 单次隔离运行的 system 上下文，不进入对话历史或后续 fork。
+    run_system_context: Option<String>,
     /// 可用技能摘要（追加到 system prompt）
     skill_summary: Option<String>,
     /// Bootstrap 技能内容（启动时自动注入）
@@ -90,6 +92,7 @@ impl MainBrain {
             llm_max_tokens,
             llm_temperature,
             memory_context: None,
+            run_system_context: None,
             skill_summary: None,
             bootstrap_content: None,
             session_prompt_tokens: 0,
@@ -660,6 +663,12 @@ impl MainBrain {
         self.memory_context = memory_context.filter(|value| !value.trim().is_empty());
     }
 
+    /// Replace request-scoped policy/context appended to the Provider system
+    /// message. This value is intentionally excluded from conversation history.
+    pub fn replace_run_system_context(&mut self, context: Option<String>) {
+        self.run_system_context = context.filter(|value| !value.trim().is_empty());
+    }
+
     /// 注入可用技能摘要（追加到 system prompt）
     pub fn inject_skill_summary(&mut self, summary: String) {
         if summary.is_empty() {
@@ -747,6 +756,9 @@ impl MainBrain {
             parts.push(skills.clone());
         }
         if let Some(ref ctx) = self.memory_context {
+            parts.push(format!("\n{ctx}"));
+        }
+        if let Some(ref ctx) = self.run_system_context {
             parts.push(format!("\n{ctx}"));
         }
         let full_prompt = parts.join("\n");
@@ -978,6 +990,7 @@ mod tests {
         brain.inject_memory_context("持久人格上下文");
         brain.inject_skill_summary("可用技能摘要".into());
         brain.inject_bootstrap("启动约束".into());
+        brain.replace_run_system_context(Some("旧成员运行策略".into()));
         brain.history.push_user("旧成员私有历史");
         brain.session_prompt_tokens = 321;
 
@@ -993,6 +1006,34 @@ mod tests {
         assert!(prompt.contains("可用技能摘要"));
         assert!(prompt.contains("启动约束"));
         assert!(!prompt.contains("旧成员私有历史"));
+        assert!(!prompt.contains("旧成员运行策略"));
+    }
+
+    #[test]
+    fn run_system_context_stays_in_the_single_provider_system_message() {
+        let llm = Arc::new(StubLlm);
+        let executor = Arc::new(StubToolExecutor::new());
+        let mut brain = MainBrain::new(llm, executor, BrainConfig::default(), 32768, 0.7);
+        brain.restore_history(vec![
+            ChatMessageRestore {
+                role: "user".into(),
+                content: "earlier question".into(),
+            },
+            ChatMessageRestore {
+                role: "assistant".into(),
+                content: "earlier answer".into(),
+            },
+        ]);
+        brain.replace_run_system_context(Some("member A policy".into()));
+
+        let messages = brain.build_messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, brain_llm::MessageRole::System);
+        assert!(messages[0].text_content().contains("member A policy"));
+        assert_eq!(messages[1].role, brain_llm::MessageRole::User);
+        assert_eq!(messages[1].text_content(), "earlier question");
+        assert_eq!(messages[2].role, brain_llm::MessageRole::Assistant);
+        assert_eq!(messages[2].text_content(), "earlier answer");
     }
 
     /// 测试 push_memory_context 注入独立 system 消息
