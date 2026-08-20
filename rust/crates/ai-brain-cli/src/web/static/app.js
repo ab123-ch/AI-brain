@@ -64,6 +64,7 @@ const CHARS_PER_FRAME = 3;
 
 // ── DOM References ──────────────────────────────────────────────
 const $messages = document.getElementById('messages');
+const $inputArea = document.getElementById('input-area');
 const $input = document.getElementById('input');
 const $sendBtn = document.getElementById('send-btn');
 const $personaSelect = document.getElementById('persona-select');
@@ -173,6 +174,9 @@ const composerResizeScheduler = RoomReply.createFrameScheduler(
     (callback) => requestAnimationFrame(callback),
     (frameId) => cancelAnimationFrame(frameId),
 );
+const composerViewportObserver = typeof ResizeObserver === 'function'
+    ? new ResizeObserver(syncComposerViewportOffset)
+    : null;
 const runRenderScheduler = RoomReply.createFrameScheduler(
     flushPendingRunRenders,
     (callback) => requestAnimationFrame(callback),
@@ -809,6 +813,13 @@ function resizeComposerNow() {
     }
     $input.style.height = 'auto';
     $input.style.height = `${Math.min($input.scrollHeight, 120)}px`;
+}
+
+function syncComposerViewportOffset() {
+    const height = Math.ceil($inputArea.getBoundingClientRect().height);
+    if (height > 0) {
+        document.documentElement.style.setProperty('--composer-height', `${height}px`);
+    }
 }
 
 function scheduleComposerResize() {
@@ -4036,12 +4047,16 @@ function switchView(view) {
     $cockpitArea.classList.toggle('active', showCockpit);
     $chatTab.classList.toggle('active', !showCockpit);
     $cockpitTab.classList.toggle('active', showCockpit);
+    syncComposerViewportOffset();
     if (showCockpit) {
         renderCockpit();
     }
 }
 
 // ── Init ────────────────────────────────────────────────────────
+syncComposerViewportOffset();
+composerViewportObserver?.observe($inputArea);
+window.addEventListener('resize', syncComposerViewportOffset);
 connect();
 renderCockpit();
 refreshIcons();

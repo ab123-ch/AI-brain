@@ -2160,8 +2160,17 @@ mod tests {
         assert!(css_rule(".reply-preview strong").contains("overflow-wrap: anywhere"));
         assert!(css_rule(".room-reply-reference strong").contains("overflow-wrap: anywhere"));
         assert!(css_rule("#messages").contains("contain: layout paint style"));
+        assert!(css_rule("#messages").contains("min-height: 0"));
         assert!(css_rule("#messages > *").contains("content-visibility: auto"));
+        assert!(css_rule("#main").contains("min-height: 0"));
+        assert!(css_rule(".view-panel").contains("min-height: 0"));
+        assert!(css_rule("#input-area").contains("flex: 0 0 auto"));
+        assert!(css_rule("body.preview-open .markdown-preview")
+            .contains("bottom: var(--composer-height)"));
+        assert!(css_rule("body.preview-open #input-area").contains("z-index: 100"));
         assert!(css_rule("#input").contains("field-sizing: content"));
+        assert!(script.contains("new ResizeObserver(syncComposerViewportOffset)"));
+        assert!(script.contains("style.setProperty('--composer-height'"));
 
         for contract in [
             "RoomReply.beginReply",
