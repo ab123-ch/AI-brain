@@ -11,16 +11,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
-use brain_llm::config::LlmConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::orchestrator::Orchestrator;
-use crate::web::collaboration::{
-    default_runtime_dir, CollaborationConfig, CollaborationRepository,
-};
-use crate::web::collaboration_runtime::CollaborationRuntime;
+use crate::web::collaboration_app::CollaborationApplication;
 use crate::web::session_manager::SessionManager;
 use crate::web::ws_handler::{ws_upgrade, AppState};
 
@@ -427,45 +423,13 @@ async fn serve_web_with_policy(
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("ai-brain");
     let sessions = Arc::new(Mutex::new(SessionManager::new(&base_dir)));
-    let runtime_dir = default_runtime_dir();
-    let llm_config = Arc::new(match LlmConfig::load_default() {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!("加载实例模型目录失败，仅保留 main 策略: {error}");
-            LlmConfig::default_config()
-        }
-    });
-    let model_policy_details = llm_config.available_instance_model_policies();
-    let collaboration_config = CollaborationConfig::load(&runtime_dir.join("config.toml"))
-        .map_err(|error| format!("加载协作配置失败: {error}"))?
-        .with_available_model_policies(
-            model_policy_details
-                .iter()
-                .map(|policy| policy.policy_id.clone()),
-        );
-    let collaboration_repository = Arc::new(
-        CollaborationRepository::new_with_startup_working_directory(
-            &runtime_dir,
-            collaboration_config,
-            &workspace_root,
-        )
-        .map_err(|error| format!("初始化协作存储失败: {error}"))?,
-    );
-    let orch = Arc::new(orch);
-    let collaboration = CollaborationRuntime::start(
-        Arc::clone(&collaboration_repository),
-        Arc::clone(&orch),
-        Arc::clone(&llm_config),
-        model_policy_details,
-    )
-    .await
-    .map_err(|error| format!("启动协作运行时失败: {error}"))?;
+    let collaboration_app = CollaborationApplication::start(orch, &workspace_root).await?;
     let state = Arc::new(AppState {
-        orch,
+        orch: collaboration_app.orchestrator,
         sessions,
-        collaboration,
-        collaboration_repository,
-        workspace_root: workspace_root.clone(),
+        collaboration: collaboration_app.runtime,
+        collaboration_repository: collaboration_app.repository,
+        workspace_root: collaboration_app.workspace_root,
         local_file_save_lock: Mutex::new(()),
     });
 

@@ -7,6 +7,7 @@ pub mod api_server;
 pub mod command;
 pub(crate) mod command_execution;
 pub mod config_manager;
+pub mod dingtalk;
 pub mod init;
 pub mod llm_usage_logger;
 pub mod novel_adapters;

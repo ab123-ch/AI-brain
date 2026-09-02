@@ -216,6 +216,24 @@ export ZHIPU_API_KEY="your-api-key"
 
 编辑 `~/.ai-brain/config.toml`，设置 `api_key` 字段。
 
+### 钉钉 Stream 机器人
+
+智脑可以作为企业内部应用机器人直接运行在本机，通过出站 Stream 长连接收发消息，
+不需要公网服务器、域名或内网穿透：
+
+```bash
+export DINGTALK_CLIENT_ID="ding..."
+export DINGTALK_CLIENT_SECRET="..."
+export DINGTALK_ALLOWED_STAFF_IDS="staff-id-1"
+
+cd rust
+cargo run -p ai-brain-cli -- dingtalk
+```
+
+当前支持机器人单聊文本和群聊 `@机器人` 文本，并将每个钉钉会话映射到持久化智脑
+Room。完整的钉钉后台配置、安全限制和运行说明见
+[钉钉 Stream 接入](rust/docs/dingtalk-stream.md)。
+
 ### 兼容其他 OpenAI 格式 API
 
 以 OpenAI 官方为例：

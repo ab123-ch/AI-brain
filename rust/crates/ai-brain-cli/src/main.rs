@@ -1,4 +1,4 @@
-use ai_brain_cli::{api_server, init, orchestrator, remote_access, repl, tui};
+use ai_brain_cli::{api_server, dingtalk, init, orchestrator, remote_access, repl, tui};
 use clap::{Parser, Subcommand};
 use orchestrator::{format_output, Orchestrator};
 use std::io::IsTerminal;
@@ -45,6 +45,8 @@ enum Commands {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// 启动钉钉企业机器人 Stream 长连接
+    Dingtalk,
     /// v2 路径集成测试（3 轮对话，验证 eval_gate + 评估脑）
     V2Test,
     /// 导出完整 system prompt 到桌面文件（调试用）
@@ -227,6 +229,17 @@ async fn run_command(cli: Cli) {
                 std::process::exit(1);
             }
         },
+        Some(Commands::Dingtalk) => {
+            if let Err(error) = dingtalk::validate_environment() {
+                eprintln!("钉钉 Stream 配置无效: {error}");
+                std::process::exit(1);
+            }
+            let orch = init_or_die().await;
+            if let Err(error) = dingtalk::run(orch).await {
+                eprintln!("钉钉 Stream 启动失败: {error}");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Brain { action }) => {
             let orch = init_or_die().await;
             handle_brain_command(orch, action).await;
